@@ -4,11 +4,12 @@
 
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
+#include <FEXCore/fextl/vector.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
+#include <FEXCore/Utils/Threads.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,41 +41,18 @@ namespace {
     uint64_t DiskCacheHitCount;
   };
 
-  struct Delta {
-    Sample D;
-    double CPUPercent;
-  };
-
-  // All state is static and fixed-size: a tick runs inside FEX's exception handler on whatever guest thread happens
-  // to be there, where allocating could deadlock against a lock the interrupted code holds.
   struct LogState {
     const StatAlloc* Stats;
     FILE* File;
     uint64_t CounterFreq;
-    uint64_t IntervalTicks;
-    uint64_t StartTicks;
-    uint64_t LastTicks;
-    std::atomic<uint64_t> NextDue;
-    std::atomic<bool> Busy;
     Sample Prev[MaxTracked];
     size_t PrevCount;
-    Sample Current[MaxTracked];
-    Delta Deltas[MaxTracked];
-    char Line[8192];
   };
-
-  LogState* State;
 
   uint64_t GetCounterFrequency() {
     uint64_t Result {};
     __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Result));
     return Result ? Result : 1;
-  }
-
-  uint64_t GetCounter() {
-    uint64_t Result {};
-    __asm volatile("mrs %[Res], CNTVCT_EL0" : [Res] "=r"(Result));
-    return Result;
   }
 
   HANDLE OpenThreadForQuery(uint32_t TID) {
@@ -104,134 +82,146 @@ namespace {
     return Result;
   }
 
-  // Writes the thread's name (ASCII, spaces replaced) into Out, which must hold at least 64 bytes.
-  void QueryThreadName(uint32_t TID, char* Out, size_t OutSize) {
-    Out[0] = '-';
-    Out[1] = 0;
+  fextl::string QueryThreadName(uint32_t TID) {
     HANDLE Handle = OpenThreadForQuery(TID);
     if (!Handle) {
-      return;
+      return {};
     }
     alignas(8) uint8_t Buffer[sizeof(UNICODE_STRING) + 128 * sizeof(WCHAR)] {};
+    fextl::string Result;
     ULONG Length {};
     if (NtQueryInformationThread(Handle, static_cast<THREADINFOCLASS>(38) /* ThreadNameInformation */, Buffer, sizeof(Buffer), &Length) ==
         STATUS_SUCCESS) {
       const auto* Name = reinterpret_cast<const UNICODE_STRING*>(Buffer);
-      size_t o = 0;
-      for (USHORT i = 0; Name->Buffer && i < Name->Length / sizeof(WCHAR) && o + 1 < OutSize; ++i) {
+      for (USHORT i = 0; Name->Buffer && i < Name->Length / sizeof(WCHAR); ++i) {
         const WCHAR c = Name->Buffer[i];
-        Out[o++] = c > 0x20 && c < 0x7f ? static_cast<char>(c) : '_';
-      }
-      if (o) {
-        Out[o] = 0;
+        Result.push_back(c >= 0x20 && c < 0x7f && c != ' ' ? static_cast<char>(c) : '_');
       }
     }
     NtClose(Handle);
+    return Result;
   }
 
-  template<typename... Args>
-  size_t Append(size_t Pos, fmt::format_string<Args...> Format, Args&&... args) {
-    if (Pos >= sizeof(State->Line)) {
-      return Pos;
-    }
-    auto Result = fmt::format_to_n(State->Line + Pos, sizeof(State->Line) - Pos, Format, std::forward<Args>(args)...);
-    return std::min(Pos + Result.size, sizeof(State->Line));
+  void Sleep1s() {
+    LARGE_INTEGER Time {.QuadPart = -10'000'000LL};
+    NtDelayExecution(FALSE, &Time);
   }
 
-  void WriteSample(uint64_t Now) {
+  void* LogThread(void* Arg) {
+    auto* State = static_cast<LogState*>(Arg);
     const double MsPerTick = 1000.0 / static_cast<double>(State->CounterFreq);
-    const double Elapsed100ns = static_cast<double>(Now - State->LastTicks) * 10'000'000.0 / static_cast<double>(State->CounterFreq);
-    const double Seconds = static_cast<double>(Now - State->StartTicks) / static_cast<double>(State->CounterFreq);
-    State->LastTicks = Now;
+    uint64_t Seconds {};
 
-    size_t CurrentCount = 0;
-    State->Stats->ForEachSlot([&](const FEXCore::SHMStats::ThreadStats& Slot) {
-      if (CurrentCount == MaxTracked) {
-        return;
-      }
-      const uint32_t TID = Slot.TID.load(std::memory_order_relaxed);
-      State->Current[CurrentCount++] = {
-        .TID = TID,
-        .CPUTime100ns = QueryThreadCPUTime(TID),
-        .JITTime = Slot.AccumulatedJITTime,
-        .JITCount = Slot.AccumulatedJITCount,
-        .SignalTime = Slot.AccumulatedSignalTime,
-        .SIGBUSCount = Slot.AccumulatedSIGBUSCount,
-        .SMCCount = Slot.AccumulatedSMCCount,
-        .CacheMissCount = Slot.AccumulatedCacheMissCount,
-        .CacheLockTime = Slot.AccumulatedCacheReadLockTime + Slot.AccumulatedCacheWriteLockTime,
-        .FloatFallbackCount = Slot.AccumulatedFloatFallbackCount,
-        .DiskCacheHitCount = Slot.AccumulatedDiskCacheHitCount,
-      };
-    });
+    fextl::vector<Sample> Current;
+    Current.reserve(MaxTracked);
 
-    Sample Total {};
-    double TotalCPU {};
-    for (size_t c = 0; c < CurrentCount; ++c) {
-      const Sample& Cur = State->Current[c];
-      static const Sample Zero {};
-      const Sample* Old = &Zero;
-      for (size_t i = 0; i < State->PrevCount; ++i) {
-        if (State->Prev[i].TID == Cur.TID) {
-          Old = &State->Prev[i];
-          break;
+    for (;;) {
+      Sleep1s();
+      ++Seconds;
+
+      Current.clear();
+      State->Stats->ForEachSlot([&](const FEXCore::SHMStats::ThreadStats& Slot) {
+        if (Current.size() == MaxTracked) {
+          return;
         }
+        const uint32_t TID = Slot.TID.load(std::memory_order_relaxed);
+        Current.push_back({
+          .TID = TID,
+          .CPUTime100ns = QueryThreadCPUTime(TID),
+          .JITTime = Slot.AccumulatedJITTime,
+          .JITCount = Slot.AccumulatedJITCount,
+          .SignalTime = Slot.AccumulatedSignalTime,
+          .SIGBUSCount = Slot.AccumulatedSIGBUSCount,
+          .SMCCount = Slot.AccumulatedSMCCount,
+          .CacheMissCount = Slot.AccumulatedCacheMissCount,
+          .CacheLockTime = Slot.AccumulatedCacheReadLockTime + Slot.AccumulatedCacheWriteLockTime,
+          .FloatFallbackCount = Slot.AccumulatedFloatFallbackCount,
+          .DiskCacheHitCount = Slot.AccumulatedDiskCacheHitCount,
+        });
+      });
+
+      struct Delta {
+        Sample D;
+        double CPUPercent;
+      };
+      fextl::vector<Delta> Deltas;
+      Deltas.reserve(Current.size());
+      Sample Total {};
+      double TotalCPU {};
+
+      for (const auto& Cur : Current) {
+        const Sample* Old = nullptr;
+        for (size_t i = 0; i < State->PrevCount; ++i) {
+          if (State->Prev[i].TID == Cur.TID) {
+            Old = &State->Prev[i];
+            break;
+          }
+        }
+        const Sample Zero {};
+        if (!Old) {
+          Old = &Zero;
+        }
+        // A reused slot (new thread, same TID) or a reset can make counters go backwards; treat that as a fresh start.
+        auto Diff = [](uint64_t New, uint64_t OldV) {
+          return New >= OldV ? New - OldV : New;
+        };
+        Delta Entry {
+          .D =
+            {
+              .TID = Cur.TID,
+              .CPUTime100ns = Diff(Cur.CPUTime100ns, Old->CPUTime100ns),
+              .JITTime = Diff(Cur.JITTime, Old->JITTime),
+              .JITCount = Diff(Cur.JITCount, Old->JITCount),
+              .SignalTime = Diff(Cur.SignalTime, Old->SignalTime),
+              .SIGBUSCount = Diff(Cur.SIGBUSCount, Old->SIGBUSCount),
+              .SMCCount = Diff(Cur.SMCCount, Old->SMCCount),
+              .CacheMissCount = Diff(Cur.CacheMissCount, Old->CacheMissCount),
+              .CacheLockTime = Diff(Cur.CacheLockTime, Old->CacheLockTime),
+              .FloatFallbackCount = Diff(Cur.FloatFallbackCount, Old->FloatFallbackCount),
+              .DiskCacheHitCount = Diff(Cur.DiskCacheHitCount, Old->DiskCacheHitCount),
+            },
+        };
+        // 100ns units over a 1s interval: 10'000'000 == 100%.
+        Entry.CPUPercent = static_cast<double>(Entry.D.CPUTime100ns) / 100'000.0;
+        TotalCPU += Entry.CPUPercent;
+        Total.JITTime += Entry.D.JITTime;
+        Total.JITCount += Entry.D.JITCount;
+        Total.SignalTime += Entry.D.SignalTime;
+        Total.SIGBUSCount += Entry.D.SIGBUSCount;
+        Total.SMCCount += Entry.D.SMCCount;
+        Total.CacheMissCount += Entry.D.CacheMissCount;
+        Total.FloatFallbackCount += Entry.D.FloatFallbackCount;
+        Deltas.push_back(Entry);
       }
-      // A reused TID can make counters go backwards; treat that as a fresh start.
-      auto Diff = [](uint64_t New, uint64_t OldV) {
-        return New >= OldV ? New - OldV : New;
-      };
-      Delta& Entry = State->Deltas[c];
-      Entry.D = {
-        .TID = Cur.TID,
-        .CPUTime100ns = Diff(Cur.CPUTime100ns, Old->CPUTime100ns),
-        .JITTime = Diff(Cur.JITTime, Old->JITTime),
-        .JITCount = Diff(Cur.JITCount, Old->JITCount),
-        .SignalTime = Diff(Cur.SignalTime, Old->SignalTime),
-        .SIGBUSCount = Diff(Cur.SIGBUSCount, Old->SIGBUSCount),
-        .SMCCount = Diff(Cur.SMCCount, Old->SMCCount),
-        .CacheMissCount = Diff(Cur.CacheMissCount, Old->CacheMissCount),
-        .CacheLockTime = Diff(Cur.CacheLockTime, Old->CacheLockTime),
-        .FloatFallbackCount = Diff(Cur.FloatFallbackCount, Old->FloatFallbackCount),
-        .DiskCacheHitCount = Diff(Cur.DiskCacheHitCount, Old->DiskCacheHitCount),
-      };
-      Entry.CPUPercent = Elapsed100ns > 0 ? static_cast<double>(Entry.D.CPUTime100ns) * 100.0 / Elapsed100ns : 0.0;
-      TotalCPU += Entry.CPUPercent;
-      Total.JITTime += Entry.D.JITTime;
-      Total.JITCount += Entry.D.JITCount;
-      Total.SignalTime += Entry.D.SignalTime;
-      Total.SIGBUSCount += Entry.D.SIGBUSCount;
-      Total.SMCCount += Entry.D.SMCCount;
-      Total.CacheMissCount += Entry.D.CacheMissCount;
-      Total.FloatFallbackCount += Entry.D.FloatFallbackCount;
+
+      State->PrevCount = std::min(Current.size(), MaxTracked);
+      std::copy_n(Current.begin(), State->PrevCount, State->Prev);
+
+      std::sort(Deltas.begin(), Deltas.end(), [](const Delta& a, const Delta& b) { return a.CPUPercent > b.CPUPercent; });
+
+      auto Line = fextl::fmt::format("t={} threads={} cpu={:.0f}% jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} x87fb={}\n",
+                                     Seconds, Current.size(), TotalCPU, Total.JITTime * MsPerTick, Total.JITCount, Total.SMCCount,
+                                     Total.SIGBUSCount, Total.SignalTime * MsPerTick, Total.CacheMissCount, Total.FloatFallbackCount);
+
+      size_t Printed {};
+      for (const auto& Entry : Deltas) {
+        const auto& D = Entry.D;
+        const bool Interesting = Entry.CPUPercent >= 3.0 || D.JITCount || D.SMCCount || D.SIGBUSCount;
+        if (!Interesting || Printed == MaxPrinted) {
+          continue;
+        }
+        ++Printed;
+        Line += fextl::fmt::format("  tid={} {} cpu={:.0f}% jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} lock={:.1f}ms x87fb={} "
+                                   "dc={}\n",
+                                   D.TID, QueryThreadName(D.TID), Entry.CPUPercent, D.JITTime * MsPerTick, D.JITCount, D.SMCCount,
+                                   D.SIGBUSCount, D.SignalTime * MsPerTick, D.CacheMissCount, D.CacheLockTime * MsPerTick,
+                                   D.FloatFallbackCount, D.DiskCacheHitCount);
+      }
+
+      fwrite(Line.data(), 1, Line.size(), State->File);
     }
 
-    std::copy_n(State->Current, CurrentCount, State->Prev);
-    State->PrevCount = CurrentCount;
-
-    std::sort(State->Deltas, State->Deltas + CurrentCount, [](const Delta& a, const Delta& b) { return a.CPUPercent > b.CPUPercent; });
-
-    const double IntervalMs = Elapsed100ns / 10'000.0;
-    size_t Pos = Append(0, "t={:.1f}s span={:.0f}ms threads={} cpu={:.0f}% jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} x87fb={}\n",
-                        Seconds, IntervalMs, CurrentCount, TotalCPU, Total.JITTime * MsPerTick, Total.JITCount, Total.SMCCount,
-                        Total.SIGBUSCount, Total.SignalTime * MsPerTick, Total.CacheMissCount, Total.FloatFallbackCount);
-
-    size_t Printed {};
-    for (size_t c = 0; c < CurrentCount && Printed < MaxPrinted; ++c) {
-      const auto& Entry = State->Deltas[c];
-      const auto& D = Entry.D;
-      if (Entry.CPUPercent < 3.0 && !D.JITCount && !D.SMCCount && !D.SIGBUSCount) {
-        continue;
-      }
-      ++Printed;
-      char Name[64];
-      QueryThreadName(D.TID, Name, sizeof(Name));
-      Pos = Append(Pos, "  tid={} {} cpu={:.0f}% jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} lock={:.1f}ms x87fb={} dc={}\n",
-                   D.TID, static_cast<const char*>(Name), Entry.CPUPercent, D.JITTime * MsPerTick, D.JITCount, D.SMCCount, D.SIGBUSCount,
-                   D.SignalTime * MsPerTick, D.CacheMissCount, D.CacheLockTime * MsPerTick, D.FloatFallbackCount, D.DiskCacheHitCount);
-    }
-
-    fwrite(State->Line, 1, Pos, State->File);
+    return nullptr;
   }
 
   bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
@@ -281,45 +271,19 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
     return;
   }
 
-  auto Header = fextl::fmt::format("# FEX stats for {} (pid {}), roughly one block per second. span = length of the block; cpu = thread "
-                                   "CPU time; jit = time/blocks compiled; smc = writes to translated code; sigbus = unaligned atomic "
-                                   "fixups; sig = time in exception handling; miss = lookup cache misses; lock = lookup cache lock "
-                                   "time; x87fb = x87 fallbacks; dc = disk cache hits\n",
+  auto Header = fextl::fmt::format("# FEX stats for {} (pid {}), one block per second. cpu = thread CPU time; jit = time/blocks compiled; "
+                                   "smc = writes to translated code; sigbus = unaligned atomic fixups; sig = time in exception "
+                                   "handling; miss = lookup cache misses; lock = lookup cache lock time; x87fb = x87 fallbacks; dc = disk "
+                                   "cache hits\n",
                                    AppName, GetCurrentProcessId());
-  // No fflush anywhere in here: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub
-  // that terminates the process.
+  // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
+  // terminates the process.
   fwrite(Header.data(), 1, Header.size(), File);
 
-  // Lives for the rest of the process. No background thread: a thread of our own never reported anything in D2R
-  // (most likely stopped by its protector), so samples are taken from StatsLogTick() on guest threads instead.
-  State = new LogState {};
-  State->Stats = Stats;
-  State->File = File;
-  State->CounterFreq = GetCounterFrequency();
-  State->IntervalTicks = State->CounterFreq;
-  State->StartTicks = GetCounter();
-  State->LastTicks = State->StartTicks;
-  State->NextDue.store(State->StartTicks + State->IntervalTicks, std::memory_order_relaxed);
-}
-
-void StatsLogTick() {
-  if (!State) {
-    return;
-  }
-
-  const uint64_t Now = GetCounter();
-  uint64_t Due = State->NextDue.load(std::memory_order_relaxed);
-  if (Now < Due) {
-    return;
-  }
-
-  // One writer at a time; anyone else just carries on.
-  if (State->Busy.exchange(true, std::memory_order_acquire)) {
-    return;
-  }
-  if (State->NextDue.compare_exchange_strong(Due, Now + State->IntervalTicks, std::memory_order_relaxed)) {
-    WriteSample(Now);
-  }
-  State->Busy.store(false, std::memory_order_release);
+  // Lives for the rest of the process.
+  auto* State = new LogState {.Stats = Stats, .File = File, .CounterFreq = GetCounterFrequency()};
+  // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
+  static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
+  Thread = FEXCore::Threads::Thread::Create(LogThread, State, {.LowPriority = false, .Internal = true}, "FEXStatsLog");
 }
 } // namespace FEX::Windows
