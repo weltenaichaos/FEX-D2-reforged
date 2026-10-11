@@ -1,14 +1,13 @@
 diff --git a/include/context.hpp b/include/context.hpp
-index ae382de..2c3407b 100644
+index ae382de..c8c7073 100644
 --- a/include/context.hpp
 +++ b/include/context.hpp
-@@ -118,6 +118,18 @@ class LsContext {
+@@ -118,6 +118,17 @@ class LsContext {
      uint64_t statsWorkNs{0};        // copy fence wait + framegen + waitIdle
      uint64_t statsGenSleepNs{0};    // slept before generated presents
      uint64_t statsGenLateNs{0};     // generated present lateness vs its slot
 +    uint64_t dbgStatsWindows{0};
 +    uint64_t dbgPacerLate{0};
-+    uint64_t dbgRealSpacingNs{0};
 +    // GPU timestamps per pass slot: [0] copy start, [1] copy end, [2] after framegen
 +    VkQueryPool dbgQueryPool{};
 +    double dbgTsPeriodNs{1.0};
@@ -22,21 +21,27 @@ index ae382de..2c3407b 100644
      uint64_t statsGenPresentNs{0};  // time blocked in generated queuePresent calls
      uint64_t statsRealPresentNs{0}; // time blocked in the real queuePresent call
 diff --git a/include/layer.hpp b/include/layer.hpp
-index 2990194..3e06d3b 100644
+index 2990194..22471f4 100644
 --- a/include/layer.hpp
 +++ b/include/layer.hpp
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
  #pragma once
  
  #include <vulkan/vulkan_core.h>
 +#include <mutex>
++#include <cstdlib>
  
  #ifdef __ANDROID__
  #include <vulkan/vulkan_android.h>
-@@ -198,6 +199,11 @@ namespace Layer {
+@@ -198,6 +200,16 @@ namespace Layer {
          VkExtensionProperties* pProperties);
      /// The instance the layer initialized on.
      VkInstance ovkInstance();
++    /// Diagnostic logging, enabled with LSFG_DEBUG=1.
++    inline bool lsfgDebug() {
++        static const bool enabled = std::getenv("LSFG_DEBUG") != nullptr;
++        return enabled;
++    }
 +    /// The queue the layer submits its own work on (serialized with the game).
 +    void setLayerQueue(VkQueue queue);
 +    std::recursive_mutex& layerQueueMutex();
@@ -46,16 +51,16 @@ index 2990194..3e06d3b 100644
      /// Call to the original vkQueueSubmit function.
      VkResult ovkQueueSubmit(
 diff --git a/src/context.cpp b/src/context.cpp
-index 2385454..71ef467 100644
+index 2385454..d92ff98 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
 @@ -318,7 +318,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
      // Android: single-device framegen on the game's own device and queue —
      // two ICDs interpret shared AHB memory differently and scramble it.
  
-+    std::cerr << "lsfg-vk: [dbg] ctx: extent " << extent.width << "x" << extent.height << " images " << swapchainImages.size() << " mult " << conf.multiplier << " instance " << static_cast<void*>(Layer::ovkInstanceFor(info.physicalDevice)) << "\n";
++    if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] ctx: extent " << extent.width << "x" << extent.height << " images " << swapchainImages.size() << " mult " << conf.multiplier << " instance " << static_cast<void*>(Layer::ovkInstanceFor(info.physicalDevice)) << "\n";
      this->preCopyFence = Mini::Fence(info.device, true);
-+    std::cerr << "lsfg-vk: [dbg] ctx: fence ok\n";
++    if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] ctx: fence ok\n";
  
      const VkImageUsageFlags sharedUsage = VK_IMAGE_USAGE_STORAGE_BIT
          | VK_IMAGE_USAGE_SAMPLED_BIT
@@ -63,7 +68,7 @@ index 2385454..71ef467 100644
          this->out_n.emplace_back(Mini::Image::createDeviceLocal(info.device, info.physicalDevice,
              extent, format, sharedUsage, VK_IMAGE_ASPECT_COLOR_BIT));
  
-+    std::cerr << "lsfg-vk: [dbg] ctx: images ok\n";
++    if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] ctx: images ok\n";
      setenv("DISABLE_LSFG", "1", 1); // NOLINT
 +    const std::lock_guard<std::recursive_mutex> qlockInit(Layer::layerQueueMutex());
  
@@ -85,14 +90,14 @@ index 2385454..71ef467 100644
              static_cast<uint32_t>(info.queue.first), info.queue.second,
              conf.hdr, 1.0F / conf.flowScale, conf.multiplier - 1, shaderLoader);
  
-+    std::cerr << "lsfg-vk: [dbg] ctx: lsfg initialized\n";
++    if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] ctx: lsfg initialized\n";
      std::vector<VkImage> outImages;
      outImages.reserve(conf.multiplier - 1);
      for (size_t i = 0; i < static_cast<size_t>(conf.multiplier - 1); ++i)
          outImages.push_back(this->out_n.at(i).handle());
  
      int32_t ctxId;
-+    std::cerr << "lsfg-vk: [dbg] ctx: creating lsfg context\n";
++    if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] ctx: creating lsfg context\n";
      if (conf.performance)
          ctxId = LSFG_3_1P::createContextFromImages(
              this->frame_0.handle(), this->frame_1.handle(),
@@ -119,7 +124,7 @@ index 2385454..71ef467 100644
          return passRes;
      }
      this->preCopyFence.reset();
-+    if (this->frameIdx == 0 && !this->dbgQueryPool) {
++    if (this->frameIdx == 0 && !this->dbgQueryPool && Layer::lsfgDebug()) {
 +        auto createPool = reinterpret_cast<PFN_vkCreateQueryPool>(
 +            Layer::ovkGetDeviceProcAddr(info.device, "vkCreateQueryPool"));
 +        this->dbgCmdWriteTimestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(
@@ -140,7 +145,7 @@ index 2385454..71ef467 100644
 +                || !this->dbgGetQueryPoolResults
 +                || createPool(info.device, &qpInfo, nullptr, &this->dbgQueryPool) != VK_SUCCESS)
 +            this->dbgQueryPool = VK_NULL_HANDLE;
-+        std::cerr << "lsfg-vk: [dbg] gpu timestamps " << (this->dbgQueryPool ? "on" : "off")
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] gpu timestamps " << (this->dbgQueryPool ? "on" : "off")
 +            << " period " << this->dbgTsPeriodNs << "ns\n";
 +    }
 +    // read the GPU timestamps of the pass 4 frames ago (non-blocking)
@@ -162,7 +167,7 @@ index 2385454..71ef467 100644
 +        }
 +    }
 +    if (this->frameIdx == 0)
-+        std::cerr << "lsfg-vk: [dbg] first present on queue " << static_cast<void*>(queue)
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] first present on queue " << static_cast<void*>(queue)
 +            << ", layer queue " << static_cast<void*>(info.queue.second)
 +            << ", game waits " << gameRenderSemaphores.size() << "\n";
  
@@ -209,35 +214,12 @@ index 2385454..71ef467 100644
              imageBarrier(cmd, this->swapchainImages.at(imageIdx),
                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-@@ -1009,9 +1084,21 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
-     //    (the first one was consumed by that frame's own present). If every
-     //    generated frame was skipped no semaphore is needed: the copy fence
-     //    wait above already proved the game's rendering finished.
--    if (outIntervalNs > 0 && conf.fpsLimit > 0)
-+    if (outIntervalNs > 0 && conf.fpsLimit > 0) {
-         sleepUntilNs(this->pacerAnchorNs
-             + static_cast<int64_t>((conf.multiplier - 1) * outIntervalNs));
-+    } else if (outIntervalNs > 0 && outIntervalNs < 50'000'000ull) {
-+        // Uncapped: without this the real frame went out right behind the
-+        // generated one, so the screen showed two frames back to back and
-+        // then a full base-frame gap. Space it by the measured interval,
-+        // slightly short so a faster next frame never queues behind it.
-+        const int64_t dueNs = this->pacerAnchorNs
-+            + static_cast<int64_t>((conf.multiplier - 1) * outIntervalNs * 9 / 10);
-+        const int64_t nowRealNs = nowNs();
-+        if (dueNs > nowRealNs)
-+            this->dbgRealSpacingNs += static_cast<uint64_t>(dueNs - nowRealNs);
-+        sleepUntilNs(dueNs);
-+    }
-     if (this->statsSeq.size() < 200) {
-         this->statsSeq += 'A' + static_cast<char>(presentIdx % 26);
-         this->statsSeq += '0' + static_cast<char>(gameRenderSemaphores.size() % 10);
-@@ -1059,7 +1146,33 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1059,7 +1134,31 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
                  .genSkips      = this->statsGenSkips,
                  .seq           = this->statsSeq,
              });
 +        if (++this->dbgStatsWindows % 4 == 0) {
-+            std::cerr << "lsfg-vk: [dbg] stats fps=" << static_cast<double>(this->statsPresents) / windowSec
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] stats fps=" << static_cast<double>(this->statsPresents) / windowSec
 +                << " base=" << frames / windowSec
 +                << " work_ms=" << static_cast<double>(this->statsWorkNs) / 1e6 / frames
 +                << " gen_sleep_ms=" << static_cast<double>(this->statsGenSleepNs) / 1e6 / frames
@@ -247,11 +229,10 @@ index 2385454..71ef467 100644
 +                << " gen_skips=" << this->statsGenSkips
 +                << " fence_timeouts=" << this->copyFenceTimeouts
 +                << " pacer_cap=" << conf.fpsLimit << " pacer_late=" << this->dbgPacerLate
-+                << " real_spacing_ms=" << static_cast<double>(this->dbgRealSpacingNs) / 1e6 / frames
 +                << " seq=" << this->statsSeq << "\n";
 +            if (this->dbgGpuSamples > 0) {
 +                const double n = static_cast<double>(this->dbgGpuSamples);
-+                std::cerr << "lsfg-vk: [dbg] gpu frame_ms=" << this->dbgGpuIntervalNs / n / 1e6
++                if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] gpu frame_ms=" << this->dbgGpuIntervalNs / n / 1e6
 +                    << " copy_ms=" << this->dbgGpuCopyNs / n / 1e6
 +                    << " framegen_ms=" << this->dbgGpuLsfgNs / n / 1e6
 +                    << " game_and_idle_ms=" << (this->dbgGpuIntervalNs - this->dbgGpuCopyNs - this->dbgGpuLsfgNs) / n / 1e6
@@ -262,12 +243,11 @@ index 2385454..71ef467 100644
 +        }
          this->statsSeq.clear();
 +        this->dbgPacerLate = 0;
-+        this->dbgRealSpacingNs = 0;
          this->statsPresents = 0;
          this->statsRealPresents = 0;
          this->statsWorkNs = 0;
 diff --git a/src/hooks.cpp b/src/hooks.cpp
-index 681f8e4..8623584 100644
+index 681f8e4..2e9a721 100644
 --- a/src/hooks.cpp
 +++ b/src/hooks.cpp
 @@ -192,6 +192,15 @@ namespace {
@@ -276,11 +256,11 @@ index 681f8e4..8623584 100644
          });
 +        Layer::setLayerQueue(deviceToInfo.at(*pDevice).queue.second);
 +        for (uint32_t q = 0; q < pCreateInfo->queueCreateInfoCount; q++)
-+            std::cerr << "lsfg-vk: [dbg] device queue family "
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] device queue family "
 +                << pCreateInfo->pQueueCreateInfos[q].queueFamilyIndex
 +                << " count " << pCreateInfo->pQueueCreateInfos[q].queueCount << "\n";
-+        std::cerr << "lsfg-vk: [dbg] layer queue " << static_cast<void*>(deviceToInfo.at(*pDevice).queue.second) << "\n";
-+        std::cerr << "lsfg-vk: [dbg] device " << static_cast<void*>(*pDevice)
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] layer queue " << static_cast<void*>(deviceToInfo.at(*pDevice).queue.second) << "\n";
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] device " << static_cast<void*>(*pDevice)
 +            << " on phys " << static_cast<void*>(physicalDevice)
 +            << " instance " << static_cast<void*>(Layer::ovkInstanceFor(physicalDevice)) << "\n";
          return VK_SUCCESS;
@@ -290,7 +270,7 @@ index 681f8e4..8623584 100644
          }
          Utils::resetLimitN("swapMap");
          auto& deviceInfo = it->second;
-+        std::cerr << "lsfg-vk: [dbg] swapchain: device " << static_cast<void*>(device)
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: device " << static_cast<void*>(device)
 +            << " phys " << static_cast<void*>(deviceInfo.physicalDevice)
 +            << " queue family " << deviceInfo.queue.first
 +            << " size " << pCreateInfo->imageExtent.width << "x" << pCreateInfo->imageExtent.height
@@ -301,7 +281,7 @@ index 681f8e4..8623584 100644
 +            << " old " << static_cast<void*>(pCreateInfo->oldSwapchain) << "\n";
 +        for (auto* node = reinterpret_cast<const VkBaseInStructure*>(pCreateInfo->pNext);
 +                node != nullptr; node = node->pNext)
-+            std::cerr << "lsfg-vk: [dbg] swapchain: pNext sType " << node->sType << "\n";
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: pNext sType " << node->sType << "\n";
  
          // increase amount of images in swapchain
          VkSwapchainCreateInfoKHR createInfo = *pCreateInfo;
@@ -312,11 +292,11 @@ index 681f8e4..8623584 100644
 +            maxImages = Utils::getMaxImageCount(
 +                deviceInfo.physicalDevice, pCreateInfo->surface);
 +        } catch (const std::exception& e) {
-+            std::cerr << "lsfg-vk: [dbg] swapchain: surface caps failed: " << e.what() << "\n";
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: surface caps failed: " << e.what() << "\n";
 +        } catch (...) {
-+            std::cerr << "lsfg-vk: [dbg] swapchain: surface caps failed (unknown)\n";
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: surface caps failed (unknown)\n";
 +        }
-+        std::cerr << "lsfg-vk: [dbg] swapchain: maxImages " << maxImages << "\n";
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: maxImages " << maxImages << "\n";
          createInfo.minImageCount = createInfo.minImageCount + 1
              + static_cast<uint32_t>(deviceInfo.queue.first);
          if (createInfo.minImageCount > maxImages) {
@@ -324,16 +304,16 @@ index 681f8e4..8623584 100644
          }
  
          // create swapchain
-+        std::cerr << "lsfg-vk: [dbg] swapchain: creating with minImages " << createInfo.minImageCount
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: creating with minImages " << createInfo.minImageCount
 +            << " present " << createInfo.presentMode << "\n";
          auto res = Layer::ovkCreateSwapchainKHR(device, &createInfo, pAllocator, pSwapchain);
 -        if (res != VK_SUCCESS)
 -            return res; // can't be caused by lsfg-vk (yet)
-+        std::cerr << "lsfg-vk: [dbg] swapchain: driver returned " << res << "\n";
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: driver returned " << res << "\n";
 +        if (res != VK_SUCCESS) {
 +            // fall back to exactly what the game asked for
 +            res = Layer::ovkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
-+            std::cerr << "lsfg-vk: [dbg] swapchain: unmodified retry returned " << res << "\n";
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: unmodified retry returned " << res << "\n";
 +            return res;
 +        }
  
@@ -343,7 +323,7 @@ index 681f8e4..8623584 100644
                  throw LSFG::vulkan_error(res, "Failed to get swapchain images");
  
              // create swapchain context
-+            std::cerr << "lsfg-vk: [dbg] swapchain: " << imageCount << " images, creating context\n";
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: " << imageCount << " images, creating context\n";
              swapchainToDeviceTable.emplace(*pSwapchain, device);
              swapchains.emplace(*pSwapchain, LsContext(
                  deviceInfo, *pSwapchain, pCreateInfo->imageExtent,
@@ -351,21 +331,21 @@ index 681f8e4..8623584 100644
  
              Utils::resetLimitN("swapCtxCreate");
          } catch (const std::exception& e) {
-+            std::cerr << "lsfg-vk: [dbg] swapchain: context failed: " << e.what() << "\n";
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: context failed: " << e.what() << "\n";
 +            swapchainToDeviceTable.erase(*pSwapchain);
              Utils::logLimitN("swapCtxCreate", 5,
                  "An error occurred while creating the swapchain wrapper:\n"
                  "- " + std::string(e.what()));
              return VK_SUCCESS; // swapchain is still valid
 +        } catch (...) {
-+            std::cerr << "lsfg-vk: [dbg] swapchain: context failed (unknown exception)\n";
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: context failed (unknown exception)\n";
 +            swapchainToDeviceTable.erase(*pSwapchain);
 +            return VK_SUCCESS;
          }
          return VK_SUCCESS;
      }
 diff --git a/src/layer.cpp b/src/layer.cpp
-index fa9c173..dfada72 100644
+index fa9c173..5b161bb 100644
 --- a/src/layer.cpp
 +++ b/src/layer.cpp
 @@ -11,6 +11,9 @@
@@ -458,7 +438,7 @@ index fa9c173..dfada72 100644
 +                const std::lock_guard<std::mutex> lock(g_instanceMutex);
 +                g_liveInstances.insert(*pInstance);
 +            }
-+            std::cerr << "lsfg-vk: [dbg] instance created " << static_cast<void*>(*pInstance) << "\n";
++            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] instance created " << static_cast<void*>(*pInstance) << "\n";
  
              std::cerr << "lsfg-vk: Vulkan instance layer initialized successfully.\n";
          } catch (const std::exception& e) {
@@ -524,7 +504,7 @@ index fa9c173..dfada72 100644
 +            if (g_instanceHandle == instance)
 +                g_instanceHandle = g_liveInstances.empty() ? VK_NULL_HANDLE : *g_liveInstances.begin();
 +        }
-+        std::cerr << "lsfg-vk: [dbg] instance destroyed " << static_cast<void*>(instance) << "\n";
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] instance destroyed " << static_cast<void*>(instance) << "\n";
 +        if (fn) fn(instance, pAllocator);
 +    }
 +}
@@ -577,7 +557,7 @@ index fa9c173..dfada72 100644
 +        auto it = g_physToInstance.find(physicalDevice);
 +        if (it != g_physToInstance.end())
 +            return it->second;
-+        std::cerr << "lsfg-vk: [dbg] physical device " << static_cast<void*>(physicalDevice)
++        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] physical device " << static_cast<void*>(physicalDevice)
 +            << " has no known instance, using " << static_cast<void*>(g_instanceHandle) << "\n";
          return g_instanceHandle;
      }

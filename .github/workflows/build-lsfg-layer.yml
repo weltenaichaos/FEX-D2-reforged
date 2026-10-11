@@ -1,4 +1,4 @@
-name: Build LSFG layer (D2R debug)
+name: Build LSFG layer (D2R)
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
           cd lsfg
           git checkout "$LSFG_COMMIT"
           git submodule update --init --recursive
-          git apply --verbose ../fex/tools/lsfg/d2r-debug.patch
+          git apply --verbose ../fex/tools/lsfg/d2r.patch
 
       - name: Install Android build tools
         run: |
@@ -65,8 +65,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="lsfg-d2r-debug-${{ github.run_number }}"
+          TAG="lsfg-d2r-${{ github.run_number }}"
           gh release create "$TAG" out/liblsfg-vk-layer.so \
             --repo "${{ github.repository }}" --target "${{ github.sha }}" \
             --title "$TAG" --prerelease \
-            --notes "GameNative lsfg-vk layer ($LSFG_COMMIT) with D2R swapchain fix attempt and debug logging. Replace Z:\\home\\xuser-STEAM_2536520\\.local\\lib\\liblsfg-vk-layer.so with this file."
+            --notes "GameNative lsfg-vk layer ($LSFG_COMMIT) with the D2R fixes (instance tracking, queue lock, pacer). Set LSFG_DEBUG=1 for diagnostic logging. Replace Z:\\home\\xuser-STEAM_2536520\\.local\\lib\\liblsfg-vk-layer.so with this file."
