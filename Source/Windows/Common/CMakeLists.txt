@@ -12,6 +12,7 @@ add_library(CommonWindows STATIC
   EnvironmentVariablesHandling.cpp
   FEXUnixLib.cpp
   SHMStats.cpp
+  StatsLog.cpp
   InvalidationTracker.cpp
   ImageTracker.cpp
   Logging.cpp

@@ -49,6 +49,7 @@ $end_info$
 #include "DummyHandlers.h"
 #include "BTInterface.h"
 #include "Windows/Common/SHMStats.h"
+#include "Windows/Common/StatsLog.h"
 
 #include <atomic>
 #include <cstdint>
@@ -843,7 +844,11 @@ NTSTATUS ProcessInit() {
   FEX_CONFIG_OPT(StartupSleep, STARTUPSLEEP);
   FEX_CONFIG_OPT(StartupSleepProcName, STARTUPSLEEPPROCNAME);
 
-  if (IsWine && ProfileStats()) {
+  const bool StatsLog = FEX::Windows::StatsLogRequested(AppConfigName);
+  if (StatsLog) {
+    StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC, true);
+    FEX::Windows::StartStatsLog(StatAllocHandler.get(), AppConfigName);
+  } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
 

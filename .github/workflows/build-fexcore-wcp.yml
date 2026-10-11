@@ -33,11 +33,11 @@ jobs:
       matrix:
         include:
           - variant: base
-            version: 2610-d2rfix28-base
+            version: 2610-d2rfix28s-base
             tune: -DTUNE_ARCH=generic -DTUNE_CPU=none -DENABLE_LTO=False
             cflags: ""
           - variant: thor
-            version: 2610-d2rfix28-thor
+            version: 2610-d2rfix28s-thor
             tune: -DTUNE_ARCH=armv8.4-a -DTUNE_CPU=none -DENABLE_LTO=False
             cflags: -mtune=cortex-x3
     env:
@@ -128,7 +128,7 @@ jobs:
             "type": "FEXCore",
             "versionName": "${FEX_WCP_VERSION}",
             "versionCode": 1,
-            "description": "FEXCore ${FEX_WCP_VERSION} (FEX-D2-reforged, variant ${{ matrix.variant }}) - d2rfix27 (compiler fault recovery, mtrack deadlock fix) plus: rep movs/stos with a 32-bit address size in 64-bit mode are translated, and FS/GS selector writes in 64-bit mode load the selector instead of raising #UD. Logs [xrange]/[compilefault] with FEX_SILENTLOG=0; per-exception debug lines only with FEX_DEBUGLOG=1. Built from ${GITHUB_SHA}.",
+            "description": "FEXCore ${FEX_WCP_VERSION} (FEX-D2-reforged, variant ${{ matrix.variant }}) - d2rfix27 (compiler fault recovery, mtrack deadlock fix) plus: rep movs/stos with a 32-bit address size in 64-bit mode are translated, and FS/GS selector writes in 64-bit mode load the selector instead of raising #UD. Logs [xrange]/[compilefault] with FEX_SILENTLOG=0; per-exception debug lines only with FEX_DEBUGLOG=1. Optional per-second stats log: FEX_STATSLOG=<folder> (FEX_STATSLOG_APP=<exe> to limit it to one process). Built from ${GITHUB_SHA}.",
             "files": [
               {"source": "libarm64ecfex.dll", "target": "\${system32}/libarm64ecfex.dll"},
               {"source": "libwow64fex.dll",   "target": "\${system32}/libwow64fex.dll"}
