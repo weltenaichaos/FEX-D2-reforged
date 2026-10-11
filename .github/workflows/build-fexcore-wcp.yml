@@ -37,7 +37,7 @@ jobs:
             cflags: ""
           - variant: thor
             version: 2610-d2rfix28-thor
-            tune: -DTUNE_ARCH=armv8.4-a -DTUNE_CPU=none -DENABLE_LTO=True
+            tune: -DTUNE_ARCH=armv8.4-a -DTUNE_CPU=none -DENABLE_LTO=False
             cflags: -mtune=cortex-x3
     env:
       FEX_WCP_VERSION: ${{ matrix.version }}
