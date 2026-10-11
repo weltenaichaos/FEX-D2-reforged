@@ -7,6 +7,7 @@
 #include <FEXCore/fextl/unordered_map.h>
 #include <FEXCore/fextl/vector.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/Threads.h>
 
@@ -22,7 +23,6 @@
 // Exported by ntdll (Defs/ntdll.def) but not declared by the bundled headers.
 extern "C" NTSTATUS WINAPI NtOpenThread(HANDLE* Handle, ACCESS_MASK Access, const OBJECT_ATTRIBUTES* Attr, const CLIENT_ID* Id);
 extern "C" NTSTATUS WINAPI RtlSystemTimeToLocalTime(const LARGE_INTEGER* SystemTime, LARGE_INTEGER* LocalTime);
-extern "C" NTSTATUS WINAPI NtResumeThread(HANDLE Handle, ULONG* Count);
 extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE Process, const void* Address, void* Buffer, SIZE_T Size, SIZE_T* BytesRead);
 
 namespace FEX::Windows {
@@ -33,13 +33,23 @@ namespace {
   constexpr size_t MaxSampled = 16;
   constexpr int64_t SampleInterval100ns = 20'000; // 2ms
 
-  // FEX_STATSLOG_PROFILE=1: every ProfileEveryNthTick ticks, briefly suspend the ProfiledThreads busiest threads and record
-  // their x86 RIP (or native PC when outside emulation). The hottest addresses are written every ProfileWindowSeconds.
+  // FEX_STATSLOG_PROFILE=1: every tick, note which JIT block each of the ProfiledThreads busiest threads is in while it runs
+  // emulated code, by reading the block header pointer the JIT stores on every block entry. Nothing is suspended. Every
+  // ProfileWindowSeconds the hottest blocks are written with their guest RIP and guest code bytes.
   constexpr size_t ProfiledThreads = 4;
-  constexpr uint32_t ProfileEveryNthTick = 5; // 10ms
   constexpr uint64_t ProfileWindowSeconds = 30;
   constexpr size_t ProfilePrinted = 40;
-  constexpr size_t ProfileBytes = 48;
+  constexpr size_t ProfileBytes = 128;
+
+  // Mirrors of FEXCore's CPUBackend::JITCodeHeader / JITCodeTail (Interface/Core/CPUBackend.h).
+  struct JITCodeHeaderMirror {
+    uint32_t OffsetToBlockTail;
+  };
+  struct JITCodeTailMirror {
+    size_t Size;
+    uint64_t RIP;
+    size_t GuestSize;
+  };
 
   // Every counter we report, sampled once per interval and diffed against the previous sample.
   struct Sample {
@@ -64,7 +74,7 @@ namespace {
     const volatile BOOLEAN* InSimulation;
     uint32_t Samples;
     uint32_t InSimulationSamples;
-    HANDLE ProfileHandle;
+    const volatile uint64_t* BlockHeader;
     bool IsMain;
   };
 
@@ -82,10 +92,8 @@ namespace {
     SampledThread Sampled[MaxSampled];
     size_t SampledCount;
     bool Profile;
-    uint32_t Ticks;
     fextl::unordered_map<uint64_t, ProfileCount> ProfileCounts;
     uint32_t ProfileSamples[2];
-    uint32_t ProfileFailures;
   };
 
   uint64_t GetCounter() {
@@ -147,7 +155,7 @@ namespace {
     return Result;
   }
 
-  const volatile BOOLEAN* QueryInSimulationFlag(uint32_t TID) {
+  const CHPE_V2_CPU_AREA_INFO* QueryCPUArea(uint32_t TID) {
     HANDLE Handle {};
     CLIENT_ID ClientId {
       .UniqueProcess = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())),
@@ -164,97 +172,74 @@ namespace {
       return nullptr;
     }
     // TEB->ChpeV2CpuAreaInfo, see ThreadCPUArea in ARM64EC/Module.cpp. Wine keeps TEBs mapped after thread exit.
-    const auto* Area = *reinterpret_cast<CHPE_V2_CPU_AREA_INFO* const*>(reinterpret_cast<uintptr_t>(Info.TebBaseAddress) + 0x1788);
-    return Area ? &Area->InSimulation : nullptr;
+    return *reinterpret_cast<CHPE_V2_CPU_AREA_INFO* const*>(reinterpret_cast<uintptr_t>(Info.TebBaseAddress) + 0x1788);
   }
 
-  HANDLE OpenThreadForProfile(uint32_t TID) {
-    HANDLE Handle {};
-    CLIENT_ID ClientId {
-      .UniqueProcess = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())),
-      .UniqueThread = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(TID)),
-    };
-    OBJECT_ATTRIBUTES Attr {.Length = sizeof(Attr)};
-    if (NtOpenThread(&Handle, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, &Attr, &ClientId) !=
-        STATUS_SUCCESS) {
-      return nullptr;
-    }
-    return Handle;
+  // EmulatorData[0] is FEX's CpuStateFrame for the thread, see ThreadCPUArea in ARM64EC/Module.cpp.
+  const volatile uint64_t* BlockHeaderPointer(const CHPE_V2_CPU_AREA_INFO* Area) {
+    const auto* Frame = Area ? static_cast<const FEXCore::Core::CpuStateFrame*>(Area->EmulatorData[0]) : nullptr;
+    return Frame ? &Frame->State.InlineJITBlockHeader : nullptr;
   }
 
   void ProfileTick(LogState* State) {
-    struct Pending {
-      uint64_t RIP;
-      bool IsMain;
-    };
-    Pending Samples[ProfiledThreads];
-    size_t Count {};
     for (size_t i = 0; i < std::min(State->SampledCount, ProfiledThreads); ++i) {
-      auto& T = State->Sampled[i];
-      if (!T.ProfileHandle || T.Slot->TID.load(std::memory_order_relaxed) != T.TID) {
+      const auto& T = State->Sampled[i];
+      if (!T.BlockHeader || !T.InSimulation || T.Slot->TID.load(std::memory_order_relaxed) != T.TID || !*T.InSimulation) {
         continue;
       }
-      if (NtSuspendThread(T.ProfileHandle, nullptr) != STATUS_SUCCESS) {
-        ++State->ProfileFailures;
+      const uint64_t Header = *T.BlockHeader;
+      if (!Header) {
         continue;
       }
-      // Nothing between suspend and resume may allocate or take a lock: the suspended thread might hold it.
-      CONTEXT Context {};
-      Context.ContextFlags = CONTEXT_CONTROL;
-      const NTSTATUS Err = NtGetContextThread(T.ProfileHandle, &Context);
-      NtResumeThread(T.ProfileHandle, nullptr);
-      if (Err != STATUS_SUCCESS) {
-        ++State->ProfileFailures;
-        continue;
-      }
-#ifdef _M_ARM64EC
-      Samples[Count++] = {.RIP = Context.Rip, .IsMain = T.IsMain};
-#else
-      Samples[Count++] = {.RIP = Context.Pc, .IsMain = T.IsMain};
-#endif
-    }
-    for (size_t i = 0; i < Count; ++i) {
-      auto& C = State->ProfileCounts[Samples[i].RIP];
-      ++(Samples[i].IsMain ? C.Main : C.Other);
-      ++State->ProfileSamples[Samples[i].IsMain ? 0 : 1];
+      auto& C = State->ProfileCounts[Header];
+      ++(T.IsMain ? C.Main : C.Other);
+      ++State->ProfileSamples[T.IsMain ? 0 : 1];
     }
   }
 
   void WriteProfile(LogState* State, uint64_t Seconds) {
     struct Entry {
-      uint64_t RIP;
+      uint64_t Header;
       ProfileCount C;
     };
     fextl::vector<Entry> Entries;
     Entries.reserve(State->ProfileCounts.size());
-    for (const auto& [RIP, C] : State->ProfileCounts) {
-      Entries.push_back({RIP, C});
+    for (const auto& [Header, C] : State->ProfileCounts) {
+      Entries.push_back({Header, C});
     }
     const size_t Printed = std::min(Entries.size(), ProfilePrinted);
     std::partial_sort(Entries.begin(), Entries.begin() + Printed, Entries.end(),
                       [](const Entry& a, const Entry& b) { return a.C.Main + a.C.Other > b.C.Main + b.C.Other; });
 
-    auto Text = fextl::fmt::format("# profile t={}-{} samples main={} other={} failed={} addresses={}\n", Seconds - ProfileWindowSeconds + 1,
-                                   Seconds, State->ProfileSamples[0], State->ProfileSamples[1], State->ProfileFailures, Entries.size());
+    auto Text = fextl::fmt::format("# profile t={}-{} samples main={} other={} blocks={}\n", Seconds - ProfileWindowSeconds + 1, Seconds,
+                                   State->ProfileSamples[0], State->ProfileSamples[1], Entries.size());
     for (size_t i = 0; i < Printed; ++i) {
       const auto& E = Entries[i];
+      // The block may have been freed since it was sampled, so read it through NtReadVirtualMemory, which fails safely.
+      JITCodeHeaderMirror Header {};
+      JITCodeTailMirror Tail {};
+      if (NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(E.Header), &Header, sizeof(Header), nullptr) != STATUS_SUCCESS ||
+          NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(E.Header + Header.OffsetToBlockTail), &Tail, sizeof(Tail), nullptr) !=
+            STATUS_SUCCESS) {
+        Text += fextl::fmt::format("#P block={:X} main={} other={} (freed)\n", E.Header, E.C.Main, E.C.Other);
+        continue;
+      }
       MEMORY_BASIC_INFORMATION Info {};
-      NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(E.RIP), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
+      NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Tail.RIP), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
       uint8_t Bytes[ProfileBytes] {};
       SIZE_T Read {};
-      NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(E.RIP), Bytes, sizeof(Bytes), &Read);
+      NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Tail.RIP), Bytes, std::min(sizeof(Bytes), Tail.GuestSize), &Read);
       fextl::string Hex;
       for (SIZE_T b = 0; b < Read; ++b) {
         Hex += fextl::fmt::format("{:02x}", Bytes[b]);
       }
-      Text += fextl::fmt::format("#P rip={:X} base={:X} main={} other={} bytes={}\n", E.RIP, reinterpret_cast<uintptr_t>(Info.AllocationBase),
-                                 E.C.Main, E.C.Other, Hex);
+      Text += fextl::fmt::format("#P rip={:X} base={:X} guestsize={} hostsize={} main={} other={} bytes={}\n", Tail.RIP,
+                                 reinterpret_cast<uintptr_t>(Info.AllocationBase), Tail.GuestSize, Tail.Size, E.C.Main, E.C.Other, Hex);
     }
     fwrite(Text.data(), 1, Text.size(), State->File);
 
     State->ProfileCounts.clear();
     State->ProfileSamples[0] = State->ProfileSamples[1] = 0;
-    State->ProfileFailures = 0;
   }
 
   // Waits one second, polling the sampled threads' InSimulation flag every few milliseconds.
@@ -272,7 +257,7 @@ namespace {
         ++T.Samples;
         T.InSimulationSamples += *T.InSimulation ? 1 : 0;
       }
-      if (State->Profile && ++State->Ticks % ProfileEveryNthTick == 0) {
+      if (State->Profile) {
         ProfileTick(State);
       }
     } while (GetCounter() < End);
@@ -426,21 +411,20 @@ namespace {
         const auto* Old = FindSampled(State, Entry.D.TID);
         const bool Reuse = Old && Old->Slot == Entry.Slot;
         auto& N = Next[NextCount++];
+        if (Reuse && Old->InSimulation && (!State->Profile || Old->BlockHeader)) {
+          N = *Old;
+          N.Samples = N.InSimulationSamples = 0;
+          continue;
+        }
+        const auto* Area = QueryCPUArea(Entry.D.TID);
         N = {
           .TID = Entry.D.TID,
           .Slot = Entry.Slot,
-          .InSimulation = Reuse ? Old->InSimulation : QueryInSimulationFlag(Entry.D.TID),
+          .InSimulation = Area ? &Area->InSimulation : nullptr,
         };
-        if (State->Profile && NextCount <= ProfiledThreads) {
-          N.ProfileHandle = Reuse && Old->ProfileHandle ? Old->ProfileHandle : OpenThreadForProfile(N.TID);
-          N.IsMain = Reuse && Old->ProfileHandle ? Old->IsMain : QueryThreadName(N.TID) == "Main";
-        }
-      }
-      // Close the profiling handles of threads that are no longer profiled.
-      for (size_t i = 0; i < State->SampledCount; ++i) {
-        const HANDLE H = State->Sampled[i].ProfileHandle;
-        if (H && std::none_of(Next, Next + NextCount, [H](const SampledThread& T) { return T.ProfileHandle == H; })) {
-          NtClose(H);
+        if (State->Profile) {
+          N.BlockHeader = BlockHeaderPointer(Area);
+          N.IsMain = QueryThreadName(N.TID) == "Main";
         }
       }
       std::copy_n(Next, NextCount, State->Sampled);

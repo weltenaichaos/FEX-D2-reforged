@@ -10,7 +10,7 @@ class StatAlloc;
 //
 //   FEX_STATSLOG=<directory>      enables it; writes <directory>\fexstats-<exe>-<HHMMSS>-<pid>.txt
 //   FEX_STATSLOG_APP=<exe name>   optional; only log this process (e.g. D2R.exe)
-//   FEX_STATSLOG_PROFILE=1        optional; also sample the busiest threads' RIP and log the hottest code every 30s
+//   FEX_STATSLOG_PROFILE=1        optional; also sample which JIT blocks the busiest threads run and log the hottest every 30s
 //
 // Returns true if the log should run in this process, in which case the caller must allocate stats slots for every
 // thread and then call StartStatsLog().
