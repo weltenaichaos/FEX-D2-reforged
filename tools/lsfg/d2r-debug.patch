@@ -1,18 +1,41 @@
+diff --git a/include/context.hpp b/include/context.hpp
+index ae382de..4be1179 100644
+--- a/include/context.hpp
++++ b/include/context.hpp
+@@ -118,6 +118,7 @@ class LsContext {
+     uint64_t statsWorkNs{0};        // copy fence wait + framegen + waitIdle
+     uint64_t statsGenSleepNs{0};    // slept before generated presents
+     uint64_t statsGenLateNs{0};     // generated present lateness vs its slot
++    uint64_t dbgStatsWindows{0};
+     uint64_t statsGenSkips{0};      // generated frames dropped to hold cadence
+     uint64_t statsGenPresentNs{0};  // time blocked in generated queuePresent calls
+     uint64_t statsRealPresentNs{0}; // time blocked in the real queuePresent call
 diff --git a/include/layer.hpp b/include/layer.hpp
-index 2990194..8d7db3b 100644
+index 2990194..3e06d3b 100644
 --- a/include/layer.hpp
 +++ b/include/layer.hpp
-@@ -198,6 +198,8 @@ namespace Layer {
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <vulkan/vulkan_core.h>
++#include <mutex>
+ 
+ #ifdef __ANDROID__
+ #include <vulkan/vulkan_android.h>
+@@ -198,6 +199,11 @@ namespace Layer {
          VkExtensionProperties* pProperties);
      /// The instance the layer initialized on.
      VkInstance ovkInstance();
++    /// The queue the layer submits its own work on (serialized with the game).
++    void setLayerQueue(VkQueue queue);
++    std::recursive_mutex& layerQueueMutex();
 +    /// The live instance a physical device was enumerated from.
 +    VkInstance ovkInstanceFor(VkPhysicalDevice physicalDevice);
  
      /// Call to the original vkQueueSubmit function.
      VkResult ovkQueueSubmit(
 diff --git a/src/context.cpp b/src/context.cpp
-index 2385454..0e7eaa7 100644
+index 2385454..09f27b9 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
 @@ -318,7 +318,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
@@ -25,15 +48,17 @@ index 2385454..0e7eaa7 100644
  
      const VkImageUsageFlags sharedUsage = VK_IMAGE_USAGE_STORAGE_BIT
          | VK_IMAGE_USAGE_SAMPLED_BIT
-@@ -333,6 +335,7 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -333,7 +335,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          this->out_n.emplace_back(Mini::Image::createDeviceLocal(info.device, info.physicalDevice,
              extent, format, sharedUsage, VK_IMAGE_ASPECT_COLOR_BIT));
  
 +    std::cerr << "lsfg-vk: [dbg] ctx: images ok\n";
      setenv("DISABLE_LSFG", "1", 1); // NOLINT
++    const std::lock_guard<std::recursive_mutex> qlockInit(Layer::layerQueueMutex());
  
      const auto shaderLoader = [](const std::string& name) {
-@@ -364,22 +367,24 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+         // debug override: override_<name>.spv next to conf.toml (brackets -> underscores)
+@@ -364,22 +368,24 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          return spirv;
      };
      if (conf.performance)
@@ -60,21 +85,65 @@ index 2385454..0e7eaa7 100644
      if (conf.performance)
          ctxId = LSFG_3_1P::createContextFromImages(
              this->frame_0.handle(), this->frame_1.handle(),
+@@ -789,6 +795,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+         return passRes;
+     }
+     this->preCopyFence.reset();
++    if (this->frameIdx == 0)
++        std::cerr << "lsfg-vk: [dbg] first present on queue " << static_cast<void*>(queue)
++            << ", layer queue " << static_cast<void*>(info.queue.second)
++            << ", game waits " << gameRenderSemaphores.size() << "\n";
+ 
+     // 1. copy swapchain image to frame_0/frame_1
+     //    Use a simple semaphore (no fd export) to synchronize the copy.
+@@ -846,6 +856,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+     std::vector<int> noOutSems;  // empty
+     setStage("framegen submit");
+     try {
++        const std::lock_guard<std::recursive_mutex> qlock(Layer::layerQueueMutex());
+         if (conf.performance)
+             LSFG_3_1P::presentContext(*this->lsfgCtxId, -1, noOutSems);
+         else
+@@ -1059,6 +1070,18 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+                 .genSkips      = this->statsGenSkips,
+                 .seq           = this->statsSeq,
+             });
++        if (++this->dbgStatsWindows % 4 == 0) {
++            std::cerr << "lsfg-vk: [dbg] stats fps=" << static_cast<double>(this->statsPresents) / windowSec
++                << " base=" << frames / windowSec
++                << " work_ms=" << static_cast<double>(this->statsWorkNs) / 1e6 / frames
++                << " gen_sleep_ms=" << static_cast<double>(this->statsGenSleepNs) / 1e6 / frames
++                << " gen_late_ms=" << static_cast<double>(this->statsGenLateNs) / 1e6 / frames
++                << " gen_present_ms=" << static_cast<double>(this->statsGenPresentNs) / 1e6 / frames
++                << " real_present_ms=" << static_cast<double>(this->statsRealPresentNs) / 1e6 / frames
++                << " gen_skips=" << this->statsGenSkips
++                << " fence_timeouts=" << this->copyFenceTimeouts
++                << " seq=" << this->statsSeq << "\n";
++        }
+         this->statsSeq.clear();
+         this->statsPresents = 0;
+         this->statsRealPresents = 0;
 diff --git a/src/hooks.cpp b/src/hooks.cpp
-index 681f8e4..d026446 100644
+index 681f8e4..8623584 100644
 --- a/src/hooks.cpp
 +++ b/src/hooks.cpp
-@@ -192,6 +192,9 @@ namespace {
+@@ -192,6 +192,15 @@ namespace {
              .physicalDevice = physicalDevice,
              .queue = Utils::findQueue(*pDevice, physicalDevice, pCreateInfo, VK_QUEUE_GRAPHICS_BIT)
          });
++        Layer::setLayerQueue(deviceToInfo.at(*pDevice).queue.second);
++        for (uint32_t q = 0; q < pCreateInfo->queueCreateInfoCount; q++)
++            std::cerr << "lsfg-vk: [dbg] device queue family "
++                << pCreateInfo->pQueueCreateInfos[q].queueFamilyIndex
++                << " count " << pCreateInfo->pQueueCreateInfos[q].queueCount << "\n";
++        std::cerr << "lsfg-vk: [dbg] layer queue " << static_cast<void*>(deviceToInfo.at(*pDevice).queue.second) << "\n";
 +        std::cerr << "lsfg-vk: [dbg] device " << static_cast<void*>(*pDevice)
 +            << " on phys " << static_cast<void*>(physicalDevice)
 +            << " instance " << static_cast<void*>(Layer::ovkInstanceFor(physicalDevice)) << "\n";
          return VK_SUCCESS;
      }
  
-@@ -225,11 +228,31 @@ namespace {
+@@ -225,11 +234,31 @@ namespace {
          }
          Utils::resetLimitN("swapMap");
          auto& deviceInfo = it->second;
@@ -108,7 +177,7 @@ index 681f8e4..d026446 100644
          createInfo.minImageCount = createInfo.minImageCount + 1
              + static_cast<uint32_t>(deviceInfo.queue.first);
          if (createInfo.minImageCount > maxImages) {
-@@ -262,9 +285,16 @@ namespace {
+@@ -262,9 +291,16 @@ namespace {
          }
  
          // create swapchain
@@ -127,7 +196,7 @@ index 681f8e4..d026446 100644
  
          try {
              swapchainToPresent.emplace(*pSwapchain, createInfo.presentMode);
-@@ -282,6 +312,7 @@ namespace {
+@@ -282,6 +318,7 @@ namespace {
                  throw LSFG::vulkan_error(res, "Failed to get swapchain images");
  
              // create swapchain context
@@ -135,7 +204,7 @@ index 681f8e4..d026446 100644
              swapchainToDeviceTable.emplace(*pSwapchain, device);
              swapchains.emplace(*pSwapchain, LsContext(
                  deviceInfo, *pSwapchain, pCreateInfo->imageExtent,
-@@ -294,10 +325,16 @@ namespace {
+@@ -294,10 +331,16 @@ namespace {
  
              Utils::resetLimitN("swapCtxCreate");
          } catch (const std::exception& e) {
@@ -153,19 +222,20 @@ index 681f8e4..d026446 100644
          return VK_SUCCESS;
      }
 diff --git a/src/layer.cpp b/src/layer.cpp
-index fa9c173..8588582 100644
+index fa9c173..dfada72 100644
 --- a/src/layer.cpp
 +++ b/src/layer.cpp
-@@ -11,6 +11,8 @@
+@@ -11,6 +11,9 @@
  #include <vulkan/vulkan_core.h>
  
  #include <unordered_map>
 +#include <unordered_set>
 +#include <mutex>
++#include <vector>
  #include <exception>
  #include <iostream>
  #include <cstdint>
-@@ -38,6 +40,14 @@ namespace {
+@@ -38,6 +41,14 @@ namespace {
  
      VkInstance g_instanceHandle{};
  
@@ -180,7 +250,64 @@ index fa9c173..8588582 100644
      PFN_vkCreateSwapchainKHR  next_vkCreateSwapchainKHR{};
      PFN_vkQueuePresentKHR     next_vkQueuePresentKHR{};
      PFN_vkDestroySwapchainKHR next_vkDestroySwapchainKHR{};
-@@ -169,6 +179,11 @@ namespace {
+@@ -60,6 +71,56 @@ namespace {
+     PFN_vkGetSemaphoreFdKHR next_vkGetSemaphoreFdKHR{};
+     PFN_vkGetDeviceQueue next_vkGetDeviceQueue{};
+     PFN_vkQueueSubmit next_vkQueueSubmit{};
++    PFN_vkQueueSubmit2 next_vkQueueSubmit2{};
++    PFN_vkQueueSubmit2 next_vkQueueSubmit2KHR{};
++    PFN_vkQueueBindSparse next_vkQueueBindSparse{};
++    PFN_vkQueueWaitIdle next_vkQueueWaitIdle{};
++
++    // The layer submits its copies and the framegen work on queue 0 of the
++    // graphics family from the present thread. A D3D12 translation layer can
++    // spread its queues across several VkQueues and only locks the one it is
++    // presenting on, so queue 0 could be submitted to concurrently, which
++    // Vulkan forbids. Every submission to the layer's queue goes through
++    // this lock.
++    std::recursive_mutex g_layerQueueMutex;
++    VkQueue g_layerQueue{};
++
++    VkResult layer_vkQueueSubmit(VkQueue queue, uint32_t count,
++            const VkSubmitInfo* pSubmits, VkFence fence) {
++        if (queue != g_layerQueue)
++            return next_vkQueueSubmit(queue, count, pSubmits, fence);
++        const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
++        return next_vkQueueSubmit(queue, count, pSubmits, fence);
++    }
++    VkResult layer_vkQueueSubmit2(VkQueue queue, uint32_t count,
++            const VkSubmitInfo2* pSubmits, VkFence fence) {
++        auto fn = next_vkQueueSubmit2 ? next_vkQueueSubmit2 : next_vkQueueSubmit2KHR;
++        if (queue != g_layerQueue)
++            return fn(queue, count, pSubmits, fence);
++        const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
++        return fn(queue, count, pSubmits, fence);
++    }
++    VkResult layer_vkQueueSubmit2KHR(VkQueue queue, uint32_t count,
++            const VkSubmitInfo2* pSubmits, VkFence fence) {
++        auto fn = next_vkQueueSubmit2KHR ? next_vkQueueSubmit2KHR : next_vkQueueSubmit2;
++        if (queue != g_layerQueue)
++            return fn(queue, count, pSubmits, fence);
++        const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
++        return fn(queue, count, pSubmits, fence);
++    }
++    VkResult layer_vkQueueBindSparse(VkQueue queue, uint32_t count,
++            const VkBindSparseInfo* pInfo, VkFence fence) {
++        if (queue != g_layerQueue)
++            return next_vkQueueBindSparse(queue, count, pInfo, fence);
++        const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
++        return next_vkQueueBindSparse(queue, count, pInfo, fence);
++    }
++    VkResult layer_vkQueueWaitIdle(VkQueue queue) {
++        if (queue != g_layerQueue)
++            return next_vkQueueWaitIdle(queue);
++        const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
++        return next_vkQueueWaitIdle(queue);
++    }
+     PFN_vkCreateFence next_vkCreateFence{};
+     PFN_vkDestroyFence next_vkDestroyFence{};
+     PFN_vkWaitForFences next_vkWaitForFences{};
+@@ -169,6 +230,11 @@ namespace {
              initInstanceFunc(*pInstance,
                  "vkEnumerateDeviceExtensionProperties", &next_vkEnumerateDeviceExtensionProperties);
              g_instanceHandle = *pInstance;
@@ -192,7 +319,22 @@ index fa9c173..8588582 100644
  
              std::cerr << "lsfg-vk: Vulkan instance layer initialized successfully.\n";
          } catch (const std::exception& e) {
-@@ -290,7 +305,63 @@ namespace {
+@@ -255,6 +321,14 @@ namespace {
+             initDeviceFunc(*pDevice, "vkGetSemaphoreFdKHR", &next_vkGetSemaphoreFdKHR);
+             success &= initDeviceFunc(*pDevice, "vkGetDeviceQueue", &next_vkGetDeviceQueue);
+             success &= initDeviceFunc(*pDevice, "vkQueueSubmit", &next_vkQueueSubmit);
++            next_vkQueueSubmit2 = reinterpret_cast<PFN_vkQueueSubmit2>(
++                next_vkGetDeviceProcAddr(*pDevice, "vkQueueSubmit2"));
++            next_vkQueueSubmit2KHR = reinterpret_cast<PFN_vkQueueSubmit2>(
++                next_vkGetDeviceProcAddr(*pDevice, "vkQueueSubmit2KHR"));
++            next_vkQueueBindSparse = reinterpret_cast<PFN_vkQueueBindSparse>(
++                next_vkGetDeviceProcAddr(*pDevice, "vkQueueBindSparse"));
++            next_vkQueueWaitIdle = reinterpret_cast<PFN_vkQueueWaitIdle>(
++                next_vkGetDeviceProcAddr(*pDevice, "vkQueueWaitIdle"));
+             success &= initDeviceFunc(*pDevice, "vkCreateFence", &next_vkCreateFence);
+             success &= initDeviceFunc(*pDevice, "vkDestroyFence", &next_vkDestroyFence);
+             success &= initDeviceFunc(*pDevice, "vkWaitForFences", &next_vkWaitForFences);
+@@ -290,7 +364,63 @@ namespace {
      } // NOLINTEND
  }
  
@@ -256,7 +398,31 @@ index fa9c173..8588582 100644
      { "vkCreateInstance",
          reinterpret_cast<PFN_vkVoidFunction>(&layer_vkCreateInstance) },
      { "vkCreateDevice",
-@@ -408,13 +479,31 @@ namespace Layer {
+@@ -324,6 +454,23 @@ PFN_vkVoidFunction layer_vkGetDeviceProcAddr(VkDevice device, const char* pName)
+     if (it != Hooks::hooks.end() && Config::activeConf.enable)
+         return it->second;
+ 
++    if (Config::activeConf.enable) {
++        // only intercept queue functions the driver actually provides
++        auto* next = next_vkGetDeviceProcAddr(device, pName);
++        if (!next) return nullptr;
++        if (name == "vkQueueSubmit")
++            return reinterpret_cast<PFN_vkVoidFunction>(&layer_vkQueueSubmit);
++        if (name == "vkQueueSubmit2")
++            return reinterpret_cast<PFN_vkVoidFunction>(&layer_vkQueueSubmit2);
++        if (name == "vkQueueSubmit2KHR")
++            return reinterpret_cast<PFN_vkVoidFunction>(&layer_vkQueueSubmit2KHR);
++        if (name == "vkQueueBindSparse")
++            return reinterpret_cast<PFN_vkVoidFunction>(&layer_vkQueueBindSparse);
++        if (name == "vkQueueWaitIdle")
++            return reinterpret_cast<PFN_vkVoidFunction>(&layer_vkQueueWaitIdle);
++        return next;
++    }
++
+     return next_vkGetDeviceProcAddr(device, pName);
+ }
+ 
+@@ -408,13 +555,31 @@ namespace Layer {
              physicalDevice, nullptr, pPropertyCount, pProperties) == VK_SUCCESS;
      }
      VkInstance ovkInstance() {
@@ -289,3 +455,19 @@ index fa9c173..8588582 100644
      }
  
      VkResult ovkCreateSwapchainKHR(
+@@ -565,8 +730,15 @@ namespace Layer {
+             uint32_t submitCount,
+             const VkSubmitInfo* pSubmits,
+             VkFence fence) {
++        const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
+         return next_vkQueueSubmit(queue, submitCount, pSubmits, fence);
+     }
++    void setLayerQueue(VkQueue queue) {
++        g_layerQueue = queue;
++    }
++    std::recursive_mutex& layerQueueMutex() {
++        return g_layerQueueMutex;
++    }
+ 
+     VkResult ovkCreateFence(
+             VkDevice device,
