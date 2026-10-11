@@ -23,6 +23,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Checkout vkd3d-proton
         uses: actions/checkout@v4
