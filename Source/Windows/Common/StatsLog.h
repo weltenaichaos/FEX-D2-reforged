@@ -15,4 +15,8 @@ class StatAlloc;
 // thread and then call StartStatsLog().
 bool StatsLogRequested(std::string_view AppName);
 void StartStatsLog(const StatAlloc* Stats, std::string_view AppName);
+
+// Adds a "# ..." line to the log. Lines noted before the log is opened are kept and written after its header.
+// No-op unless FEX_STATSLOG is set.
+void StatsLogNote(std::string_view Line);
 } // namespace FEX::Windows

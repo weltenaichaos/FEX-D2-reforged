@@ -224,6 +224,9 @@ namespace {
     return nullptr;
   }
 
+  FILE* NoteFile;
+  fextl::string PendingNotes;
+
   bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) {
       return false;
@@ -279,11 +282,29 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
   fwrite(Header.data(), 1, Header.size(), File);
+  if (!PendingNotes.empty()) {
+    fwrite(PendingNotes.data(), 1, PendingNotes.size(), File);
+    PendingNotes.clear();
+  }
+  NoteFile = File;
 
   // Lives for the rest of the process.
   auto* State = new LogState {.Stats = Stats, .File = File, .CounterFreq = GetCounterFrequency()};
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
   Thread = FEXCore::Threads::Thread::Create(LogThread, State, {.LowPriority = false, .Internal = true}, "FEXStatsLog");
+}
+
+void StatsLogNote(std::string_view Line) {
+  const char* Dir = getenv("FEX_STATSLOG");
+  if (!Dir || !Dir[0] || (Dir[0] == '0' && !Dir[1])) {
+    return;
+  }
+  auto Text = fextl::fmt::format("# {}\n", Line);
+  if (NoteFile) {
+    fwrite(Text.data(), 1, Text.size(), NoteFile);
+  } else if (PendingNotes.size() < 64 * 1024) {
+    PendingNotes += Text;
+  }
 }
 } // namespace FEX::Windows
