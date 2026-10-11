@@ -18,8 +18,9 @@
 #include <winternl.h>
 #include <winbase.h>
 
-// Exported by ntdll (Defs/ntdll.def) but not declared by the bundled winternl.h.
+// Exported by ntdll (Defs/ntdll.def) but not declared by the bundled headers.
 extern "C" NTSTATUS WINAPI NtOpenThread(HANDLE* Handle, ACCESS_MASK Access, const OBJECT_ATTRIBUTES* Attr, const CLIENT_ID* Id);
+extern "C" NTSTATUS WINAPI RtlSystemTimeToLocalTime(const LARGE_INTEGER* SystemTime, LARGE_INTEGER* LocalTime);
 
 namespace FEX::Windows {
 namespace {
@@ -267,7 +268,13 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
     Dir.pop_back();
   }
 
-  const auto Path = fextl::fmt::format("{}\\fexstats-{}-{}.txt", Dir, AppName, GetCurrentProcessId());
+  // Wine reuses small PIDs, so add the local time: on Android shared storage an existing log often can't be replaced.
+  LARGE_INTEGER SystemTime {}, LocalTime {};
+  NtQuerySystemTime(&SystemTime);
+  RtlSystemTimeToLocalTime(&SystemTime, &LocalTime);
+  const uint64_t SecondOfDay = (static_cast<uint64_t>(LocalTime.QuadPart) / 10'000'000ULL) % 86400;
+  const auto Path = fextl::fmt::format("{}\\fexstats-{}-{:02}{:02}{:02}-{}.txt", Dir, AppName, SecondOfDay / 3600, (SecondOfDay / 60) % 60,
+                                       SecondOfDay % 60, GetCurrentProcessId());
   FILE* File = fopen(Path.c_str(), "w");
   if (!File) {
     LogMan::Msg::EFmt("FEX_STATSLOG: can't open {}", Path);
