@@ -1,12 +1,13 @@
 diff --git a/include/context.hpp b/include/context.hpp
-index ae382de..1dbb727 100644
+index ae382de..c8c7073 100644
 --- a/include/context.hpp
 +++ b/include/context.hpp
-@@ -118,6 +118,16 @@ class LsContext {
+@@ -118,6 +118,17 @@ class LsContext {
      uint64_t statsWorkNs{0};        // copy fence wait + framegen + waitIdle
      uint64_t statsGenSleepNs{0};    // slept before generated presents
      uint64_t statsGenLateNs{0};     // generated present lateness vs its slot
 +    uint64_t dbgStatsWindows{0};
++    uint64_t dbgPacerLate{0};
 +    // GPU timestamps per pass slot: [0] copy start, [1] copy end, [2] after framegen
 +    VkQueryPool dbgQueryPool{};
 +    double dbgTsPeriodNs{1.0};
@@ -44,7 +45,7 @@ index 2990194..3e06d3b 100644
      /// Call to the original vkQueueSubmit function.
      VkResult ovkQueueSubmit(
 diff --git a/src/context.cpp b/src/context.cpp
-index 2385454..8d04929 100644
+index 2385454..f32a6b1 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
 @@ -318,7 +318,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
@@ -94,7 +95,26 @@ index 2385454..8d04929 100644
      if (conf.performance)
          ctxId = LSFG_3_1P::createContextFromImages(
              this->frame_0.handle(), this->frame_1.handle(),
-@@ -789,6 +795,52 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -524,7 +530,17 @@ void LsContext::paceBaseFrame(int fpsLimit) {
+         const int64_t stepNs = std::max<int64_t>(1,
+             (targetNs + this->vsyncPeriodNs / 2) / this->vsyncPeriodNs) * this->vsyncPeriodNs;
+         int64_t due = this->pacerNextDueNs;
+-        if (due <= 0 || due < entryNs - stepNs || due > entryNs + 2 * stepNs) {
++        if (due > 0 && due < entryNs - stepNs) {
++            // The game is already slower than the cap: present now. Snapping a
++            // late frame to the next vsync slot rounds every frame up to a
++            // whole number of slots (a ~45 ms frame became 66.7 ms at a 60 cap).
++            this->pacerAnchorNs = entryNs;
++            this->pacerNextDueNs = this->vsyncPhaseNs
++                + ((entryNs - this->vsyncPhaseNs) / stepNs + 1) * stepNs;
++            this->dbgPacerLate++;
++            return;
++        }
++        if (due <= 0 || due > entryNs + 2 * stepNs) {
+             due = this->vsyncPhaseNs
+                 + ((entryNs - this->vsyncPhaseNs) / stepNs + 1) * stepNs;
+         }
+@@ -789,6 +805,52 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          return passRes;
      }
      this->preCopyFence.reset();
@@ -147,7 +167,7 @@ index 2385454..8d04929 100644
  
      // 1. copy swapchain image to frame_0/frame_1
      //    Use a simple semaphore (no fd export) to synchronize the copy.
-@@ -799,6 +851,12 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -799,6 +861,12 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      pass.preCopySemaphores.at(1) = Mini::Semaphore(info.device);
      pass.preCopyBuf = Mini::CommandBuffer(info.device, this->cmdPool);
      pass.preCopyBuf.begin();
@@ -160,7 +180,7 @@ index 2385454..8d04929 100644
      {
          VkCommandBuffer cmd = pass.preCopyBuf.handle();
          VkImage inputImg = this->frameIdx % 2 == 0
-@@ -822,6 +880,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -822,6 +890,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
      }
@@ -170,7 +190,7 @@ index 2385454..8d04929 100644
      pass.preCopyBuf.end();
  
      std::vector<VkSemaphore> gameRenderSemaphores2 = gameRenderSemaphores;
-@@ -846,6 +907,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -846,6 +917,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      std::vector<int> noOutSems;  // empty
      setStage("framegen submit");
      try {
@@ -178,7 +198,7 @@ index 2385454..8d04929 100644
          if (conf.performance)
              LSFG_3_1P::presentContext(*this->lsfgCtxId, -1, noOutSems);
          else
-@@ -953,6 +1015,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -953,6 +1025,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                  conf.debugInputs == 2 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL,
                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -188,7 +208,7 @@ index 2385454..8d04929 100644
              imageBarrier(cmd, this->swapchainImages.at(imageIdx),
                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-@@ -1059,6 +1124,28 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1059,7 +1134,31 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
                  .genSkips      = this->statsGenSkips,
                  .seq           = this->statsSeq,
              });
@@ -202,6 +222,7 @@ index 2385454..8d04929 100644
 +                << " real_present_ms=" << static_cast<double>(this->statsRealPresentNs) / 1e6 / frames
 +                << " gen_skips=" << this->statsGenSkips
 +                << " fence_timeouts=" << this->copyFenceTimeouts
++                << " pacer_cap=" << conf.fpsLimit << " pacer_late=" << this->dbgPacerLate
 +                << " seq=" << this->statsSeq << "\n";
 +            if (this->dbgGpuSamples > 0) {
 +                const double n = static_cast<double>(this->dbgGpuSamples);
@@ -215,8 +236,10 @@ index 2385454..8d04929 100644
 +            this->dbgGpuCopyNs = this->dbgGpuLsfgNs = this->dbgGpuIntervalNs = 0;
 +        }
          this->statsSeq.clear();
++        this->dbgPacerLate = 0;
          this->statsPresents = 0;
          this->statsRealPresents = 0;
+         this->statsWorkNs = 0;
 diff --git a/src/hooks.cpp b/src/hooks.cpp
 index 681f8e4..8623584 100644
 --- a/src/hooks.cpp
