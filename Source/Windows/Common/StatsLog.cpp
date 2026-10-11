@@ -4,6 +4,7 @@
 
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
+#include <FEXCore/fextl/unordered_map.h>
 #include <FEXCore/fextl/vector.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
@@ -21,6 +22,8 @@
 // Exported by ntdll (Defs/ntdll.def) but not declared by the bundled headers.
 extern "C" NTSTATUS WINAPI NtOpenThread(HANDLE* Handle, ACCESS_MASK Access, const OBJECT_ATTRIBUTES* Attr, const CLIENT_ID* Id);
 extern "C" NTSTATUS WINAPI RtlSystemTimeToLocalTime(const LARGE_INTEGER* SystemTime, LARGE_INTEGER* LocalTime);
+extern "C" NTSTATUS WINAPI NtResumeThread(HANDLE Handle, ULONG* Count);
+extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE Process, const void* Address, void* Buffer, SIZE_T Size, SIZE_T* BytesRead);
 
 namespace FEX::Windows {
 namespace {
@@ -29,6 +32,14 @@ namespace {
   // Threads whose InSimulation flag is sampled during the next second: the busiest ones of the previous second.
   constexpr size_t MaxSampled = 16;
   constexpr int64_t SampleInterval100ns = 20'000; // 2ms
+
+  // FEX_STATSLOG_PROFILE=1: every ProfileEveryNthTick ticks, briefly suspend the ProfiledThreads busiest threads and record
+  // their x86 RIP (or native PC when outside emulation). The hottest addresses are written every ProfileWindowSeconds.
+  constexpr size_t ProfiledThreads = 4;
+  constexpr uint32_t ProfileEveryNthTick = 5; // 10ms
+  constexpr uint64_t ProfileWindowSeconds = 30;
+  constexpr size_t ProfilePrinted = 40;
+  constexpr size_t ProfileBytes = 48;
 
   // Every counter we report, sampled once per interval and diffed against the previous sample.
   struct Sample {
@@ -53,6 +64,13 @@ namespace {
     const volatile BOOLEAN* InSimulation;
     uint32_t Samples;
     uint32_t InSimulationSamples;
+    HANDLE ProfileHandle;
+    bool IsMain;
+  };
+
+  struct ProfileCount {
+    uint32_t Main;
+    uint32_t Other;
   };
 
   struct LogState {
@@ -63,6 +81,11 @@ namespace {
     size_t PrevCount;
     SampledThread Sampled[MaxSampled];
     size_t SampledCount;
+    bool Profile;
+    uint32_t Ticks;
+    fextl::unordered_map<uint64_t, ProfileCount> ProfileCounts;
+    uint32_t ProfileSamples[2];
+    uint32_t ProfileFailures;
   };
 
   uint64_t GetCounter() {
@@ -145,6 +168,91 @@ namespace {
     return Area ? &Area->InSimulation : nullptr;
   }
 
+  HANDLE OpenThreadForProfile(uint32_t TID) {
+    HANDLE Handle {};
+    CLIENT_ID ClientId {
+      .UniqueProcess = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())),
+      .UniqueThread = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(TID)),
+    };
+    OBJECT_ATTRIBUTES Attr {.Length = sizeof(Attr)};
+    if (NtOpenThread(&Handle, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, &Attr, &ClientId) !=
+        STATUS_SUCCESS) {
+      return nullptr;
+    }
+    return Handle;
+  }
+
+  void ProfileTick(LogState* State) {
+    struct Pending {
+      uint64_t RIP;
+      bool IsMain;
+    };
+    Pending Samples[ProfiledThreads];
+    size_t Count {};
+    for (size_t i = 0; i < std::min(State->SampledCount, ProfiledThreads); ++i) {
+      auto& T = State->Sampled[i];
+      if (!T.ProfileHandle || T.Slot->TID.load(std::memory_order_relaxed) != T.TID) {
+        continue;
+      }
+      if (NtSuspendThread(T.ProfileHandle, nullptr) != STATUS_SUCCESS) {
+        ++State->ProfileFailures;
+        continue;
+      }
+      // Nothing between suspend and resume may allocate or take a lock: the suspended thread might hold it.
+      CONTEXT Context {};
+      Context.ContextFlags = CONTEXT_CONTROL;
+      const NTSTATUS Err = NtGetContextThread(T.ProfileHandle, &Context);
+      NtResumeThread(T.ProfileHandle, nullptr);
+      if (Err != STATUS_SUCCESS) {
+        ++State->ProfileFailures;
+        continue;
+      }
+      Samples[Count++] = {.RIP = Context.Rip, .IsMain = T.IsMain};
+    }
+    for (size_t i = 0; i < Count; ++i) {
+      auto& C = State->ProfileCounts[Samples[i].RIP];
+      ++(Samples[i].IsMain ? C.Main : C.Other);
+      ++State->ProfileSamples[Samples[i].IsMain ? 0 : 1];
+    }
+  }
+
+  void WriteProfile(LogState* State, uint64_t Seconds) {
+    struct Entry {
+      uint64_t RIP;
+      ProfileCount C;
+    };
+    fextl::vector<Entry> Entries;
+    Entries.reserve(State->ProfileCounts.size());
+    for (const auto& [RIP, C] : State->ProfileCounts) {
+      Entries.push_back({RIP, C});
+    }
+    const size_t Printed = std::min(Entries.size(), ProfilePrinted);
+    std::partial_sort(Entries.begin(), Entries.begin() + Printed, Entries.end(),
+                      [](const Entry& a, const Entry& b) { return a.C.Main + a.C.Other > b.C.Main + b.C.Other; });
+
+    auto Text = fextl::fmt::format("# profile t={}-{} samples main={} other={} failed={} addresses={}\n", Seconds - ProfileWindowSeconds + 1,
+                                   Seconds, State->ProfileSamples[0], State->ProfileSamples[1], State->ProfileFailures, Entries.size());
+    for (size_t i = 0; i < Printed; ++i) {
+      const auto& E = Entries[i];
+      MEMORY_BASIC_INFORMATION Info {};
+      NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(E.RIP), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
+      uint8_t Bytes[ProfileBytes] {};
+      SIZE_T Read {};
+      NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(E.RIP), Bytes, sizeof(Bytes), &Read);
+      fextl::string Hex;
+      for (SIZE_T b = 0; b < Read; ++b) {
+        Hex += fextl::fmt::format("{:02x}", Bytes[b]);
+      }
+      Text += fextl::fmt::format("#P rip={:X} base={:X} main={} other={} bytes={}\n", E.RIP, reinterpret_cast<uintptr_t>(Info.AllocationBase),
+                                 E.C.Main, E.C.Other, Hex);
+    }
+    fwrite(Text.data(), 1, Text.size(), State->File);
+
+    State->ProfileCounts.clear();
+    State->ProfileSamples[0] = State->ProfileSamples[1] = 0;
+    State->ProfileFailures = 0;
+  }
+
   // Waits one second, polling the sampled threads' InSimulation flag every few milliseconds.
   void SampleFor1s(LogState* State) {
     const uint64_t End = GetCounter() + State->CounterFreq;
@@ -159,6 +267,9 @@ namespace {
         }
         ++T.Samples;
         T.InSimulationSamples += *T.InSimulation ? 1 : 0;
+      }
+      if (State->Profile && ++State->Ticks % ProfileEveryNthTick == 0) {
+        ProfileTick(State);
       }
     } while (GetCounter() < End);
   }
@@ -297,6 +408,10 @@ namespace {
 
       fwrite(Line.data(), 1, Line.size(), State->File);
 
+      if (State->Profile && Seconds % ProfileWindowSeconds == 0) {
+        WriteProfile(State, Seconds);
+      }
+
       // Sample the busiest threads during the next second, reusing the CPU area lookup for threads already sampled.
       SampledThread Next[MaxSampled];
       size_t NextCount {};
@@ -305,11 +420,24 @@ namespace {
           break;
         }
         const auto* Old = FindSampled(State, Entry.D.TID);
-        Next[NextCount++] = {
+        const bool Reuse = Old && Old->Slot == Entry.Slot;
+        auto& N = Next[NextCount++];
+        N = {
           .TID = Entry.D.TID,
           .Slot = Entry.Slot,
-          .InSimulation = Old && Old->Slot == Entry.Slot ? Old->InSimulation : QueryInSimulationFlag(Entry.D.TID),
+          .InSimulation = Reuse ? Old->InSimulation : QueryInSimulationFlag(Entry.D.TID),
         };
+        if (State->Profile && NextCount <= ProfiledThreads) {
+          N.ProfileHandle = Reuse && Old->ProfileHandle ? Old->ProfileHandle : OpenThreadForProfile(N.TID);
+          N.IsMain = Reuse && Old->ProfileHandle ? Old->IsMain : QueryThreadName(N.TID) == "Main";
+        }
+      }
+      // Close the profiling handles of threads that are no longer profiled.
+      for (size_t i = 0; i < State->SampledCount; ++i) {
+        const HANDLE H = State->Sampled[i].ProfileHandle;
+        if (H && std::none_of(Next, Next + NextCount, [H](const SampledThread& T) { return T.ProfileHandle == H; })) {
+          NtClose(H);
+        }
       }
       std::copy_n(Next, NextCount, State->Sampled);
       State->SampledCount = NextCount;
@@ -391,6 +519,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
 
   // Lives for the rest of the process.
   auto* State = new LogState {.Stats = Stats, .File = File, .CounterFreq = GetCounterFrequency()};
+  const char* Profile = getenv("FEX_STATSLOG_PROFILE");
+  State->Profile = Profile && Profile[0] == '1';
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
   Thread = FEXCore::Threads::Thread::Create(LogThread, State, {.LowPriority = false, .Internal = true}, "FEXStatsLog");
