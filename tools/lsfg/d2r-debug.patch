@@ -1,13 +1,14 @@
 diff --git a/include/context.hpp b/include/context.hpp
-index ae382de..c8c7073 100644
+index ae382de..2c3407b 100644
 --- a/include/context.hpp
 +++ b/include/context.hpp
-@@ -118,6 +118,17 @@ class LsContext {
+@@ -118,6 +118,18 @@ class LsContext {
      uint64_t statsWorkNs{0};        // copy fence wait + framegen + waitIdle
      uint64_t statsGenSleepNs{0};    // slept before generated presents
      uint64_t statsGenLateNs{0};     // generated present lateness vs its slot
 +    uint64_t dbgStatsWindows{0};
 +    uint64_t dbgPacerLate{0};
++    uint64_t dbgRealSpacingNs{0};
 +    // GPU timestamps per pass slot: [0] copy start, [1] copy end, [2] after framegen
 +    VkQueryPool dbgQueryPool{};
 +    double dbgTsPeriodNs{1.0};
@@ -45,7 +46,7 @@ index 2990194..3e06d3b 100644
      /// Call to the original vkQueueSubmit function.
      VkResult ovkQueueSubmit(
 diff --git a/src/context.cpp b/src/context.cpp
-index 2385454..f32a6b1 100644
+index 2385454..71ef467 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
 @@ -318,7 +318,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
@@ -208,7 +209,30 @@ index 2385454..f32a6b1 100644
              imageBarrier(cmd, this->swapchainImages.at(imageIdx),
                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-@@ -1059,7 +1134,31 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1009,9 +1084,21 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+     //    (the first one was consumed by that frame's own present). If every
+     //    generated frame was skipped no semaphore is needed: the copy fence
+     //    wait above already proved the game's rendering finished.
+-    if (outIntervalNs > 0 && conf.fpsLimit > 0)
++    if (outIntervalNs > 0 && conf.fpsLimit > 0) {
+         sleepUntilNs(this->pacerAnchorNs
+             + static_cast<int64_t>((conf.multiplier - 1) * outIntervalNs));
++    } else if (outIntervalNs > 0 && outIntervalNs < 50'000'000ull) {
++        // Uncapped: without this the real frame went out right behind the
++        // generated one, so the screen showed two frames back to back and
++        // then a full base-frame gap. Space it by the measured interval,
++        // slightly short so a faster next frame never queues behind it.
++        const int64_t dueNs = this->pacerAnchorNs
++            + static_cast<int64_t>((conf.multiplier - 1) * outIntervalNs * 9 / 10);
++        const int64_t nowRealNs = nowNs();
++        if (dueNs > nowRealNs)
++            this->dbgRealSpacingNs += static_cast<uint64_t>(dueNs - nowRealNs);
++        sleepUntilNs(dueNs);
++    }
+     if (this->statsSeq.size() < 200) {
+         this->statsSeq += 'A' + static_cast<char>(presentIdx % 26);
+         this->statsSeq += '0' + static_cast<char>(gameRenderSemaphores.size() % 10);
+@@ -1059,7 +1146,33 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
                  .genSkips      = this->statsGenSkips,
                  .seq           = this->statsSeq,
              });
@@ -223,6 +247,7 @@ index 2385454..f32a6b1 100644
 +                << " gen_skips=" << this->statsGenSkips
 +                << " fence_timeouts=" << this->copyFenceTimeouts
 +                << " pacer_cap=" << conf.fpsLimit << " pacer_late=" << this->dbgPacerLate
++                << " real_spacing_ms=" << static_cast<double>(this->dbgRealSpacingNs) / 1e6 / frames
 +                << " seq=" << this->statsSeq << "\n";
 +            if (this->dbgGpuSamples > 0) {
 +                const double n = static_cast<double>(this->dbgGpuSamples);
@@ -237,6 +262,7 @@ index 2385454..f32a6b1 100644
 +        }
          this->statsSeq.clear();
 +        this->dbgPacerLate = 0;
++        this->dbgRealSpacingNs = 0;
          this->statsPresents = 0;
          this->statsRealPresents = 0;
          this->statsWorkNs = 0;
