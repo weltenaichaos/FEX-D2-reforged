@@ -207,7 +207,11 @@ namespace {
         ++State->ProfileFailures;
         continue;
       }
+#ifdef _M_ARM64EC
       Samples[Count++] = {.RIP = Context.Rip, .IsMain = T.IsMain};
+#else
+      Samples[Count++] = {.RIP = Context.Pc, .IsMain = T.IsMain};
+#endif
     }
     for (size_t i = 0; i < Count; ++i) {
       auto& C = State->ProfileCounts[Samples[i].RIP];
