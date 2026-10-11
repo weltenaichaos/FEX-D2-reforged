@@ -454,6 +454,9 @@ namespace {
 } // namespace
 
 bool StatsLogRequested(std::string_view AppName) {
+#ifdef FEX_DISABLE_STATSLOG
+  return false;
+#endif
   const char* Dir = getenv("FEX_STATSLOG");
   if (!Dir || !Dir[0] || (Dir[0] == '0' && !Dir[1])) {
     return false;
@@ -515,6 +518,9 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
 }
 
 void StatsLogNote(std::string_view Line) {
+#ifdef FEX_DISABLE_STATSLOG
+  return;
+#endif
   const char* Dir = getenv("FEX_STATSLOG");
   if (!Dir || !Dir[0] || (Dir[0] == '0' && !Dir[1])) {
     return;

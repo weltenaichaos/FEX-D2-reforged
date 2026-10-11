@@ -23,7 +23,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    # Two variants for A/B testing on the device:
+    # Variants for A/B testing on the device (thor-clean is thor without the stats log):
     #   base: Dmage22's settings unchanged (generic armv8-a, no LTO).
     #   thor: tuned for Snapdragon 8 Gen 2 (Cortex-X3/A715/A510). armv8.4-a gives
     #         inline LSE atomics; SVE stays off because Qualcomm does not expose it
@@ -36,10 +36,18 @@ jobs:
             version: 2610-d2rfix28s-base
             tune: -DTUNE_ARCH=generic -DTUNE_CPU=none -DENABLE_LTO=False
             cflags: ""
+            statslog: "Optional per-second stats log: FEX_STATSLOG=<folder> (FEX_STATSLOG_APP=<exe> to limit it to one process, FEX_STATSLOG_PROFILE=1 for hot JIT blocks)."
           - variant: thor
             version: 2610-d2rfix28s-thor
             tune: -DTUNE_ARCH=armv8.4-a -DTUNE_CPU=none -DENABLE_LTO=False
             cflags: -mtune=cortex-x3
+            statslog: "Optional per-second stats log: FEX_STATSLOG=<folder> (FEX_STATSLOG_APP=<exe> to limit it to one process, FEX_STATSLOG_PROFILE=1 for hot JIT blocks)."
+          # thor without the stats log: the build for normal play.
+          - variant: thor-clean
+            version: 2610-d2rfix28-thor-clean
+            tune: -DTUNE_ARCH=armv8.4-a -DTUNE_CPU=none -DENABLE_LTO=False -DENABLE_STATSLOG=False
+            cflags: -mtune=cortex-x3
+            statslog: "No stats log in this build."
     env:
       FEX_WCP_VERSION: ${{ matrix.version }}
     # Needed for the release step: a fork's default GITHUB_TOKEN is read-only,
@@ -128,7 +136,7 @@ jobs:
             "type": "FEXCore",
             "versionName": "${FEX_WCP_VERSION}",
             "versionCode": 1,
-            "description": "FEXCore ${FEX_WCP_VERSION} (FEX-D2-reforged, variant ${{ matrix.variant }}) - d2rfix27 (compiler fault recovery, mtrack deadlock fix) plus: rep movs/stos with a 32-bit address size in 64-bit mode are translated, and FS/GS selector writes in 64-bit mode load the selector instead of raising #UD. Logs [xrange]/[compilefault] with FEX_SILENTLOG=0; per-exception debug lines only with FEX_DEBUGLOG=1. Optional per-second stats log: FEX_STATSLOG=<folder> (FEX_STATSLOG_APP=<exe> to limit it to one process). Built from ${GITHUB_SHA}.",
+            "description": "FEXCore ${FEX_WCP_VERSION} (FEX-D2-reforged, variant ${{ matrix.variant }}) - d2rfix27 (compiler fault recovery, mtrack deadlock fix) plus: rep movs/stos with a 32-bit address size in 64-bit mode are translated, and FS/GS selector writes in 64-bit mode load the selector instead of raising #UD. Logs [xrange]/[compilefault] with FEX_SILENTLOG=0; per-exception debug lines only with FEX_DEBUGLOG=1. ${{ matrix.statslog }} Built from ${GITHUB_SHA}.",
             "files": [
               {"source": "libarm64ecfex.dll", "target": "\${system32}/libarm64ecfex.dll"},
               {"source": "libwow64fex.dll",   "target": "\${system32}/libwow64fex.dll"}
