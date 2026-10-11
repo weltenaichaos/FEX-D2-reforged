@@ -1,12 +1,21 @@
 diff --git a/include/context.hpp b/include/context.hpp
-index ae382de..4be1179 100644
+index ae382de..1dbb727 100644
 --- a/include/context.hpp
 +++ b/include/context.hpp
-@@ -118,6 +118,7 @@ class LsContext {
+@@ -118,6 +118,16 @@ class LsContext {
      uint64_t statsWorkNs{0};        // copy fence wait + framegen + waitIdle
      uint64_t statsGenSleepNs{0};    // slept before generated presents
      uint64_t statsGenLateNs{0};     // generated present lateness vs its slot
 +    uint64_t dbgStatsWindows{0};
++    // GPU timestamps per pass slot: [0] copy start, [1] copy end, [2] after framegen
++    VkQueryPool dbgQueryPool{};
++    double dbgTsPeriodNs{1.0};
++    uint64_t dbgPrevT0{0};
++    uint64_t dbgGpuSamples{0};
++    double dbgGpuCopyNs{0}, dbgGpuLsfgNs{0}, dbgGpuIntervalNs{0};
++    PFN_vkCmdWriteTimestamp dbgCmdWriteTimestamp{};
++    PFN_vkCmdResetQueryPool dbgCmdResetQueryPool{};
++    PFN_vkGetQueryPoolResults dbgGetQueryPoolResults{};
      uint64_t statsGenSkips{0};      // generated frames dropped to hold cadence
      uint64_t statsGenPresentNs{0};  // time blocked in generated queuePresent calls
      uint64_t statsRealPresentNs{0}; // time blocked in the real queuePresent call
@@ -35,7 +44,7 @@ index 2990194..3e06d3b 100644
      /// Call to the original vkQueueSubmit function.
      VkResult ovkQueueSubmit(
 diff --git a/src/context.cpp b/src/context.cpp
-index 2385454..09f27b9 100644
+index 2385454..8d04929 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
 @@ -318,7 +318,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
@@ -85,10 +94,52 @@ index 2385454..09f27b9 100644
      if (conf.performance)
          ctxId = LSFG_3_1P::createContextFromImages(
              this->frame_0.handle(), this->frame_1.handle(),
-@@ -789,6 +795,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -789,6 +795,52 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          return passRes;
      }
      this->preCopyFence.reset();
++    if (this->frameIdx == 0 && !this->dbgQueryPool) {
++        auto createPool = reinterpret_cast<PFN_vkCreateQueryPool>(
++            Layer::ovkGetDeviceProcAddr(info.device, "vkCreateQueryPool"));
++        this->dbgCmdWriteTimestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(
++            Layer::ovkGetDeviceProcAddr(info.device, "vkCmdWriteTimestamp"));
++        this->dbgCmdResetQueryPool = reinterpret_cast<PFN_vkCmdResetQueryPool>(
++            Layer::ovkGetDeviceProcAddr(info.device, "vkCmdResetQueryPool"));
++        this->dbgGetQueryPoolResults = reinterpret_cast<PFN_vkGetQueryPoolResults>(
++            Layer::ovkGetDeviceProcAddr(info.device, "vkGetQueryPoolResults"));
++        VkPhysicalDeviceProperties props{};
++        Layer::ovkGetPhysicalDeviceProperties(info.physicalDevice, &props);
++        this->dbgTsPeriodNs = static_cast<double>(props.limits.timestampPeriod);
++        const VkQueryPoolCreateInfo qpInfo{
++            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
++            .queryType = VK_QUERY_TYPE_TIMESTAMP,
++            .queryCount = 8 * 3,
++        };
++        if (!createPool || !this->dbgCmdWriteTimestamp || !this->dbgCmdResetQueryPool
++                || !this->dbgGetQueryPoolResults
++                || createPool(info.device, &qpInfo, nullptr, &this->dbgQueryPool) != VK_SUCCESS)
++            this->dbgQueryPool = VK_NULL_HANDLE;
++        std::cerr << "lsfg-vk: [dbg] gpu timestamps " << (this->dbgQueryPool ? "on" : "off")
++            << " period " << this->dbgTsPeriodNs << "ns\n";
++    }
++    // read the GPU timestamps of the pass 4 frames ago (non-blocking)
++    if (this->dbgQueryPool && this->frameIdx >= 4) {
++        uint64_t ts[3]{};
++        const uint32_t slot = static_cast<uint32_t>((this->frameIdx - 4) % 8);
++        if (this->dbgGetQueryPoolResults(info.device, this->dbgQueryPool, slot * 3, 3,
++                sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS
++                && ts[1] >= ts[0] && ts[2] >= ts[1]) {
++            if (this->dbgPrevT0 != 0 && ts[0] > this->dbgPrevT0) {
++                this->dbgGpuCopyNs += static_cast<double>(ts[1] - ts[0]) * this->dbgTsPeriodNs;
++                this->dbgGpuLsfgNs += static_cast<double>(ts[2] - ts[1]) * this->dbgTsPeriodNs;
++                this->dbgGpuIntervalNs += static_cast<double>(ts[0] - this->dbgPrevT0) * this->dbgTsPeriodNs;
++                this->dbgGpuSamples++;
++            }
++            this->dbgPrevT0 = ts[0];
++        } else {
++            this->dbgPrevT0 = 0;
++        }
++    }
 +    if (this->frameIdx == 0)
 +        std::cerr << "lsfg-vk: [dbg] first present on queue " << static_cast<void*>(queue)
 +            << ", layer queue " << static_cast<void*>(info.queue.second)
@@ -96,7 +147,30 @@ index 2385454..09f27b9 100644
  
      // 1. copy swapchain image to frame_0/frame_1
      //    Use a simple semaphore (no fd export) to synchronize the copy.
-@@ -846,6 +856,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -799,6 +851,12 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+     pass.preCopySemaphores.at(1) = Mini::Semaphore(info.device);
+     pass.preCopyBuf = Mini::CommandBuffer(info.device, this->cmdPool);
+     pass.preCopyBuf.begin();
++    const uint32_t dbgSlot = static_cast<uint32_t>(this->frameIdx % 8);
++    if (this->dbgQueryPool) {
++        this->dbgCmdResetQueryPool(pass.preCopyBuf.handle(), this->dbgQueryPool, dbgSlot * 3, 3);
++        this->dbgCmdWriteTimestamp(pass.preCopyBuf.handle(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++            this->dbgQueryPool, dbgSlot * 3 + 0);
++    }
+     {
+         VkCommandBuffer cmd = pass.preCopyBuf.handle();
+         VkImage inputImg = this->frameIdx % 2 == 0
+@@ -822,6 +880,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+     }
++    if (this->dbgQueryPool)
++        this->dbgCmdWriteTimestamp(pass.preCopyBuf.handle(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++            this->dbgQueryPool, dbgSlot * 3 + 1);
+     pass.preCopyBuf.end();
+ 
+     std::vector<VkSemaphore> gameRenderSemaphores2 = gameRenderSemaphores;
+@@ -846,6 +907,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      std::vector<int> noOutSems;  // empty
      setStage("framegen submit");
      try {
@@ -104,7 +178,17 @@ index 2385454..09f27b9 100644
          if (conf.performance)
              LSFG_3_1P::presentContext(*this->lsfgCtxId, -1, noOutSems);
          else
-@@ -1059,6 +1070,18 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -953,6 +1015,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                 conf.debugInputs == 2 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++            if (this->dbgQueryPool && i == 0)
++                this->dbgCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                    this->dbgQueryPool, dbgSlot * 3 + 2);
+             imageBarrier(cmd, this->swapchainImages.at(imageIdx),
+                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+@@ -1059,6 +1124,28 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
                  .genSkips      = this->statsGenSkips,
                  .seq           = this->statsSeq,
              });
@@ -119,6 +203,16 @@ index 2385454..09f27b9 100644
 +                << " gen_skips=" << this->statsGenSkips
 +                << " fence_timeouts=" << this->copyFenceTimeouts
 +                << " seq=" << this->statsSeq << "\n";
++            if (this->dbgGpuSamples > 0) {
++                const double n = static_cast<double>(this->dbgGpuSamples);
++                std::cerr << "lsfg-vk: [dbg] gpu frame_ms=" << this->dbgGpuIntervalNs / n / 1e6
++                    << " copy_ms=" << this->dbgGpuCopyNs / n / 1e6
++                    << " framegen_ms=" << this->dbgGpuLsfgNs / n / 1e6
++                    << " game_and_idle_ms=" << (this->dbgGpuIntervalNs - this->dbgGpuCopyNs - this->dbgGpuLsfgNs) / n / 1e6
++                    << " samples=" << this->dbgGpuSamples << "\n";
++            }
++            this->dbgGpuSamples = 0;
++            this->dbgGpuCopyNs = this->dbgGpuLsfgNs = this->dbgGpuIntervalNs = 0;
 +        }
          this->statsSeq.clear();
          this->statsPresents = 0;
@@ -471,3 +565,16 @@ index fa9c173..dfada72 100644
  
      VkResult ovkCreateFence(
              VkDevice device,
+diff --git a/src/mini/commandbuffer.cpp b/src/mini/commandbuffer.cpp
+index 0806cf2..0c209a9 100644
+--- a/src/mini/commandbuffer.cpp
++++ b/src/mini/commandbuffer.cpp
+@@ -72,7 +72,7 @@ void CommandBuffer::submit(VkQueue queue,
+         throw std::logic_error("Command buffer is not in Full state");
+ 
+     const std::vector<VkPipelineStageFlags> waitStages(waitSemaphores.size(),
+-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+ 
+     const VkSubmitInfo submitInfo{
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
