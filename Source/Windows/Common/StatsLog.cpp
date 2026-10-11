@@ -26,6 +26,9 @@ namespace FEX::Windows {
 namespace {
   constexpr size_t MaxTracked = 512;
   constexpr size_t MaxPrinted = 8;
+  // Threads whose InSimulation flag is sampled during the next second: the busiest ones of the previous second.
+  constexpr size_t MaxSampled = 16;
+  constexpr int64_t SampleInterval100ns = 20'000; // 2ms
 
   // Every counter we report, sampled once per interval and diffed against the previous sample.
   struct Sample {
@@ -42,13 +45,31 @@ namespace {
     uint64_t DiskCacheHitCount;
   };
 
+  // Tells whether a thread is running translated x86 code (InSimulation set) or native ARM64EC code (Wine, VKD3D, the
+  // driver, FEX itself outside the JIT) by polling its CHPE CPU area.
+  struct SampledThread {
+    uint32_t TID;
+    const FEXCore::SHMStats::ThreadStats* Slot;
+    const volatile BOOLEAN* InSimulation;
+    uint32_t Samples;
+    uint32_t InSimulationSamples;
+  };
+
   struct LogState {
     const StatAlloc* Stats;
     FILE* File;
     uint64_t CounterFreq;
     Sample Prev[MaxTracked];
     size_t PrevCount;
+    SampledThread Sampled[MaxSampled];
+    size_t SampledCount;
   };
+
+  uint64_t GetCounter() {
+    uint64_t Result {};
+    __asm volatile("isb; mrs %[Res], CNTVCT_EL0" : [Res] "=r"(Result));
+    return Result;
+  }
 
   uint64_t GetCounterFrequency() {
     uint64_t Result {};
@@ -103,9 +124,52 @@ namespace {
     return Result;
   }
 
-  void Sleep1s() {
-    LARGE_INTEGER Time {.QuadPart = -10'000'000LL};
-    NtDelayExecution(FALSE, &Time);
+  const volatile BOOLEAN* QueryInSimulationFlag(uint32_t TID) {
+    HANDLE Handle {};
+    CLIENT_ID ClientId {
+      .UniqueProcess = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())),
+      .UniqueThread = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(TID)),
+    };
+    OBJECT_ATTRIBUTES Attr {.Length = sizeof(Attr)};
+    if (NtOpenThread(&Handle, THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, &Attr, &ClientId) != STATUS_SUCCESS) {
+      return nullptr;
+    }
+    THREAD_BASIC_INFORMATION Info {};
+    const NTSTATUS Err = NtQueryInformationThread(Handle, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
+    NtClose(Handle);
+    if (Err != STATUS_SUCCESS || !Info.TebBaseAddress) {
+      return nullptr;
+    }
+    // TEB->ChpeV2CpuAreaInfo, see ThreadCPUArea in ARM64EC/Module.cpp. Wine keeps TEBs mapped after thread exit.
+    const auto* Area = *reinterpret_cast<CHPE_V2_CPU_AREA_INFO* const*>(reinterpret_cast<uintptr_t>(Info.TebBaseAddress) + 0x1788);
+    return Area ? &Area->InSimulation : nullptr;
+  }
+
+  // Waits one second, polling the sampled threads' InSimulation flag every few milliseconds.
+  void SampleFor1s(LogState* State) {
+    const uint64_t End = GetCounter() + State->CounterFreq;
+    LARGE_INTEGER Interval {.QuadPart = -SampleInterval100ns};
+    do {
+      NtDelayExecution(FALSE, &Interval);
+      for (size_t i = 0; i < State->SampledCount; ++i) {
+        auto& T = State->Sampled[i];
+        // FEX clears the slot's TID in ThreadTerm, well before the thread's CPU area goes away.
+        if (!T.InSimulation || T.Slot->TID.load(std::memory_order_relaxed) != T.TID) {
+          continue;
+        }
+        ++T.Samples;
+        T.InSimulationSamples += *T.InSimulation ? 1 : 0;
+      }
+    } while (GetCounter() < End);
+  }
+
+  const SampledThread* FindSampled(const LogState* State, uint32_t TID) {
+    for (size_t i = 0; i < State->SampledCount; ++i) {
+      if (State->Sampled[i].TID == TID) {
+        return &State->Sampled[i];
+      }
+    }
+    return nullptr;
   }
 
   void* LogThread(void* Arg) {
@@ -115,17 +179,21 @@ namespace {
 
     fextl::vector<Sample> Current;
     Current.reserve(MaxTracked);
+    fextl::vector<const FEXCore::SHMStats::ThreadStats*> Slots;
+    Slots.reserve(MaxTracked);
 
     for (;;) {
-      Sleep1s();
+      SampleFor1s(State);
       ++Seconds;
 
       Current.clear();
+      Slots.clear();
       State->Stats->ForEachSlot([&](const FEXCore::SHMStats::ThreadStats& Slot) {
         if (Current.size() == MaxTracked) {
           return;
         }
         const uint32_t TID = Slot.TID.load(std::memory_order_relaxed);
+        Slots.push_back(&Slot);
         Current.push_back({
           .TID = TID,
           .CPUTime100ns = QueryThreadCPUTime(TID),
@@ -144,13 +212,15 @@ namespace {
       struct Delta {
         Sample D;
         double CPUPercent;
+        const FEXCore::SHMStats::ThreadStats* Slot;
       };
       fextl::vector<Delta> Deltas;
       Deltas.reserve(Current.size());
       Sample Total {};
       double TotalCPU {};
 
-      for (const auto& Cur : Current) {
+      for (size_t CurIndex = 0; CurIndex < Current.size(); ++CurIndex) {
+        const auto& Cur = Current[CurIndex];
         const Sample* Old = nullptr;
         for (size_t i = 0; i < State->PrevCount; ++i) {
           if (State->Prev[i].TID == Cur.TID) {
@@ -182,6 +252,7 @@ namespace {
               .DiskCacheHitCount = Diff(Cur.DiskCacheHitCount, Old->DiskCacheHitCount),
             },
         };
+        Entry.Slot = Slots[CurIndex];
         // 100ns units over a 1s interval: 10'000'000 == 100%.
         Entry.CPUPercent = static_cast<double>(Entry.D.CPUTime100ns) / 100'000.0;
         TotalCPU += Entry.CPUPercent;
@@ -212,14 +283,36 @@ namespace {
           continue;
         }
         ++Printed;
-        Line += fextl::fmt::format("  tid={} {} cpu={:.0f}% jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} lock={:.1f}ms x87fb={} "
-                                   "dc={}\n",
-                                   D.TID, QueryThreadName(D.TID), Entry.CPUPercent, D.JITTime * MsPerTick, D.JITCount, D.SMCCount,
+        // emu = share of the second this thread spent inside x86 emulation (translated code or FEX's JIT).
+        fextl::string Emu = "-";
+        if (const auto* T = FindSampled(State, D.TID); T && T->Samples) {
+          Emu = fextl::fmt::format("{}%", (T->InSimulationSamples * 100 + T->Samples / 2) / T->Samples);
+        }
+        Line += fextl::fmt::format("  tid={} {} cpu={:.0f}% emu={} jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} lock={:.1f}ms "
+                                   "x87fb={} dc={}\n",
+                                   D.TID, QueryThreadName(D.TID), Entry.CPUPercent, Emu, D.JITTime * MsPerTick, D.JITCount, D.SMCCount,
                                    D.SIGBUSCount, D.SignalTime * MsPerTick, D.CacheMissCount, D.CacheLockTime * MsPerTick,
                                    D.FloatFallbackCount, D.DiskCacheHitCount);
       }
 
       fwrite(Line.data(), 1, Line.size(), State->File);
+
+      // Sample the busiest threads during the next second, reusing the CPU area lookup for threads already sampled.
+      SampledThread Next[MaxSampled];
+      size_t NextCount {};
+      for (const auto& Entry : Deltas) {
+        if (NextCount == MaxSampled || Entry.CPUPercent < 3.0) {
+          break;
+        }
+        const auto* Old = FindSampled(State, Entry.D.TID);
+        Next[NextCount++] = {
+          .TID = Entry.D.TID,
+          .Slot = Entry.Slot,
+          .InSimulation = Old && Old->Slot == Entry.Slot ? Old->InSimulation : QueryInSimulationFlag(Entry.D.TID),
+        };
+      }
+      std::copy_n(Next, NextCount, State->Sampled);
+      State->SampledCount = NextCount;
     }
 
     return nullptr;
@@ -284,7 +377,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   auto Header = fextl::fmt::format("# FEX stats for {} (pid {}), one block per second. cpu = thread CPU time; jit = time/blocks compiled; "
                                    "smc = writes to translated code; sigbus = unaligned atomic fixups; sig = time in exception "
                                    "handling; miss = lookup cache misses; lock = lookup cache lock time; x87fb = x87 fallbacks; dc = disk "
-                                   "cache hits\n",
+                                   "cache hits; emu = share of the second spent in emulated x86 code (the rest of cpu is native: "
+                                   "Wine, VKD3D, driver)\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
