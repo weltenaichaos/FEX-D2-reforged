@@ -219,7 +219,6 @@ namespace {
       }
 
       fwrite(Line.data(), 1, Line.size(), State->File);
-      fflush(State->File);
     }
 
     return nullptr;
@@ -277,8 +276,9 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "handling; miss = lookup cache misses; lock = lookup cache lock time; x87fb = x87 fallbacks; dc = disk "
                                    "cache hits\n",
                                    AppName, GetCurrentProcessId());
+  // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
+  // terminates the process.
   fwrite(Header.data(), 1, Header.size(), File);
-  fflush(File);
 
   // Lives for the rest of the process.
   auto* State = new LogState {.Stats = Stats, .File = File, .CounterFreq = GetCounterFrequency()};
