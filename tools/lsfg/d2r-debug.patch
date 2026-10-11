@@ -1,0 +1,291 @@
+diff --git a/include/layer.hpp b/include/layer.hpp
+index 2990194..8d7db3b 100644
+--- a/include/layer.hpp
++++ b/include/layer.hpp
+@@ -198,6 +198,8 @@ namespace Layer {
+         VkExtensionProperties* pProperties);
+     /// The instance the layer initialized on.
+     VkInstance ovkInstance();
++    /// The live instance a physical device was enumerated from.
++    VkInstance ovkInstanceFor(VkPhysicalDevice physicalDevice);
+ 
+     /// Call to the original vkQueueSubmit function.
+     VkResult ovkQueueSubmit(
+diff --git a/src/context.cpp b/src/context.cpp
+index 2385454..0e7eaa7 100644
+--- a/src/context.cpp
++++ b/src/context.cpp
+@@ -318,7 +318,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+     // Android: single-device framegen on the game's own device and queue —
+     // two ICDs interpret shared AHB memory differently and scramble it.
+ 
++    std::cerr << "lsfg-vk: [dbg] ctx: extent " << extent.width << "x" << extent.height << " images " << swapchainImages.size() << " mult " << conf.multiplier << " instance " << static_cast<void*>(Layer::ovkInstanceFor(info.physicalDevice)) << "\n";
+     this->preCopyFence = Mini::Fence(info.device, true);
++    std::cerr << "lsfg-vk: [dbg] ctx: fence ok\n";
+ 
+     const VkImageUsageFlags sharedUsage = VK_IMAGE_USAGE_STORAGE_BIT
+         | VK_IMAGE_USAGE_SAMPLED_BIT
+@@ -333,6 +335,7 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+         this->out_n.emplace_back(Mini::Image::createDeviceLocal(info.device, info.physicalDevice,
+             extent, format, sharedUsage, VK_IMAGE_ASPECT_COLOR_BIT));
+ 
++    std::cerr << "lsfg-vk: [dbg] ctx: images ok\n";
+     setenv("DISABLE_LSFG", "1", 1); // NOLINT
+ 
+     const auto shaderLoader = [](const std::string& name) {
+@@ -364,22 +367,24 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+         return spirv;
+     };
+     if (conf.performance)
+-        LSFG_3_1P::initializeExternal(Layer::ovkGetInstanceProcAddr, Layer::ovkInstance(),
++        LSFG_3_1P::initializeExternal(Layer::ovkGetInstanceProcAddr, Layer::ovkInstanceFor(info.physicalDevice),
+             info.physicalDevice, info.device,
+             static_cast<uint32_t>(info.queue.first), info.queue.second,
+             conf.hdr, 1.0F / conf.flowScale, conf.multiplier - 1, shaderLoader);
+     else
+-        LSFG_3_1::initializeExternal(Layer::ovkGetInstanceProcAddr, Layer::ovkInstance(),
++        LSFG_3_1::initializeExternal(Layer::ovkGetInstanceProcAddr, Layer::ovkInstanceFor(info.physicalDevice),
+             info.physicalDevice, info.device,
+             static_cast<uint32_t>(info.queue.first), info.queue.second,
+             conf.hdr, 1.0F / conf.flowScale, conf.multiplier - 1, shaderLoader);
+ 
++    std::cerr << "lsfg-vk: [dbg] ctx: lsfg initialized\n";
+     std::vector<VkImage> outImages;
+     outImages.reserve(conf.multiplier - 1);
+     for (size_t i = 0; i < static_cast<size_t>(conf.multiplier - 1); ++i)
+         outImages.push_back(this->out_n.at(i).handle());
+ 
+     int32_t ctxId;
++    std::cerr << "lsfg-vk: [dbg] ctx: creating lsfg context\n";
+     if (conf.performance)
+         ctxId = LSFG_3_1P::createContextFromImages(
+             this->frame_0.handle(), this->frame_1.handle(),
+diff --git a/src/hooks.cpp b/src/hooks.cpp
+index 681f8e4..d026446 100644
+--- a/src/hooks.cpp
++++ b/src/hooks.cpp
+@@ -192,6 +192,9 @@ namespace {
+             .physicalDevice = physicalDevice,
+             .queue = Utils::findQueue(*pDevice, physicalDevice, pCreateInfo, VK_QUEUE_GRAPHICS_BIT)
+         });
++        std::cerr << "lsfg-vk: [dbg] device " << static_cast<void*>(*pDevice)
++            << " on phys " << static_cast<void*>(physicalDevice)
++            << " instance " << static_cast<void*>(Layer::ovkInstanceFor(physicalDevice)) << "\n";
+         return VK_SUCCESS;
+     }
+ 
+@@ -225,11 +228,31 @@ namespace {
+         }
+         Utils::resetLimitN("swapMap");
+         auto& deviceInfo = it->second;
++        std::cerr << "lsfg-vk: [dbg] swapchain: device " << static_cast<void*>(device)
++            << " phys " << static_cast<void*>(deviceInfo.physicalDevice)
++            << " queue family " << deviceInfo.queue.first
++            << " size " << pCreateInfo->imageExtent.width << "x" << pCreateInfo->imageExtent.height
++            << " minImages " << pCreateInfo->minImageCount
++            << " format " << pCreateInfo->imageFormat
++            << " present " << pCreateInfo->presentMode
++            << " usage 0x" << std::hex << pCreateInfo->imageUsage << std::dec
++            << " old " << static_cast<void*>(pCreateInfo->oldSwapchain) << "\n";
++        for (auto* node = reinterpret_cast<const VkBaseInStructure*>(pCreateInfo->pNext);
++                node != nullptr; node = node->pNext)
++            std::cerr << "lsfg-vk: [dbg] swapchain: pNext sType " << node->sType << "\n";
+ 
+         // increase amount of images in swapchain
+         VkSwapchainCreateInfoKHR createInfo = *pCreateInfo;
+-        const auto maxImages = Utils::getMaxImageCount(
+-            deviceInfo.physicalDevice, pCreateInfo->surface);
++        uint32_t maxImages = 999;
++        try {
++            maxImages = Utils::getMaxImageCount(
++                deviceInfo.physicalDevice, pCreateInfo->surface);
++        } catch (const std::exception& e) {
++            std::cerr << "lsfg-vk: [dbg] swapchain: surface caps failed: " << e.what() << "\n";
++        } catch (...) {
++            std::cerr << "lsfg-vk: [dbg] swapchain: surface caps failed (unknown)\n";
++        }
++        std::cerr << "lsfg-vk: [dbg] swapchain: maxImages " << maxImages << "\n";
+         createInfo.minImageCount = createInfo.minImageCount + 1
+             + static_cast<uint32_t>(deviceInfo.queue.first);
+         if (createInfo.minImageCount > maxImages) {
+@@ -262,9 +285,16 @@ namespace {
+         }
+ 
+         // create swapchain
++        std::cerr << "lsfg-vk: [dbg] swapchain: creating with minImages " << createInfo.minImageCount
++            << " present " << createInfo.presentMode << "\n";
+         auto res = Layer::ovkCreateSwapchainKHR(device, &createInfo, pAllocator, pSwapchain);
+-        if (res != VK_SUCCESS)
+-            return res; // can't be caused by lsfg-vk (yet)
++        std::cerr << "lsfg-vk: [dbg] swapchain: driver returned " << res << "\n";
++        if (res != VK_SUCCESS) {
++            // fall back to exactly what the game asked for
++            res = Layer::ovkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
++            std::cerr << "lsfg-vk: [dbg] swapchain: unmodified retry returned " << res << "\n";
++            return res;
++        }
+ 
+         try {
+             swapchainToPresent.emplace(*pSwapchain, createInfo.presentMode);
+@@ -282,6 +312,7 @@ namespace {
+                 throw LSFG::vulkan_error(res, "Failed to get swapchain images");
+ 
+             // create swapchain context
++            std::cerr << "lsfg-vk: [dbg] swapchain: " << imageCount << " images, creating context\n";
+             swapchainToDeviceTable.emplace(*pSwapchain, device);
+             swapchains.emplace(*pSwapchain, LsContext(
+                 deviceInfo, *pSwapchain, pCreateInfo->imageExtent,
+@@ -294,10 +325,16 @@ namespace {
+ 
+             Utils::resetLimitN("swapCtxCreate");
+         } catch (const std::exception& e) {
++            std::cerr << "lsfg-vk: [dbg] swapchain: context failed: " << e.what() << "\n";
++            swapchainToDeviceTable.erase(*pSwapchain);
+             Utils::logLimitN("swapCtxCreate", 5,
+                 "An error occurred while creating the swapchain wrapper:\n"
+                 "- " + std::string(e.what()));
+             return VK_SUCCESS; // swapchain is still valid
++        } catch (...) {
++            std::cerr << "lsfg-vk: [dbg] swapchain: context failed (unknown exception)\n";
++            swapchainToDeviceTable.erase(*pSwapchain);
++            return VK_SUCCESS;
+         }
+         return VK_SUCCESS;
+     }
+diff --git a/src/layer.cpp b/src/layer.cpp
+index fa9c173..8588582 100644
+--- a/src/layer.cpp
++++ b/src/layer.cpp
+@@ -11,6 +11,8 @@
+ #include <vulkan/vulkan_core.h>
+ 
+ #include <unordered_map>
++#include <unordered_set>
++#include <mutex>
+ #include <exception>
+ #include <iostream>
+ #include <cstdint>
+@@ -38,6 +40,14 @@ namespace {
+ 
+     VkInstance g_instanceHandle{};
+ 
++    // Every vkCreateInstance overwrote g_instanceHandle, so after a game (or
++    // DXVK/vkd3d) created a second, short-lived instance the layer kept using
++    // that one for the swapchain path, even once it was destroyed. Track which
++    // instance owns each physical device and which instances are still alive.
++    std::mutex g_instanceMutex;
++    std::unordered_set<VkInstance> g_liveInstances;
++    std::unordered_map<VkPhysicalDevice, VkInstance> g_physToInstance;
++
+     PFN_vkCreateSwapchainKHR  next_vkCreateSwapchainKHR{};
+     PFN_vkQueuePresentKHR     next_vkQueuePresentKHR{};
+     PFN_vkDestroySwapchainKHR next_vkDestroySwapchainKHR{};
+@@ -169,6 +179,11 @@ namespace {
+             initInstanceFunc(*pInstance,
+                 "vkEnumerateDeviceExtensionProperties", &next_vkEnumerateDeviceExtensionProperties);
+             g_instanceHandle = *pInstance;
++            {
++                const std::lock_guard<std::mutex> lock(g_instanceMutex);
++                g_liveInstances.insert(*pInstance);
++            }
++            std::cerr << "lsfg-vk: [dbg] instance created " << static_cast<void*>(*pInstance) << "\n";
+ 
+             std::cerr << "lsfg-vk: Vulkan instance layer initialized successfully.\n";
+         } catch (const std::exception& e) {
+@@ -290,7 +305,63 @@ namespace {
+     } // NOLINTEND
+ }
+ 
++namespace {
++    VkResult layer_vkEnumeratePhysicalDevices(VkInstance instance,
++            uint32_t* pCount, VkPhysicalDevice* pDevices) {
++        auto fn = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
++            next_vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices"));
++        if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
++        auto res = fn(instance, pCount, pDevices);
++        if ((res == VK_SUCCESS || res == VK_INCOMPLETE) && pDevices) {
++            const std::lock_guard<std::mutex> lock(g_instanceMutex);
++            for (uint32_t i = 0; i < *pCount; i++)
++                g_physToInstance[pDevices[i]] = instance;
++        }
++        return res;
++    }
++
++    VkResult layer_vkEnumeratePhysicalDeviceGroups(VkInstance instance,
++            uint32_t* pCount, VkPhysicalDeviceGroupProperties* pGroups) {
++        auto fn = reinterpret_cast<PFN_vkEnumeratePhysicalDeviceGroups>(
++            next_vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDeviceGroups"));
++        if (!fn) fn = reinterpret_cast<PFN_vkEnumeratePhysicalDeviceGroups>(
++            next_vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDeviceGroupsKHR"));
++        if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
++        auto res = fn(instance, pCount, pGroups);
++        if ((res == VK_SUCCESS || res == VK_INCOMPLETE) && pGroups) {
++            const std::lock_guard<std::mutex> lock(g_instanceMutex);
++            for (uint32_t i = 0; i < *pCount; i++)
++                for (uint32_t j = 0; j < pGroups[i].physicalDeviceCount; j++)
++                    g_physToInstance[pGroups[i].physicalDevices[j]] = instance;
++        }
++        return res;
++    }
++
++    void layer_vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator) {
++        auto fn = reinterpret_cast<PFN_vkDestroyInstance>(
++            next_vkGetInstanceProcAddr(instance, "vkDestroyInstance"));
++        {
++            const std::lock_guard<std::mutex> lock(g_instanceMutex);
++            g_liveInstances.erase(instance);
++            std::erase_if(g_physToInstance,
++                [instance](const auto& p) { return p.second == instance; });
++            if (g_instanceHandle == instance)
++                g_instanceHandle = g_liveInstances.empty() ? VK_NULL_HANDLE : *g_liveInstances.begin();
++        }
++        std::cerr << "lsfg-vk: [dbg] instance destroyed " << static_cast<void*>(instance) << "\n";
++        if (fn) fn(instance, pAllocator);
++    }
++}
++
+ const std::unordered_map<std::string, PFN_vkVoidFunction> layerFunctions = {
++    { "vkEnumeratePhysicalDevices",
++        reinterpret_cast<PFN_vkVoidFunction>(&layer_vkEnumeratePhysicalDevices) },
++    { "vkEnumeratePhysicalDeviceGroups",
++        reinterpret_cast<PFN_vkVoidFunction>(&layer_vkEnumeratePhysicalDeviceGroups) },
++    { "vkEnumeratePhysicalDeviceGroupsKHR",
++        reinterpret_cast<PFN_vkVoidFunction>(&layer_vkEnumeratePhysicalDeviceGroups) },
++    { "vkDestroyInstance",
++        reinterpret_cast<PFN_vkVoidFunction>(&layer_vkDestroyInstance) },
+     { "vkCreateInstance",
+         reinterpret_cast<PFN_vkVoidFunction>(&layer_vkCreateInstance) },
+     { "vkCreateDevice",
+@@ -408,13 +479,31 @@ namespace Layer {
+             physicalDevice, nullptr, pPropertyCount, pProperties) == VK_SUCCESS;
+     }
+     VkInstance ovkInstance() {
++        const std::lock_guard<std::mutex> lock(g_instanceMutex);
++        return g_instanceHandle;
++    }
++    VkInstance ovkInstanceFor(VkPhysicalDevice physicalDevice) {
++        const std::lock_guard<std::mutex> lock(g_instanceMutex);
++        auto it = g_physToInstance.find(physicalDevice);
++        if (it != g_physToInstance.end())
++            return it->second;
++        std::cerr << "lsfg-vk: [dbg] physical device " << static_cast<void*>(physicalDevice)
++            << " has no known instance, using " << static_cast<void*>(g_instanceHandle) << "\n";
+         return g_instanceHandle;
+     }
+     VkResult ovkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+             VkPhysicalDevice physicalDevice,
+             VkSurfaceKHR surface,
+             VkSurfaceCapabilitiesKHR* pSurfaceCapabilities) {
+-        return next_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, pSurfaceCapabilities);
++        auto fn = next_vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
++        const VkInstance inst = ovkInstanceFor(physicalDevice);
++        if (inst) {
++            auto own = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
++                next_vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
++            if (own) fn = own;
++        }
++        if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
++        return fn(physicalDevice, surface, pSurfaceCapabilities);
+     }
+ 
+     VkResult ovkCreateSwapchainKHR(
