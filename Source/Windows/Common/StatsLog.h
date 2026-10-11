@@ -15,4 +15,8 @@ class StatAlloc;
 // thread and then call StartStatsLog().
 bool StatsLogRequested(std::string_view AppName);
 void StartStatsLog(const StatAlloc* Stats, std::string_view AppName);
+
+// Writes a sample if one is due. Cheap when not: one counter read and a compare. Called from paths guest threads hit
+// often (exception handling, thread setup); safe to call when the log isn't running.
+void StatsLogTick();
 } // namespace FEX::Windows
