@@ -1188,6 +1188,10 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, 
   }
 }
 
+// Exported so ntdll only forwards non-image section views to an emulator that can take them; a stock
+// emulator dereferences a missing PE header in HandleImageMap.
+ULONG BTCpu64NotifyNonImageViews = 1;
+
 NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Size, ULONG AllocType, ULONG Prot) {
   if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
     return STATUS_SUCCESS;

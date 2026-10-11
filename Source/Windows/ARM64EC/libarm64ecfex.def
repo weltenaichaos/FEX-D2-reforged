@@ -11,6 +11,7 @@ EXPORTS
   BeginSimulation DATA
   FlushInstructionCacheHeavy
   NotifyMapViewOfSection
+  BTCpu64NotifyNonImageViews DATA
   NotifyMemoryAlloc
   NotifyMemoryFree
   NotifyMemoryProtect
