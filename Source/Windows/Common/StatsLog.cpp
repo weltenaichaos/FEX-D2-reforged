@@ -64,6 +64,13 @@ namespace {
     uint64_t CacheLockTime;
     uint64_t FloatFallbackCount;
     uint64_t DiskCacheHitCount;
+    uint64_t DiskCacheMissCount;
+    uint64_t DiskCacheLookupTime;
+    uint64_t DiskCacheKeyTime;
+    uint64_t DiskCacheReadTime;
+    uint64_t DiskCacheFileReadCount;
+    uint64_t DiskCacheRelocTime;
+    uint64_t DiskCacheInstallTime;
   };
 
   // Tells whether a thread is running translated x86 code (InSimulation set) or native ARM64EC code (Wine, VKD3D, the
@@ -306,6 +313,13 @@ namespace {
           .CacheLockTime = Slot.AccumulatedCacheReadLockTime + Slot.AccumulatedCacheWriteLockTime,
           .FloatFallbackCount = Slot.AccumulatedFloatFallbackCount,
           .DiskCacheHitCount = Slot.AccumulatedDiskCacheHitCount,
+          .DiskCacheMissCount = Slot.AccumulatedDiskCacheMissCount,
+          .DiskCacheLookupTime = Slot.AccumulatedDiskCacheLookupTime,
+          .DiskCacheKeyTime = Slot.AccumulatedDiskCacheKeyTime,
+          .DiskCacheReadTime = Slot.AccumulatedDiskCacheReadTime,
+          .DiskCacheFileReadCount = Slot.AccumulatedDiskCacheFileReadCount,
+          .DiskCacheRelocTime = Slot.AccumulatedDiskCacheRelocTime,
+          .DiskCacheInstallTime = Slot.AccumulatedDiskCacheInstallTime,
         });
       });
 
@@ -350,6 +364,13 @@ namespace {
               .CacheLockTime = Diff(Cur.CacheLockTime, Old->CacheLockTime),
               .FloatFallbackCount = Diff(Cur.FloatFallbackCount, Old->FloatFallbackCount),
               .DiskCacheHitCount = Diff(Cur.DiskCacheHitCount, Old->DiskCacheHitCount),
+              .DiskCacheMissCount = Diff(Cur.DiskCacheMissCount, Old->DiskCacheMissCount),
+              .DiskCacheLookupTime = Diff(Cur.DiskCacheLookupTime, Old->DiskCacheLookupTime),
+              .DiskCacheKeyTime = Diff(Cur.DiskCacheKeyTime, Old->DiskCacheKeyTime),
+              .DiskCacheReadTime = Diff(Cur.DiskCacheReadTime, Old->DiskCacheReadTime),
+              .DiskCacheFileReadCount = Diff(Cur.DiskCacheFileReadCount, Old->DiskCacheFileReadCount),
+              .DiskCacheRelocTime = Diff(Cur.DiskCacheRelocTime, Old->DiskCacheRelocTime),
+              .DiskCacheInstallTime = Diff(Cur.DiskCacheInstallTime, Old->DiskCacheInstallTime),
             },
         };
         Entry.Slot = Slots[CurIndex];
@@ -363,6 +384,9 @@ namespace {
         Total.SMCCount += Entry.D.SMCCount;
         Total.CacheMissCount += Entry.D.CacheMissCount;
         Total.FloatFallbackCount += Entry.D.FloatFallbackCount;
+        Total.DiskCacheHitCount += Entry.D.DiskCacheHitCount;
+        Total.DiskCacheMissCount += Entry.D.DiskCacheMissCount;
+        Total.DiskCacheLookupTime += Entry.D.DiskCacheLookupTime;
         Deltas.push_back(Entry);
       }
 
@@ -371,14 +395,16 @@ namespace {
 
       std::sort(Deltas.begin(), Deltas.end(), [](const Delta& a, const Delta& b) { return a.CPUPercent > b.CPUPercent; });
 
-      auto Line = fextl::fmt::format("t={} threads={} cpu={:.0f}% jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} x87fb={}\n",
+      auto Line = fextl::fmt::format("t={} threads={} cpu={:.0f}% jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} x87fb={} "
+                                     "dc={}/{} dcl={:.1f}ms\n",
                                      Seconds, Current.size(), TotalCPU, Total.JITTime * MsPerTick, Total.JITCount, Total.SMCCount,
-                                     Total.SIGBUSCount, Total.SignalTime * MsPerTick, Total.CacheMissCount, Total.FloatFallbackCount);
+                                     Total.SIGBUSCount, Total.SignalTime * MsPerTick, Total.CacheMissCount, Total.FloatFallbackCount,
+                                     Total.DiskCacheHitCount, Total.DiskCacheMissCount, Total.DiskCacheLookupTime * MsPerTick);
 
       size_t Printed {};
       for (const auto& Entry : Deltas) {
         const auto& D = Entry.D;
-        const bool Interesting = Entry.CPUPercent >= 3.0 || D.JITCount || D.SMCCount || D.SIGBUSCount;
+        const bool Interesting = Entry.CPUPercent >= 3.0 || D.JITCount || D.SMCCount || D.SIGBUSCount || D.DiskCacheHitCount;
         if (!Interesting || Printed == MaxPrinted) {
           continue;
         }
@@ -393,6 +419,14 @@ namespace {
                                    D.TID, QueryThreadName(D.TID), Entry.CPUPercent, Emu, D.JITTime * MsPerTick, D.JITCount, D.SMCCount,
                                    D.SIGBUSCount, D.SignalTime * MsPerTick, D.CacheMissCount, D.CacheLockTime * MsPerTick,
                                    D.FloatFallbackCount, D.DiskCacheHitCount);
+        // Disk cache lookup breakdown (dcl = whole lookup incl. misses; key = lookup key/anon decode; read = entry reads, file
+        // = how many came from the cache file; rel = relocations; inst = putting a hit into the code buffer).
+        if (D.DiskCacheHitCount || D.DiskCacheMissCount) {
+          Line += fextl::fmt::format("    dc hit={} miss={} dcl={:.1f}ms key={:.1f}ms read={:.1f}ms file={} rel={:.1f}ms inst={:.1f}ms\n",
+                                     D.DiskCacheHitCount, D.DiskCacheMissCount, D.DiskCacheLookupTime * MsPerTick,
+                                     D.DiskCacheKeyTime * MsPerTick, D.DiskCacheReadTime * MsPerTick, D.DiskCacheFileReadCount,
+                                     D.DiskCacheRelocTime * MsPerTick, D.DiskCacheInstallTime * MsPerTick);
+        }
       }
 
       fwrite(Line.data(), 1, Line.size(), State->File);

@@ -15,6 +15,7 @@
 #include <FEXCore/Utils/FileUtils.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/Profiler.h>
+#include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXHeaderUtils/Filesystem.h>
 
@@ -177,7 +178,10 @@ namespace DiskCache {
 
     File::File::FileHandleType CacheFileHandle = CacheFOZ.GetHandle();
     if (FileMapper && CacheFileHandle != (File::File::FileHandleType)-1) {
-      CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, ReadOnly ? CacheFOZ.Size() : BIG_MAPPING_SIZE));
+      uint64_t MapSize = ReadOnly ? CacheFOZ.Size() : BIG_MAPPING_SIZE;
+      uint64_t MappedSize = MapSize;
+      CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, MapSize, &MappedSize));
+      CacheFileMappedSize = CacheFileMapping ? std::min(MapSize, MappedSize) : 0;
       CacheFileSize = CacheFOZ.Size();
     }
 
@@ -261,7 +265,7 @@ namespace DiskCache {
   }
 
   bool IndexedDB::ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob) {
-    if (CacheFileMapping && (ReadOnly || Offset + OutBlob.size() <= BIG_MAPPING_SIZE)) {
+    if (CacheFileMapping && Offset + OutBlob.size() <= CacheFileMappedSize) {
       if (Offset + OutBlob.size() > CacheFileSize) {
         return false;
       }
@@ -548,6 +552,8 @@ namespace DiskCache {
     if (!IsReadingDiskCache()) {
       return std::nullopt;
     }
+    std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> KeyTimer;
+    KeyTimer.emplace(Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedDiskCacheKeyTime : nullptr);
     if (Region && Region->FileStartVA) {
       struct __attribute__((packed)) {
         uint64_t GuestOffset;
@@ -593,6 +599,7 @@ namespace DiskCache {
 
     uint64_t LookupKey =
       MakeLookupKey(Thread, *GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
+    KeyTimer.reset();
 
     XXH128_hash_t LiveGuestHash;
     uint64_t LastFootprintHashed = 0;
@@ -775,6 +782,8 @@ namespace DiskCache {
     memcpy(HitData.Blob.data(), GuestPages.data(), GuestPages.size() * sizeof(uint64_t));
     uint32_t BlobOffset = GuestPages.size() * sizeof(uint64_t);
     bool FoundInLRU = false;
+    std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> ReadTimer;
+    ReadTimer.emplace(Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedDiskCacheReadTime : nullptr);
     if (BlobRef && BlobRef->size() >= EntrySizeWithoutGuestCode) {
       FoundInLRU = true;
       memcpy(HitData.Blob.data() + BlobOffset, BlobRef->data(), EntrySizeWithoutGuestCode);
@@ -784,9 +793,13 @@ namespace DiskCache {
         // LogMan::Msg::IFmt("lru hit! {}", MemoryLRUCurrentSize);
         MemoryLRU.splice(MemoryLRU.begin(), MemoryLRU, *LRUIter);
       }
-    } else if (!Entry.DB->ReadCacheBlob(Entry.Offset, {HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode})) {
-      return std::nullopt;
+    } else {
+      FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheFileReadCount, 1);
+      if (!Entry.DB->ReadCacheBlob(Entry.Offset, {HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode})) {
+        return std::nullopt;
+      }
     }
+    ReadTimer.reset();
 
     if (EntrySizeWithoutGuestCode < sizeof(BlobFixedHeader)) {
       return std::nullopt;
@@ -847,8 +860,11 @@ namespace DiskCache {
       EntryPointRip += GuestRIP;
     }
 
-    if (!CTX->CodeCache.ApplyPackedCodeRelocations(GuestRIP, std::as_writable_bytes(HitData.HostCode), SmallRelocs, ThunkRelocs)) {
-      return std::nullopt;
+    {
+      FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheRelocTime);
+      if (!CTX->CodeCache.ApplyPackedCodeRelocations(GuestRIP, std::as_writable_bytes(HitData.HostCode), SmallRelocs, ThunkRelocs)) {
+        return std::nullopt;
+      }
     }
 
     return HitData;

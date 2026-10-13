@@ -193,7 +193,7 @@ void Shutdown(fextl::vector<FEXCore::Allocator::MemoryRegion>&& MemoryRegions) {
 }
 } // namespace FEX::Allocator
 
-static void* DiskCacheFilemapper(FEXCore::File::File::FileHandleType Handle, uint64_t MapSize) {
+static void* DiskCacheFilemapper(FEXCore::File::File::FileHandleType Handle, uint64_t MapSize, uint64_t* MappedSize) {
   int mapFD = dup(Handle);
   void* Result = FEXCore::Allocator::mmap(nullptr, MapSize, PROT_READ, MAP_SHARED | MAP_NORESERVE, mapFD, 0);
   close(mapFD);

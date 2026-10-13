@@ -10,6 +10,7 @@
 #include <libloaderapi.h>
 #include "FEXUnixLib.h"
 #include "Priv.h"
+#include "StatsLog.h"
 
 #define PR_SET_VMA 0x53564d41
 #define PR_SET_VMA_ANON_NAME 0
@@ -179,7 +180,7 @@ void DeleteSHMStatsFile() {
   Call(FEXUnixLibFunctions::DeleteSHMStatsFile, nullptr);
 }
 
-void* MapFile(HANDLE FileHandle, uint64_t MapSize) {
+void* MapFile(HANDLE FileHandle, uint64_t MapSize, uint64_t* MappedSize) {
   if (Available() && WineServerHandleToFd) {
     FEXUnixLib_MapFile Args {
       .FD = -1,
@@ -193,11 +194,32 @@ void* MapFile(HANDLE FileHandle, uint64_t MapSize) {
     }
 
     if (Call(FEXUnixLibFunctions::MapFile, &Args) == STATUS_SUCCESS) {
+      *MappedSize = MapSize;
+      FEX::Windows::StatsLogNote(fextl::fmt::format("diskcache file mapping: unixlib, {} bytes", MapSize));
       return Args.Result;
     }
   }
 
-  return nullptr;
+  // Without the unixlib (GameNative ships only the PE DLLs), map the file through a Windows section instead. A section
+  // can't be larger than the read-only file, so this only covers what the file holds now; entries written later in
+  // this session are read from the file.
+  HANDLE Section {};
+  auto Status = NtCreateSection(&Section, SECTION_MAP_READ | SECTION_QUERY, nullptr, nullptr, PAGE_READONLY, SEC_COMMIT, FileHandle);
+  if (!NT_SUCCESS(Status)) {
+    FEX::Windows::StatsLogNote(fextl::fmt::format("diskcache file mapping: none (section status {:#x})", static_cast<uint32_t>(Status)));
+    return nullptr;
+  }
+  void* View {};
+  SIZE_T ViewSize {};
+  Status = NtMapViewOfSection(Section, NtCurrentProcess(), &View, 0, 0, nullptr, &ViewSize, ViewUnmap, 0, PAGE_READONLY);
+  NtClose(Section);
+  if (!NT_SUCCESS(Status)) {
+    FEX::Windows::StatsLogNote(fextl::fmt::format("diskcache file mapping: none (view status {:#x})", static_cast<uint32_t>(Status)));
+    return nullptr;
+  }
+  *MappedSize = ViewSize;
+  FEX::Windows::StatsLogNote(fextl::fmt::format("diskcache file mapping: section, {} bytes", ViewSize));
+  return View;
 }
 
 uint32_t GetPID() {

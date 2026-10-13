@@ -912,6 +912,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheLookupTime);
     Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
     if (Hit && !DiskCache.IsValidating()) {
+      FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheInstallTime);
       auto LoadedCode = Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
       if (LoadedCode.BlockBegin) {
         for (auto& CodePage : Hit->GuestPages) {

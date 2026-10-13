@@ -74,7 +74,13 @@ struct ThreadStats {
   uint64_t AccumulatedDiskCacheHitCount;
   uint64_t AccumulatedDiskCacheMissCount;
   uint64_t AccumulatedDiskCacheLookupTime;
-  uint64_t Padding;
+  // Disk cache lookup breakdown: computing the lookup key, reading entries (and how many came from the file rather
+  // than memory), applying relocations, and installing a hit into the code buffer and lookup cache.
+  uint64_t AccumulatedDiskCacheKeyTime;
+  uint64_t AccumulatedDiskCacheReadTime;
+  uint64_t AccumulatedDiskCacheFileReadCount;
+  uint64_t AccumulatedDiskCacheRelocTime;
+  uint64_t AccumulatedDiskCacheInstallTime;
 };
 
 // Ensure 16-byte alignment to take advantage of ARM single-copy atomicity.

@@ -808,9 +808,7 @@ NTSTATUS ProcessInit() {
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
   FEX::Windows::UnixLib::Init(NtDll);
-  if (FEX::Windows::UnixLib::Available()) {
-    FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
-  }
+  FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
 
   {
     auto HostFeatures =

@@ -179,6 +179,7 @@ namespace DiskCache {
 
     FOZFile CacheFOZ;
     uint8_t* CacheFileMapping = nullptr;
+    uint64_t CacheFileMappedSize = 0;
     std::atomic<uint64_t> CacheFileSize;
     FOZFile IndexFOZ;
     bool ReadOnly = false;
