@@ -1,0 +1,4 @@
+fexcore-2610-d2rfix28-thor-clean-24/fexcore-2610-d2rfix28-thor-clean.wcp
+fexcore-2610-d2rfix28s-thor-24/fexcore-2610-d2rfix28s-thor.wcp
+lsfg-d2r-6/liblsfg-vk-layer.so
+vkd3d-proton-3.0b-arm64ec-2/vkd3d-proton-3.0b-arm64ec.wcp
