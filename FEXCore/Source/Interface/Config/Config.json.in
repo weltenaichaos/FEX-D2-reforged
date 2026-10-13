@@ -133,16 +133,6 @@
           "Scales the cycle counter on systems that have low frequencies."
         ]
       },
-      "PauseISB": {
-        "Type": "bool",
-        "Default": "false",
-        "AffectsCodeGen": "true",
-        "Desc": [
-          "Translates the x86 PAUSE instruction to ISB instead of YIELD.",
-          "YIELD is a no-op on cores without SMT, so x86 spin-wait loops poll the lock as fast as possible.",
-          "ISB stalls for a short time, which slows the polling and keeps the cache line free for the lock owner."
-        ]
-      },
       "HideHybrid": {
         "Type": "bool",
         "Default": "true",

@@ -345,11 +345,7 @@ DEF_OP(RDRAND) {
 }
 
 DEF_OP(Yield) {
-  if (CTX->Config.PauseISB) {
-    isb();
-  } else {
-    yield();
-  }
+  yield();
 }
 
 DEF_OP(MonoBackpatcherWrite) {
