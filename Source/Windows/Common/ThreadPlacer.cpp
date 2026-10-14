@@ -28,6 +28,10 @@ namespace {
   constexpr uint32_t DemoteAfterSeconds = 3;
   // After a failed affinity change, wait this many seconds before trying that thread again.
   constexpr uint32_t RetryAfterSeconds = 10;
+  // Sticky mode: a game thread goes to the little cores only after this many seconds in a row below IdleLoad, and
+  // returns to the big cores the first second it is above it.
+  constexpr uint32_t IdleAfterSeconds = 10;
+  constexpr double IdleLoad = 1.0;
 
   // Same layout as Windows' THREAD_BASIC_INFORMATION; spelled out because the bundled headers differ in field names.
   struct ThreadBasicInfo {
@@ -46,6 +50,7 @@ namespace {
     uint32_t Heavy;
     int Fast;
     fextl::string RestName;
+    bool Sticky; // FEX_PIN_MODE=sticky (default): game threads stay on the big cores unless idle; =load: busiest-N ranking
     bool Other; // a process other than FEX_PIN_APP: everything goes to the little cores
   };
 
@@ -54,6 +59,7 @@ namespace {
     double Load; // smoothed share of one core, in percent
     bool Heavy;
     uint32_t OutCount;
+    uint32_t IdleCount;
     uint64_t SetMask; // what we last set, 0 = nothing yet
     uint32_t RetryAt;
     bool ReportedForeign;
@@ -243,6 +249,8 @@ namespace {
         T.Load = New ? Now : 0.5 * T.Load + 0.5 * Now;
         T.LastTime100ns = S.Time100ns;
         T.SeenAt = Second;
+        // A new thread has no load history yet, so it never counts as idle in its first round.
+        T.IdleCount = (!New && T.Load < IdleLoad) ? T.IdleCount + 1 : 0;
         if (T.Name.empty()) {
           T.Name = QueryName(S.Handle);
         }
@@ -287,6 +295,16 @@ namespace {
         uint64_t Target;
         if (S.TID == SelfTID || IsFEXThread(T.Name)) {
           Target = C->Little;
+        } else if (C->Sticky) {
+          if (T.IdleCount >= IdleAfterSeconds) {
+            Target = C->Little;
+            ++Rest;
+          } else {
+            Target = C->Big;
+            if (T.Load >= MinHeavyLoad) {
+              HeavyList += fextl::fmt::format(" {}{}{}:{:.0f}%", S.TID, T.Name.empty() ? "" : "/", T.Name.substr(0, 16), T.Load);
+            }
+          }
         } else if (T.Heavy) {
           if (C->Fast >= 0 && S.TID == FastTID) {
             Target = 1ULL << C->Fast;
@@ -363,7 +381,14 @@ void StartThreadPlacer(std::string_view AppName) {
   C->Rest = RestAll ? (C->Big | C->Little) : C->Little;
   C->RestName = RestAll ? "all" : "little";
   C->Fast = ParseInt(getenv("FEX_PIN_FAST"), -1);
+  const char* Mode = getenv("FEX_PIN_MODE");
+  C->Sticky = !(Mode && Mode[0] == 'l');
+  if (C->Sticky) {
+    C->Fast = -1;
+    C->RestName = "little after 10s idle";
+  }
   if (Other) {
+    C->Sticky = false;
     C->Heavy = 0;
     C->Rest = C->Little;
     C->RestName = "little (not FEX_PIN_APP)";
@@ -376,9 +401,9 @@ void StartThreadPlacer(std::string_view AppName) {
 
   const auto* Peb = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb;
   const char* Topology = getenv("WINE_CPU_TOPOLOGY");
-  StatsLogNote(fextl::fmt::format("pin: on in {} heavy={} big={:#x} little={:#x} rest={} fast={} | cpus={} process_affinity={:#x} "
+  StatsLogNote(fextl::fmt::format("pin: on in {} mode={} heavy={} big={:#x} little={:#x} rest={} fast={} | cpus={} process_affinity={:#x} "
                                   "WINE_CPU_TOPOLOGY={}",
-                                  AppName, C->Heavy, C->Big, C->Little, C->RestName, C->Fast, Peb->NumberOfProcessors,
+                                  AppName, C->Sticky ? "sticky" : "load", C->Heavy, C->Big, C->Little, C->RestName, C->Fast, Peb->NumberOfProcessors,
                                   static_cast<uint64_t>(Peb->ActiveProcessAffinityMask), Topology ? Topology : "-"));
 
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
