@@ -49,7 +49,9 @@ $end_info$
 #include "DummyHandlers.h"
 #include "BTInterface.h"
 #include "Windows/Common/SHMStats.h"
+#include "Windows/Common/StatsLog.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <type_traits>
@@ -74,6 +76,8 @@ extern void* ExitFunctionEC;
 extern void* CheckCall;
 extern void* ExitFunctionSuspendPoint;
 extern void* ExitFunctionSuspendResumePoint;
+extern uint64_t SyscallTable[];
+extern uint64_t SyscallTableEnd[];
 
 void* X64ReturnInstr; // See Module.S
 uintptr_t NtDllBase;
@@ -82,7 +86,7 @@ uintptr_t NtDllBase;
 uint32_t* NtDllRedirectionLUT;
 uint32_t NtDllRedirectionLUTSize;
 
-// Wine doesn't support issuing direct system calls with SVC, and unlike Windows it doesn't have a 'stable' syscall number for NtContinue
+// Wine doesn't support issuing direct system calls with SVC, and like Windows it also doesn't have 'stable' syscall numbers
 void* WineSyscallDispatcher;
 uint64_t WineNtContinueSyscallId;
 uint64_t WineNtAllocateVirtualMemorySyscallId;
@@ -145,6 +149,7 @@ fextl::unique_ptr<FEX::DummyHandlers::DummySignalDelegator> SignalDelegator;
 fextl::unique_ptr<Exception::ECSyscallHandler> SyscallHandler;
 fextl::unique_ptr<FEX::Windows::StatAlloc> StatAllocHandler;
 std::optional<FEX::Windows::InvalidationTracker> InvalidationTracker;
+bool NtDllExtendedEFlags {};
 std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
@@ -268,11 +273,51 @@ void ParseWineSyscallNumbers(HMODULE NtDll) {
   }
 }
 
+uint64_t GetNTSyscallNo(HMODULE NtDll, const char* ExportName) {
+  ULONG LoadConfigSize;
+  const _IMAGE_LOAD_CONFIG_DIRECTORY64* NtDllLoadConfig = reinterpret_cast<_IMAGE_LOAD_CONFIG_DIRECTORY64*>(
+    RtlImageDirectoryEntryToData(NtDll, true, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &LoadConfigSize));
+
+  const IMAGE_ARM64EC_METADATA* NtDllARM64ECMetadata = reinterpret_cast<IMAGE_ARM64EC_METADATA*>(NtDllLoadConfig->CHPEMetadataPointer);
+
+  // This redirection table stores a mapping from x64 entry points for fast forward sequences,
+  // to the real ARM64EC implementation of the function.
+  const IMAGE_ARM64EC_REDIRECTION_ENTRY* RedirectionTableBegin =
+    reinterpret_cast<IMAGE_ARM64EC_REDIRECTION_ENTRY*>(NtDllBase + NtDllARM64ECMetadata->RedirectionMetadata);
+  const IMAGE_ARM64EC_REDIRECTION_ENTRY* RedirectionTableEnd = RedirectionTableBegin + NtDllARM64ECMetadata->RedirectionMetadataCount;
+
+  // Walk through the table until we find an entry matching the x64 FFS.
+  const uintptr_t x64FFS = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, ExportName)) - NtDllBase;
+  uintptr_t ARM64ECImplementation = 0;
+  for (const IMAGE_ARM64EC_REDIRECTION_ENTRY* RedirectionEntry = RedirectionTableBegin; RedirectionEntry != RedirectionTableEnd;
+       RedirectionEntry++) {
+    if (RedirectionEntry->Source == x64FFS) {
+      ARM64ECImplementation = NtDllBase + RedirectionEntry->Destination;
+      break;
+    }
+  }
+
+  // Now walk through the syscall FFS table and find which entry points to the ARM64EC implementation
+  // we found in the previous table. The index of this entry in that table will be the syscall number.
+  const uintptr_t* SyscallImplementationTable = reinterpret_cast<uintptr_t*>(GetProcAddress(NtDll, "__arm64ec_syscall_ffs"));
+  const uint32_t* SyscallImplementationCount = reinterpret_cast<uint32_t*>(GetProcAddress(NtDll, "__arm64ec_syscall_ffs_size"));
+  if (!ARM64ECImplementation || !SyscallImplementationTable || !SyscallImplementationCount) {
+    return -1;
+  }
+
+  for (uint64_t SyscallNo = 0; SyscallNo < *SyscallImplementationCount; SyscallNo++) {
+    if (SyscallImplementationTable[SyscallNo] == ARM64ECImplementation) {
+      return SyscallNo;
+    }
+  }
+  return -1;
+}
+
 // Syscall thunks may have been patched before FEX has loaded, the default call checker installed by ntdll into FEX will
 // try to invoke the JIT when calling such patched syscalls but this obviously doesn't work before FEX is initalised.
 // This function parses ntdll and sets up a custom call checker to prevent this, as such it must avoid using any syscall
 // thunks itself.
-void InitSyscalls() {
+bool InitSyscalls() {
   // The ntdll exports called by GetModuleHandle/GetProcAddress aren't known to be patched before JIT init by any current
   // software so are safe to call, but if that changes the loader structures in the PEB could be parsed manually.
   const auto NtDll = GetModuleHandleW(L"ntdll.dll");
@@ -282,17 +327,57 @@ void InitSyscalls() {
   if (WineSyscallDispatcherPtr) {
     WineSyscallDispatcher = *WineSyscallDispatcherPtr;
     ParseWineSyscallNumbers(NtDll);
+  } else {
+    // NT syscall numbers may change between versions, so we need to find the numbers
+    // for the syscalls we need ahead of time.
+    WineNtContinueSyscallId = GetNTSyscallNo(NtDll, "NtContinue");
+    WineNtAllocateVirtualMemorySyscallId = GetNTSyscallNo(NtDll, "NtAllocateVirtualMemory");
+    WineNtProtectVirtualMemorySyscallId = GetNTSyscallNo(NtDll, "NtProtectVirtualMemory");
+    WineNtRaiseExceptionSyscallId = GetNTSyscallNo(NtDll, "NtRaiseException");
+
+    // Fail if the syscall number we found is beyond the bounds
+    // of our static table. This is almost certainly not going
+    // to happen, but failing here will make debugging easier later on.
+    const uint64_t SyscallTableSize = SyscallTableEnd - SyscallTable;
+    if (std::max({WineNtContinueSyscallId, WineNtAllocateVirtualMemorySyscallId, WineNtProtectVirtualMemorySyscallId,
+                  WineNtRaiseExceptionSyscallId}) >= SyscallTableSize) {
+      return false;
+    }
   }
 
   FillNtDllLUTs(NtDll);
   PatchCallChecker();
+  return true;
 }
 
-void HandleImageMap(uint64_t Address, bool MainImage = false) {
+bool HandleImageMap(uint64_t Address, bool MainImage = false) {
+  // Only a SEC_IMAGE view is an image. A pagefile-backed section can still carry a valid PE header:
+  // protectors that remap their own image copy it into such a section, unmap the original and map
+  // the copy back at the same base (Blizzard's *_loader.dll does this). Parsing that as an image
+  // walks the load config in .rdata before the protector has restored its page protections, and
+  // faults inside FEX. Decide by the view type, which a copied header cannot fake.
+  MEMORY_BASIC_INFORMATION Info;
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ||
+      Info.Type != MEM_IMAGE) {
+    return false;
+  }
+
+  auto* Nt = RtlImageNtHeader(reinterpret_cast<HMODULE>(Address));
+  if (!Nt || Nt->Signature != IMAGE_NT_SIGNATURE) {
+    return false;
+  }
+
   fextl::string ModulePath = FEX::Windows::GetSectionFilePath(Address);
   fextl::string ModuleName = fextl::string {FEX::Windows::BaseName(ModulePath)};
   InvalidationTracker->HandleImageMap(ModuleName, Address);
   ImageTracker->HandleImageMap(ModulePath, Address, MainImage);
+  return true;
+}
+
+// A mapped view that is not a PE image still needs its executability tracked. Sanity-check the
+// notification before trusting it.
+bool IsLikelyMapViewNotification(uint64_t Address, uint64_t Size, ULONG Prot) {
+  return Address && Size && !(Address + Size < Address) && Prot;
 }
 
 void HandleImageUnmap(uint64_t Address, uint64_t Size) {
@@ -467,8 +552,10 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ECContext.X24 = 0;
   ECContext.X28 = 0;
 
-  // NZCV+SS will be converted into EFlags by ntdll, the rest are lost during exception handling.
-  // See HandleGuestException
+  // NZCV+SS will be converted into EFlags by ntdll. PF and AF have no AArch64 equivalent and ride in the RES0 cpsr
+  // bits 26/27, which a patched ntdll maps back (Dmage22/proton-wine ow/eflags-pf-af); stock ntdll ignores them.
+  // Without this, an exception or syscall round trip clears PF - Overwatch_loader.dll resumes a decrypt-on-demand
+  // fault on a jp and takes the wrong path. See HandleGuestException
   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
   ECContext.Cpsr = 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)) ? (1U << 21) : 0;
@@ -476,6 +563,8 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC)) ? (1U << 29) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC)) ? (1U << 30) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC)) ? (1U << 31) : 0;
+  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC)) ? (1U << 26) : 0;
+  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC)) ? (1U << 27) : 0;
 
   ECContext.Fpcr = FPCR;
   ECContext.Fpsr = FPSR;
@@ -511,6 +600,94 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   }
 
   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
+}
+
+// A NoExec stub is compiled when a block entry is not executable at compile time. If another thread makes the page
+// executable while that stub is being compiled, the invalidation from the protection change can land before the stub
+// is published, leaving it cached for good: every later run raises an execute fault for a page that is executable.
+// Decrypt-on-demand protectors (Overwatch_loader.dll) then spin forever, since their handler has nothing left to
+// unlock. Real hardware would just run the code, so when the fault is stale drop the cached code and resume at RIP.
+static bool RetryStaleNoExecFault(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT& Context) {
+  auto* Thread = CPUArea.ThreadState();
+  auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+  if (!Fault.FaultToTopAndGeneratedException || Fault.Signal != FEXCore::Core::FAULT_SIGSEGV ||
+      Fault.TrapNo != FEXCore::X86State::X86_TRAPNO_PF || !InvalidationTracker) {
+    return false;
+  }
+
+  if (!IsDispatcherAddress(Context.Pc)) {
+    ReconstructThreadState(Thread, Context);
+  }
+  const uint64_t Rip = Thread->CurrentFrame->State.rip;
+
+  // Bound the retries so a disagreement between the tracker and the compiler can never become a hang.
+  static thread_local uint64_t LastRip {};
+  static thread_local uint32_t Retries {};
+  Retries = (Rip == LastRip) ? Retries + 1 : 0;
+  LastRip = Rip;
+  if (Retries >= 16) {
+    Retries = 0;
+    return false;
+  }
+
+  // Use the same query the frontend decodes against, so a retry cannot compile another NoExec stub unless the
+  // range really is non-executable again. An x86 instruction is at most 15 bytes.
+  const uint64_t End = Rip + 15;
+  uint64_t Address = Rip;
+  while (Address < End) {
+    const auto Range = InvalidationTracker->QueryExecutableRange(Address);
+    if (!Range.Size) {
+      return false;
+    }
+    Address = Range.Base + Range.Size;
+  }
+
+  const uint64_t FirstPage = Rip & FEXCore::Utils::FEX_PAGE_MASK;
+  const uint64_t LastPage = (End - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+  InvalidationTracker->InvalidateAlignedInterval(FirstPage, LastPage - FirstPage + FEXCore::Utils::FEX_PAGE_SIZE, false);
+
+  Fault.FaultToTopAndGeneratedException = false;
+  Context.Pc = CPUArea.DispatcherLoopTopEnterECFillSRA();
+  Context.Sp = CPUArea.EmulatorStackBase();
+  Context.X11 = 0;                                        // ENTRY_FILL_SRA_SINGLE_INST_REG: normal block
+  Context.X17 = reinterpret_cast<uint64_t>(CPUArea.Area); // EC_ENTRY_CPUAREA_REG
+  return true;
+}
+
+// A guest memory read inside the compiler faulted: the decoder or the disk cache lookup touched a page that is
+// inaccessible right now (a decrypt-on-demand protector keeps undecrypted pages at PAGE_NOACCESS), on a thread
+// that holds CodeInvalidationMutex shared. Letting that exception reach the guest is fatal either way: the
+// protector's handler re-enters the JIT on this thread, which blocks on the non-recursive mutex as soon as any
+// other thread has a write-fault invalidation queued (every SMC trap under mtrack), and its compile would
+// trample the decoder state of the compile it interrupted. Real hardware never pre-reads code, so the right
+// outcome is for the block to end in front of that page. Record the page, which the executable range query
+// below then reports as non-executable, and resume at the compiler's restart point.
+static bool RestartCompileOnFault(FEXCore::Core::InternalThreadState* Thread, uint64_t FaultAddress, uint64_t AccessType,
+                                  ARM64_NT_CONTEXT& Context) {
+  static constexpr uint32_t MaxRestarts = 64;
+  static std::atomic<uint64_t> FaultCount {};
+
+  // The compiler only ever reads guest memory. A write or an execute fault here is something else.
+  if (AccessType != 0) {
+    return false;
+  }
+
+  const auto Count = FaultCount.fetch_add(1);
+  if (Thread->CompileRestartCount >= MaxRestarts) {
+    LogMan::Msg::EFmt("[compilefault] giving up after {} restarts: fault={:X} block={:X} pc={:X}", Thread->CompileRestartCount,
+                      FaultAddress, Thread->CompileEntryRIP, Context.Pc);
+    return false;
+  }
+
+  Thread->CompileRestartCount++;
+  Thread->CompileFaultPage = FaultAddress & FEXCore::Utils::FEX_PAGE_MASK;
+  if (Count < 32 || (Count & 255) == 0) {
+    LogMan::Msg::IFmt("[compilefault] fault={:X} block={:X} pc={:X} depth={} restart={} (#{})", FaultAddress, Thread->CompileEntryRIP,
+                      Context.Pc, Thread->CompileDepth, Thread->CompileRestartCount, Count);
+  }
+
+  FEXCore::UncheckedLongJump::ManuallyLoadJumpBuf(Thread->CompileRestartJump, 1, Context.X, reinterpret_cast<__uint128_t*>(Context.V), &Context.Pc);
+  return true;
 }
 
 class ECSyscallHandler : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
@@ -556,7 +733,24 @@ public:
   }
 
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
-    return InvalidationTracker->QueryExecutableRange(Address);
+    auto Range = InvalidationTracker->QueryExecutableRange(Address);
+
+    // A compile restarted by RestartCompileOnFault must not read the page that faulted again, whatever the
+    // tracker or the OS say about it now: the fault is the ground truth for this compile.
+    const auto FaultPage = Thread->CompileFaultPage;
+    if (Range.Size && FaultPage) {
+      const auto FaultPageEnd = FaultPage + FEXCore::Utils::FEX_PAGE_SIZE;
+      const auto End = Range.Base + Range.Size;
+      if (Address >= FaultPage && Address < FaultPageEnd) {
+        return {};
+      } else if (Address < FaultPage && End > FaultPage) {
+        Range.Size = FaultPage - Range.Base;
+      } else if (Address >= FaultPageEnd && Range.Base < FaultPageEnd) {
+        Range.Size = End - FaultPageEnd;
+        Range.Base = FaultPageEnd;
+      }
+    }
+    return Range;
   }
 
   void PreCompile() override {
@@ -570,9 +764,13 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
   auto* Thread = GetCPUArea().ThreadState();
   // All other EFlags bits are lost when converting to/from an ARM64EC context, so merge them in from the current JIT state.
   // This is advisable over dropping their values as thread suspend/resume uses this function, and that can happen at any point in guest code.
-  static constexpr uint32_t ECValidEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
-                                               (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
-                                               (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
+  // An ntdll exporting __wine_arm64ec_extended_eflags also carries PF and AF through the conversion.
+  static constexpr uint32_t ECBaseEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
+                                              (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
+                                              (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
+  static constexpr uint32_t ECExtendedEFlagsMask {ECBaseEFlagsMask | (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC) |
+                                                  (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC)};
+  const uint32_t ECValidEFlagsMask = NtDllExtendedEFlags ? ECExtendedEFlagsMask : ECBaseEFlagsMask;
 
   uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
   Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
@@ -580,7 +778,9 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
 }
 
 NTSTATUS ProcessInit() {
-  InitSyscalls();
+  if (!InitSyscalls()) {
+    return STATUS_NOT_SUPPORTED;
+  }
 
   FEX::Windows::InitCRTProcess();
   FEX::Windows::SetupThreadHandlers();
@@ -601,15 +801,14 @@ NTSTATUS ProcessInit() {
 
   const auto NtDll = GetModuleHandleW(L"ntdll.dll");
   const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
+  NtDllExtendedEFlags = !!GetProcAddress(NtDll, "__wine_arm64ec_extended_eflags");
   OvercommitTracker.emplace(IsWine);
 
   FEX::Windows::SetupEnvironmentVariableValues(NtDll);
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
   FEX::Windows::UnixLib::Init(NtDll);
-  if (FEX::Windows::UnixLib::Available()) {
-    FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
-  }
+  FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
 
   {
     auto HostFeatures =
@@ -643,7 +842,11 @@ NTSTATUS ProcessInit() {
   FEX_CONFIG_OPT(StartupSleep, STARTUPSLEEP);
   FEX_CONFIG_OPT(StartupSleepProcName, STARTUPSLEEPPROCNAME);
 
-  if (IsWine && ProfileStats()) {
+  const bool StatsLog = FEX::Windows::StatsLogRequested(AppConfigName);
+  if (StatsLog) {
+    StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC, true);
+    FEX::Windows::StartStatsLog(StatAllocHandler.get(), AppConfigName);
+  } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
 
@@ -700,6 +903,13 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
       return true;
     }
 
+    // Must come before ThreadCreationMutex is taken: a thread that holds that mutex while it waits for the code
+    // invalidation lock (HandleRWXAccessViolation below) would otherwise deadlock against this compiling thread.
+    if (Thread->CompileDepth && !CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc) && !IsDispatcherAddress(NativeContext->Pc) &&
+        Exception::RestartCompileOnFault(Thread, FaultAddress, Exception->ExceptionInformation[0], *NativeContext)) {
+      return true;
+    }
+
     std::scoped_lock Lock(ThreadCreationMutex);
     if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress)) {
       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
@@ -740,6 +950,10 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     LogMan::Msg::DFmt("Suspending: RIP: {:X} SP: {:X}", NativeContext->Pc, NativeContext->Sp);
     CPUArea.Area->InSimulation = 0;
     *CPUArea.Area->SuspendDoorbell = 0;
+    return true;
+  }
+
+  if (Exception::RetryStaleNoExecFault(CPUArea, *NativeContext)) {
     return true;
   }
 
@@ -841,7 +1055,18 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
 
   {
     std::scoped_lock Lock(ThreadCreationMutex);
-    HandleImageMap(reinterpret_cast<uint64_t>(Address));
+    // Executable views of non-image sections reach us here but have no PE header, so HandleImageMap
+    // cannot track them, and their executability comes from the view's access rights rather than a
+    // later NtProtectVirtualMemory call - so no protection notification ever fires either. Such a
+    // range ends up untracked and executing it is rejected even though the OS considers the page
+    // executable. Protectors that dodge W^X by double-mapping one section - executable at one
+    // address, writable at another - land exactly here (Blizzard's *_loader.dll among them).
+    const uint64_t GuestAddress = reinterpret_cast<uint64_t>(Address);
+    const uint64_t GuestSize = static_cast<uint64_t>(Size);
+
+    if (!HandleImageMap(GuestAddress) && IsLikelyMapViewNotification(GuestAddress, GuestSize, Prot)) {
+      InvalidationTracker->HandleMemoryProtectionNotification(GuestAddress, GuestSize, Prot);
+    }
   }
 
 
@@ -1018,7 +1243,7 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
     return STATUS_ACCESS_DENIED;
   }
 
-  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME);
+  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT);
 
   THREAD_BASIC_INFORMATION Info;
   if (auto Err = NtQueryInformationThread(*ThreadDup, ThreadBasicInformation, &Info, sizeof(Info), nullptr); Err) {
@@ -1032,6 +1257,7 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
     // If we are suspending a thread that isn't ourselves, try to suspend it first so we know internal JIT locks aren't being held.
     NtSuspendThread(*ThreadDup, NULL);
     // This will wait for the thread to be suspended
+    TmpContext.ContextFlags = CONTEXT_CONTROL;
     NtGetContextThread(*ThreadDup, &TmpContext);
   }
 

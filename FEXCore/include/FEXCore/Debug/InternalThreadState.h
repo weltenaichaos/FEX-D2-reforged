@@ -118,6 +118,19 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   uint64_t JITGuardOverflowArgument {};
   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
 
+  // Compiler fault recovery (see ContextImpl::CompileBlock).
+  // CompileDepth is non-zero while this thread is inside CompileBlock/CompileSingleStep, i.e. while it holds
+  // CodeInvalidationMutex shared and the frontend decoder's state is live. A guest memory read that faults in
+  // that window (the decoder or the disk cache lookup touching a page a protector keeps inaccessible) must not
+  // be dispatched to the guest: the guest handler would re-enter the compiler on this thread and either deadlock
+  // on the non-recursive mutex or trample the live decoder state. The frontend instead records the faulting
+  // page and resumes at CompileRestartJump, which recompiles with that page treated as non-executable.
+  uint32_t CompileDepth {};
+  uint32_t CompileRestartCount {};
+  uint64_t CompileEntryRIP {};
+  uint64_t CompileFaultPage {};
+  FEXCore::UncheckedLongJump::JumpBuf CompileRestartJump;
+
   // BaseFrameState should always be at the end, directly before the interrupt fault page
   FEXCore::Core::CpuStateFrame BaseFrameState {};
 

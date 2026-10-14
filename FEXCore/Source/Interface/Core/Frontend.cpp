@@ -1765,6 +1765,11 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
 
   TotalInstructions = 0;
 
+  // Re-query the executable range for every block. The frontend may clamp the answer to what the OS reports
+  // as accessible right now (a decrypt-on-demand protector flips pages between no-access and executable at
+  // runtime), and that can change between blocks without any invalidation reaching this decoder.
+  ResetExecutableRangeCache();
+
   SectionMinAddress = 0;
   SectionMaxAddress = ~0ULL;
   Relocations = nullptr;

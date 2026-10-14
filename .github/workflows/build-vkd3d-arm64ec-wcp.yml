@@ -1,0 +1,140 @@
+# Build vkd3d-proton as ARM64EC and package it as a GameNative VKD3D .wcp.
+#
+# GameNative's stock VKD3D packages are x86-64, so every D3D12 call made by the
+# game also runs through FEX. An ARM64EC d3d12.dll/d3d12core.dll runs natively
+# and leaves FEX only the game itself. syswow64 gets an i686 build from the same
+# source so 32-bit D3D12 apps keep working.
+#
+# vkd3d-proton ships no ARM64EC cross file, so both are written here. Uses the
+# same bylaws llvm-mingw as build-fexcore-wcp.yml.
+name: Build VKD3D ARM64EC WCP
+
+on:
+  push:
+    branches: [ d2r/clean ]
+    paths: [ .github/workflows/build-vkd3d-arm64ec-wcp.yml ]
+  workflow_dispatch:
+
+env:
+  LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+  VKD3D_TAG: v3.0b
+  WCP_VERSION: 3.0b-arm64ec
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout vkd3d-proton
+        uses: actions/checkout@v4
+        with:
+          repository: HansKristian-Work/vkd3d-proton
+          ref: ${{ env.VKD3D_TAG }}
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build python3-pip glslang-tools zstd
+          pip install --user meson
+
+      - name: Cache LLVM MinGW toolchain
+        id: cache-mingw
+        uses: actions/cache@v4
+        with:
+          path: ~/llvm-mingw
+          key: bylaws-${{ env.LLVM_MINGW }}
+
+      - name: Set up LLVM MinGW toolchain
+        if: steps.cache-mingw.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://github.com/bylaws/llvm-mingw/releases/download/20250920/${LLVM_MINGW}.tar.xz
+          mkdir -p ~/llvm-mingw
+          tar -xf ${LLVM_MINGW}.tar.xz -C ~/llvm-mingw --strip-components=1
+
+      - name: Write cross files
+        run: |
+          write_cross() {
+            cat > "$1" <<EOF
+          [binaries]
+          c = '$2-w64-mingw32-clang'
+          cpp = '$2-w64-mingw32-clang++'
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          widl-mingw-tools-fallback = '$2-w64-mingw32-widl'
+
+          [properties]
+          needs_exe_wrapper = true
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = '$3'
+          cpu = '$4'
+          endian = 'little'
+          EOF
+          }
+          write_cross build-arm64ec.txt arm64ec aarch64 arm64ec
+          write_cross build-i686.txt i686 x86 i686
+          cat build-arm64ec.txt
+
+      - name: Build
+        run: |
+          export PATH="$HOME/llvm-mingw/bin:$HOME/.local/bin:$PATH"
+          for arch in arm64ec i686; do
+            meson setup --cross-file build-$arch.txt --buildtype release --strip \
+              -Denable_tests=false build.$arch
+            ninja -C build.$arch
+          done
+
+      - name: Verify ARM64EC
+        run: |
+          for f in build.arm64ec/libs/d3d12/d3d12.dll build.arm64ec/libs/d3d12core/d3d12core.dll; do
+            llvm-readobj --coff-load-config "$f" | grep -q CHPEMetadata || { echo "$f is not ARM64EC"; exit 1; }
+          done
+        env:
+          PATH: /home/runner/llvm-mingw/bin:/usr/bin:/bin
+
+      - name: Package .wcp
+        run: |
+          mkdir -p pkg/system32 pkg/syswow64
+          cp build.arm64ec/libs/d3d12/d3d12.dll build.arm64ec/libs/d3d12core/d3d12core.dll pkg/system32/
+          cp build.i686/libs/d3d12/d3d12.dll build.i686/libs/d3d12core/d3d12core.dll pkg/syswow64/
+          cat > pkg/profile.json <<EOF
+          {
+            "type": "VKD3D",
+            "versionName": "${WCP_VERSION}",
+            "versionCode": 1,
+            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64). FEX-D2-reforged build from ${GITHUB_SHA}.",
+            "files": [
+              {"source": "system32/d3d12.dll",     "target": "\${system32}/d3d12.dll"},
+              {"source": "system32/d3d12core.dll", "target": "\${system32}/d3d12core.dll"},
+              {"source": "syswow64/d3d12.dll",     "target": "\${syswow64}/d3d12.dll"},
+              {"source": "syswow64/d3d12core.dll", "target": "\${syswow64}/d3d12core.dll"}
+            ]
+          }
+          EOF
+          python3 -m json.tool pkg/profile.json
+          cd pkg
+          tar -I 'zstd -T0 -19' -cf "../vkd3d-proton-${WCP_VERSION}.wcp" profile.json system32 syswow64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vkd3d-wcp
+          path: vkd3d-proton-${{ env.WCP_VERSION }}.wcp
+          retention-days: 30
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: vkd3d-proton-${{ env.WCP_VERSION }}-${{ github.run_number }}
+          name: VKD3D-Proton ${{ env.WCP_VERSION }} (build ${{ github.run_number }})
+          files: vkd3d-proton-${{ env.WCP_VERSION }}.wcp
+          prerelease: true
+          body: |
+            vkd3d-proton ${{ env.VKD3D_TAG }} compiled as ARM64EC, so D3D12 translation runs
+            natively instead of through FEX. Install in GameNative as a VKD3D content profile;
+            it appears as `${{ env.WCP_VERSION }}`.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -26,6 +26,7 @@
 #include "Module.h"
 #include "Priv.h"
 #include "ImageTracker.h"
+#include "StatsLog.h"
 
 namespace FEX::Windows {
 static fextl::string ToLower(std::string_view String) {
@@ -191,6 +192,20 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
   }
   if (auto It = ExtendedMetaData.find(fextl::string {ModuleName}); It != ExtendedMetaData.end()) {
     FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
+  }
+
+  {
+    ULONG LoadConfigSize {};
+    const auto* LoadConfig = reinterpret_cast<ArchImageLoadConfigDirectory*>(
+      RtlImageDirectoryEntryToData(Module, true, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &LoadConfigSize));
+    size_t RangeCount {};
+    for ([[maybe_unused]] const auto& Range : VolatileValidRanges) {
+      ++RangeCount;
+    }
+    FEX::Windows::StatsLogNote(fextl::fmt::format(
+      "image {} at {:X}: loadconfig={} metadataptr={} volatile_accesses={} valid_ranges={}", ModuleName, Address, LoadConfig ? LoadConfig->Size : 0,
+      LoadConfig && LoadConfig->Size > offsetof(ArchImageLoadConfigDirectory, VolatileMetadataPointer) ? LoadConfig->VolatileMetadataPointer != 0 : false,
+      VolatileInstructions.size(), RangeCount));
   }
 
   if (!VolatileInstructions.empty() || !VolatileValidRanges.Empty()) {

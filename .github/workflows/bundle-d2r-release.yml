@@ -1,0 +1,34 @@
+# Publishes one release that bundles the current D2R-on-Thor components (FEX, frame gen layer, vkd3d), taken from
+# their own releases. Edit tools/release/d2r-thor-assets.txt and d2r-thor-notes.md, then push or run it by hand.
+name: Bundle D2R release
+
+on:
+  push:
+    branches: [ d2r/clean ]
+    paths: [ tools/release/** ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect assets
+        run: |
+          mkdir out
+          while read -r Path; do
+            [ -n "$Path" ] || continue
+            curl -sSfL -o "out/$(basename "$Path")" "https://github.com/${{ github.repository }}/releases/download/$Path"
+          done < tools/release/d2r-thor-assets.txt
+          cp tools/release/d2r-thor-notes.md notes.md
+          { echo; echo '## SHA-256'; echo '```'; (cd out && sha256sum *); echo '```'; } >> notes.md
+      - name: Publish
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: d2r-thor-${{ github.run_number }}
+          name: D2R on AYN Thor, setup bundle ${{ github.run_number }}
+          body_path: notes.md
+          files: out/*

@@ -10,6 +10,9 @@
 #include <windef.h>
 #include <winternl.h>
 
+#include <algorithm>
+#include <atomic>
+
 namespace FEX::Windows {
 InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
   : CTX {CTX}
@@ -248,19 +251,117 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
   return ProtectRWXIntervalsInternal(Address, Size, true);
 }
 
-FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
-  std::shared_lock Lock(IntervalsLock);
-  const auto XResult = XIntervals.Query(Address);
-  if (!XResult.Enclosed) {
+// Clamps an interval-list answer to the OS region containing Address. The interval lists describe what was
+// mapped or protected as executable at notification time, at region granularity; they say nothing about whether
+// a page can be read right now. A decrypt-on-demand protector keeps the pages it has not yet decrypted at
+// PAGE_NOACCESS inside a region the lists consider executable (D2R's whole decrypted image is one such interval),
+// and it may flip protections through paths that never notify FEX. The decoder and the disk cache lookup read
+// guest memory under the compilation lock based on this answer, so an inaccessible page must end the range:
+// the block then stops in front of it and execution reaches the page through a NoExec stub, which raises the
+// fault the protector's handler expects, outside the compiler.
+static FEXCore::HLE::ExecutableRangeInfo ClampToAccessible(FEXCore::HLE::ExecutableRangeInfo Result, uint64_t Address,
+                                                           const MEMORY_BASIC_INFORMATION& Info) {
+  if (!Result.Size) {
+    return Result;
+  }
+
+  static std::atomic<uint64_t> ClampCount {};
+
+  const bool Accessible = Info.State == MEM_COMMIT && ProtIsReadable(Info.Protect) && !(Info.Protect & PAGE_GUARD);
+  if (!Accessible) {
+    const auto Count = ClampCount.fetch_add(1);
+    if (Count < 32 || (Count & 1023) == 0) {
+      LogMan::Msg::IFmt("[xrange] {:X} is tracked executable ({:X}-{:X}) but not readable: state={:X} prot={:X} (#{})", Address,
+                        Result.Base, Result.Base + Result.Size, Info.State, Info.Protect, Count);
+    }
     return {};
   }
-  const auto RWXResult = RWXIntervals.Query(Address);
-  if (RWXResult.Enclosed) {
-    return {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
-  } else if (RWXResult.Size && RWXResult.Size < XResult.Size) {
-    return {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
+
+  const auto RegionBase = reinterpret_cast<uint64_t>(Info.BaseAddress) & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto RegionEnd = RegionBase + ((Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
+  const auto Base = std::max(Result.Base, RegionBase);
+  const auto End = std::min(Result.Base + Result.Size, RegionEnd);
+  if (Address < Base || Address >= End) {
+    return {};
   }
-  return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
+  return {Base, End - Base, Result.Writable};
+}
+
+FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
+  MEMORY_BASIC_INFORMATION Info;
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
+    return {};
+  }
+
+  // Assumes IntervalsLock is held.
+  const auto BuildResult = [this](uint64_t Address) -> FEXCore::HLE::ExecutableRangeInfo {
+    const auto XResult = XIntervals.Query(Address);
+    if (!XResult.Enclosed) {
+      return {};
+    }
+    const auto RWXResult = RWXIntervals.Query(Address);
+    if (RWXResult.Enclosed) {
+      return {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
+    } else if (RWXResult.Size && RWXResult.Size < XResult.Size) {
+      return {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
+    }
+    return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
+  };
+
+  {
+    std::shared_lock Lock(IntervalsLock);
+    const auto Result = BuildResult(Address);
+    if (Result.Size) {
+      return ClampToAccessible(Result, Address, Info);
+    }
+  }
+
+  // The interval lists are only ever populated from allocation/protection notifications and from PE image
+  // maps. An executable view of a non-image section (NtMapViewOfSection with SECTION_MAP_EXECUTE) goes
+  // through neither: it has no PE header for HandleImageMap to walk, and its executability comes from the
+  // view's access rights rather than a subsequent NtProtectVirtualMemory call. Such a region is therefore
+  // never tracked, and executing it is rejected even though the OS considers the page executable.
+  //
+  // Protectors that avoid W^X by double-mapping one section - executable at one address, writable at
+  // another - land exactly here (Blizzard's *_loader.dll among them). Rather than add a notification for
+  // every mapping path, treat a miss as "ask the OS": if it says the page is executable, trust it and
+  // start tracking the region.
+  if (Info.State != MEM_COMMIT) {
+    return {};
+  }
+
+  const bool HasExec = ProtHasExec(Info.Protect);
+  const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Info.Protect));
+  if (!EffectiveExec) {
+    return {};
+  }
+
+  const auto BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
+  const auto AlignedBase = BaseAddress & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedSize =
+    (BaseAddress - AlignedBase + Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+
+  {
+    std::unique_lock Lock(IntervalsLock);
+
+    // Insert directly instead of going through HandleMemoryProtectionNotification: that would also run
+    // InvalidateIntervalInternal, which takes the code invalidation mutex while a block is being compiled.
+    // Nothing needs invalidating anyway - a range that was never in XIntervals has no compiled code, and
+    // unmapping already invalidates through InvalidateContainingSection.
+    FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
+
+    XIntervals.Insert(ProtInterval);
+    if (ProtIsWritable(Info.Protect)) {
+      LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
+      RWXIntervals.Insert(ProtInterval);
+    }
+    if (DEPDisabled && !HasExec) {
+      DEPPromotedIntervals.Insert(ProtInterval);
+    }
+  }
+
+  std::shared_lock Lock(IntervalsLock);
+  return ClampToAccessible(BuildResult(Address), Address, Info);
 }
 
 void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc) {

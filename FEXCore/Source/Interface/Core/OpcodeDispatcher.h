@@ -1084,8 +1084,9 @@ public:
   void AVX128_VFMAScalarImpl(OpcodeArgs, IROps IROp, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
   void AVX128_VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
 
-  RefPair AVX128_VPGatherQPSImpl(OpcodeArgs, Ref Dest, Ref Mask, RefVSIB VSIB);
-  RefPair AVX128_VPGatherImpl(OpcodeArgs, OpSize Size, OpSize ElementLoadSize, OpSize AddrElementSize, RefPair Dest, RefPair Mask, RefVSIB VSIB);
+  RefPair AVX128_VPGatherQPSImpl(OpcodeArgs, Ref Dest, Ref Mask, RefVSIB VSIB, bool MaskAllOnes);
+  RefPair AVX128_VPGatherImpl(OpcodeArgs, OpSize Size, OpSize ElementLoadSize, OpSize AddrElementSize, RefPair Dest, RefPair Mask,
+                              RefVSIB VSIB, bool MaskAllOnesLow = false, bool MaskAllOnesHigh = false);
 
   void AVX128_VPGATHER(OpcodeArgs, OpSize AddrElementSize);
 
@@ -1178,6 +1179,11 @@ public:
     // At block boundaries, fix up the carry flag.
     if (!SRAOnly) {
       RectifyCarryInvert(CFInvertedABI);
+
+      // Also we can't trust the LastDef accross block boundaries, so clear that as well.
+      for (auto& Def : RegCache.LastDef) {
+        Def = nullptr;
+      }
     }
 
     if (!MMXOnly) {
@@ -1392,6 +1398,11 @@ private:
                     const X86Tables::DecodedOperand& Imm, bool IsAVX);
 
   void PCMPXSTRXOpImpl(OpcodeArgs, bool IsExplicit, bool IsMask, bool IsAVX);
+  Ref PCMPXSTRXSaturateExplicitLength(IR::OpSize ElementSize, IR::OpSize LengthSize, Ref RawLength);
+  Ref PCMPXSTRXEqualAny(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements);
+  Ref PCMPXSTRXRanges(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements, bool IsSigned);
+  Ref PCMPXSTRXEqualEach(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements);
+  Ref PCMPXSTRXEqualOrdered(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1Length, Ref Src2Length, Ref Src1ValidElements, Ref Indices);
 
   Ref PHADDSOpImpl(OpSize Size, Ref Src1, Ref Src2);
 
@@ -1505,6 +1516,8 @@ private:
 #undef OpcodeArgs
 
   Ref AppendSegmentOffset(Ref Value, uint32_t Flags, uint32_t DefaultPrefix = 0, bool Override = false);
+  // Writes back a string-instruction address register (RSI/RDI) honouring the address size.
+  void StoreStringAddress(X86State::X86Reg Reg, Ref Value, IR::OpSize AddrSize);
   Ref GetSegment(uint32_t Flags, uint32_t DefaultPrefix = FEXCore::X86Tables::DecodeFlags::FLAG_NO_PREFIX, bool Override = false);
 
   void UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg);
@@ -1958,12 +1971,17 @@ private:
     uint64_t Partial;
 
     Ref Value[64];
+
+    // Keep track of where each register was last written to within the current block,
+    // for use in peephole optimizations.
+    Ref LastDef[64];
   } RegCache {};
 
   void InvalidateReg(uint8_t Index) {
     uint64_t Bit = (1ull << (uint64_t)Index);
     RegCache.Cached &= ~Bit;
     RegCache.Written &= ~Bit;
+    RegCache.LastDef[Index] = nullptr;
   }
 
   Ref LoadRegCache(uint64_t Offset, uint8_t Index, RegClass Class, IR::OpSize Size) {
@@ -2079,6 +2097,7 @@ private:
     RegCache.Value[Index] = Value;
     RegCache.Cached |= Bit;
     RegCache.Written |= Bit;
+    RegCache.LastDef[Index] = Value;
   }
 
   void InvalidateHighAVXRegisters() {

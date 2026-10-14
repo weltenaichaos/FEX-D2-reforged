@@ -6,6 +6,7 @@
 #include <winternl.h>
 
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 
 namespace FEX::Windows {
@@ -74,12 +75,33 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
       }
       break;
     case FEXCore::X86State::X86_TRAPNO_OF: Dst.ExceptionCode = EXCEPTION_INT_OVERFLOW; return Dst;
-    case FEXCore::X86State::X86_TRAPNO_PF:
-      // A page-fault raised by an explicit break in JIT code is always an execute fault
+    case FEXCore::X86State::X86_TRAPNO_PF: {
+      // A page-fault raised by an explicit break in JIT code is always an execute fault.
+      //
+      // The reported address has to be the first byte that could not be fetched, which is not always
+      // the start of the instruction: an instruction sitting at the tail of an executable page and
+      // running into the next one faults on that next page. Reporting the instruction start instead
+      // makes decrypt-on-demand protectors spin forever - their handler looks at
+      // ExceptionInformation[1], sees a page it has already unlocked, decides there is nothing to do,
+      // resumes, and faults identically. An x86 instruction is at most 15 bytes, so it can only ever
+      // cross a single page boundary.
+      uint64_t FaultAddress = Rip;
+      const uint64_t RipPage = Rip & FEXCore::Utils::FEX_PAGE_MASK;
+      constexpr ULONG ExecProt = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+      MEMORY_BASIC_INFORMATION Info;
+      if (VirtualQuery(reinterpret_cast<LPCVOID>(RipPage), &Info, sizeof(Info)) && Info.State == MEM_COMMIT &&
+          (Info.Protect & ExecProt)) {
+        FaultAddress = RipPage + FEXCore::Utils::FEX_PAGE_SIZE;
+      }
+
+      // Set the code explicitly like every other case: the host trap that got us here is not necessarily an
+      // access violation (on Windows the SIGSEGV trampoline raises it with hlt).
+      Dst.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
       Dst.NumberParameters = 2;
       Dst.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
-      Dst.ExceptionInformation[1] = Rip;
+      Dst.ExceptionInformation[1] = FaultAddress;
       return Dst;
+    }
     default: LogMan::Msg::EFmt("Unknown SIGSEGV trap: {}", Fault.TrapNo); break;
     }
     break;

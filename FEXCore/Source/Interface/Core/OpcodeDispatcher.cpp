@@ -59,12 +59,6 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs, bool IsSyscallInst) {
 
   FlushRegisterCache();
   _Syscall();
-
-  if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_BLOCK_END) {
-    // RIP could have been updated after coming back from the Syscall.
-    NewRIP = _LoadContextGPR(GPRSize, offsetof(FEXCore::Core::CPUState, rip));
-    ExitFunction(NewRIP);
-  }
 }
 
 void OpDispatchBuilder::ThunkOp(OpcodeArgs) {
@@ -456,6 +450,11 @@ void OpDispatchBuilder::POPSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
     _StoreContextGPR(DstSize, NewSegment, offsetof(FEXCore::Core::CPUState, gs_idx));
     break;
   default: break; // Do nothing
+  }
+
+  if (Is64BitMode && (SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX || SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX)) {
+    // See MOVSegOp: in 64-bit mode only the selector changes, the base stays.
+    return;
   }
 
   UpdatePrefixFromSegment(NewSegment, SegmentReg);
@@ -1281,8 +1280,10 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
       } else {
-        LogMan::Msg::EFmt("We don't support modifying GS selector in 64bit mode!");
-        DecodeFailure = true;
+        // 64-bit mode: a valid instruction that loads the selector only. The FS/GS bases live in MSRs there and the OS
+        // keeps GS pointing at the TEB, so the cached base must not be touched (the GDT walk in UpdatePrefixFromSegment
+        // would clobber it). Protectors execute this as an anti-debug probe; refusing it raised a bogus #UD every time.
+        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
       }
       break;
     case FEXCore::X86State::REG_RSP: // FS
@@ -1291,8 +1292,8 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
       } else {
-        LogMan::Msg::EFmt("We don't support modifying FS selector in 64bit mode!");
-        DecodeFailure = true;
+        // See GS above.
+        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
       }
       break;
     default: UnimplementedOp(Op); return;
@@ -3219,14 +3220,25 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
   }
 }
 
+void OpDispatchBuilder::StoreStringAddress(X86State::X86Reg Reg, Ref Value, IR::OpSize AddrSize) {
+  if (Is64BitMode && AddrSize == OpSize::i32Bit) {
+    // 32-bit address size in 64-bit mode: the register is written back zero-extended, as the hardware does.
+    StoreGPRRegister(Reg, _Bfe(OpSize::i64Bit, 32, 0, Value));
+  } else {
+    StoreGPRRegister(Reg, Value, AddrSize);
+  }
+}
+
 void OpDispatchBuilder::STOSOp(OpcodeArgs) {
-  if (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) {
-    LogMan::Msg::EFmt("STOSOp: Can't handle address size override (OP: 0x{:04X}, Flags: 0x{:08X})", Op->OP, Op->Flags);
+  if (!Is64BitMode && (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE)) {
+    LogMan::Msg::EFmt("STOSOp: Address size override (0x67) not supported in 32-bit mode (OP: 0x{:04X}).", Op->OP);
     DecodeFailure = true;
     return;
   }
 
   const auto Size = OpSizeFromSrc(Op);
+  // In 64-bit mode an address size override makes the string registers 32-bit (EDI, ECX), handled like CMPS/SCAS/LODS.
+  const OpSize AddrSize = GetStringOpSize(Op);
   const bool Repeat = (Op->Flags & (FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX | FEXCore::X86Tables::DecodeFlags::FLAG_REPNE_PREFIX)) != 0;
 
   if (!Repeat) {
@@ -3234,7 +3246,8 @@ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
     Ref Src = LoadGPRRegister(X86State::REG_RAX, Size, 0, true);
 
     // Only ES prefix
-    Ref Dest = MakeSegmentAddress(X86State::REG_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+    Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+    Ref Dest = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
 
     // Store to memory where RDI points
     if (CTX->IsMemcpyAtomicTSOEnabled()) {
@@ -3244,40 +3257,41 @@ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
     }
 
     // Offset the pointer
-    Ref TailDest = LoadGPRRegister(X86State::REG_RDI);
-    StoreGPRRegister(X86State::REG_RDI, OffsetByDir(TailDest, IR::OpSizeToSize(Size)));
+    StoreStringAddress(X86State::REG_RDI, OffsetByDir(Src_RDI, IR::OpSizeToSize(Size)), AddrSize);
   } else {
     // FEX doesn't support partial faulting REP instructions.
     // Converting this to a `MemSet` IR op optimizes this quite significantly in our codegen.
     // If FEX is to gain support for faulting REP instructions, then this implementation needs to change significantly.
     Ref Src = LoadGPRRegister(X86State::REG_RAX, Size);
-    Ref Dest = LoadGPRRegister(X86State::REG_RDI);
+    Ref Dest = LoadGPRRegister(X86State::REG_RDI, AddrSize);
 
     // Only ES prefix
     auto Segment = GetSegment(0, FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
 
-    Ref Counter = LoadGPRRegister(X86State::REG_RCX);
+    Ref Counter = LoadGPRRegister(X86State::REG_RCX, AddrSize);
 
     auto Result = _MemSet(CTX->IsAtomicTSOEnabled(), Size, Segment ?: InvalidNode, Dest, Src, Counter, LoadDir(1));
     StoreGPRRegister(X86State::REG_RCX, Constant(0));
-    StoreGPRRegister(X86State::REG_RDI, Result);
+    StoreStringAddress(X86State::REG_RDI, Result, AddrSize);
   }
 }
 
 void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
-  if (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) {
-    LogMan::Msg::EFmt("MOVSOp: Can't handle address size override (OP: 0x{:04X}, Flags: 0x{:08X})", Op->OP, Op->Flags);
+  if (!Is64BitMode && (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE)) {
+    LogMan::Msg::EFmt("MOVSOp: Address size override (0x67) not supported in 32-bit mode (OP: 0x{:04X}).", Op->OP);
     DecodeFailure = true;
     return;
   }
 
   // RA now can handle these to be here, to avoid DF accesses
   const auto Size = OpSizeFromSrc(Op);
+  // In 64-bit mode an address size override makes the string registers 32-bit (ESI, EDI, ECX), handled like CMPS/SCAS/LODS.
+  const OpSize AddrSize = GetStringOpSize(Op);
 
   if (Op->Flags & (FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX | FEXCore::X86Tables::DecodeFlags::FLAG_REPNE_PREFIX)) {
-    auto SrcAddr = LoadGPRRegister(X86State::REG_RSI);
-    auto DstAddr = LoadGPRRegister(X86State::REG_RDI);
-    auto Counter = LoadGPRRegister(X86State::REG_RCX);
+    auto SrcAddr = LoadGPRRegister(X86State::REG_RSI, AddrSize);
+    auto DstAddr = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+    auto Counter = LoadGPRRegister(X86State::REG_RCX, AddrSize);
 
     auto DstSegment = GetSegment(0, FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
     auto SrcSegment = GetSegment(Op->Flags, FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX);
@@ -3303,11 +3317,13 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
     }
 
     StoreGPRRegister(X86State::REG_RCX, Constant(0));
-    StoreGPRRegister(X86State::REG_RDI, Result_Dst);
-    StoreGPRRegister(X86State::REG_RSI, Result_Src);
+    StoreStringAddress(X86State::REG_RDI, Result_Dst, AddrSize);
+    StoreStringAddress(X86State::REG_RSI, Result_Src, AddrSize);
   } else {
-    Ref RSI = MakeSegmentAddress(X86State::REG_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
-    Ref RDI = MakeSegmentAddress(X86State::REG_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+    Ref Src_RSI = LoadGPRRegister(X86State::REG_RSI, AddrSize);
+    Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+    Ref RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
+    Ref RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
 
     if (CTX->IsMemcpyAtomicTSOEnabled()) {
       auto Src = _LoadMemGPRAutoTSO(Size, RSI, Size);
@@ -3319,11 +3335,9 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
       _StoreMem(RegClass::GPR, Size, Src, RDI, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
     }
 
-    RSI = OffsetByDir(RSI, IR::OpSizeToSize(Size));
-    RDI = OffsetByDir(RDI, IR::OpSizeToSize(Size));
-
-    StoreGPRRegister(X86State::REG_RSI, RSI);
-    StoreGPRRegister(X86State::REG_RDI, RDI);
+    // Advance the registers themselves, not the segment-adjusted addresses.
+    StoreStringAddress(X86State::REG_RSI, OffsetByDir(Src_RSI, IR::OpSizeToSize(Size)), AddrSize);
+    StoreStringAddress(X86State::REG_RDI, OffsetByDir(Src_RDI, IR::OpSizeToSize(Size)), AddrSize);
   }
 }
 

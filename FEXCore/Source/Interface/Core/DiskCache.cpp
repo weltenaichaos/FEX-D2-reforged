@@ -2,18 +2,23 @@
 
 #define XXH_STATIC_LINKING_ONLY
 
-#include "FEXCore/Utils/TypeDefines.h"
 #include "Interface/Core/Frontend.h"
-#include "FEXCore/Config/Config.h"
-#include "FEXCore/fextl/string.h"
-#include "FEXHeaderUtils/Filesystem.h"
-#include "FEXCore/Core/DiskCache.h"
-#include "FEXCore/Core/DiskCacheFileMapper.h"
-#include "FEXCore/Utils/LogManager.h"
 #include "Interface/Context/Context.h"
-#include "FEXCore/HLE/SyscallHandler.h"
-#include "FEXCore/Utils/File.h"
-#include "FEXCore/fextl/memory.h"
+
+#include <FEXCore/Config/Config.h>
+#include <FEXCore/Core/DiskCache.h>
+#include <FEXCore/Core/DiskCacheFileMapper.h>
+#include <FEXCore/fextl/memory.h>
+#include <FEXCore/fextl/string.h>
+#include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/Utils/File.h>
+#include <FEXCore/Utils/FileUtils.h>
+#include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/Profiler.h>
+#include <FEXCore/Utils/SHMStats.h>
+#include <FEXCore/Utils/TypeDefines.h>
+#include <FEXHeaderUtils/Filesystem.h>
+
 #include <cstdint>
 #include <cstring>
 #include <atomic>
@@ -173,7 +178,10 @@ namespace DiskCache {
 
     File::File::FileHandleType CacheFileHandle = CacheFOZ.GetHandle();
     if (FileMapper && CacheFileHandle != (File::File::FileHandleType)-1) {
-      CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, ReadOnly ? CacheFOZ.Size() : BIG_MAPPING_SIZE));
+      uint64_t MapSize = ReadOnly ? CacheFOZ.Size() : BIG_MAPPING_SIZE;
+      uint64_t MappedSize = MapSize;
+      CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, MapSize, &MappedSize));
+      CacheFileMappedSize = CacheFileMapping ? std::min(MapSize, MappedSize) : 0;
       CacheFileSize = CacheFOZ.Size();
     }
 
@@ -257,7 +265,7 @@ namespace DiskCache {
   }
 
   bool IndexedDB::ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob) {
-    if (CacheFileMapping && (ReadOnly || Offset + OutBlob.size() <= BIG_MAPPING_SIZE)) {
+    if (CacheFileMapping && Offset + OutBlob.size() <= CacheFileMappedSize) {
       if (Offset + OutBlob.size() > CacheFileSize) {
         return false;
       }
@@ -273,6 +281,11 @@ namespace DiskCache {
                                  MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob) {
     if (ReadOnly) {
       // shouldn't happen
+      return false;
+    }
+
+    if (MaxSizeReached || CacheFileSize + Blob.size() >= MaxFileSize) {
+      MaxSizeReached = true;
       return false;
     }
 
@@ -351,6 +364,39 @@ namespace DiskCache {
     FileMapper = Func;
   }
 
+  static inline void PruneStaleEntries(std::string_view CacheBase, std::string_view MachineBucketHash) {
+    FEXCORE_PROFILE_SCOPED("DiskCache::PruneStaleEntries");
+    FEX_CONFIG_OPT(DiskCachePruneStaleEntries, DISKCACHEPRUNESTALEENTRIES);
+
+    if (!DiskCachePruneStaleEntries) {
+      return;
+    }
+
+    struct SimpleCapture {
+      std::string_view CacheBase, MachineBucketHash;
+    } const SimpleCapture {
+      .CacheBase = CacheBase,
+      .MachineBucketHash = MachineBucketHash,
+    };
+
+    FEXCore::FileUtils::WalkDirectory(
+      CacheBase,
+      [](std::string_view name, bool is_dir, const void* user_data) {
+        if (!is_dir) {
+          return;
+        }
+
+        auto capture = reinterpret_cast<const struct SimpleCapture*>(user_data);
+
+        // Current behaviour is to remove entries that no longer match the MachineBucketHash.
+        // This means that if the Disk Cache version no longer matches, or the FEXCore::HostFeatures differ, then they get removed.
+        if (name != capture->MachineBucketHash) {
+          FEXCore::FileUtils::RecursiveRemoveDirectory(fextl::fmt::format("{}/{}", capture->CacheBase, name));
+        }
+      },
+      &SimpleCapture);
+  }
+
   void DiskCache::Init(FEXCore::Context::ContextImpl* CTX) {
     this->CTX = CTX;
 
@@ -360,30 +406,43 @@ namespace DiskCache {
 
     fextl::string SerializedConfig = FEXCore::Config::SerializeForCache();
 
+    const auto HostFeatureHash = CTX->HostFeatures.HashForCaching();
+
     struct __attribute__((packed)) {
       uint16_t FormatVersion;
-      uint8_t Is64BitMode;
       uint64_t HostFeaturesHash;
-    } BucketHeader = {FormatVersion, CTX->Config.Is64BitMode, CTX->HostFeatures.HashForCaching()};
+    } MachineBucketData = {FormatVersion, HostFeatureHash.HostFeaturesHash};
 
-    fextl::vector<uint8_t> BucketBytes;
-    BucketBytes.resize(sizeof(BucketHeader) + SerializedConfig.size());
-    memcpy(BucketBytes.data(), &BucketHeader, sizeof(BucketHeader));
-    memcpy(BucketBytes.data() + sizeof(BucketHeader), SerializedConfig.data(), SerializedConfig.size());
-    BucketHash = XXH3_128bits(BucketBytes.data(), BucketBytes.size());
+    fextl::vector<uint8_t> BucketBytes(sizeof(MachineBucketData) + (sizeof(uint8_t) * 2) + SerializedConfig.size());
+    memcpy(BucketBytes.data(), &MachineBucketData, sizeof(MachineBucketData));
+
+    // 64-bit mode and HostType is in the ProcessBucket hash only instead of the MachineBucketHash
+    // These effect code-gen, but they aren't part of the MachineBucketHash, as it comes from Process state.
+    BucketBytes[sizeof(MachineBucketData)] = CTX->Config.Is64BitMode;
+    BucketBytes[sizeof(MachineBucketData) + 1] = FEXCore::ToUnderlying(HostFeatureHash.HostType);
+    memcpy(BucketBytes.data() + sizeof(MachineBucketData) + 2, SerializedConfig.data(), SerializedConfig.size());
+
+    uint64_t MachineBucketHash = XXH3_64bits(BucketBytes.data(), sizeof(MachineBucketData));
+    uint64_t ProcessBucketHash = XXH3_64bits(BucketBytes.data() + sizeof(MachineBucketData), 2 + SerializedConfig.size());
+    BucketHash.high64 = MachineBucketHash;
+    BucketHash.low64 = ProcessBucketHash;
 
     fextl::string BasePath = BasePathOverride();
     if (BasePath.empty()) {
       BasePath = FEXCore::Config::GetCacheDirectory() + "DiskCache/";
-      BasePath += fextl::fmt::format("{:016x}{:016x}", BucketHash.high64, BucketHash.low64) + "/";
     }
+
+    const auto MachineBucketHashAsString = fextl::fmt::format("{:016x}", MachineBucketHash);
+    PruneStaleEntries(BasePath, MachineBucketHashAsString);
+
+    BasePath += MachineBucketHashAsString + "/";
     FHU::Filesystem::CreateDirectories(BasePath);
 
     if (!MapDiskCacheFiles) {
       FileMapper = nullptr;
     }
 
-    fextl::string RWDBBasePath = BasePath + "RWCacheDB";
+    const auto RWDBBasePath = fextl::fmt::format("{}RWCacheDB_{:016x}", BasePath, ProcessBucketHash);
     OpenCacheDB(RWDBBasePath, false);
 
     if (RWCacheDB && !FoundMetadata) {
@@ -493,6 +552,8 @@ namespace DiskCache {
     if (!IsReadingDiskCache()) {
       return std::nullopt;
     }
+    std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> KeyTimer;
+    KeyTimer.emplace(Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedDiskCacheKeyTime : nullptr);
     if (Region && Region->FileStartVA) {
       struct __attribute__((packed)) {
         uint64_t GuestOffset;
@@ -538,6 +599,7 @@ namespace DiskCache {
 
     uint64_t LookupKey =
       MakeLookupKey(Thread, *GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
+    KeyTimer.reset();
 
     XXH128_hash_t LiveGuestHash;
     uint64_t LastFootprintHashed = 0;
@@ -619,6 +681,12 @@ namespace DiskCache {
       }
 
       Advance = true;
+
+      // entry not backed by anything right now - todo prune..
+      if (!EntryUnderReview->DB && !BlobRef) {
+        continue;
+      }
+
       // do we have enough room in our live code to even hash GuestSize worth?
       if (Available < EntryUnderReview->GuestSize) {
         continue;
@@ -649,7 +717,7 @@ namespace DiskCache {
           break;
         } else if (Validation) {
           fextl::vector<uint8_t> GuestCode(Entry.GuestSize);
-          if (Entry.Size >= Entry.GuestSize && Entry.DB->ReadCacheBlob(Entry.Offset + Entry.Size - Entry.GuestSize, GuestCode)) {
+          if (Entry.Size >= Entry.GuestSize && Entry.DB && Entry.DB->ReadCacheBlob(Entry.Offset + Entry.Size - Entry.GuestSize, GuestCode)) {
             const uint8_t* CachedGuest = GuestCode.data();
             const uint8_t* LiveGuest = reinterpret_cast<const uint8_t*>(GuestRIP);
             uint64_t DiffCount = 0;
@@ -714,6 +782,8 @@ namespace DiskCache {
     memcpy(HitData.Blob.data(), GuestPages.data(), GuestPages.size() * sizeof(uint64_t));
     uint32_t BlobOffset = GuestPages.size() * sizeof(uint64_t);
     bool FoundInLRU = false;
+    std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> ReadTimer;
+    ReadTimer.emplace(Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedDiskCacheReadTime : nullptr);
     if (BlobRef && BlobRef->size() >= EntrySizeWithoutGuestCode) {
       FoundInLRU = true;
       memcpy(HitData.Blob.data() + BlobOffset, BlobRef->data(), EntrySizeWithoutGuestCode);
@@ -723,9 +793,13 @@ namespace DiskCache {
         // LogMan::Msg::IFmt("lru hit! {}", MemoryLRUCurrentSize);
         MemoryLRU.splice(MemoryLRU.begin(), MemoryLRU, *LRUIter);
       }
-    } else if (!Entry.DB->ReadCacheBlob(Entry.Offset, {HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode})) {
-      return std::nullopt;
+    } else {
+      FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheFileReadCount, 1);
+      if (!Entry.DB->ReadCacheBlob(Entry.Offset, {HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode})) {
+        return std::nullopt;
+      }
     }
+    ReadTimer.reset();
 
     if (EntrySizeWithoutGuestCode < sizeof(BlobFixedHeader)) {
       return std::nullopt;
@@ -786,8 +860,11 @@ namespace DiskCache {
       EntryPointRip += GuestRIP;
     }
 
-    if (!CTX->CodeCache.ApplyPackedCodeRelocations(GuestRIP, std::as_writable_bytes(HitData.HostCode), SmallRelocs, ThunkRelocs)) {
-      return std::nullopt;
+    {
+      FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheRelocTime);
+      if (!CTX->CodeCache.ApplyPackedCodeRelocations(GuestRIP, std::as_writable_bytes(HitData.HostCode), SmallRelocs, ThunkRelocs)) {
+        return std::nullopt;
+      }
     }
 
     return HitData;
@@ -857,53 +934,55 @@ namespace DiskCache {
     uint64_t LookupKey;
     std::span<uint8_t> Blob;
     fextl::vector<uint8_t> IndexBlob;
+    bool StoreDisk;
     CacheStoreWorkItem(DiskCache* Self, IndexedDB* DB, const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey,
-                       std::span<uint8_t> Blob, fextl::vector<uint8_t>&& IndexBlob)
+                       std::span<uint8_t> Blob, fextl::vector<uint8_t>&& IndexBlob, bool StoreDisk)
       : Self(Self)
       , DB(DB)
       , UniqueKey(UniqueKey)
       , LookupKey(LookupKey)
       , Blob(Blob)
-      , IndexBlob(std::move(IndexBlob)) {}
+      , IndexBlob(std::move(IndexBlob))
+      , StoreDisk(StoreDisk) {}
     void Run() override {
       struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
-      bool Success = DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
+      bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
 
-      if (Success) {
-        bool KeepEntryInMemory = true;
-        // todo possible other lru condition here like entry size?
-        if (Blob.size() > Self->MemoryLRUMaxSize) {
-          KeepEntryInMemory = false;
-        } else {
-          Self->MemoryLRUCurrentSize += Blob.size();
-        }
+      bool KeepEntryInMemory = true;
+      // todo possible other lru condition here like entry size?
+      if (Blob.size() > Self->MemoryLRUMaxSize) {
+        KeepEntryInMemory = false;
+      } else {
+        Self->MemoryLRUCurrentSize += Blob.size();
+      }
 
-        const IndexExtraBlobHeader* IndexAfterHeader = reinterpret_cast<const IndexExtraBlobHeader*>(IndexBlob.data());
+      const IndexExtraBlobHeader* IndexAfterHeader = reinterpret_cast<const IndexExtraBlobHeader*>(IndexBlob.data());
 
-        fextl::list<MemoryLRUKey>::iterator NewLRUEntry;
-        if (KeepEntryInMemory) {
-          std::lock_guard Guard(Self->MemoryLRULock);
-          Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob.size()});
-          NewLRUEntry = Self->MemoryLRU.begin();
-        }
-        {
-          std::lock_guard Guard(Self->IndexLock);
-          auto IndexEntry = Self->LookupLocked(LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint);
-          LOGMAN_THROW_A_FMT(IndexEntry != nullptr, "Stored Index entry not found?");
-          if (IndexEntry) {
+      fextl::list<MemoryLRUKey>::iterator NewLRUEntry;
+      if (KeepEntryInMemory) {
+        std::lock_guard Guard(Self->MemoryLRULock);
+        Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob.size()});
+        NewLRUEntry = Self->MemoryLRU.begin();
+      }
+      {
+        std::lock_guard Guard(Self->IndexLock);
+        auto IndexEntry = Self->LookupLocked(LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint);
+        LOGMAN_THROW_A_FMT(IndexEntry != nullptr, "Stored Index entry not found?");
+        if (IndexEntry) {
+          if (StoreDisk && DiskSuccess) {
             IndexEntry->DB = DB;
             IndexEntry->Offset = IndexHeader.cache_db_file_offset;
-            if (!KeepEntryInMemory) {
-              IndexEntry->MemoryBlob.reset();
-            } else {
-              IndexEntry->LRUEntry = NewLRUEntry;
-            }
+          }
+          if (!KeepEntryInMemory) {
+            IndexEntry->MemoryBlob.reset();
+          } else {
+            IndexEntry->LRUEntry = NewLRUEntry;
           }
         }
+      }
 
-        if (KeepEntryInMemory && Self->MemoryLRUCurrentSize > Self->MemoryLRUMaxSize + Self->MemoryLRUEvictThreshold) {
-          Self->Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(Self));
-        }
+      if (KeepEntryInMemory && Self->MemoryLRUCurrentSize > Self->MemoryLRUMaxSize + Self->MemoryLRUEvictThreshold) {
+        Self->Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(Self));
       }
     }
   };
@@ -1153,7 +1232,15 @@ namespace DiskCache {
       }
     }
 
-    memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
+    // Copy only the decoded extents. With multiblock the span between StartAddr and StartAddr + Length can
+    // cover gaps the decoder never read - possibly pages that are not accessible right now (e.g. code a
+    // protector keeps PAGE_NOACCESS until it decrypts it on demand). Touching those from inside the
+    // compiler faults with compilation locks held. Gaps are never compared (lookup and validation only
+    // look at the extents), so zero them instead.
+    memset(BlobData + GuestCodeOffset, 0, GuestCode.size());
+    for (uint32_t i = 0; i < ExactGuestCodeExtents.size(); i += 2) {
+      memcpy(BlobData + GuestCodeOffset + ExactGuestCodeExtents[i], GuestCode.data() + ExactGuestCodeExtents[i], ExactGuestCodeExtents[i + 1]);
+    }
 
     MesaFOZ::foz_payload_key Key = {};
     {
@@ -1173,9 +1260,15 @@ namespace DiskCache {
     memcpy(IndexBlob.data(), &IndexBlobHeader, sizeof(IndexExtraBlobHeader));
     memcpy(IndexBlob.data() + sizeof(IndexExtraBlobHeader), ExactGuestCodeExtents.data(), ExactGuestCodeExtents.size() * sizeof(uint32_t));
 
+    bool StoreDisk = true;
+
+    if (RWCacheDB->Full()) {
+      StoreDisk = false;
+    }
+
     // hand the rest off to the writer thread
-    Writer->QueueWork(
-      fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize), std::move(IndexBlob)));
+    Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize),
+                                                             std::move(IndexBlob), StoreDisk));
     return true;
   }
 

@@ -47,7 +47,9 @@ struct SHMSlotResult {
 SHMSlotResult AllocateSHMSlots(void* SHMBase, uint32_t MapSize, uint32_t MaxSize);
 void DeleteSHMStatsFile();
 
-void* MapFile(HANDLE FileHandle, uint64_t MapSize);
+// Maps a disk cache file read-only, through the unixlib when available, else through a Windows section covering the
+// file's current size. FEX_DISKCACHEFILEMAPPING=0 turns mapping off.
+void* MapFile(HANDLE FileHandle, uint64_t MapSize, uint64_t* MappedSize);
 
 // Returns the process pid when unixlib is available.
 // Or returns the process ID otherwise.

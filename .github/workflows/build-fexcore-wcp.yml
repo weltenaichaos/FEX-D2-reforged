@@ -1,0 +1,191 @@
+# Build libarm64ecfex.dll / libwow64fex.dll and package them as a GameNative
+# FEXCore .wcp content profile.
+#
+# Upstream's wine_dll_artifacts.yml needs a self-hosted ARM64+MinGW runner. This
+# builds the same Windows DLLs by cross-compiling from an ordinary x86_64 runner
+# with bylaws' llvm-mingw, the same toolchain GameNative/proton-wine uses for its
+# arm64ec Wine build.
+#
+# A FEXCore .wcp carries only the two PE DLLs (see GameNative's
+# ContentsManager.FEXCORE_TRUST_FILES), so UnixLib is deliberately not built.
+name: Build FEXCore WCP
+
+on:
+  push:
+    branches: [ d2r/clean ]
+    paths-ignore: [ .github/workflows/build-vkd3d-arm64ec-wcp.yml ]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # Variants for A/B testing on the device (thor-clean is thor without the stats log):
+    #   base: Dmage22's settings unchanged (generic armv8-a, no LTO).
+    #   thor: tuned for Snapdragon 8 Gen 2 (Cortex-X3/A715/A510). armv8.4-a gives
+    #         inline LSE atomics; SVE stays off because Qualcomm does not expose it
+    #         on this SoC. Adds -mtune and LTO.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: base
+            version: 2610-d2rfix28s-base
+            tune: -DTUNE_ARCH=generic -DTUNE_CPU=none -DENABLE_LTO=False
+            cflags: ""
+            statslog: "Optional per-second stats log: FEX_STATSLOG=<folder> (FEX_STATSLOG_APP=<exe> to limit it to one process, FEX_STATSLOG_PROFILE=1 for hot JIT blocks)."
+          - variant: thor
+            version: 2610-d2rfix28s-thor
+            tune: -DTUNE_ARCH=armv8.4-a -DTUNE_CPU=none -DENABLE_LTO=False
+            cflags: -mtune=cortex-x3
+            statslog: "Optional per-second stats log: FEX_STATSLOG=<folder> (FEX_STATSLOG_APP=<exe> to limit it to one process, FEX_STATSLOG_PROFILE=1 for hot JIT blocks)."
+          # thor without the stats log: the build for normal play.
+          - variant: thor-clean
+            version: 2610-d2rfix28-thor-clean
+            tune: -DTUNE_ARCH=armv8.4-a -DTUNE_CPU=none -DENABLE_LTO=False -DENABLE_STATSLOG=False
+            cflags: -mtune=cortex-x3
+            statslog: "No stats log in this build."
+    env:
+      FEX_WCP_VERSION: ${{ matrix.version }}
+    # Needed for the release step: a fork's default GITHUB_TOKEN is read-only,
+    # which makes softprops/action-gh-release fail with HTTP 403.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3 zstd ccache clang lld
+
+      - name: Cache LLVM MinGW toolchain
+        id: cache-mingw
+        uses: actions/cache@v4
+        with:
+          path: ~/llvm-mingw
+          key: bylaws-${{ env.LLVM_MINGW }}
+
+      - name: Set up LLVM MinGW toolchain
+        if: steps.cache-mingw.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://github.com/bylaws/llvm-mingw/releases/download/20250920/${LLVM_MINGW}.tar.xz
+          mkdir -p ~/llvm-mingw
+          tar -xf ${LLVM_MINGW}.tar.xz -C ~/llvm-mingw --strip-components=1
+
+      - name: Add toolchain to PATH and verify arm64ec support
+        run: |
+          echo "$HOME/llvm-mingw/bin" >> $GITHUB_PATH
+          export PATH="$HOME/llvm-mingw/bin:$PATH"
+          arm64ec-w64-mingw32-clang --version
+          aarch64-w64-mingw32-clang --version
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: fexcore-ccache-${{ matrix.variant }}-${{ github.sha }}
+          restore-keys: fexcore-ccache-${{ matrix.variant }}-
+
+      - name: Build arm64ec (libarm64ecfex.dll)
+        run: |
+          cmake -S . -B build_arm64ec -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+            -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+            -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows -G Ninja \
+            -DENABLE_ASSERTIONS=False -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+            -DBUILD_TESTING=False -DCMAKE_INSTALL_PREFIX=/usr \
+            ${{ matrix.tune }} -DCMAKE_C_FLAGS="${{ matrix.cflags }}" -DCMAKE_CXX_FLAGS="${{ matrix.cflags }}" \
+            -DRANGES_NATIVE=OFF
+          cmake --build build_arm64ec
+          DESTDIR="$PWD/install" cmake --build build_arm64ec -t install
+
+      - name: Build wow64 (libwow64fex.dll)
+        run: |
+          cmake -S . -B build_wow64 -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+            -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+            -DMINGW_TRIPLE=aarch64-w64-mingw32 \
+            -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows -G Ninja \
+            -DENABLE_ASSERTIONS=False -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+            -DBUILD_TESTING=False -DCMAKE_INSTALL_PREFIX=/usr \
+            ${{ matrix.tune }} -DCMAKE_C_FLAGS="${{ matrix.cflags }}" -DCMAKE_CXX_FLAGS="${{ matrix.cflags }}" \
+            -DRANGES_NATIVE=OFF
+          cmake --build build_wow64
+          DESTDIR="$PWD/install" cmake --build build_wow64 -t install
+
+      - name: Collect DLLs
+        run: |
+          mkdir -p pkg
+          find install -name 'libarm64ecfex.dll' -exec cp -v {} pkg/ \;
+          find install -name 'libwow64fex.dll'   -exec cp -v {} pkg/ \;
+          ls -lah pkg/
+          test -s pkg/libarm64ecfex.dll
+          test -s pkg/libwow64fex.dll
+
+      - name: Generate profile.json
+        run: |
+          cat > pkg/profile.json <<EOF
+          {
+            "type": "FEXCore",
+            "versionName": "${FEX_WCP_VERSION}",
+            "versionCode": 1,
+            "description": "FEXCore ${FEX_WCP_VERSION} (FEX-D2-reforged, variant ${{ matrix.variant }}) - d2rfix27 (compiler fault recovery, mtrack deadlock fix) plus: rep movs/stos with a 32-bit address size in 64-bit mode are translated, and FS/GS selector writes in 64-bit mode load the selector instead of raising #UD. Logs [xrange]/[compilefault] with FEX_SILENTLOG=0; per-exception debug lines only with FEX_DEBUGLOG=1. ${{ matrix.statslog }} Built from ${GITHUB_SHA}.",
+            "files": [
+              {"source": "libarm64ecfex.dll", "target": "\${system32}/libarm64ecfex.dll"},
+              {"source": "libwow64fex.dll",   "target": "\${system32}/libwow64fex.dll"}
+            ]
+          }
+          EOF
+          cat pkg/profile.json
+
+      - name: Package .wcp
+        run: |
+          cd pkg
+          tar -I 'zstd -T0 -19' -cf "../fexcore-${FEX_WCP_VERSION}.wcp" \
+            profile.json libarm64ecfex.dll libwow64fex.dll
+          cd ..
+          ls -lah "fexcore-${FEX_WCP_VERSION}.wcp"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fexcore-wcp-${{ matrix.variant }}
+          path: fexcore-${{ env.FEX_WCP_VERSION }}.wcp
+          retention-days: 30
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: fexcore-${{ env.FEX_WCP_VERSION }}-${{ github.run_number }}
+          name: FEXCore ${{ env.FEX_WCP_VERSION }} (build ${{ github.run_number }})
+          files: fexcore-${{ env.FEX_WCP_VERSION }}.wcp
+          draft: false
+          prerelease: true
+          body: |
+            FEXCore built from upstream `main` plus two fixes for Blizzard's Arxan-wrapped
+            loaders under Wine ARM64EC.
+
+            - **Executable views of non-image sections are now tracked.** `NotifyMapViewOfSection`
+              routed everything through `HandleImageMap`, which needs a PE header. A view of a
+              pagefile-backed section has none, so the range never entered `XIntervals` and
+              executing it was rejected despite the OS considering the page executable.
+            - **Instruction-fetch faults report the first unfetchable byte**, not the instruction
+              start. Decrypt-on-demand protectors otherwise spin forever re-faulting on a page
+              they have already unlocked.
+
+            Ported from the analysis in FEX-Emu/FEX#5328. Bugs 2 and 4 from that report are
+            already upstream.
+
+            Built from commit ${{ github.sha }}.
+
+            Install in GameNative as a FEXCore content profile; it appears as
+            `${{ env.FEX_WCP_VERSION }}`.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
