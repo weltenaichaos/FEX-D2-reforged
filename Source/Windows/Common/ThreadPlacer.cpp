@@ -20,8 +20,8 @@ extern "C" NTSTATUS WINAPI NtGetNextThread(HANDLE Process, HANDLE Thread, ACCESS
 
 namespace FEX::Windows {
 namespace {
-  constexpr THREADINFOCLASS ThreadAffinityMaskClass = static_cast<THREADINFOCLASS>(4);
-  constexpr THREADINFOCLASS ThreadNameInformationClass = static_cast<THREADINFOCLASS>(38);
+  const THREADINFOCLASS ThreadAffinityMaskClass = static_cast<THREADINFOCLASS>(4);
+  const THREADINFOCLASS ThreadNameInformationClass = static_cast<THREADINFOCLASS>(38);
   // A thread must use at least this share of a core to count as one of the busiest.
   constexpr double MinHeavyLoad = 15.0;
   // A busy thread keeps the big cores until it has been outside the busiest set for this many seconds in a row.
