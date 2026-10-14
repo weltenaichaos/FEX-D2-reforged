@@ -1,6 +1,37 @@
-> ## This fork: Diablo II: Resurrected and Overwatch 2 on GameNative
+> ## This fork: Diablo II: Resurrected on the AYN Thor
 >
-> *Written by the fork maintainer (Dmage22), not the FEX project. The upstream FEX readme follows below.*
+> *Fork by weltenaichaos, built on [Dmage22/FEX-D2](https://github.com/Dmage22/FEX-D2). Not the FEX project. The upstream FEX readme follows further below.*
+>
+> Runs **Diablo II: Resurrected (Steam)** in **GameNative** on the **AYN Thor** (Snapdragon 8 Gen 2) at a steady **60 FPS shown**: 30 real frames plus Lossless Scaling frame generation 2x, also in fights. No anti-cheat changes. Use at your own risk.
+>
+> - **Download:** the latest [`d2r-thor` release](https://github.com/weltenaichaos/FEX-D2-reforged/releases/tag/d2r-thor-2). It holds all four files: FEX for play (`thor-clean`), FEX with a stats log (`thor`), vkd3d-proton ARM64EC, and the fixed frame gen layer.
+> - **Install and settings:** step by step in [docs/d2r-thor-setup.md](docs/d2r-thor-setup.md).
+> - **What we changed and measured:** [docs/d2r-thor-findings.md](docs/d2r-thor-findings.md).
+> - **Source:** branch [`d2r/clean`](https://github.com/weltenaichaos/FEX-D2-reforged/tree/d2r/clean). The frame gen layer patch is `tools/lsfg/d2r.patch`.
+>
+> **Short version of the setup**
+>
+> | | |
+> |---|---|
+> | FEX | `2610-d2rfix28-thor-clean`, CPU cores 3 to 7, `FEX_DISKCACHE=1` |
+> | Proton | GameNative proton-11.0-1-arm64ec (GameNative's 11.0-2 crashes D2R) |
+> | DX12 | vkd3d-proton 3.0b ARM64EC, DXVK 2.7.1; never set `VKD3D_DISABLE_EXTENSIONS` |
+> | Frame gen | 2x, flow scale 0.25, Performance Mode on, Mailbox, fixed `liblsfg-vk-layer.so` copied over GameNative's |
+> | Limiter | GameNative FPS limiter 30, set before launch |
+> | In game | VSync off, frame cap unlimited |
+>
+> **What this fork adds on top of Dmage22's D2R fixes**
+>
+> - Thor-tuned FEX builds (armv8.4-a, Cortex-X3), plus a per-second stats log for diagnosis.
+> - Faster FEX disk cache loading on GameNative (cache file mapping without the unixlib).
+> - vkd3d-proton built as native ARM64EC (about +5 FPS).
+> - Four fixes to GameNative's frame gen layer: the D2R crash, the 12/15 FPS locks and the late-frame stutter.
+>
+> ---
+>
+> ## Upstream fork notes: Diablo II: Resurrected and Overwatch 2 on GameNative
+>
+> *Written by Dmage22 for [Dmage22/FEX-D2](https://github.com/Dmage22/FEX-D2), kept for reference. The links below point to Dmage22's repositories.*
 >
 > Small compatibility fixes so Blizzard's protected launchers run under Wine ARM64EC on Android. No anti-cheat changes. Use at your own risk.
 >

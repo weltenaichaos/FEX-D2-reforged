@@ -14,7 +14,7 @@ Result: a steady **60 FPS shown** (30 real frames + frame generation 2x), also i
 ## What you need first
 
 - GameNative with D2R (Steam version) installed in its own container.
-- **Proton 11.0-1 (arm64ec)** in that container. 11.0-2 crashes D2R.
+- **GameNative's Proton 11.0-1 (arm64ec)** in that container. GameNative's 11.0-2 crashes D2R.
 - A Turnip Adreno driver, and DXVK 2.7.1.
 - For frame gen: Lossless Scaling owned on Steam, so GameNative can use its `Lossless.dll`.
 - Leave `D2R_loader.dll` in the game folder. It belongs to the game, and D2R crashes without it.
@@ -77,7 +77,7 @@ Once you have played through most areas, back up the folder `AppData\Local\fex-e
 | Heavy flicker or crash at start with frame gen | The old layer is active. Redo step 3.3. |
 | Fights drop below 20 FPS | Check that only cores 3 to 7 are enabled. |
 | Stutter in new areas | Normal while the FEX cache fills. Keep `FEX_DISKCACHE=1` and back up the cache once it is full. |
-| Game crashes at start | Check Proton 11.0-1 (not 11.0-2) and that `D2R_loader.dll` is in place. |
+| Game crashes at start | Check GameNative's Proton 11.0-1 (not 11.0-2) and that `D2R_loader.dll` is in place. |
 
 ## Diagnosis (optional)
 
