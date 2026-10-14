@@ -68,6 +68,7 @@ Uncapped looks better on paper, but the swings feel stuttery. The 30 cap gives e
 | TSO off for D2R.exe | No gain, and unsafe without volatile metadata |
 | Uncapped real-frame spacing in the layer | Less stable than the 30 cap |
 | PAUSE as ISB instead of YIELD (D2R spinlocks, main thread ~11% in one lock) | No measurable change (25-45 FPS both ways). Removed again, because adding it reset everyone's disk cache |
+| Caching the executable-range query per thread (build 27) | Cut the lookup-key step from ~13 to ~1 µs, but D2R crashed within 2 seconds. D2R's protector flips page protections without telling FEX, so FEX must ask Windows fresh every time. Reverted |
 | Flow scale 0.5 | Heavier and looked worse than 0.25 |
 | In-game VSync | More latency, no gain; use Mailbox instead |
 | Precompiling D2R.exe ahead of time | Not possible: D2R.exe is encrypted on disk and only decrypted in memory while running |
