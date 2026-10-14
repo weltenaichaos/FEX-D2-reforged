@@ -29,9 +29,12 @@ namespace {
   // After a failed affinity change, wait this many seconds before trying that thread again.
   constexpr uint32_t RetryAfterSeconds = 10;
   // Sticky mode: a game thread goes to the little cores only after this many seconds in a row below IdleLoad, and
-  // returns to the big cores the first second it is above it.
-  constexpr uint32_t IdleAfterSeconds = 10;
-  constexpr double IdleLoad = 1.0;
+  // returns to the big cores the first second it is above WakeLoad.
+  constexpr uint32_t IdleAfterSeconds = 30;
+  constexpr double IdleLoad = 0.3;
+  constexpr double WakeLoad = 2.0;
+  // A thread that fails this many times in a row with STATUS_THREAD_IS_TERMINATING is left alone.
+  constexpr uint32_t MaxTerminatingFailures = 2;
 
   // Same layout as Windows' THREAD_BASIC_INFORMATION; spelled out because the bundled headers differ in field names.
   struct ThreadBasicInfo {
@@ -60,6 +63,7 @@ namespace {
     bool Heavy;
     uint32_t OutCount;
     uint32_t IdleCount;
+    uint32_t TerminatingFailures;
     uint64_t SetMask; // what we last set, 0 = nothing yet
     uint32_t RetryAt;
     bool ReportedForeign;
@@ -162,6 +166,17 @@ namespace {
     return Name.size() >= 3 && Name.compare(0, 3, "FEX") == 0;
   }
 
+  bool StartsWith(const fextl::string& Name, std::string_view Prefix) {
+    return Name.size() >= Prefix.size() && Name.compare(0, Prefix.size(), Prefix) == 0;
+  }
+
+  // Threads that use little CPU but wake every frame (GPU submission, fences, present, audio). A slow little core or a
+  // migration delays the frame, so sticky mode never moves them off the big cores.
+  bool IsFrameThread(const fextl::string& Name) {
+    return StartsWith(Name, "vkd3d") || StartsWith(Name, "dxvk") || StartsWith(Name, "wine_vk") || StartsWith(Name, "audio") ||
+           StartsWith(Name, "Audio");
+  }
+
   const char* MaskKind(const Config& C, uint64_t Mask) {
     if (C.Fast >= 0 && Mask == (1ULL << C.Fast)) {
       return "fast";
@@ -250,7 +265,11 @@ namespace {
         T.LastTime100ns = S.Time100ns;
         T.SeenAt = Second;
         // A new thread has no load history yet, so it never counts as idle in its first round.
-        T.IdleCount = (!New && T.Load < IdleLoad) ? T.IdleCount + 1 : 0;
+        if (New || T.Load >= WakeLoad) {
+          T.IdleCount = 0;
+        } else if (T.Load < IdleLoad) {
+          ++T.IdleCount;
+        }
         if (T.Name.empty()) {
           T.Name = QueryName(S.Handle);
         }
@@ -296,7 +315,7 @@ namespace {
         if (S.TID == SelfTID || IsFEXThread(T.Name)) {
           Target = C->Little;
         } else if (C->Sticky) {
-          if (T.IdleCount >= IdleAfterSeconds) {
+          if (T.IdleCount >= IdleAfterSeconds && !IsFrameThread(T.Name)) {
             Target = C->Little;
             ++Rest;
           } else {
@@ -325,7 +344,7 @@ namespace {
                                           T.Name, S.CurrentMask, T.SetMask));
         }
 
-        if ((Target != T.SetMask || S.CurrentMask != Target) && Second >= T.RetryAt) {
+        if ((Target != T.SetMask || S.CurrentMask != Target) && Second >= T.RetryAt && T.TerminatingFailures < MaxTerminatingFailures) {
           KAFFINITY Mask = Target;
           const NTSTATUS Status = NtSetInformationThread(S.Handle, ThreadAffinityMaskClass, &Mask, sizeof(Mask));
           if (Status == STATUS_SUCCESS) {
@@ -334,7 +353,9 @@ namespace {
               StatsLogNote(fextl::fmt::format("pin: s={} tid={} {} load={:.0f}% -> {}", Second, S.TID, T.Name, T.Load, MaskKind(*C, Target)));
             }
             T.SetMask = Target;
+            T.TerminatingFailures = 0;
           } else {
+            T.TerminatingFailures = Status == STATUS_THREAD_IS_TERMINATING ? T.TerminatingFailures + 1 : 0;
             ++Failed;
             T.RetryAt = Second + RetryAfterSeconds;
             StatsLogNote(fextl::fmt::format("pin: s={} tid={} {} load={:.0f}% -> {} FAILED status={:#x}", Second, S.TID, T.Name, T.Load,
@@ -385,7 +406,7 @@ void StartThreadPlacer(std::string_view AppName) {
   C->Sticky = !(Mode && Mode[0] == 'l');
   if (C->Sticky) {
     C->Fast = -1;
-    C->RestName = "little after 10s idle";
+    C->RestName = "little after 30s idle";
   }
   if (Other) {
     C->Sticky = false;

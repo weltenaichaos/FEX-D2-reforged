@@ -5,8 +5,9 @@
 
 namespace FEX::Windows {
 // Opt-in thread placement for big.LITTLE devices. Once per second:
-//   sticky mode (default): every game thread stays on the big cores; only threads idle (<1% of a core) for 10 seconds in a
-//     row and FEX's own helper threads go to the little cores. An idle thread returns to the big cores as soon as it works.
+//   sticky mode (default): every game thread stays on the big cores; only threads idle (<0.3% of a core) for 30 seconds in
+//     a row and FEX's own helper threads go to the little cores. An idle thread returns to the big cores above 2%. Frame
+//     threads (vkd3d*, dxvk*, wine_vk*, audio*) never leave the big cores.
 //   load mode (FEX_PIN_MODE=load): the FEX_PIN_HEAVY busiest threads get the big cores, everything else FEX_PIN_REST.
 //
 //   FEX_THREADPIN=1            enables it (off by default)
