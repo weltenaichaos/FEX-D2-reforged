@@ -13,6 +13,7 @@ add_library(CommonWindows STATIC
   FEXUnixLib.cpp
   SHMStats.cpp
   StatsLog.cpp
+  ThreadPlacer.cpp
   InvalidationTracker.cpp
   ImageTracker.cpp
   Logging.cpp

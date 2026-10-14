@@ -50,6 +50,7 @@ $end_info$
 #include "DummyHandlers.h"
 #include "BTInterface.h"
 #include "Windows/Common/SHMStats.h"
+#include "Windows/Common/ThreadPlacer.h"
 
 #include <cstdint>
 #include <type_traits>
@@ -568,6 +569,8 @@ void BTCpuProcessInit() {
   if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_WOW64);
   }
+
+  FEX::Windows::StartThreadPlacer(ExecutableName);
 
   if (StartupSleep() && (StartupSleepProcName().empty() || ExecutableName == StartupSleepProcName())) {
     LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), ExecutableName, StartupSleep());

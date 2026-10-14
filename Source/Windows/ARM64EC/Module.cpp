@@ -50,6 +50,7 @@ $end_info$
 #include "BTInterface.h"
 #include "Windows/Common/SHMStats.h"
 #include "Windows/Common/StatsLog.h"
+#include "Windows/Common/ThreadPlacer.h"
 
 #include <atomic>
 #include <cstdint>
@@ -854,6 +855,7 @@ NTSTATUS ProcessInit() {
   } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
+  FEX::Windows::StartThreadPlacer(AppConfigName);
 
   if (StartupSleep() && (StartupSleepProcName().empty() || AppConfigName == StartupSleepProcName())) {
     LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), AppConfigName, StartupSleep());

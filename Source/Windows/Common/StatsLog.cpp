@@ -155,6 +155,37 @@ namespace {
     return Readable;
   }
 
+  // CPU clock per core from sysfs (through Wine's Z: drive), in MHz, as "c0/c1/.../c7". Empty when unreadable.
+  constexpr int MaxClockCores = 8;
+  bool ClocksUnreadable {};
+
+  fextl::string ReadCoreClocks() {
+    if (ClocksUnreadable) {
+      return {};
+    }
+    fextl::string Out;
+    bool Any {};
+    for (int Core = 0; Core < MaxClockCores; ++Core) {
+      const auto Path = fextl::fmt::format("Z:\\sys\\devices\\system\\cpu\\cpu{}\\cpufreq\\scaling_cur_freq", Core);
+      uint64_t KHz {};
+      if (FILE* F = fopen(Path.c_str(), "r")) {
+        char Buf[32] {};
+        const size_t Len = fread(Buf, 1, sizeof(Buf) - 1, F);
+        fclose(F);
+        for (size_t i = 0; i < Len && Buf[i] >= '0' && Buf[i] <= '9'; ++i) {
+          KHz = KHz * 10 + (Buf[i] - '0');
+        }
+      }
+      Any |= KHz != 0;
+      Out += fextl::fmt::format("{}{}", Core ? "/" : "", KHz ? fextl::fmt::format("{}", KHz / 1000) : fextl::string("-"));
+    }
+    if (!Any) {
+      ClocksUnreadable = true;
+      return {};
+    }
+    return Out;
+  }
+
   struct LogState {
     const StatAlloc* Stats;
     FILE* File;
@@ -499,6 +530,13 @@ namespace {
       const uint64_t ReadablePages = ScanImage(static_cast<uint32_t>(Seconds), TotalPages);
       Line += fextl::fmt::format("  pre exe early={} late={} other={} boot={} readable={}/{}\n", HitsEarly.exchange(0),
                                  HitsLate.exchange(0), HitsOther.exchange(0), HitsBoot.exchange(0), ReadablePages, TotalPages);
+
+      // CPU clocks in MHz per core 0-7 (0-2 little, 3-6 middle, 7 the X3 on a Snapdragon 8 Gen 2).
+      if (const auto Clocks = ReadCoreClocks(); !Clocks.empty()) {
+        Line += fextl::fmt::format("  clk={}\n", Clocks);
+      } else if (ClocksUnreadable && Seconds == 1) {
+        Line += "  clk=unreadable\n";
+      }
 
       fwrite(Line.data(), 1, Line.size(), State->File);
 
