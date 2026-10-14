@@ -41,6 +41,9 @@ public:
 
   virtual void PreCompile() {}
 
+  // Called after a block was installed from the disk cache, only while per-thread stats are being collected.
+  virtual void OnDiskCacheHit(uint64_t GuestRIP) {}
+
   virtual SourcecodeResolver* GetSourcecodeResolver() {
     return nullptr;
   }

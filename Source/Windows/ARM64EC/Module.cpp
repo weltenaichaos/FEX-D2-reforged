@@ -756,6 +756,10 @@ public:
   void PreCompile() override {
     ProcessPendingCrossProcessEmulatorWork();
   }
+
+  void OnDiskCacheHit(uint64_t GuestRIP) override {
+    FEX::Windows::StatsLogDiskCacheHit(GuestRIP);
+  }
 };
 } // namespace Exception
 
@@ -845,6 +849,7 @@ NTSTATUS ProcessInit() {
   const bool StatsLog = FEX::Windows::StatsLogRequested(AppConfigName);
   if (StatsLog) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC, true);
+    FEX::Windows::StatsLogWatchImage(reinterpret_cast<uint64_t>(MainModule));
     FEX::Windows::StartStatsLog(StatAllocHandler.get(), AppConfigName);
   } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);

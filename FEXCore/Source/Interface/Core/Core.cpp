@@ -935,6 +935,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
         LOGMAN_THROW_A_FMT(CachedHostCode != 0, "Couldn't find GuestRIP in Disk Cache entrypoints!");
 
         FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheHitCount, 1);
+        if (Thread->ThreadStats) {
+          SyscallHandler->OnDiskCacheHit(GuestRIP);
+        }
         Thread->FrontendDecoder->DelayedDisownBuffer();
 
         Thread->FrontendDecoder->ValidateDisownedOrFree();

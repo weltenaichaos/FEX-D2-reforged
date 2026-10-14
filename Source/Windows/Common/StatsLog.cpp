@@ -12,6 +12,7 @@
 #include <FEXCore/Utils/Threads.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -89,6 +90,70 @@ namespace {
     uint32_t Main;
     uint32_t Other;
   };
+
+  // Preload probe: once per second the log thread scans the main executable's pages and remembers the second each page
+  // was first seen readable. A disk cache hit in the executable whose page was already readable at an earlier scan could
+  // have been loaded in the background ahead of time ("early"); one whose page only just became readable could not
+  // ("late"). D2R's protector decrypts its code page by page, so this tells how much a background preload could cover.
+  struct ImageWatch {
+    uint64_t Base;
+    uint64_t Size;
+    std::atomic<uint32_t>* FirstReadable; // second of the first scan that saw the page readable, 0 = not yet
+    std::atomic<uint32_t> Second;         // second of the latest completed scan
+  };
+  std::atomic<ImageWatch*> Watch {};
+  uint64_t WatchBase {};
+  std::atomic<uint64_t> HitsEarly {}, HitsLate {}, HitsOther {}, HitsBoot {};
+
+  bool IsReadable(const MEMORY_BASIC_INFORMATION& Info) {
+    return Info.State == MEM_COMMIT && !(Info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+           (Info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+  }
+
+  // Runs on the log thread only. Returns how many of the image's pages are readable right now.
+  uint64_t ScanImage(uint32_t Seconds, uint64_t& TotalPages) {
+    auto* W = Watch.load(std::memory_order_acquire);
+    if (!W) {
+      if (!WatchBase) {
+        return 0;
+      }
+      // The image is one allocation: walk its regions to find its size.
+      uint64_t End = WatchBase;
+      MEMORY_BASIC_INFORMATION Info {};
+      while (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(End), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ==
+               STATUS_SUCCESS &&
+             reinterpret_cast<uint64_t>(Info.AllocationBase) == WatchBase && Info.RegionSize) {
+        End = reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize;
+      }
+      if (End == WatchBase) {
+        return 0;
+      }
+      W = new ImageWatch {.Base = WatchBase, .Size = End - WatchBase};
+      W->FirstReadable = new std::atomic<uint32_t>[W->Size / 4096]();
+      Watch.store(W, std::memory_order_release);
+    }
+
+    TotalPages = W->Size / 4096;
+    uint64_t Readable {};
+    uint64_t Address = W->Base;
+    MEMORY_BASIC_INFORMATION Info {};
+    while (Address < W->Base + W->Size &&
+           NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ==
+             STATUS_SUCCESS &&
+           Info.RegionSize) {
+      const uint64_t RegionEnd = std::min(reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize, W->Base + W->Size);
+      if (IsReadable(Info)) {
+        for (uint64_t Page = (Address - W->Base) / 4096; Page < (RegionEnd - W->Base) / 4096; ++Page) {
+          uint32_t Expected = 0;
+          W->FirstReadable[Page].compare_exchange_strong(Expected, Seconds, std::memory_order_relaxed);
+          ++Readable;
+        }
+      }
+      Address = RegionEnd;
+    }
+    W->Second.store(Seconds, std::memory_order_release);
+    return Readable;
+  }
 
   struct LogState {
     const StatAlloc* Stats;
@@ -429,6 +494,12 @@ namespace {
         }
       }
 
+      // Preload probe, see ImageWatch. boot = hits before the first scan (game start).
+      uint64_t TotalPages {};
+      const uint64_t ReadablePages = ScanImage(static_cast<uint32_t>(Seconds), TotalPages);
+      Line += fextl::fmt::format("  pre exe early={} late={} other={} boot={} readable={}/{}\n", HitsEarly.exchange(0),
+                                 HitsLate.exchange(0), HitsOther.exchange(0), HitsBoot.exchange(0), ReadablePages, TotalPages);
+
       fwrite(Line.data(), 1, Line.size(), State->File);
 
       if (State->Profile && Seconds % ProfileWindowSeconds == 0) {
@@ -549,6 +620,28 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
   Thread = FEXCore::Threads::Thread::Create(LogThread, State, {.LowPriority = false, .Internal = true}, "FEXStatsLog");
+}
+
+void StatsLogWatchImage(uint64_t Base) {
+  WatchBase = Base;
+}
+
+void StatsLogDiskCacheHit(uint64_t GuestRIP) {
+#ifdef FEX_DISABLE_STATSLOG
+  return;
+#endif
+  const auto* W = Watch.load(std::memory_order_acquire);
+  if (!W) {
+    HitsBoot.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (GuestRIP < W->Base || GuestRIP >= W->Base + W->Size) {
+    HitsOther.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  const uint32_t First = W->FirstReadable[(GuestRIP - W->Base) / 4096].load(std::memory_order_relaxed);
+  const uint32_t Second = W->Second.load(std::memory_order_acquire);
+  (First && First < Second ? HitsEarly : HitsLate).fetch_add(1, std::memory_order_relaxed);
 }
 
 void StatsLogNote(std::string_view Line) {

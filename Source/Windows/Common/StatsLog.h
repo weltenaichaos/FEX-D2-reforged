@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstdint>
 #include <string_view>
 
 namespace FEX::Windows {
@@ -20,4 +21,10 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName);
 // Adds a "# ..." line to the log. Lines noted before the log is opened are kept and written after its header.
 // No-op unless FEX_STATSLOG is set.
 void StatsLogNote(std::string_view Line);
+
+// Classifies a disk cache hit for the preload probe: was the main executable's page holding GuestRIP already readable
+// at an earlier once-per-second scan (so a background preload could have loaded it), or not.
+void StatsLogDiskCacheHit(uint64_t GuestRIP);
+// Sets the image the preload probe watches (the main executable). Call before StartStatsLog.
+void StatsLogWatchImage(uint64_t Base);
 } // namespace FEX::Windows
