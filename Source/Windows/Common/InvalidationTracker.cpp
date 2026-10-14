@@ -14,6 +14,49 @@
 #include <atomic>
 
 namespace FEX::Windows {
+// QueryExecutableRange runs for every disk cache lookup and block compile, and VirtualQuery is a Wine syscall costing
+// ~10us. Each thread keeps the last region it queried and reuses it until any protection change, free, unmap or image
+// map bumps this generation. Only fully usable (committed, readable, unguarded) regions are reused: a stale "usable"
+// answer just makes the compiler fault and restart, while a stale "unusable" one could wrongly fault the guest.
+// FEX_XRANGECACHE=0 turns it off.
+static std::atomic<uint64_t> MemoryGeneration {1};
+struct CachedRegion {
+  uint64_t Generation;
+  MEMORY_BASIC_INFORMATION Info;
+};
+static thread_local CachedRegion LastRegion {};
+
+static void BumpMemoryGeneration() {
+  MemoryGeneration.fetch_add(1, std::memory_order_acq_rel);
+}
+
+static bool QueryRegion(uint64_t Address, MEMORY_BASIC_INFORMATION& Info) {
+  // Read on first use rather than at DLL load, when the environment may not be set up yet.
+  static const bool RegionCacheEnabled = [] {
+    const char* Env = getenv("FEX_XRANGECACHE");
+    return !(Env && Env[0] == '0');
+  }();
+  if (RegionCacheEnabled) {
+    const auto Generation = MemoryGeneration.load(std::memory_order_acquire);
+    const auto& Cached = LastRegion;
+    const auto Base = reinterpret_cast<uint64_t>(Cached.Info.BaseAddress);
+    if (Cached.Generation == Generation && Address >= Base && Address < Base + Cached.Info.RegionSize) {
+      Info = Cached.Info;
+      return true;
+    }
+    if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
+      return false;
+    }
+    if (Info.State == MEM_COMMIT && (Info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                                      PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) &&
+        !(Info.Protect & PAGE_GUARD)) {
+      LastRegion = {Generation, Info};
+    }
+    return true;
+  }
+  return VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info));
+}
+
 InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
   : CTX {CTX}
   , Threads {Threads} {
@@ -47,6 +90,7 @@ static bool ProtIsWritable(ULONG Prot) {
 }
 
 void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot) {
+  BumpMemoryGeneration();
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
 
@@ -88,6 +132,7 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
 }
 
 void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
+  BumpMemoryGeneration();
   const bool DisableDEP = (Flags & MEM_EXECUTE_OPTION_ENABLE) != 0;
 
   std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
@@ -135,6 +180,7 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
 }
 
 void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address) {
+  BumpMemoryGeneration();
   auto* Nt = RtlImageNtHeader(reinterpret_cast<HMODULE>(Address));
   auto* SectionsBegin = IMAGE_FIRST_SECTION(Nt);
   auto* SectionsEnd = SectionsBegin + Nt->FileHeader.NumberOfSections;
@@ -172,6 +218,7 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
 }
 
 InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::InvalidateContainingSection(uint64_t Address, bool Free) {
+  BumpMemoryGeneration();
   MEMORY_BASIC_INFORMATION Info;
   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
     return {Address, 0};
@@ -198,6 +245,9 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
 }
 
 void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
+  if (Free) {
+    BumpMemoryGeneration();
+  }
   if (!Address) {
     // Match the Windows behaviour when passed a NULL base address.
     Size = std::numeric_limits<uint64_t>::max();
@@ -240,6 +290,7 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
       SIZE_T TmpSize = 1;
       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+      BumpMemoryGeneration();
     }
     DetectMonoBackpatcherBlock(Thread, HostPc);
     return true;
@@ -289,7 +340,7 @@ static FEXCore::HLE::ExecutableRangeInfo ClampToAccessible(FEXCore::HLE::Executa
 
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
   MEMORY_BASIC_INFORMATION Info;
-  if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
+  if (!QueryRegion(Address, Info)) {
     return {};
   }
 
@@ -407,6 +458,7 @@ void InvalidationTracker::DisableSMCDetection() {
       SIZE_T TmpSize = static_cast<SIZE_T>(Query.Size);
       ULONG TmpProt;
       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, GetUntrapProt(Address), &TmpProt);
+      BumpMemoryGeneration();
     }
     Address += Query.Size;
   } while (Query.Size);
@@ -465,6 +517,7 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
       SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
       ULONG TmpProt;
       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address), &TmpProt);
+      BumpMemoryGeneration();
     } else if (!Query.Size) {
       // No more regions past `Address` in the interval list
       break;
