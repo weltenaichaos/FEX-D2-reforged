@@ -81,6 +81,15 @@ struct ThreadStats {
   uint64_t AccumulatedDiskCacheFileReadCount;
   uint64_t AccumulatedDiskCacheRelocTime;
   uint64_t AccumulatedDiskCacheInstallTime;
+
+  // Longest single JIT request, exception, and disk cache lookup since the stats reader last reset them (in unscaled
+  // CPU cycles), and the cycle counter at the moment each one ended. Written by the owning thread, reset by the reader.
+  uint64_t MaxJITTime;
+  uint64_t MaxJITAt;
+  uint64_t MaxSignalTime;
+  uint64_t MaxSignalAt;
+  uint64_t MaxDiskCacheLookupTime;
+  uint64_t MaxDiskCacheLookupAt;
 };
 
 // Ensure 16-byte alignment to take advantage of ARM single-copy atomicity.
@@ -89,21 +98,32 @@ static_assert(sizeof(ThreadStats) % 16 == 0, "Needs to be 16-byte aligned!");
 template<typename T, size_t FlatOffset = 0>
 class AccumulationBlock final {
 public:
-  AccumulationBlock(T* Stat)
+  // MaxStat, when given, points at a {longest duration, end time} pair that keeps the longest single block.
+  AccumulationBlock(T* Stat, T* MaxStat = nullptr)
     : Begin {Stat ? GetCycleCounter() : 0}
-    , Stat {Stat} {}
+    , Stat {Stat}
+    , MaxStat {MaxStat} {}
 
   ~AccumulationBlock() {
     if (Stat) {
-      const auto Duration = GetCycleCounter() - Begin + FlatOffset;
+      const auto End = GetCycleCounter();
+      const auto Duration = End - Begin + FlatOffset;
       auto ref = std::atomic_ref<T>(*Stat);
       ref.fetch_add(Duration, std::memory_order_relaxed);
+      if (MaxStat) {
+        auto Max = std::atomic_ref<T>(MaxStat[0]);
+        if (Duration > Max.load(std::memory_order_relaxed)) {
+          Max.store(Duration, std::memory_order_relaxed);
+          std::atomic_ref<T>(MaxStat[1]).store(End, std::memory_order_relaxed);
+        }
+      }
     }
   }
 
 private:
   uint64_t Begin;
   T* Stat;
+  T* MaxStat;
 };
 #define UniqueScopeName2(name, line) name##line
 #define UniqueScopeName(name, line) UniqueScopeName2(name, line)
@@ -111,6 +131,9 @@ private:
 #define FEXCORE_PROFILE_ACCUMULATION(ThreadState, Stat)                                                                          \
   FEXCore::SHMStats::AccumulationBlock<decltype(ThreadState->ThreadStats->Stat)> UniqueScopeName(ScopedAccumulation_, __LINE__)( \
     ThreadState->ThreadStats ? &ThreadState->ThreadStats->Stat : nullptr);
+#define FEXCORE_PROFILE_ACCUMULATION_MAX(ThreadState, Stat, MaxStat)                                                             \
+  FEXCore::SHMStats::AccumulationBlock<decltype(ThreadState->ThreadStats->Stat)> UniqueScopeName(ScopedAccumulation_, __LINE__)( \
+    ThreadState->ThreadStats ? &ThreadState->ThreadStats->Stat : nullptr, ThreadState->ThreadStats ? &ThreadState->ThreadStats->MaxStat : nullptr);
 #define FEXCORE_PROFILE_INSTANT_INCREMENT(ThreadState, Stat, value) \
   do {                                                              \
     if (ThreadState->ThreadStats) {                                 \

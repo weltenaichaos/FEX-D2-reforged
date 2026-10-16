@@ -880,7 +880,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   auto Thread = Frame->Thread;
   FEXCORE_PROFILE_SCOPED("CompileBlock");
-  FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
+  FEXCORE_PROFILE_ACCUMULATION_MAX(Thread, AccumulatedJITTime, MaxJITTime);
 
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
@@ -909,7 +909,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   std::optional<DiskCache::CodeHitData> Hit;
   std::optional<uint64_t> DiskCacheGuestCodeKey;
   {
-    FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheLookupTime);
+    FEXCORE_PROFILE_ACCUMULATION_MAX(Thread, AccumulatedDiskCacheLookupTime, MaxDiskCacheLookupTime);
     Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
     if (Hit && !DiskCache.IsValidating()) {
       FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheInstallTime);

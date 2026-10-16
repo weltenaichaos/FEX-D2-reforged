@@ -886,7 +886,7 @@ public:
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
 bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
   auto Thread = CPUArea.ThreadState();
-  FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
+  FEXCORE_PROFILE_ACCUMULATION_MAX(Thread, AccumulatedSignalTime, MaxSignalTime);
   LogMan::Msg::DFmt("Exception: Code: {:X} Address: {:X}", Exception->ExceptionCode, reinterpret_cast<uintptr_t>(Exception->ExceptionAddress));
 
   if (NativeContext->Pc == reinterpret_cast<uint64_t>(&ExitFunctionSuspendPoint)) {

@@ -33,6 +33,13 @@ namespace {
   // Threads whose InSimulation flag is sampled during the next second: the busiest ones of the previous second.
   constexpr size_t MaxSampled = 16;
   constexpr int64_t SampleInterval100ns = 20'000; // 2ms
+  // Timeline (on unless FEX_STATSLOG_TIMELINE=0): for the TimelineThreads busiest threads, one character per 10ms bin
+  // saying how much of that bin the thread spent in emulated x86 code. Together with the longest single JIT request,
+  // exception and disk cache lookup per second (and when in the second it ended) this shows what a short hitch was made of.
+  constexpr size_t TimelineThreads = 6;
+  constexpr size_t TimelineBins = 100;
+  // Longest single events shorter than this are not printed.
+  constexpr double MaxEventPrintMs = 2.0;
 
   // FEX_STATSLOG_PROFILE=1: every tick, note which JIT block each of the ProfiledThreads busiest threads is in while it runs
   // emulated code, by reading the block header pointer the JIT stores on every block entry. Nothing is suspended. Every
@@ -72,6 +79,13 @@ namespace {
     uint64_t DiskCacheFileReadCount;
     uint64_t DiskCacheRelocTime;
     uint64_t DiskCacheInstallTime;
+    // Longest single events of the last second (cycles) and when they ended (cycle counter), see ThreadStats.
+    uint64_t MaxJITTime;
+    uint64_t MaxJITAt;
+    uint64_t MaxSignalTime;
+    uint64_t MaxSignalAt;
+    uint64_t MaxDiskCacheLookupTime;
+    uint64_t MaxDiskCacheLookupAt;
   };
 
   // Tells whether a thread is running translated x86 code (InSimulation set) or native ARM64EC code (Wine, VKD3D, the
@@ -84,6 +98,8 @@ namespace {
     uint32_t InSimulationSamples;
     const volatile uint64_t* BlockHeader;
     bool IsMain;
+    uint8_t BinSamples[TimelineBins];
+    uint8_t BinInSimulation[TimelineBins];
   };
 
   struct ProfileCount {
@@ -195,6 +211,8 @@ namespace {
     SampledThread Sampled[MaxSampled];
     size_t SampledCount;
     bool Profile;
+    bool Timeline;
+    uint64_t SecondStart; // cycle counter when the current second's sampling began
     fextl::unordered_map<uint64_t, ProfileCount> ProfileCounts;
     uint32_t ProfileSamples[2];
   };
@@ -347,18 +365,31 @@ namespace {
 
   // Waits one second, polling the sampled threads' InSimulation flag every few milliseconds.
   void SampleFor1s(LogState* State) {
-    const uint64_t End = GetCounter() + State->CounterFreq;
+    const uint64_t Start = GetCounter();
+    const uint64_t End = Start + State->CounterFreq;
+    State->SecondStart = Start;
+    for (size_t i = 0; i < State->SampledCount; ++i) {
+      memset(State->Sampled[i].BinSamples, 0, sizeof(State->Sampled[i].BinSamples));
+      memset(State->Sampled[i].BinInSimulation, 0, sizeof(State->Sampled[i].BinInSimulation));
+    }
     LARGE_INTEGER Interval {.QuadPart = -SampleInterval100ns};
     do {
       NtDelayExecution(FALSE, &Interval);
+      const uint64_t Now = GetCounter();
+      const size_t Bin = std::min<size_t>((Now - Start) * TimelineBins / State->CounterFreq, TimelineBins - 1);
       for (size_t i = 0; i < State->SampledCount; ++i) {
         auto& T = State->Sampled[i];
         // FEX clears the slot's TID in ThreadTerm, well before the thread's CPU area goes away.
         if (!T.InSimulation || T.Slot->TID.load(std::memory_order_relaxed) != T.TID) {
           continue;
         }
+        const bool In = *T.InSimulation;
         ++T.Samples;
-        T.InSimulationSamples += *T.InSimulation ? 1 : 0;
+        T.InSimulationSamples += In ? 1 : 0;
+        if (T.BinSamples[Bin] < 255) {
+          ++T.BinSamples[Bin];
+          T.BinInSimulation[Bin] += In ? 1 : 0;
+        }
       }
       if (State->Profile) {
         ProfileTick(State);
@@ -417,6 +448,18 @@ namespace {
           .DiskCacheRelocTime = Slot.AccumulatedDiskCacheRelocTime,
           .DiskCacheInstallTime = Slot.AccumulatedDiskCacheInstallTime,
         });
+        // Take the longest single events and reset them for the next second.
+        auto& Cur = Current.back();
+        auto* Mutable = const_cast<FEXCore::SHMStats::ThreadStats*>(&Slot);
+        auto Take = [](uint64_t& Field) {
+          return std::atomic_ref<uint64_t>(Field).exchange(0, std::memory_order_relaxed);
+        };
+        Cur.MaxJITTime = Take(Mutable->MaxJITTime);
+        Cur.MaxJITAt = Take(Mutable->MaxJITAt);
+        Cur.MaxSignalTime = Take(Mutable->MaxSignalTime);
+        Cur.MaxSignalAt = Take(Mutable->MaxSignalAt);
+        Cur.MaxDiskCacheLookupTime = Take(Mutable->MaxDiskCacheLookupTime);
+        Cur.MaxDiskCacheLookupAt = Take(Mutable->MaxDiskCacheLookupAt);
       });
 
       struct Delta {
@@ -467,6 +510,12 @@ namespace {
               .DiskCacheFileReadCount = Diff(Cur.DiskCacheFileReadCount, Old->DiskCacheFileReadCount),
               .DiskCacheRelocTime = Diff(Cur.DiskCacheRelocTime, Old->DiskCacheRelocTime),
               .DiskCacheInstallTime = Diff(Cur.DiskCacheInstallTime, Old->DiskCacheInstallTime),
+              .MaxJITTime = Cur.MaxJITTime,
+              .MaxJITAt = Cur.MaxJITAt,
+              .MaxSignalTime = Cur.MaxSignalTime,
+              .MaxSignalAt = Cur.MaxSignalAt,
+              .MaxDiskCacheLookupTime = Cur.MaxDiskCacheLookupTime,
+              .MaxDiskCacheLookupAt = Cur.MaxDiskCacheLookupAt,
             },
         };
         Entry.Slot = Slots[CurIndex];
@@ -515,6 +564,22 @@ namespace {
                                    D.TID, QueryThreadName(D.TID), Entry.CPUPercent, Emu, D.JITTime * MsPerTick, D.JITCount, D.SMCCount,
                                    D.SIGBUSCount, D.SignalTime * MsPerTick, D.CacheMissCount, D.CacheLockTime * MsPerTick,
                                    D.FloatFallbackCount, D.DiskCacheHitCount);
+        // Longest single events of the second: duration and the 10ms timeline bin in which each one ended.
+        fextl::string Max;
+        auto AddMax = [&](const char* Name, uint64_t Time, uint64_t At) {
+          const double Ms = Time * MsPerTick;
+          if (Ms < MaxEventPrintMs) {
+            return;
+          }
+          const int64_t Offset = At > State->SecondStart ? static_cast<int64_t>((At - State->SecondStart) * TimelineBins / State->CounterFreq) : -1;
+          Max += fextl::fmt::format(" {}={:.1f}ms@{}", Name, Ms, Offset);
+        };
+        AddMax("jit", D.MaxJITTime, D.MaxJITAt);
+        AddMax("sig", D.MaxSignalTime, D.MaxSignalAt);
+        AddMax("dcl", D.MaxDiskCacheLookupTime, D.MaxDiskCacheLookupAt);
+        if (!Max.empty()) {
+          Line += fextl::fmt::format("    max{}\n", Max);
+        }
         // Disk cache lookup breakdown (dcl = whole lookup incl. misses; key = lookup key/anon decode; read = entry reads, file
         // = how many came from the cache file; rel = relocations; inst = putting a hit into the code buffer).
         if (D.DiskCacheHitCount || D.DiskCacheMissCount) {
@@ -522,6 +587,27 @@ namespace {
                                      D.DiskCacheHitCount, D.DiskCacheMissCount, D.DiskCacheLookupTime * MsPerTick,
                                      D.DiskCacheKeyTime * MsPerTick, D.DiskCacheReadTime * MsPerTick, D.DiskCacheFileReadCount,
                                      D.DiskCacheRelocTime * MsPerTick, D.DiskCacheInstallTime * MsPerTick);
+        }
+      }
+
+      // Timeline of the busiest threads, see TimelineThreads. Per 10ms bin: ' ' not sampled, '.' all native (Wine, VKD3D,
+      // the driver, or waiting), '1'-'9' tenths of the bin in emulated x86 code, '#' all emulated.
+      if (State->Timeline) {
+        for (size_t i = 0; i < std::min(State->SampledCount, TimelineThreads); ++i) {
+          const auto& T = State->Sampled[i];
+          if (!T.Samples) {
+            continue;
+          }
+          char Bins[TimelineBins + 1] {};
+          for (size_t b = 0; b < TimelineBins; ++b) {
+            if (!T.BinSamples[b]) {
+              Bins[b] = ' ';
+            } else {
+              const uint32_t Tenths = (T.BinInSimulation[b] * 10 + T.BinSamples[b] / 2) / T.BinSamples[b];
+              Bins[b] = Tenths == 0 ? '.' : Tenths >= 10 ? '#' : static_cast<char>('0' + Tenths);
+            }
+          }
+          Line += fextl::fmt::format("  tl tid={} {:<12}|{}|\n", T.TID, QueryThreadName(T.TID).substr(0, 12), Bins);
         }
       }
 
@@ -655,6 +741,11 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   auto* State = new LogState {.Stats = Stats, .File = File, .CounterFreq = GetCounterFrequency()};
   const char* Profile = getenv("FEX_STATSLOG_PROFILE");
   State->Profile = Profile && Profile[0] == '1';
+  const char* Timeline = getenv("FEX_STATSLOG_TIMELINE");
+  State->Timeline = !(Timeline && Timeline[0] == '0');
+  const auto Switches = fextl::fmt::format("# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={}\n",
+                                           State->Profile ? 1 : 0, State->Timeline ? 1 : 0, getenv("FEX_THREADPIN") ? getenv("FEX_THREADPIN") : "-");
+  fwrite(Switches.data(), 1, Switches.size(), File);
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
   Thread = FEXCore::Threads::Thread::Create(LogThread, State, {.LowPriority = false, .Internal = true}, "FEXStatsLog");
