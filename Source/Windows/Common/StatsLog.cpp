@@ -61,8 +61,17 @@ namespace {
   constexpr size_t HitchPrinted = 6;
   constexpr size_t HitchDumped = 3;
   constexpr size_t MaxHitchLines = 400;
-  constexpr size_t MaxDumps = 256;
+  constexpr size_t MaxDumps = 512;
   constexpr size_t MaxMainSamples = 1024;
+  // A run of at least HitchMinBins bins in which Main was sampled only outside emulated code (waiting, or in Wine, VKD3D or
+  // the driver) gets a "# stall" line the same way: at 30 FPS the game never waits that long between frames.
+  // Both lines also name the other threads that ran emulated code for at least HitchOtherMinPercent of the run, with the
+  // blocks they were in: usually the job Main is waiting for.
+  constexpr uint32_t HitchOtherMinPercent = 50;
+  constexpr uint32_t HitchOtherMinSamples = 10;
+  constexpr size_t HitchOthersPrinted = 2;
+  constexpr size_t HitchOtherBlocksPrinted = 3;
+  constexpr size_t MaxOtherSamples = 8192;
 
   // Native-call sampler (with FEX_STATSLOG_PROFILE=1): ExitFunctionEC (ARM64EC/Module.S) stores the native function it
   // enters in the thread's CHPE CPU area (EmulatorDataInline). Samples of a thread outside emulated code count against the
@@ -111,6 +120,11 @@ namespace {
     uint64_t MaxSignalAt;
     uint64_t MaxDiskCacheLookupTime;
     uint64_t MaxDiskCacheLookupAt;
+    // Disk cache outcomes (see FEXCore::SHMStats::DiskCacheMissReason / DiskCacheStoreResult) and how far the RIP rings got.
+    uint64_t DCMisses[8];
+    uint64_t DCStores[8];
+    uint64_t DCMissRIPCount;
+    uint64_t DCRejectRIPCount;
   };
 
   // Tells whether a thread is running translated x86 code (InSimulation set) or native ARM64EC code (Wine, VKD3D, the
@@ -257,13 +271,34 @@ namespace {
     };
     MainSample MainSamples[MaxMainSamples];
     size_t MainSampleCount;
-    size_t HitchBins;
-    size_t HitchFullBins;
-    uint64_t HitchStartSecond;
-    size_t HitchStartBin;
-    uint32_t HitchSamples;
-    fextl::unordered_map<uint64_t, uint32_t> HitchCounts;
-    size_t HitchLines;
+    // The other sampled threads' samples of the current second, in time order: block header when In, native target |
+    // NativeSampleFlag otherwise (0 when unknown).
+    struct OtherSample {
+      uint8_t Bin;
+      bool In;
+      uint32_t TID;
+      uint64_t Value;
+    };
+    OtherSample OtherSamples[MaxOtherSamples];
+    size_t OtherSampleCount;
+    struct RunThread {
+      uint32_t Samples;
+      uint32_t InSim;
+      fextl::unordered_map<uint64_t, uint32_t> Counts;
+    };
+    // A Main run in progress (busy: emulated code in every bin; idle: none in any bin), which can go on into the next second.
+    struct Run {
+      size_t Bins;
+      size_t FullBins;
+      uint64_t StartSecond;
+      size_t StartBin;
+      uint32_t Samples;
+      fextl::unordered_map<uint64_t, uint32_t> Counts;
+      fextl::unordered_map<uint32_t, RunThread> Others;
+      size_t Lines;
+    };
+    Run Busy;
+    Run Idle;
 
     // Names of native functions seen by the native-call sampler, and the export tables of the modules they are in.
     struct ModuleExports {
@@ -480,7 +515,59 @@ namespace {
     return Out;
   }
 
-  // The module's name and its exported functions, from its export directory.
+  // The file name (without .dll/.exe) of the image or file mapped at Base, empty for anonymous memory.
+  fextl::string MappedFileName(uint64_t Base) {
+    alignas(8) uint8_t Buffer[sizeof(UNICODE_STRING) + 600 * sizeof(WCHAR)] {};
+    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Base), static_cast<MEMORY_INFORMATION_CLASS>(2) /* MemoryMappedFilenameInformation */,
+                             Buffer, sizeof(Buffer), nullptr) != STATUS_SUCCESS) {
+      return {};
+    }
+    const auto* Name = reinterpret_cast<const UNICODE_STRING*>(Buffer);
+    fextl::string Out;
+    for (USHORT i = 0; Name->Buffer && i < Name->Length / sizeof(WCHAR); ++i) {
+      const WCHAR c = Name->Buffer[i];
+      if (c == '\\' || c == '/') {
+        Out.clear();
+      } else {
+        Out.push_back(c > 0x20 && c < 0x7f ? static_cast<char>(c) : '_');
+      }
+    }
+    const size_t n = Out.size();
+    auto Lower = [](char c) {
+      return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    if (n > 4 && Out[n - 4] == '.' &&
+        ((Lower(Out[n - 3]) == 'd' && Lower(Out[n - 2]) == 'l' && Lower(Out[n - 1]) == 'l') ||
+         (Lower(Out[n - 3]) == 'e' && Lower(Out[n - 2]) == 'x' && Lower(Out[n - 1]) == 'e'))) {
+      Out.resize(n - 4);
+    }
+    return Out;
+  }
+
+  // Like ReadMemory, but falls back to page-sized pieces when one large read is refused.
+  bool ReadMemoryChunked(uint64_t Address, void* Out, size_t Size) {
+    if (ReadMemory(Address, Out, Size)) {
+      return true;
+    }
+    auto* Dest = static_cast<uint8_t*>(Out);
+    size_t Done = 0;
+    while (Done < Size) {
+      const uint64_t At = Address + Done;
+      const size_t Piece = std::min<size_t>(Size - Done, 4096 - (At & 4095));
+      if (!ReadMemory(At, Dest + Done, Piece)) {
+        return false;
+      }
+      Done += Piece;
+    }
+    return true;
+  }
+
+  // ARM64EC hybrid-patchable exports point at a small x64 thunk ("mov rax, rsp; mov [rax+20h], rbx; push rbp; pop rbp;
+  // jmp target") so that x86 code can hook them; ExitFunctionEC then enters the jmp target, which carries no name of its own.
+  constexpr uint8_t PatchableThunk[] = {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9};
+  constexpr size_t PatchableThunkSize = sizeof(PatchableThunk) + 4;
+
+  // The module's name and its exported functions, from its export directory, including the code behind patchable exports.
   const LogState::ModuleExports& ModuleExportsFor(LogState* State, uint64_t Base) {
     auto [It, Inserted] = State->Modules.try_emplace(Base);
     auto& M = It->second;
@@ -492,7 +579,13 @@ namespace {
     IMAGE_NT_HEADERS64 Nt {};
     if (!ReadMemory(Base, &Dos, sizeof(Dos)) || Dos.e_magic != IMAGE_DOS_SIGNATURE || !ReadMemory(Base + Dos.e_lfanew, &Nt, sizeof(Nt)) ||
         Nt.Signature != IMAGE_NT_SIGNATURE || Nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+      if (auto File = MappedFileName(Base); !File.empty()) {
+        M.Name = std::move(File);
+      }
       return M;
+    }
+    if (auto File = MappedFileName(Base); !File.empty()) {
+      M.Name = std::move(File);
     }
     const auto Dir = Nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     IMAGE_EXPORT_DIRECTORY Exports {};
@@ -513,9 +606,10 @@ namespace {
     const uint32_t Functions = std::min<uint32_t>(Exports.NumberOfFunctions, 65536);
     fextl::vector<uint32_t> NameRVAs(Names), FunctionRVAs(Functions);
     fextl::vector<uint16_t> Ordinals(Names);
-    if (!Names || !Functions || !ReadMemory(Base + Exports.AddressOfNames, NameRVAs.data(), Names * sizeof(uint32_t)) ||
-        !ReadMemory(Base + Exports.AddressOfNameOrdinals, Ordinals.data(), Names * sizeof(uint16_t)) ||
-        !ReadMemory(Base + Exports.AddressOfFunctions, FunctionRVAs.data(), Functions * sizeof(uint32_t))) {
+    if (!Names || !Functions || !ReadMemoryChunked(Base + Exports.AddressOfNames, NameRVAs.data(), Names * sizeof(uint32_t)) ||
+        !ReadMemoryChunked(Base + Exports.AddressOfNameOrdinals, Ordinals.data(), Names * sizeof(uint16_t)) ||
+        !ReadMemoryChunked(Base + Exports.AddressOfFunctions, FunctionRVAs.data(), Functions * sizeof(uint32_t))) {
+      StatsLogNote(fextl::fmt::format("native names: {} at {:X}: export tables unreadable (names={} functions={})", M.Name, Base, Names, Functions));
       return M;
     }
     for (uint32_t i = 0; i < Names; ++i) {
@@ -530,11 +624,47 @@ namespace {
       M.Functions.push_back({RVA, NameRVAs[i]});
     }
     std::sort(M.Functions.begin(), M.Functions.end());
+
+    // Follow patchable thunks to the code they jump to, reading each page of export entry points once.
+    const size_t Exported = M.Functions.size();
+    size_t Thunks = 0;
+    uint8_t Page[4096 + PatchableThunkSize];
+    uint64_t PageRVA = ~0ull;
+    size_t PageLength = 0;
+    for (size_t i = 0; i < Exported; ++i) {
+      const uint32_t RVA = M.Functions[i].first;
+      const uint64_t Want = RVA & ~4095ull;
+      if (Want != PageRVA) {
+        PageRVA = Want;
+        PageLength = ReadMemory(Base + PageRVA, Page, sizeof(Page)) ? sizeof(Page) : ReadMemory(Base + PageRVA, Page, 4096) ? 4096 : 0;
+      }
+      uint8_t Entry[PatchableThunkSize];
+      if ((RVA & 4095) + PatchableThunkSize <= PageLength) {
+        memcpy(Entry, Page + (RVA & 4095), sizeof(Entry));
+      } else if (!ReadMemory(Base + RVA, Entry, sizeof(Entry))) {
+        continue;
+      }
+      if (memcmp(Entry, PatchableThunk, sizeof(PatchableThunk)) != 0) {
+        continue;
+      }
+      int32_t Rel {};
+      memcpy(&Rel, Entry + sizeof(PatchableThunk), sizeof(Rel));
+      const int64_t Target = static_cast<int64_t>(RVA) + static_cast<int64_t>(PatchableThunkSize) + Rel;
+      if (Target > 0 && Target < Nt.OptionalHeader.SizeOfImage) {
+        M.Functions.push_back({static_cast<uint32_t>(Target), M.Functions[i].second});
+        ++Thunks;
+      }
+    }
+    std::sort(M.Functions.begin(), M.Functions.end());
+    StatsLogNote(fextl::fmt::format("native names: {} at {:X}: {} exports, {} patchable", M.Name, Base, Exported, Thunks));
     return M;
   }
 
+  // Exports further than this below an address are not taken as the function it is in.
+  constexpr uint32_t MaxNameDistance = 0x1000;
+
   // "module!export" (plus the offset when Address is inside the function rather than at its start), a name FEX gave it,
-  // or the address.
+  // or "module+RVA" / the address.
   fextl::string NativeName(LogState* State, uint64_t Address) {
     if (const auto It = State->NativeNames.find(Address); It != State->NativeNames.end()) {
       return It->second;
@@ -553,7 +683,7 @@ namespace {
         const auto& M = ModuleExportsFor(State, Base);
         const uint32_t RVA = static_cast<uint32_t>(Address - Base);
         auto It = std::upper_bound(M.Functions.begin(), M.Functions.end(), RVA, [](uint32_t Value, const auto& F) { return Value < F.first; });
-        if (It == M.Functions.begin()) {
+        if (It == M.Functions.begin() || RVA - std::prev(It)->first > MaxNameDistance) {
           Name = fextl::fmt::format("{}+{:X}", M.Name, RVA);
         } else {
           --It;
@@ -661,47 +791,122 @@ namespace {
     State->ProfileSamples[0] = State->ProfileSamples[1] = 0;
   }
 
-  fextl::string FormatHitch(LogState* State) {
-    fextl::vector<std::pair<uint32_t, uint64_t>> Blocks;
-    fextl::vector<std::pair<uint32_t, uint64_t>> Natives;
-    Blocks.reserve(State->HitchCounts.size());
-    for (const auto& [Header, Count] : State->HitchCounts) {
-      if (Header & NativeSampleFlag) {
-        Natives.push_back({Count, Header & ~NativeSampleFlag});
+  // Top entries of a sample count map, split into JIT blocks and native targets (NativeSampleFlag).
+  void SplitCounts(const fextl::unordered_map<uint64_t, uint32_t>& Counts, fextl::vector<std::pair<uint32_t, uint64_t>>& Blocks,
+                   fextl::vector<std::pair<uint32_t, uint64_t>>& Natives) {
+    for (const auto& [Value, Count] : Counts) {
+      if (Value & NativeSampleFlag) {
+        Natives.push_back({Count, Value & ~NativeSampleFlag});
       } else {
-        Blocks.push_back({Count, Header});
+        Blocks.push_back({Count, Value});
       }
     }
-    const size_t Printed = std::min(Blocks.size(), HitchPrinted);
-    std::partial_sort(Blocks.begin(), Blocks.begin() + Printed, Blocks.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    auto Text = fextl::fmt::format("# hitch t={}.{:02} {}ms full={}ms samples={} blocks={}:", State->HitchStartSecond, State->HitchStartBin,
-                                   State->HitchBins * 10, State->HitchFullBins * 10, State->HitchSamples, Blocks.size());
-    fextl::string Dumps;
-    for (size_t i = 0; i < Printed; ++i) {
+    const auto ByCount = [](const auto& a, const auto& b) {
+      return a.first > b.first;
+    };
+    std::sort(Blocks.begin(), Blocks.end(), ByCount);
+    std::sort(Natives.begin(), Natives.end(), ByCount);
+  }
+
+  void AppendBlocks(LogState* State, const fextl::vector<std::pair<uint32_t, uint64_t>>& Blocks, size_t Printed, size_t Dumped,
+                    fextl::string& Text, fextl::string& Dumps) {
+    for (size_t i = 0; i < std::min(Blocks.size(), Printed); ++i) {
       JITCodeTailMirror Tail {};
       if (!ReadBlockTail(Blocks[i].second, Tail)) {
         Text += fextl::fmt::format(" freed x{}", Blocks[i].first);
         continue;
       }
       Text += fextl::fmt::format(" {:X}@{:X} x{}", Tail.RIP, AllocationBase(Tail.RIP), Blocks[i].first);
-      if (i < HitchDumped) {
+      if (i < Dumped) {
         DumpBlock(State, Tail.RIP, Tail.GuestSize, Dumps);
       }
     }
-    // Where the thread was outside emulated code during the hitch.
-    if (!Natives.empty()) {
-      const size_t NativesPrinted = std::min<size_t>(Natives.size(), 3);
-      std::partial_sort(Natives.begin(), Natives.begin() + NativesPrinted, Natives.end(),
-                        [](const auto& a, const auto& b) { return a.first > b.first; });
-      Text += " native:";
-      for (size_t i = 0; i < NativesPrinted; ++i) {
-        Text += fextl::fmt::format(" {} x{}", NativeName(State, Natives[i].second), Natives[i].first);
+  }
+
+  void AppendNatives(LogState* State, const fextl::vector<std::pair<uint32_t, uint64_t>>& Natives, size_t Printed, fextl::string& Text) {
+    if (Natives.empty()) {
+      return;
+    }
+    Text += " native:";
+    for (size_t i = 0; i < std::min(Natives.size(), Printed); ++i) {
+      Text += fextl::fmt::format(" {} x{}", NativeName(State, Natives[i].second), Natives[i].first);
+    }
+  }
+
+  fextl::string FormatRun(LogState* State, const LogState::Run& R, const char* Kind) {
+    fextl::vector<std::pair<uint32_t, uint64_t>> Blocks, Natives;
+    SplitCounts(R.Counts, Blocks, Natives);
+    auto Text = fextl::fmt::format("# {} t={}.{:02} {}ms full={}ms samples={} blocks={}:", Kind, R.StartSecond, R.StartBin, R.Bins * 10,
+                                   R.FullBins * 10, R.Samples, Blocks.size());
+    fextl::string Dumps;
+    AppendBlocks(State, Blocks, HitchPrinted, HitchDumped, Text, Dumps);
+    // Where the thread was outside emulated code during the run.
+    AppendNatives(State, Natives, 3, Text);
+
+    // Other threads that mostly ran emulated code meanwhile.
+    fextl::vector<std::pair<uint32_t, const LogState::RunThread*>> Others;
+    for (const auto& [TID, T] : R.Others) {
+      if (T.InSim >= HitchOtherMinSamples && T.InSim * 100 >= T.Samples * HitchOtherMinPercent) {
+        Others.push_back({TID, &T});
       }
+    }
+    std::sort(Others.begin(), Others.end(), [](const auto& a, const auto& b) { return a.second->InSim > b.second->InSim; });
+    for (size_t i = 0; i < std::min(Others.size(), HitchOthersPrinted); ++i) {
+      const auto& T = *Others[i].second;
+      Text += fextl::fmt::format(" | tid={} {} emu={}%:", Others[i].first, QueryThreadName(Others[i].first), T.InSim * 100 / T.Samples);
+      fextl::vector<std::pair<uint32_t, uint64_t>> OtherBlocks, OtherNatives;
+      SplitCounts(T.Counts, OtherBlocks, OtherNatives);
+      AppendBlocks(State, OtherBlocks, HitchOtherBlocksPrinted, 2, Text, Dumps);
+      AppendNatives(State, OtherNatives, 1, Text);
+    }
+    if (Others.size() > HitchOthersPrinted) {
+      Text += fextl::fmt::format(" | +{} busy", Others.size() - HitchOthersPrinted);
     }
     return Text + "\n" + Dumps;
   }
 
-  // Finds runs of emulated code on the Main thread in this second's timeline bins, see HitchMinBins.
+  void StartRun(LogState::Run& R, uint64_t Seconds, size_t Bin) {
+    R.StartSecond = Seconds;
+    R.StartBin = Bin;
+    R.FullBins = 0;
+    R.Samples = 0;
+    R.Counts.clear();
+    R.Others.clear();
+  }
+
+  // Adds bin Bin's samples to the run. s and o are cursors into this second's Main and other samples, which are in bin order.
+  void AddRunBin(LogState* State, LogState::Run& R, size_t Bin, size_t& s, size_t& o) {
+    while (s < State->MainSampleCount && State->MainSamples[s].Bin < Bin) {
+      ++s;
+    }
+    for (; s < State->MainSampleCount && State->MainSamples[s].Bin == Bin; ++s) {
+      ++R.Counts[State->MainSamples[s].Header];
+      ++R.Samples;
+    }
+    while (o < State->OtherSampleCount && State->OtherSamples[o].Bin < Bin) {
+      ++o;
+    }
+    for (; o < State->OtherSampleCount && State->OtherSamples[o].Bin == Bin; ++o) {
+      const auto& O = State->OtherSamples[o];
+      auto& T = R.Others[O.TID];
+      ++T.Samples;
+      T.InSim += O.In ? 1 : 0;
+      if (O.Value) {
+        ++T.Counts[O.Value];
+      }
+    }
+  }
+
+  void EndRun(LogState* State, LogState::Run& R, const char* Kind, fextl::string& Out) {
+    if (R.Bins >= HitchMinBins && R.Lines < MaxHitchLines) {
+      ++R.Lines;
+      Out += FormatRun(State, R, Kind);
+    }
+    R.Bins = 0;
+  }
+
+  // Finds runs of emulated code (hitch) and of no emulated code (stall) on the Main thread in this second's timeline bins, see
+  // HitchMinBins.
   fextl::string MainHitches(LogState* State, uint64_t Seconds) {
     const SampledThread* Main = nullptr;
     for (size_t i = 0; i < State->SampledCount; ++i) {
@@ -712,40 +917,39 @@ namespace {
     }
     fextl::string Out;
     size_t s = 0;
+    size_t o = 0;
     for (size_t b = 0; b < TimelineBins; ++b) {
       bool Busy = false;
+      bool Idle = false;
       bool Full = false;
       if (Main && Main->BinSamples[b]) {
         const uint32_t Tenths = (Main->BinInSimulation[b] * 10 + Main->BinSamples[b] / 2) / Main->BinSamples[b];
         Busy = Tenths > 0;
+        Idle = Main->BinInSimulation[b] == 0;
         Full = Tenths >= 10;
       }
       if (Busy) {
-        if (!State->HitchBins) {
-          State->HitchStartSecond = Seconds;
-          State->HitchStartBin = b;
-          State->HitchFullBins = 0;
-          State->HitchSamples = 0;
-          State->HitchCounts.clear();
+        if (!State->Busy.Bins) {
+          StartRun(State->Busy, Seconds, b);
         }
-        ++State->HitchBins;
-        State->HitchFullBins += Full ? 1 : 0;
-        while (s < State->MainSampleCount && State->MainSamples[s].Bin < b) {
-          ++s;
+        ++State->Busy.Bins;
+        State->Busy.FullBins += Full ? 1 : 0;
+        AddRunBin(State, State->Busy, b, s, o);
+      } else if (State->Busy.Bins) {
+        EndRun(State, State->Busy, "hitch", Out);
+      }
+      if (Idle) {
+        if (!State->Idle.Bins) {
+          StartRun(State->Idle, Seconds, b);
         }
-        for (; s < State->MainSampleCount && State->MainSamples[s].Bin == b; ++s) {
-          ++State->HitchCounts[State->MainSamples[s].Header];
-          ++State->HitchSamples;
-        }
-      } else if (State->HitchBins) {
-        if (State->HitchBins >= HitchMinBins && State->HitchLines < MaxHitchLines) {
-          ++State->HitchLines;
-          Out += FormatHitch(State);
-        }
-        State->HitchBins = 0;
+        ++State->Idle.Bins;
+        AddRunBin(State, State->Idle, b, s, o);
+      } else if (State->Idle.Bins) {
+        EndRun(State, State->Idle, "stall", Out);
       }
     }
     State->MainSampleCount = 0;
+    State->OtherSampleCount = 0;
     return Out;
   }
 
@@ -779,13 +983,19 @@ namespace {
             State->MainSamples[State->MainSampleCount++] = {static_cast<uint8_t>(Bin), Header};
           }
         }
+        uint64_t NativeTarget {};
         if (!In && T.NativeTarget) {
           if (const uint64_t Target = *T.NativeTarget) {
+            NativeTarget = Target;
             CountNative(T, Target);
             if (T.IsMain && State->MainSampleCount < MaxMainSamples) {
               State->MainSamples[State->MainSampleCount++] = {static_cast<uint8_t>(Bin), Target | NativeSampleFlag};
             }
           }
+        }
+        if (State->Profile && !T.IsMain && State->OtherSampleCount < MaxOtherSamples) {
+          const uint64_t Value = In ? (T.BlockHeader ? *T.BlockHeader : 0) : (NativeTarget ? NativeTarget | NativeSampleFlag : 0);
+          State->OtherSamples[State->OtherSampleCount++] = {static_cast<uint8_t>(Bin), In, T.TID, Value};
         }
         if (T.BinSamples[Bin] < 255) {
           ++T.BinSamples[Bin];
@@ -805,6 +1015,124 @@ namespace {
       }
     }
     return nullptr;
+  }
+
+  constexpr const char* DCMissNames[8] = {"notreading", "anonoff", "anondecode", "range", "noindex", "nomatch", "badentry", "notloaded"};
+  constexpr const char* DCStoreNames[8] = {"queued", "nokey", "notwriting", "customir", "reloc", "decode", "bucket", "dupe"};
+  constexpr size_t DCWherePrinted = 4;
+  constexpr size_t DCWhereRVAs = 3;
+
+  // Disk cache misses or store refusals of the last second, grouped by the module (or anonymous allocation) the RIP is in.
+  struct DCWhere {
+    uint32_t Count;
+    uint32_t Reasons[8];
+    fextl::vector<uint32_t> RVAs;
+  };
+
+  void AddDCWhere(fextl::unordered_map<uint64_t, DCWhere>& Where, uint64_t Packed) {
+    const uint64_t RIP = Packed & ((1ull << 56) - 1);
+    const uint8_t Reason = static_cast<uint8_t>(Packed >> 56) & 7;
+    const uint64_t Base = AllocationBase(RIP);
+    auto& W = Where[Base];
+    ++W.Count;
+    ++W.Reasons[Reason];
+    const uint32_t RVA = static_cast<uint32_t>(RIP - Base);
+    if (W.RVAs.size() < DCWhereRVAs && std::find(W.RVAs.begin(), W.RVAs.end(), RVA) == W.RVAs.end()) {
+      W.RVAs.push_back(RVA);
+    }
+  }
+
+  fextl::string FormatDCWhere(LogState* State, const char* Title, const fextl::unordered_map<uint64_t, DCWhere>& Where, const char* const* Names) {
+    if (Where.empty()) {
+      return {};
+    }
+    fextl::vector<std::pair<uint32_t, uint64_t>> Order;
+    for (const auto& [Base, W] : Where) {
+      Order.push_back({W.Count, Base});
+    }
+    std::sort(Order.begin(), Order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    auto Out = fextl::fmt::format("  {}", Title);
+    for (size_t i = 0; i < std::min(Order.size(), DCWherePrinted); ++i) {
+      const uint64_t Base = Order[i].second;
+      const auto& W = Where.at(Base);
+      const auto& M = ModuleExportsFor(State, Base);
+      Out += fextl::fmt::format(" {} x{} [", M.Name, W.Count);
+      bool First = true;
+      for (int r = 0; r < 8; ++r) {
+        if (W.Reasons[r]) {
+          Out += fextl::fmt::format("{}{} {}", First ? "" : " ", Names[r], W.Reasons[r]);
+          First = false;
+        }
+      }
+      Out += "]";
+      for (const auto RVA : W.RVAs) {
+        Out += fextl::fmt::format(" +{:X}", RVA);
+      }
+      Out += ";";
+    }
+    if (Order.size() > DCWherePrinted) {
+      Out += fextl::fmt::format(" +{} more", Order.size() - DCWherePrinted);
+    }
+    return Out + "\n";
+  }
+
+  // Process page faults that had to read from storage, and bytes read from storage, from procfs (through Wine's Z: drive).
+  bool IOUnreadable {};
+  bool IOHavePrev {};
+  uint64_t IOPrevMajorFaults {}, IOPrevReadBytes {};
+
+  bool ReadSmallFile(const char* Path, char* Buf, size_t Size) {
+    FILE* F = fopen(Path, "r");
+    if (!F) {
+      return false;
+    }
+    const size_t Len = fread(Buf, 1, Size - 1, F);
+    fclose(F);
+    Buf[Len] = 0;
+    return Len != 0;
+  }
+
+  fextl::string IOLine() {
+    if (IOUnreadable) {
+      return {};
+    }
+    uint64_t MajorFaults {}, ReadBytes {};
+    bool HaveFaults {}, HaveRead {};
+    char Buf[1024];
+    if (ReadSmallFile("Z:\\proc\\self\\stat", Buf, sizeof(Buf))) {
+      // Fields after the command name, which is in parentheses and may contain spaces: state is field 3, majflt field 12.
+      if (const char* P = strrchr(Buf, ')')) {
+        int Field = 2;
+        for (++P; *P && Field < 12; ++P) {
+          if (*P == ' ') {
+            ++Field;
+            if (Field == 12) {
+              MajorFaults = strtoull(P + 1, nullptr, 10);
+              HaveFaults = true;
+            }
+          }
+        }
+      }
+    }
+    if (ReadSmallFile("Z:\\proc\\self\\io", Buf, sizeof(Buf))) {
+      if (const char* P = strstr(Buf, "\nread_bytes:")) {
+        ReadBytes = strtoull(P + 12, nullptr, 10);
+        HaveRead = true;
+      }
+    }
+    if (!HaveFaults && !HaveRead) {
+      IOUnreadable = true;
+      return "  io=unreadable\n";
+    }
+    fextl::string Out;
+    if (IOHavePrev) {
+      Out = fextl::fmt::format("  io majflt={} read={:.1f}MB\n", HaveFaults ? MajorFaults - std::min(MajorFaults, IOPrevMajorFaults) : 0,
+                               HaveRead ? static_cast<double>(ReadBytes - std::min(ReadBytes, IOPrevReadBytes)) / (1024.0 * 1024.0) : 0.0);
+    }
+    IOPrevMajorFaults = MajorFaults;
+    IOPrevReadBytes = ReadBytes;
+    IOHavePrev = true;
+    return Out;
   }
 
   void* LogThread(void* Arg) {
@@ -861,7 +1189,16 @@ namespace {
         Cur.MaxSignalAt = Take(Mutable->MaxSignalAt);
         Cur.MaxDiskCacheLookupTime = Take(Mutable->MaxDiskCacheLookupTime);
         Cur.MaxDiskCacheLookupAt = Take(Mutable->MaxDiskCacheLookupAt);
+        Cur.DCMissRIPCount = std::atomic_ref<uint64_t>(Mutable->DiskCacheMissRIPCount).load(std::memory_order_acquire);
+        Cur.DCRejectRIPCount = std::atomic_ref<uint64_t>(Mutable->DiskCacheRejectRIPCount).load(std::memory_order_acquire);
+        for (int i = 0; i < 8; ++i) {
+          Cur.DCMisses[i] = Slot.DiskCacheMisses[i];
+          Cur.DCStores[i] = Slot.DiskCacheStores[i];
+        }
       });
+
+      uint64_t DCMisses[8] {}, DCStores[8] {};
+      fextl::unordered_map<uint64_t, DCWhere> MissWhere, RejectWhere;
 
       struct Delta {
         Sample D;
@@ -920,6 +1257,21 @@ namespace {
             },
         };
         Entry.Slot = Slots[CurIndex];
+        for (int i = 0; i < 8; ++i) {
+          DCMisses[i] += Diff(Cur.DCMisses[i], Old->DCMisses[i]);
+          DCStores[i] += Diff(Cur.DCStores[i], Old->DCStores[i]);
+        }
+        {
+          // The newest ring entries since last second (at most 16 each).
+          const uint64_t MissFrom = Cur.DCMissRIPCount >= Old->DCMissRIPCount ? Old->DCMissRIPCount : 0;
+          for (uint64_t i = std::max(MissFrom, Cur.DCMissRIPCount >= 16 ? Cur.DCMissRIPCount - 16 : 0); i < Cur.DCMissRIPCount; ++i) {
+            AddDCWhere(MissWhere, Entry.Slot->DiskCacheMissRIPs[i % 16]);
+          }
+          const uint64_t RejectFrom = Cur.DCRejectRIPCount >= Old->DCRejectRIPCount ? Old->DCRejectRIPCount : 0;
+          for (uint64_t i = std::max(RejectFrom, Cur.DCRejectRIPCount >= 16 ? Cur.DCRejectRIPCount - 16 : 0); i < Cur.DCRejectRIPCount; ++i) {
+            AddDCWhere(RejectWhere, Entry.Slot->DiskCacheRejectRIPs[i % 16]);
+          }
+        }
         // 100ns units over a 1s interval: 10'000'000 == 100%.
         Entry.CPUPercent = static_cast<double>(Entry.D.CPUTime100ns) / 100'000.0;
         TotalCPU += Entry.CPUPercent;
@@ -1033,6 +1385,42 @@ namespace {
       } else if (ClocksUnreadable && Seconds == 1) {
         Line += "  clk=unreadable\n";
       }
+
+      // Disk cache outcomes: why compiles missed, what happened to the compiled code, and what the writer did with it.
+      {
+        static uint64_t PrevWritten, PrevFailed, PrevMemoryOnly;
+        const auto& Writer = FEXCore::SHMStats::DiskCacheWriter;
+        const uint64_t Written = Writer.Written.load(std::memory_order_relaxed);
+        const uint64_t Failed = Writer.Failed.load(std::memory_order_relaxed);
+        const uint64_t MemoryOnly = Writer.MemoryOnly.load(std::memory_order_relaxed);
+        fextl::string Outcome;
+        auto Add = [&Outcome](const char* Name, uint64_t Value) {
+          if (Value) {
+            Outcome += fextl::fmt::format(" {}={}", Name, Value);
+          }
+        };
+        for (int i = 0; i < 8; ++i) {
+          Add(DCMissNames[i], DCMisses[i]);
+        }
+        Outcome += " | store";
+        for (int i = 0; i < 8; ++i) {
+          Add(DCStoreNames[i], DCStores[i]);
+        }
+        Outcome += " | writer";
+        Add("written", Written - PrevWritten);
+        Add("failed", Failed - PrevFailed);
+        Add("memonly", MemoryOnly - PrevMemoryOnly);
+        PrevWritten = Written;
+        PrevFailed = Failed;
+        PrevMemoryOnly = MemoryOnly;
+        if (Outcome != " | store | writer") {
+          Line += fextl::fmt::format("  dco miss{}\n", Outcome);
+        }
+        Line += FormatDCWhere(State, "dc missed at:", MissWhere, DCMissNames);
+        Line += FormatDCWhere(State, "dc refused at:", RejectWhere, DCStoreNames);
+      }
+
+      Line += IOLine();
 
       if (Seconds % 10 == 1) {
         Line += MemoryLine();
@@ -1149,7 +1537,10 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "smc = writes to translated code; sigbus = unaligned atomic fixups; sig = time in exception "
                                    "handling; miss = lookup cache misses; lock = lookup cache lock time; x87fb = x87 fallbacks; dc = disk "
                                    "cache hits; emu = share of the second spent in emulated x86 code (the rest of cpu is native: "
-                                   "Wine, VKD3D, driver)\n",
+                                   "Wine, VKD3D, driver); dco = why compiles missed the disk cache and what happened to the code "
+                                   "compiled instead; io = page faults that read storage, and storage reads; with FEX_STATSLOG_PROFILE=1, "
+                                   "'# hitch' / '# stall' = Main ran emulated code / no emulated code for 100ms or more, with the other "
+                                   "threads that were busy in emulated code meanwhile\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.

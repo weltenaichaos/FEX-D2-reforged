@@ -953,6 +953,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
         return CachedHostCode;
       }
     }
+    if (Hit) {
+      FEXCore::SHMStats::NoteDiskCacheMiss(Thread->ThreadStats, FEXCore::SHMStats::DC_MISS_NOT_LOADED, GuestRIP);
+    }
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheMissCount, 1);
   }
 
@@ -1040,6 +1043,8 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       const Frontend::Decoder::DecodedBlockInformation* BlockInfo =
         NeedsAddGuestCodeRanges ? Thread->FrontendDecoder->GetDecodedBlockInfo() : nullptr;
       DiskCache.Store(Thread, Region, GuestRIP, *DiskCacheGuestCodeKey, GuestCode, CompiledCode, Relocations, BlockInfo);
+    } else {
+      FEXCore::SHMStats::NoteDiskCacheStore(Thread->ThreadStats, FEXCore::SHMStats::DC_STORE_NO_KEY, GuestRIP);
     }
 
     if (CodeMapWriter && Region && Region->FileStartVA != 0) {

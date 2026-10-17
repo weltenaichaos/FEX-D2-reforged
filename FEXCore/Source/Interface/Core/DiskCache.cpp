@@ -24,6 +24,9 @@
 #include <atomic>
 
 namespace FEXCore {
+namespace SHMStats {
+  DiskCacheWriterStats DiskCacheWriter {};
+} // namespace SHMStats
 
 namespace DiskCache {
 
@@ -549,8 +552,12 @@ namespace DiskCache {
 
   std::optional<CodeHitData> DiskCache::Lookup(Core::InternalThreadState* Thread, std::optional<ExecutableFileSectionInfo> Region,
                                                uint64_t GuestRIP, std::optional<uint64_t>& GuestCodeKey) {
-    if (!IsReadingDiskCache()) {
+    const auto Miss = [Thread, GuestRIP](FEXCore::SHMStats::DiskCacheMissReason Reason) {
+      FEXCore::SHMStats::NoteDiskCacheMiss(Thread->ThreadStats, Reason, GuestRIP);
       return std::nullopt;
+    };
+    if (!IsReadingDiskCache()) {
+      return Miss(FEXCore::SHMStats::DC_MISS_NOT_READING);
     }
     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> KeyTimer;
     KeyTimer.emplace(Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedDiskCacheKeyTime : nullptr);
@@ -562,7 +569,7 @@ namespace DiskCache {
       GuestCodeKey = XXH3_64bits(&FileBackedKey, sizeof(FileBackedKey));
     } else {
       if (!AnonCaching) {
-        return std::nullopt;
+        return Miss(FEXCore::SHMStats::DC_MISS_ANON_OFF);
       }
       Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(GuestRIP), AnonPrefixGuestBytes);
       const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
@@ -571,7 +578,7 @@ namespace DiskCache {
       XXH3_64bits_reset(&HashState);
       for (auto& SubBlock : BlockInfo->Blocks) {
         if (SubBlock.BlockStatus != Frontend::Decoder::DecodedBlockStatus::SUCCESS) {
-          return std::nullopt;
+          return Miss(FEXCore::SHMStats::DC_MISS_ANON_DECODE);
         }
         uint64_t HashStart = SubBlock.Entry;
         // skip over masked in-block data and data/etc gaps between blocks
@@ -593,7 +600,7 @@ namespace DiskCache {
 
     auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
     if (RangeInfo.Size == 0 || RangeInfo.Base > GuestRIP) {
-      return std::nullopt;
+      return Miss(FEXCore::SHMStats::DC_MISS_RANGE);
     }
     uint64_t Available = RangeInfo.Base + RangeInfo.Size - GuestRIP;
 
@@ -618,7 +625,7 @@ namespace DiskCache {
       auto It = Index.find(LookupKey);
       if (It == Index.end()) {
         // definite miss
-        return std::nullopt;
+        return Miss(FEXCore::SHMStats::DC_MISS_NO_INDEX);
       }
 
       MainEntry = It->second.MainEntry;
@@ -759,7 +766,7 @@ namespace DiskCache {
     }
 
     if (!FoundMatchingHash || !EntryUnderReview) {
-      return std::nullopt;
+      return Miss(FEXCore::SHMStats::DC_MISS_NO_MATCH);
     }
 
     IndexEntry& Entry = *EntryUnderReview;
@@ -796,13 +803,13 @@ namespace DiskCache {
     } else {
       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheFileReadCount, 1);
       if (!Entry.DB->ReadCacheBlob(Entry.Offset, {HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode})) {
-        return std::nullopt;
+        return Miss(FEXCore::SHMStats::DC_MISS_BAD_ENTRY);
       }
     }
     ReadTimer.reset();
 
     if (EntrySizeWithoutGuestCode < sizeof(BlobFixedHeader)) {
-      return std::nullopt;
+      return Miss(FEXCore::SHMStats::DC_MISS_BAD_ENTRY);
     }
     BlobFixedHeader Header;
     memcpy(&Header, HitData.Blob.data() + BlobOffset, sizeof(Header));
@@ -811,11 +818,11 @@ namespace DiskCache {
     uint32_t SizeNeeded = sizeof(Header) + Header.HostSize + Header.EntryPointCount * (sizeof(uint64_t) + sizeof(uint32_t));
     SizeNeeded += Header.SmallRelocCount * sizeof(BlobSmallRelocation) + Header.ThunkRelocCount * sizeof(BlobThunkRelocation);
     if (EntrySizeWithoutGuestCode != SizeNeeded) {
-      return std::nullopt;
+      return Miss(FEXCore::SHMStats::DC_MISS_BAD_ENTRY);
     }
 
     if (Entry.GuestSize != Header.GuestSize || !XXH128_isEqual(Header.GuestHash, Entry.GuestHash)) {
-      return std::nullopt;
+      return Miss(FEXCore::SHMStats::DC_MISS_BAD_ENTRY);
     }
 
     bool StoreInMemory = !FoundInLRU;
@@ -863,7 +870,7 @@ namespace DiskCache {
     {
       FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheRelocTime);
       if (!CTX->CodeCache.ApplyPackedCodeRelocations(GuestRIP, std::as_writable_bytes(HitData.HostCode), SmallRelocs, ThunkRelocs)) {
-        return std::nullopt;
+        return Miss(FEXCore::SHMStats::DC_MISS_BAD_ENTRY);
       }
     }
 
@@ -947,6 +954,8 @@ namespace DiskCache {
     void Run() override {
       struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
       bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
+      auto& WriterStats = FEXCore::SHMStats::DiskCacheWriter;
+      (!StoreDisk ? WriterStats.MemoryOnly : DiskSuccess ? WriterStats.Written : WriterStats.Failed).fetch_add(1, std::memory_order_relaxed);
 
       bool KeepEntryInMemory = true;
       // todo possible other lru condition here like entry size?
@@ -990,11 +999,15 @@ namespace DiskCache {
   bool DiskCache::Store(Core::InternalThreadState* Thread, std::optional<ExecutableFileSectionInfo> Region, uint64_t GuestRIP,
                         uint64_t GuestCodeKey, std::span<const uint8_t> GuestCode, const CPU::CPUBackend::CompiledCode& CompiledCode,
                         std::span<const FEXCore::CPU::Relocation> Relocations, const Frontend::Decoder::DecodedBlockInformation* DecodedBlockInfo) {
-    if (!IsWritingDiskCache()) {
+    const auto Refuse = [Thread, GuestRIP](FEXCore::SHMStats::DiskCacheStoreResult Result) {
+      FEXCore::SHMStats::NoteDiskCacheStore(Thread->ThreadStats, Result, GuestRIP);
       return false;
+    };
+    if (!IsWritingDiskCache()) {
+      return Refuse(FEXCore::SHMStats::DC_STORE_NOT_WRITING);
     }
     if (!DecodedBlockInfo) {
-      return false;
+      return Refuse(FEXCore::SHMStats::DC_STORE_NO_BLOCK_INFO);
     }
     // check for any reloc targets outside of our jurisdiction
     // todo what are they exactly? caching those blocks is great when it works, so need to figure this out and make finer-grained if we can
@@ -1015,7 +1028,7 @@ namespace DiskCache {
         auto TargetSection = CTX->SyscallHandler->LookupExecutableFileSection(Thread, Target);
         if (!TargetSection || TargetSection->FileInfo.FileId != Region->FileInfo.FileId) {
           // we don't know where it's pointing, so we don't know how to encode the offset, so we can't cache atm
-          return false;
+          return Refuse(FEXCore::SHMStats::DC_STORE_RELOC);
         }
       }
     }
@@ -1136,7 +1149,7 @@ namespace DiskCache {
     const Frontend::Decoder::DecodedBlocks* LastBlock = nullptr;
     for (auto& SubBlock : DecodedBlockInfo->Blocks) {
       if (SubBlock.BlockStatus != Frontend::Decoder::DecodedBlockStatus::SUCCESS) {
-        return false;
+        return Refuse(FEXCore::SHMStats::DC_STORE_DECODE);
       }
       if (!CurStartExtent) {
         CurStartExtent = SubBlock.Entry;
@@ -1221,12 +1234,13 @@ namespace DiskCache {
         }
         // could happen if it's seen again while in flight in the store queue
         if (Dupe) {
+          FEXCore::SHMStats::NoteDiskCacheStore(Thread->ThreadStats, FEXCore::SHMStats::DC_STORE_DUPE, GuestRIP);
           return true;
         }
         if (!It->second.MoreEntries.get()) {
           It->second.MoreEntries = fextl::make_unique<fextl::multimap<uint64_t, struct IndexEntry>>();
         } else if (It->second.MoreEntries->size() >= LOOKUP_KEY_MAX_BUCKET_DEPTH) {
-          return false;
+          return Refuse(FEXCore::SHMStats::DC_STORE_BUCKET);
         }
         It->second.MoreEntries->insert({GuestFootprint, std::move(NewEntry)});
       }
@@ -1267,6 +1281,7 @@ namespace DiskCache {
     }
 
     // hand the rest off to the writer thread
+    FEXCore::SHMStats::NoteDiskCacheStore(Thread->ThreadStats, FEXCore::SHMStats::DC_STORE_QUEUED, GuestRIP);
     Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize),
                                                              std::move(IndexBlob), StoreDisk));
     return true;

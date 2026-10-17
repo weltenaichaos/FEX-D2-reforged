@@ -90,7 +90,72 @@ struct ThreadStats {
   uint64_t MaxSignalAt;
   uint64_t MaxDiskCacheLookupTime;
   uint64_t MaxDiskCacheLookupAt;
+
+  // Why compiles were not served from the disk cache (indexed by DiskCacheMissReason) and what happened when the
+  // compiled code was offered back to it (indexed by DiskCacheStoreResult).
+  uint64_t DiskCacheMisses[8];
+  uint64_t DiskCacheStores[8];
+  // The latest misses and store refusals: guest RIP in the low 56 bits, the reason in the top 8 bits. Rings indexed by
+  // the counts, written by the owning thread only.
+  uint64_t DiskCacheMissRIPs[16];
+  uint64_t DiskCacheRejectRIPs[16];
+  uint64_t DiskCacheMissRIPCount;
+  uint64_t DiskCacheRejectRIPCount;
+  uint64_t Pad[4];
 };
+
+enum DiskCacheMissReason : uint8_t {
+  DC_MISS_NOT_READING,
+  DC_MISS_ANON_OFF,     // not file backed and anonymous caching off
+  DC_MISS_ANON_DECODE,  // not file backed and its first bytes didn't decode
+  DC_MISS_RANGE,        // no executable range around the RIP
+  DC_MISS_NO_INDEX,     // nothing stored under this key
+  DC_MISS_NO_MATCH,     // entries under this key, but none matches the live guest code
+  DC_MISS_BAD_ENTRY,    // a matching entry that couldn't be read or relocated
+  DC_MISS_NOT_LOADED,   // a hit that wasn't installed (validation mode or code buffer refused it)
+};
+
+enum DiskCacheStoreResult : uint8_t {
+  DC_STORE_QUEUED,
+  DC_STORE_NO_KEY,      // the lookup had no key for it, so it was never offered
+  DC_STORE_NOT_WRITING,
+  DC_STORE_NO_BLOCK_INFO, // custom IR or no decoder information
+  DC_STORE_RELOC,       // a relocation points outside the code's own file
+  DC_STORE_DECODE,      // part of the block didn't decode cleanly
+  DC_STORE_BUCKET,      // too many variants under this key already
+  DC_STORE_DUPE,        // already stored (or in flight)
+};
+
+// What the disk cache writer did with queued entries, process wide.
+struct DiskCacheWriterStats {
+  std::atomic<uint64_t> Written;
+  std::atomic<uint64_t> Failed;     // file write or lock failed, the entry only lives in memory this session
+  std::atomic<uint64_t> MemoryOnly; // cache file full
+};
+extern DiskCacheWriterStats DiskCacheWriter;
+
+inline void NoteDiskCacheMiss(ThreadStats* Stats, DiskCacheMissReason Reason, uint64_t GuestRIP) {
+  if (!Stats) {
+    return;
+  }
+  ++Stats->DiskCacheMisses[Reason];
+  const uint64_t Count = Stats->DiskCacheMissRIPCount;
+  Stats->DiskCacheMissRIPs[Count % 16] = (GuestRIP & ((1ull << 56) - 1)) | (static_cast<uint64_t>(Reason) << 56);
+  std::atomic_ref<uint64_t>(Stats->DiskCacheMissRIPCount).store(Count + 1, std::memory_order_release);
+}
+
+inline void NoteDiskCacheStore(ThreadStats* Stats, DiskCacheStoreResult Result, uint64_t GuestRIP) {
+  if (!Stats) {
+    return;
+  }
+  ++Stats->DiskCacheStores[Result];
+  if (Result == DC_STORE_QUEUED || Result == DC_STORE_DUPE) {
+    return;
+  }
+  const uint64_t Count = Stats->DiskCacheRejectRIPCount;
+  Stats->DiskCacheRejectRIPs[Count % 16] = (GuestRIP & ((1ull << 56) - 1)) | (static_cast<uint64_t>(Result) << 56);
+  std::atomic_ref<uint64_t>(Stats->DiskCacheRejectRIPCount).store(Count + 1, std::memory_order_release);
+}
 
 // Ensure 16-byte alignment to take advantage of ARM single-copy atomicity.
 static_assert(sizeof(ThreadStats) % 16 == 0, "Needs to be 16-byte aligned!");
