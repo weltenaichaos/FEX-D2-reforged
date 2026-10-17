@@ -14,7 +14,9 @@ $end_info$
 //
 // Storing doesn't wait for the disk: the game's thread copies the output into a ring buffer, and a writer thread hashes
 // and writes it, in the order the space was taken. A stream can be found once it is written; when the ring is full, new
-// streams aren't stored this time. The ring is allocated once, so copying into it doesn't fault in fresh pages.
+// streams aren't stored this time. The ring is allocated once and faulted in by the writer, so copying into it doesn't
+// fault in fresh pages. If the writer isn't ready a few seconds after the cache opened, the game's threads write
+// themselves.
 
 #include "NativeUnpackCache.h"
 #include "Windows/Common/StatsLog.h"
@@ -114,7 +116,6 @@ struct Cache {
   uint64_t RingHead {};
   uint64_t RingTail {};
   std::condition_variable QueueWake;
-  fextl::unique_ptr<FEXCore::Threads::Thread> Writer;
 };
 
 Cache* TheCache {};
@@ -237,73 +238,103 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
   return 1;
 }
 
-extern "C" void FEXUnpackCachePut(const uint64_t Key[2], const uint8_t* Out, uint32_t Produced, uint32_t Trailer) {
-  auto* C = TheCache;
-  if (!C || C->Full) {
-    return;
+namespace {
+// Takes data and index space for a new stream and marks its key as taken, so it's stored only once. With UseRing, also
+// takes ring space and queues the job (Job then points at the queued copy). Returns false when the stream isn't stored.
+bool Reserve(Cache* C, const uint64_t Key[2], uint32_t Produced, uint32_t Trailer, bool UseRing, Job*& J, Job& Direct) {
+  std::scoped_lock Guard {C->Lock};
+  if (C->Entries.contains({Key[0], Key[1]})) {
+    return false;
   }
-  const uint64_t Start = ReadTicks();
-
-  if (!C->RingReady.load(std::memory_order_acquire)) {
-    __atomic_fetch_add(&FEXUnpackCacheStats.Dropped, 1, __ATOMIC_RELAXED);
-    return;
-  }
-
-  Job* J;
-  {
-    std::scoped_lock Guard {C->Lock};
-    if (C->Entries.contains({Key[0], Key[1]})) {
-      return;
-    }
+  uint64_t RingStart = C->RingHead;
+  if (UseRing) {
     // The data has to be in one piece: skip what's left at the end of the ring if it doesn't fit there.
-    uint64_t RingStart = C->RingHead;
     if (RingStart % RingSize + Produced > RingSize) {
       RingStart += RingSize - RingStart % RingSize;
     }
     if (RingStart + Produced - C->RingTail > RingSize) {
       __atomic_fetch_add(&FEXUnpackCacheStats.Dropped, 1, __ATOMIC_RELAXED);
-      return;
+      return false;
     }
-    if (C->DataEnd + Produced > C->MaxDataBytes) {
-      C->Full = true;
-      FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: full at {} MB, not storing more", C->DataEnd >> 20));
-      return;
-    }
-    Job New {};
-    New.R.Key[0] = Key[0];
-    New.R.Key[1] = Key[1];
-    New.R.Produced = Produced;
-    New.R.Trailer = Trailer;
-    New.R.Offset = C->DataEnd;
-    New.RecordOffset = C->IndexEnd;
+  }
+  if (C->DataEnd + Produced > C->MaxDataBytes) {
+    C->Full = true;
+    FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: full at {} MB, not storing more", C->DataEnd >> 20));
+    return false;
+  }
+  Job New {};
+  New.R.Key[0] = Key[0];
+  New.R.Key[1] = Key[1];
+  New.R.Produced = Produced;
+  New.R.Trailer = Trailer;
+  New.R.Offset = C->DataEnd;
+  New.RecordOffset = C->IndexEnd;
+  C->DataEnd = AlignUp(C->DataEnd + Produced, DataAlignment);
+  C->IndexEnd += sizeof(Record);
+  C->Entries.emplace(std::pair {Key[0], Key[1]}, Entry {New.R.Offset, 0, Produced, Trailer, false});
+  if (UseRing) {
     New.RingStart = RingStart;
     New.RingEnd = RingStart + Produced;
-    C->DataEnd = AlignUp(C->DataEnd + Produced, DataAlignment);
-    C->IndexEnd += sizeof(Record);
     C->RingHead = New.RingEnd;
-    C->Entries.emplace(std::pair {Key[0], Key[1]}, Entry {New.R.Offset, 0, Produced, Trailer, false});
     // Stays valid while other jobs are added and taken: a deque keeps its elements in place, and the writer doesn't take
     // this one before it's ready.
     J = &C->Queue.emplace_back(New);
+  } else {
+    Direct = New;
+    J = &Direct;
   }
-
-  memcpy(C->Ring + J->RingStart % RingSize, Out, Produced);
-  {
-    std::scoped_lock Guard {C->Lock};
-    J->Ready = true;
-  }
-  C->QueueWake.notify_one();
-  __atomic_fetch_add(&FEXUnpackCacheStats.Stores, 1, __ATOMIC_RELAXED);
-  __atomic_fetch_add(&FEXUnpackCacheStats.StoreBytes, Produced, __ATOMIC_RELAXED);
-  __atomic_fetch_add(&FEXUnpackCacheStats.StoreTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
+  return true;
 }
 
-namespace {
-void* WriterThread(void* Arg) {
-  auto* C = static_cast<Cache*>(Arg);
+// Hashes and writes a reserved stream's data and record, then makes it findable.
+void Write(Cache* C, Job& J, const uint8_t* Data) {
+  const uint64_t Start = ReadTicks();
+  J.R.OutputHash = XXH3_64bits(Data, J.R.Produced);
+  J.R.Check = RecordCheck(J.R);
+  const bool Written = WriteExact(C->Data, Data, J.R.Produced, J.R.Offset) && WriteExact(C->Index, &J.R, sizeof(J.R), J.RecordOffset);
+  {
+    std::scoped_lock Guard {C->Lock};
+    if (Written) {
+      C->Entries.insert_or_assign(std::pair {J.R.Key[0], J.R.Key[1]}, Entry {J.R.Offset, J.R.OutputHash, J.R.Produced, J.R.Trailer, true});
+    } else {
+      // The space stays unused; a record that wasn't written completely fails its check when loaded.
+      C->Entries.erase({J.R.Key[0], J.R.Key[1]});
+    }
+  }
+  if (Written) {
+    __atomic_fetch_add(&FEXUnpackCacheStats.Written, 1, __ATOMIC_RELAXED);
+  } else {
+    __atomic_fetch_add(&FEXUnpackCacheStats.Failures, 1, __ATOMIC_RELAXED);
+  }
+  __atomic_fetch_add(&FEXUnpackCacheStats.WriteTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
+}
+
+// The writer thread is started with the process (NativeUnpackCache::StartWriter) and waits for the cache to open.
+std::mutex WriterLock;
+std::condition_variable WriterWake;
+Cache* WriterCache {}; // set when the cache opens
+fextl::unique_ptr<FEXCore::Threads::Thread> WriterThreadObject;
+std::atomic<int> WriterState {}; // 0 not running, 1 running and waiting for the cache, 2 its ring is ready
+uint64_t OpenTicks {};
+std::atomic<bool> DirectNoted {};
+constexpr uint64_t WriterGraceSeconds = 3;
+
+void* WriterThread(void*) {
+  WriterState.store(1, std::memory_order_release);
+  FEX::Windows::StatsLogNote("unpack cache: writer thread running");
+  Cache* C;
+  {
+    std::unique_lock Guard {WriterLock};
+    WriterWake.wait(Guard, [] { return WriterCache != nullptr; });
+    C = WriterCache;
+  }
   // Fault the ring's pages in here, so the game's threads don't pay for it when they copy into it.
+  const uint64_t Start = ReadTicks();
   memset(C->Ring, 0, RingSize);
   C->RingReady.store(true, std::memory_order_release);
+  WriterState.store(2, std::memory_order_release);
+  FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: write buffer ready ({} MB in {} ms)", RingSize >> 20,
+                                                (ReadTicks() - Start) * 1000 / TickFrequency));
   for (;;) {
     Job J;
     {
@@ -312,33 +343,66 @@ void* WriterThread(void* Arg) {
       J = C->Queue.front();
       C->Queue.pop_front();
     }
-    const uint64_t Start = ReadTicks();
-    const uint8_t* Buffer = C->Ring + J.RingStart % RingSize;
-    J.R.OutputHash = XXH3_64bits(Buffer, J.R.Produced);
-    J.R.Check = RecordCheck(J.R);
-    const bool Written = WriteExact(C->Data, Buffer, J.R.Produced, J.R.Offset) && WriteExact(C->Index, &J.R, sizeof(J.R), J.RecordOffset);
-    {
-      std::scoped_lock Guard {C->Lock};
-      C->RingTail = J.RingEnd;
-      if (Written) {
-        C->Entries.insert_or_assign(std::pair {J.R.Key[0], J.R.Key[1]}, Entry {J.R.Offset, J.R.OutputHash, J.R.Produced, J.R.Trailer, true});
-      } else {
-        // The space stays unused; a record that wasn't written completely fails its check when loaded.
-        C->Entries.erase({J.R.Key[0], J.R.Key[1]});
-      }
-    }
-    if (Written) {
-      __atomic_fetch_add(&FEXUnpackCacheStats.Written, 1, __ATOMIC_RELAXED);
-    } else {
-      __atomic_fetch_add(&FEXUnpackCacheStats.Failures, 1, __ATOMIC_RELAXED);
-    }
-    __atomic_fetch_add(&FEXUnpackCacheStats.WriteTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
+    Write(C, J, C->Ring + J.RingStart % RingSize);
+    std::scoped_lock Guard {C->Lock};
+    C->RingTail = J.RingEnd;
   }
   return nullptr;
 }
 } // namespace
 
+extern "C" void FEXUnpackCachePut(const uint64_t Key[2], const uint8_t* Out, uint32_t Produced, uint32_t Trailer) {
+  auto* C = TheCache;
+  if (!C || C->Full) {
+    return;
+  }
+  const uint64_t Start = ReadTicks();
+
+  // Normally the game's thread only copies the data into the ring. If the writer thread isn't ready a few seconds after
+  // the cache opened, write on this thread instead, so the cache still fills.
+  const bool UseRing = C->RingReady.load(std::memory_order_acquire);
+  if (!UseRing) {
+    if (ReadTicks() - OpenTicks < WriterGraceSeconds * TickFrequency) {
+      __atomic_fetch_add(&FEXUnpackCacheStats.Dropped, 1, __ATOMIC_RELAXED);
+      return;
+    }
+    if (!DirectNoted.exchange(true)) {
+      FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: writer thread not ready (state {}), writing on the game's threads",
+                                                    WriterState.load()));
+    }
+  }
+
+  Job* J;
+  Job Direct;
+  if (!Reserve(C, Key, Produced, Trailer, UseRing, J, Direct)) {
+    return;
+  }
+  __atomic_fetch_add(&FEXUnpackCacheStats.Stores, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&FEXUnpackCacheStats.StoreBytes, Produced, __ATOMIC_RELAXED);
+  if (UseRing) {
+    memcpy(C->Ring + J->RingStart % RingSize, Out, Produced);
+    {
+      std::scoped_lock Guard {C->Lock};
+      J->Ready = true;
+    }
+    C->QueueWake.notify_one();
+  } else {
+    Write(C, *J, Out);
+  }
+  __atomic_fetch_add(&FEXUnpackCacheStats.StoreTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
+}
+
 namespace NativeUnpackCache {
+void StartWriter() {
+  uint64_t Frequency {};
+  __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Frequency));
+  TickFrequency = Frequency ? Frequency : 1;
+  WriterThreadObject = FEXCore::Threads::Thread::Create(WriterThread, nullptr, {.LowPriority = false, .Internal = true}, "FEXUnpackCache");
+  if (!WriterThreadObject || !WriterThreadObject->joinable()) {
+    FEX::Windows::StatsLogNote("unpack cache: can't start the writer thread, the game's threads will write");
+  }
+}
+
 bool Init() {
   const char* ResetEnv = getenv("FEX_UNPACK_CACHE_RESET");
   const bool Reset = ResetEnv && ResetEnv[0] == '1';
@@ -417,15 +481,14 @@ bool Init() {
     delete C;
     return false;
   }
-  C->Writer = FEXCore::Threads::Thread::Create(WriterThread, C, {.LowPriority = false, .Internal = true}, "FEXUnpackCache");
-  if (!C->Writer || !C->Writer->joinable()) {
-    FEX::Windows::StatsLogNote("unpack cache: off, can't start its writer thread");
-    delete C;
-    return false;
-  }
-
+  OpenTicks = ReadTicks();
   TheCache = C;
   FEXUnpackCacheEnabled = 1;
+  {
+    std::scoped_lock Guard {WriterLock};
+    WriterCache = C;
+  }
+  WriterWake.notify_all();
   FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: on{}, {} streams ({} MB) in {}, {} records skipped, limit {} GB{}",
                                                 Reset ? " (reset)" : Started ? " (new)" : "", C->Entries.size(), (C->DataEnd - HeaderSize) >> 20, Dir,
                                                 Skipped, MaxGB, C->Full ? ", full" : ""));
@@ -464,13 +527,13 @@ fextl::string StatsLine() {
       Size = TheCache->DataEnd - HeaderSize;
       Waiting = TheCache->RingHead - TheCache->RingTail;
     }
-    Line = fextl::fmt::format("  ucache lookups={} key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms queued={}/{:.1f}MB/{:.1f}ms written={}/{:.1f}ms "
-                              "waiting={:.1f}MB dropped={} failed={} size={}MB{}\n",
+    Line = fextl::fmt::format("  ucache lookups={} key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms stored={}/{:.1f}MB/{:.1f}ms written={}/{:.1f}ms "
+                              "waiting={:.1f}MB dropped={} failed={} size={}MB writer={}{}\n",
                               Now.Lookups - Prev.Lookups, Ms(Now.KeyTicks - Prev.KeyTicks), Now.Hits - Prev.Hits,
                               MB(Now.HitBytes - Prev.HitBytes), Ms(Now.HitTicks - Prev.HitTicks), Now.Stores - Prev.Stores,
                               MB(Now.StoreBytes - Prev.StoreBytes), Ms(Now.StoreTicks - Prev.StoreTicks), Now.Written - Prev.Written,
                               Ms(Now.WriteTicks - Prev.WriteTicks), MB(Waiting), Now.Dropped - Prev.Dropped, Now.Failures - Prev.Failures,
-                              Size >> 20, TheCache->Full ? " full" : "");
+                              Size >> 20, WriterState.load(std::memory_order_relaxed), TheCache->Full ? " full" : "");
   }
   Prev = Now;
   return Line;

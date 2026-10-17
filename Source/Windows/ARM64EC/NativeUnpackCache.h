@@ -19,12 +19,12 @@ struct FEXUnpackCacheCounters {
   uint64_t Hits;
   uint64_t HitBytes;
   uint64_t HitTicks; // finding, reading and checking a hit
-  uint64_t Stores;     // new streams queued for writing
+  uint64_t Stores;     // new streams being stored
   uint64_t StoreBytes;
-  uint64_t StoreTicks; // checking and queueing new streams on the game's threads
+  uint64_t StoreTicks; // storing new streams on the game's threads (a copy into the ring, or the whole write)
   uint64_t Dropped;    // new streams not stored because the write buffer was full
-  uint64_t Written;    // queued streams the writer thread wrote
-  uint64_t WriteTicks; // the writer thread's time
+  uint64_t Written;    // new streams written to disk
+  uint64_t WriteTicks; // hashing and writing them
   uint64_t Failures;   // read and write errors, and data that didn't match its hash (treated as misses)
 };
 extern struct FEXUnpackCacheCounters FEXUnpackCacheStats;
@@ -43,6 +43,10 @@ void FEXUnpackCachePut(const uint64_t Key[2], const uint8_t* Out, uint32_t Produ
 #include <FEXCore/fextl/string.h>
 
 namespace NativeUnpackCache {
+// Starts the thread that writes new streams to disk; it waits until Init opens the cache. Call at process start when the
+// cache is requested.
+void StartWriter();
+
 // Reads FEX_UNPACK_CACHE_MAX_GB (default 16) and FEX_UNPACK_CACHE_RESET (1 = start empty), and opens the cache. Call
 // once (NativeRedirect does, when FEX_UNPACK_CACHE=1 and it finds the game's inflate_fast) before handing out the stubs
 // that use it. Returns whether the cache is on.

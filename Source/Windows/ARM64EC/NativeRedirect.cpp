@@ -456,6 +456,11 @@ void Init(uint64_t MainImageBase, bool StatsLog) {
     UnpackCacheRequested = ZlibEnabled;
     FEX::Windows::StatsLogNote(ZlibEnabled ? "unpack cache: requested, opens when the game's inflate_fast is found" :
                                              "unpack cache: off, it needs FEX_NATIVE_ZLIB=1");
+    if (UnpackCacheRequested) {
+      // Started with the process, like FEX's other helper threads: in build 37 the writer started later from a game
+      // thread never got ready.
+      NativeUnpackCache::StartWriter();
+    }
   } else {
     FEX::Windows::StatsLogNote("unpack cache: off");
   }
