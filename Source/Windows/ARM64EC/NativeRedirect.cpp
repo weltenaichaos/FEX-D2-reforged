@@ -14,12 +14,14 @@ $end_info$
 //
 //   FEX_NATIVE_ZLIB=1   inflate_fast and adler32_z
 //   FEX_NATIVE_MD5=1    the MD5 update and block transform
+//   FEX_UNPACK_CACHE=1  with FEX_NATIVE_ZLIB=1: serve repeated zlib streams from disk (NativeUnpackCache.h)
 //
 // A function is found by its offset in the main executable and the first bytes of its code, which are compared when the
 // JIT first asks for that address (and, for MD5, the game's round tables). Anything that doesn't match stays emulated.
 
 #include "NativeRedirect.h"
 #include "NativeStats.h"
+#include "NativeUnpackCache.h"
 #include "Windows/Common/StatsLog.h"
 
 #include <FEXCore/Core/CoreState.h>
@@ -32,6 +34,7 @@ $end_info$
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <ntstatus.h>
 #include <windef.h>
 #include <winternl.h>
@@ -160,6 +163,9 @@ namespace {
 
   bool ZlibEnabled {};
   bool MD5Enabled {};
+  bool UnpackCacheRequested {};
+  std::mutex UnpackCacheLock;
+  std::atomic<bool> UnpackCacheOpened {};
   uint64_t ImageBase {};
   uint64_t TickFrequency {1};
 
@@ -210,6 +216,19 @@ namespace {
     return CheckResult::Mismatch;
   }
 
+  // Opens the unpack cache once the game's inflate_fast is found, so other processes started with the same settings
+  // (launchers, helpers) never open the cache files. Runs before the stub is handed out, so the stub sees the cache.
+  void OpenUnpackCache() {
+    if (!UnpackCacheRequested || UnpackCacheOpened.load(std::memory_order_acquire)) {
+      return;
+    }
+    std::scoped_lock Guard {UnpackCacheLock};
+    if (!UnpackCacheOpened.load(std::memory_order_relaxed)) {
+      NativeUnpackCache::Init();
+      UnpackCacheOpened.store(true, std::memory_order_release);
+    }
+  }
+
   uintptr_t Check(Target& T) {
     uint8_t Code[MaxSignatureSize];
     if (!Read(T.GuestRIP, Code, T.SignatureSize)) {
@@ -236,6 +255,10 @@ namespace {
         T.State.store(TargetState::Rejected, std::memory_order_release);
       }
       return 0;
+    }
+
+    if (T.Stub == &NativeInflateFastRedirect) {
+      OpenUnpackCache();
     }
 
     auto Expected = TargetState::Unchecked;
@@ -402,7 +425,7 @@ namespace {
         WindowStart = Now;
       }
     }
-    return (Line.empty() ? Line : fextl::fmt::format("  native{}\n", Line)) + Window;
+    return (Line.empty() ? Line : fextl::fmt::format("  native{}\n", Line)) + NativeUnpackCache::StatsLine() + Window;
   }
 } // namespace
 
@@ -428,6 +451,13 @@ void Init(uint64_t MainImageBase, bool StatsLog) {
   FEX::Windows::StatsLogNote(fextl::fmt::format("native md5: {}", MD5Enabled ? "on (FEX_NATIVE_MD5=1)" : "off"));
   if (FEXNativeZlibTrackStreams) {
     FEX::Windows::StatsLogNote(fextl::fmt::format("native zlib: tracking streams, code range {:X}-{:X}", FEXNativeTextBegin, FEXNativeTextEnd));
+  }
+  if (const char* Cache = getenv("FEX_UNPACK_CACHE"); Cache && Cache[0] == '1') {
+    UnpackCacheRequested = ZlibEnabled;
+    FEX::Windows::StatsLogNote(ZlibEnabled ? "unpack cache: requested, opens when the game's inflate_fast is found" :
+                                             "unpack cache: off, it needs FEX_NATIVE_ZLIB=1");
+  } else {
+    FEX::Windows::StatsLogNote("unpack cache: off");
   }
   if (ZlibEnabled || MD5Enabled) {
     FEX::Windows::StatsLogSetLineProvider(StatsLine);

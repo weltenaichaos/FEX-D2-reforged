@@ -3,6 +3,7 @@ add_library(arm64ecfex SHARED
   Module.S
   NativeMD5.c
   NativeRedirect.cpp
+  NativeUnpackCache.cpp
   NativeZlib.c
   libarm64ecfex.def
   $<TARGET_OBJECTS:FEXCore_object>)
@@ -16,6 +17,7 @@ target_include_directories(arm64ecfex PRIVATE
 
 target_link_libraries(arm64ecfex PRIVATE
   FEXCore_Base
+  xxHash::xxhash
   Common
   CommonTools
   CommonWindows

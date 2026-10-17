@@ -804,10 +804,15 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   State->Profile = Profile && Profile[0] == '1';
   const char* Timeline = getenv("FEX_STATSLOG_TIMELINE");
   State->Timeline = !(Timeline && Timeline[0] == '0');
-  const auto Switches = fextl::fmt::format("# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={} FEX_NATIVE_ZLIB={} FEX_NATIVE_MD5={}\n",
-                                           State->Profile ? 1 : 0, State->Timeline ? 1 : 0, getenv("FEX_THREADPIN") ? getenv("FEX_THREADPIN") : "-",
-                                           getenv("FEX_NATIVE_ZLIB") ? getenv("FEX_NATIVE_ZLIB") : "-",
-                                           getenv("FEX_NATIVE_MD5") ? getenv("FEX_NATIVE_MD5") : "-");
+  const auto Env = [](const char* Name) {
+    const char* Value = getenv(Name);
+    return Value ? Value : "-";
+  };
+  const auto Switches = fextl::fmt::format(
+    "# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={} FEX_NATIVE_ZLIB={} FEX_NATIVE_MD5={} FEX_UNPACK_CACHE={} "
+    "FEX_UNPACK_CACHE_MAX_GB={} FEX_UNPACK_CACHE_RESET={}\n",
+    State->Profile ? 1 : 0, State->Timeline ? 1 : 0, Env("FEX_THREADPIN"), Env("FEX_NATIVE_ZLIB"), Env("FEX_NATIVE_MD5"), Env("FEX_UNPACK_CACHE"),
+    Env("FEX_UNPACK_CACHE_MAX_GB"), Env("FEX_UNPACK_CACHE_RESET"));
   fwrite(Switches.data(), 1, Switches.size(), File);
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
