@@ -51,6 +51,11 @@ extern void* NativeInflateFastRedirect;
 extern void* NativeAdler32ZRedirect;
 extern void* NativeMD5UpdateRedirect;
 extern void* NativeMD5TransformRedirect;
+// Where each stub enters native code (x9 at ExitFunctionEC), named for the stats log's native-call sampler.
+extern void* NativeInflateFastTarget;
+extern void* NativeAdler32ZTarget;
+extern void* NativeMD5UpdateTarget;
+extern void* NativeMD5TransformTarget;
 }
 
 namespace NativeRedirect {
@@ -145,6 +150,7 @@ namespace {
     size_t SignatureSize;
     void* Stub;
     FEXNativeCallStats* Stats;
+    void* Entry;
 
     uint64_t GuestRIP;
     std::atomic<TargetState> State;
@@ -154,11 +160,13 @@ namespace {
 
   Target Targets[] = {
     {"inflate_fast", Group::Zlib, 0xBD2090, InflateFastSignature, sizeof(InflateFastSignature), &NativeInflateFastRedirect,
-     &FEXNativeInflateFastStats},
-    {"adler32_z", Group::Zlib, 0xBD17F0, Adler32ZSignature, sizeof(Adler32ZSignature), &NativeAdler32ZRedirect, &FEXNativeAdler32ZStats},
-    {"md5", Group::MD5, 0xBC10F0, MD5UpdateSignature, sizeof(MD5UpdateSignature), &NativeMD5UpdateRedirect, &FEXNativeMD5UpdateStats},
+     &FEXNativeInflateFastStats, &NativeInflateFastTarget},
+    {"adler32_z", Group::Zlib, 0xBD17F0, Adler32ZSignature, sizeof(Adler32ZSignature), &NativeAdler32ZRedirect, &FEXNativeAdler32ZStats,
+     &NativeAdler32ZTarget},
+    {"md5", Group::MD5, 0xBC10F0, MD5UpdateSignature, sizeof(MD5UpdateSignature), &NativeMD5UpdateRedirect, &FEXNativeMD5UpdateStats,
+     &NativeMD5UpdateTarget},
     {"md5block", Group::MD5, 0xBC0E80, MD5TransformSignature, sizeof(MD5TransformSignature), &NativeMD5TransformRedirect,
-     &FEXNativeMD5TransformStats},
+     &FEXNativeMD5TransformStats, &NativeMD5TransformTarget},
   };
 
   bool ZlibEnabled {};
@@ -224,7 +232,8 @@ namespace {
     }
     std::scoped_lock Guard {UnpackCacheLock};
     if (!UnpackCacheOpened.load(std::memory_order_relaxed)) {
-      NativeUnpackCache::Init();
+      const char* MD5Cache = getenv("FEX_NATIVE_MD5_CACHE");
+      NativeUnpackCache::Init(MD5Enabled && !(MD5Cache && MD5Cache[0] == '0'));
       UnpackCacheOpened.store(true, std::memory_order_release);
     }
   }
@@ -437,6 +446,9 @@ void Init(uint64_t MainImageBase, bool StatsLog) {
   ImageBase = MainImageBase;
   for (auto& T : Targets) {
     T.GuestRIP = MainImageBase + T.RVA;
+    if (StatsLog) {
+      FEX::Windows::StatsLogNameNative(reinterpret_cast<uint64_t>(T.Entry), fextl::fmt::format("fex:{}", T.Name));
+    }
   }
   uint64_t Frequency {};
   __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Frequency));
@@ -447,7 +459,21 @@ void Init(uint64_t MainImageBase, bool StatsLog) {
     FEXNativeZlibTrackStreams = 1;
   }
 
+  // On unless set to 0.
+  auto DefaultOn = [](const char* Name) {
+    const char* Value = getenv(Name);
+    return !(Value && Value[0] == '0');
+  };
+  FEXNativeSkipHitAdler = DefaultOn("FEX_UNPACK_CACHE_SKIP_ADLER");
+  FEXNativeAdlerNeon = DefaultOn("FEX_NATIVE_ADLER_NEON");
+
   FEX::Windows::StatsLogNote(fextl::fmt::format("native zlib: {}", ZlibEnabled ? "on (FEX_NATIVE_ZLIB=1)" : "off"));
+  if (ZlibEnabled) {
+    FEX::Windows::StatsLogNote(fextl::fmt::format("native zlib: adler32 {}, cache hits' adler32 check {}",
+                                                  FEXNativeAdlerNeon ? "NEON" : "zlib C code (FEX_NATIVE_ADLER_NEON=0)",
+                                                  FEXNativeSkipHitAdler ? "answered from the stream's trailer" :
+                                                                          "computed (FEX_UNPACK_CACHE_SKIP_ADLER=0)"));
+  }
   FEX::Windows::StatsLogNote(fextl::fmt::format("native md5: {}", MD5Enabled ? "on (FEX_NATIVE_MD5=1)" : "off"));
   if (FEXNativeZlibTrackStreams) {
     FEX::Windows::StatsLogNote(fextl::fmt::format("native zlib: tracking streams, code range {:X}-{:X}", FEXNativeTextBegin, FEXNativeTextEnd));

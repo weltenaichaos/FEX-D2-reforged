@@ -17,6 +17,10 @@ $end_info$
 // streams aren't stored this time. The ring is allocated once and faulted in by the writer, so copying into it doesn't
 // fault in fresh pages. If the writer isn't ready a few seconds after the cache opened, the game's threads write
 // themselves.
+//
+// Reading ahead: data.bin holds the streams in the order they were first unpacked, and a later session asks for them in
+// much the same order. Once hits come from the same or neighbouring 1 MB pieces of data.bin, a reader thread reads the
+// next pieces into memory in large reads, and hits are copied from there instead of each reading from disk.
 
 #include "NativeUnpackCache.h"
 #include "Windows/Common/StatsLog.h"
@@ -44,6 +48,7 @@ $end_info$
 
 extern "C" {
 int FEXUnpackCacheEnabled;
+int FEXMD5CacheEnabled;
 struct FEXUnpackCacheCounters FEXUnpackCacheStats;
 }
 
@@ -53,7 +58,16 @@ constexpr char IndexMagic[8] = {'F', 'E', 'X', 'U', 'N', 'P', 'K', 'I'};
 constexpr uint32_t FormatVersion = 1;
 constexpr uint64_t HeaderSize = 64;
 constexpr uint64_t DataAlignment = 64;
-constexpr uint64_t RingSize = 256ull << 20; // output bytes waiting for the writer
+constexpr uint64_t RingSize = 64ull << 20; // output bytes waiting for the writer (build 38 peaked at 24 MB)
+
+// Read-ahead, see above.
+constexpr uint64_t ChunkSize = 1ull << 20;
+constexpr uint64_t AheadChunks = 8;       // how far past a hit to read
+constexpr uint64_t MaxHitChunks = 4;      // larger hits are read from disk directly
+constexpr size_t MaxAheadRequests = 64;   // chunks waiting for the reader
+constexpr size_t RecentDiskChunks = 16;   // chunks of recent hits read from disk, to see when they come in sequence
+constexpr uint64_t NoChunk = ~0ull;
+constexpr uint64_t DefaultReadAheadMB = 64;
 
 struct FileHeader {
   char Magic[8];
@@ -116,6 +130,29 @@ struct Cache {
   uint64_t RingHead {};
   uint64_t RingTail {};
   std::condition_variable QueueWake;
+
+  // Read-ahead memory, see above: ReadAheadSlots pieces of ChunkSize, filled by the reader thread. Its own lock, never
+  // taken together with Lock.
+  struct Slot {
+    uint64_t Chunk {NoChunk}; // piece of data.bin held (or being read) here
+    uint64_t LastUse {};
+    uint32_t Bytes {}; // read so far: less than ChunkSize at the end of data.bin
+    uint32_t Users {}; // hits copying out of it right now
+    bool Loading {};
+    bool Used {}; // served a hit since it was read
+  };
+  uint32_t ReadAheadSlots {}; // 0: read-ahead off
+  std::atomic<bool> ReadAheadReady {};
+  std::atomic<uint64_t> DataEndHint {}; // DataEnd, readable without Lock: chunks from here on aren't requested
+  std::mutex AheadLock;
+  std::condition_variable AheadWake;
+  uint8_t* AheadMemory {};
+  fextl::vector<Slot> Slots;
+  fextl::unordered_map<uint64_t, uint32_t> ChunkSlots; // chunk -> slot holding it or reading it
+  fextl::deque<uint64_t> AheadRequests;
+  uint64_t AheadClock {};
+  uint64_t RecentDisk[RecentDiskChunks] {}; // chunk + 1, 0 = empty
+  size_t RecentDiskNext {};
 };
 
 Cache* TheCache {};
@@ -133,6 +170,20 @@ uint64_t FileSize(FEXCore::File::File& F) {
     return 0;
   }
   return static_cast<uint64_t>(Size.QuadPart);
+}
+
+// Reads up to Size bytes, fewer at the end of the file. Returns how many.
+uint64_t ReadUpTo(FEXCore::File::File& F, void* Buffer, uint64_t Size, uint64_t Offset) {
+  auto* Bytes = static_cast<uint8_t*>(Buffer);
+  uint64_t Total {};
+  while (Total < Size) {
+    const auto Result = F.PRead(Bytes + Total, static_cast<uint32_t>(std::min<uint64_t>(Size - Total, 1u << 30)), Offset + Total);
+    if (Result <= 0) {
+      break;
+    }
+    Total += Result;
+  }
+  return Total;
 }
 
 bool ReadExact(FEXCore::File::File& F, void* Buffer, uint64_t Size, uint64_t Offset) {
@@ -203,6 +254,178 @@ uint64_t AlignUp(uint64_t Value, uint64_t Alignment) {
 FEXUnpackCacheCounters Prev {};
 } // namespace
 
+namespace {
+// Queues the chunks First..First+Count-1 that aren't in memory or queued yet. Takes AheadLock.
+void RequestChunksLocked(Cache* C, uint64_t First, uint64_t Count) {
+  bool Added = false;
+  const uint64_t End = (C->DataEndHint.load(std::memory_order_relaxed) + ChunkSize - 1) / ChunkSize;
+  for (uint64_t Chunk = First; Chunk < std::min(First + Count, End); ++Chunk) {
+    if (C->AheadRequests.size() >= MaxAheadRequests) {
+      break;
+    }
+    if (C->ChunkSlots.contains(Chunk) || std::find(C->AheadRequests.begin(), C->AheadRequests.end(), Chunk) != C->AheadRequests.end()) {
+      continue;
+    }
+    C->AheadRequests.push_back(Chunk);
+    Added = true;
+  }
+  if (Added) {
+    C->AheadWake.notify_one();
+  }
+}
+
+// Copies the entry's data out of read-ahead memory if all of it is there, and asks for the chunks after it.
+bool CopyFromMemory(Cache* C, const Entry& E, uint8_t* Out) {
+  const uint64_t First = E.Offset / ChunkSize;
+  const uint64_t Last = (E.Offset + E.Produced - 1) / ChunkSize;
+  if (!E.Produced || Last - First + 1 > MaxHitChunks) {
+    return false;
+  }
+  uint32_t Pinned[MaxHitChunks];
+  {
+    std::scoped_lock Guard {C->AheadLock};
+    for (uint64_t Chunk = First; Chunk <= Last; ++Chunk) {
+      const auto It = C->ChunkSlots.find(Chunk);
+      const uint64_t NeedEnd = std::min(E.Offset + E.Produced, (Chunk + 1) * ChunkSize) - Chunk * ChunkSize;
+      if (It == C->ChunkSlots.end() || C->Slots[It->second].Loading || C->Slots[It->second].Bytes < NeedEnd) {
+        return false;
+      }
+    }
+    for (uint64_t Chunk = First; Chunk <= Last; ++Chunk) {
+      const uint32_t Index = C->ChunkSlots[Chunk];
+      auto& S = C->Slots[Index];
+      ++S.Users;
+      S.LastUse = ++C->AheadClock;
+      S.Used = true;
+      Pinned[Chunk - First] = Index;
+    }
+    RequestChunksLocked(C, Last + 1, AheadChunks);
+  }
+  uint64_t Done {};
+  for (uint64_t Chunk = First; Chunk <= Last; ++Chunk) {
+    const uint64_t From = std::max(E.Offset + Done, Chunk * ChunkSize);
+    const uint64_t To = std::min<uint64_t>(E.Offset + E.Produced, (Chunk + 1) * ChunkSize);
+    memcpy(Out + Done, C->AheadMemory + Pinned[Chunk - First] * ChunkSize + (From - Chunk * ChunkSize), To - From);
+    Done += To - From;
+  }
+  std::scoped_lock Guard {C->AheadLock};
+  for (uint64_t Chunk = First; Chunk <= Last; ++Chunk) {
+    --C->Slots[Pinned[Chunk - First]].Users;
+  }
+  return true;
+}
+
+// A hit had to be read from disk. When it follows another recent one in data.bin, the hits are coming in sequence:
+// read its chunk and the ones after it into memory.
+void NoteDiskHit(Cache* C, const Entry& E) {
+  const uint64_t Chunk = E.Offset / ChunkSize;
+  std::scoped_lock Guard {C->AheadLock};
+  bool Sequential = false;
+  for (const uint64_t Recent : C->RecentDisk) {
+    Sequential |= Recent && (Recent - 1 == Chunk || Recent == Chunk); // same chunk, or the one before
+  }
+  C->RecentDisk[C->RecentDiskNext] = Chunk + 1;
+  C->RecentDiskNext = (C->RecentDiskNext + 1) % RecentDiskChunks;
+  if (Sequential) {
+    RequestChunksLocked(C, Chunk, AheadChunks + 1);
+  }
+}
+
+// Data was written to data.bin: forget any copy of those chunks in memory, which may be from before the write.
+void ForgetChunks(Cache* C, uint64_t Offset, uint64_t Size) {
+  if (!C->ReadAheadSlots || !Size) {
+    return;
+  }
+  std::scoped_lock Guard {C->AheadLock};
+  for (uint64_t Chunk = Offset / ChunkSize; Chunk <= (Offset + Size - 1) / ChunkSize; ++Chunk) {
+    if (const auto It = C->ChunkSlots.find(Chunk); It != C->ChunkSlots.end()) {
+      // A chunk still being read is dropped by the reader when it finds it gone from ChunkSlots.
+      if (!C->Slots[It->second].Loading) {
+        C->Slots[It->second].Chunk = NoChunk;
+      }
+      C->ChunkSlots.erase(It);
+    }
+  }
+}
+
+// The read-ahead thread is started with the process, like the writer, and waits for the cache to open.
+std::mutex ReaderLock;
+std::condition_variable ReaderWake;
+Cache* ReaderCache {};
+fextl::unique_ptr<FEXCore::Threads::Thread> ReaderThreadObject;
+
+void* ReaderThread(void*) {
+  Cache* C;
+  {
+    std::unique_lock Guard {ReaderLock};
+    ReaderWake.wait(Guard, [] { return ReaderCache != nullptr; });
+    C = ReaderCache;
+  }
+  if (!C->ReadAheadSlots) {
+    return nullptr;
+  }
+  C->AheadMemory = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(C->ReadAheadSlots * ChunkSize));
+  if (!C->AheadMemory) {
+    FEX::Windows::StatsLogNote("unpack cache: read-ahead off, can't allocate its memory");
+    return nullptr;
+  }
+  C->Slots.resize(C->ReadAheadSlots);
+  C->ReadAheadReady.store(true, std::memory_order_release);
+  FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: read-ahead ready ({} MB)", C->ReadAheadSlots * ChunkSize >> 20));
+  for (;;) {
+    uint64_t Chunk;
+    uint32_t Index;
+    {
+      std::unique_lock Guard {C->AheadLock};
+      C->AheadWake.wait(Guard, [C] { return !C->AheadRequests.empty(); });
+      Chunk = C->AheadRequests.front();
+      C->AheadRequests.pop_front();
+      if (C->ChunkSlots.contains(Chunk)) {
+        continue;
+      }
+      // Reuse the least recently used slot no hit is copying from.
+      Index = C->ReadAheadSlots;
+      for (uint32_t i = 0; i < C->ReadAheadSlots; ++i) {
+        const auto& S = C->Slots[i];
+        if (!S.Users && !S.Loading && (Index == C->ReadAheadSlots || S.LastUse < C->Slots[Index].LastUse)) {
+          Index = i;
+        }
+      }
+      if (Index == C->ReadAheadSlots) {
+        continue;
+      }
+      auto& S = C->Slots[Index];
+      if (const auto Old = C->ChunkSlots.find(S.Chunk); S.Chunk != NoChunk && Old != C->ChunkSlots.end() && Old->second == Index) {
+        if (!S.Used) {
+          __atomic_fetch_add(&FEXUnpackCacheStats.AheadWasted, 1, __ATOMIC_RELAXED);
+        }
+        C->ChunkSlots.erase(Old);
+      }
+      S = {.Chunk = Chunk, .LastUse = ++C->AheadClock, .Loading = true};
+      C->ChunkSlots[Chunk] = Index;
+    }
+    const uint64_t Start = ReadTicks();
+    const uint64_t Bytes = ReadUpTo(C->Data, C->AheadMemory + Index * ChunkSize, ChunkSize, Chunk * ChunkSize);
+    __atomic_fetch_add(&FEXUnpackCacheStats.AheadChunks, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&FEXUnpackCacheStats.AheadBytes, Bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&FEXUnpackCacheStats.AheadTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
+    std::scoped_lock Guard {C->AheadLock};
+    auto& S = C->Slots[Index];
+    S.Loading = false;
+    S.Bytes = static_cast<uint32_t>(Bytes);
+    if (const auto It = C->ChunkSlots.find(Chunk); It == C->ChunkSlots.end() || It->second != Index || !Bytes) {
+      // Written to while it was read (ForgetChunks), or nothing there.
+      if (It != C->ChunkSlots.end() && It->second == Index) {
+        C->ChunkSlots.erase(It);
+      }
+      S.Chunk = NoChunk;
+      S.LastUse = 0; // reused first
+    }
+  }
+  return nullptr;
+}
+} // namespace
+
 extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t OutCap, uint32_t* Produced, uint32_t* Trailer) {
   auto* C = TheCache;
   if (!C) {
@@ -223,7 +446,34 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
   if (E.Produced > OutCap) {
     return 0;
   }
-  if (!ReadExact(C->Data, Out, E.Produced, E.Offset) || XXH3_64bits(Out, E.Produced) != E.OutputHash) {
+
+  // From read-ahead memory if it's there, else from disk. Either way it is checked against its hash.
+  const bool Ahead = C->ReadAheadReady.load(std::memory_order_acquire);
+  uint64_t Now = ReadTicks();
+  bool Good = false;
+  if (Ahead && CopyFromMemory(C, E, Out)) {
+    const uint64_t Copied = ReadTicks();
+    __atomic_fetch_add(&FEXUnpackCacheStats.RamHits, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&FEXUnpackCacheStats.RamTicks, Copied - Now, __ATOMIC_RELAXED);
+    Good = XXH3_64bits(Out, E.Produced) == E.OutputHash;
+    Now = ReadTicks();
+    __atomic_fetch_add(&FEXUnpackCacheStats.VerifyTicks, Now - Copied, __ATOMIC_RELAXED);
+    if (!Good) {
+      // The copy in memory was older than the data on disk: drop it and read from disk.
+      ForgetChunks(C, E.Offset, E.Produced);
+    }
+  }
+  if (!Good) {
+    if (Ahead) {
+      NoteDiskHit(C, E);
+    }
+    const bool Read = ReadExact(C->Data, Out, E.Produced, E.Offset);
+    const uint64_t ReadDone = ReadTicks();
+    __atomic_fetch_add(&FEXUnpackCacheStats.DiskTicks, ReadDone - Now, __ATOMIC_RELAXED);
+    Good = Read && XXH3_64bits(Out, E.Produced) == E.OutputHash;
+    __atomic_fetch_add(&FEXUnpackCacheStats.VerifyTicks, ReadTicks() - ReadDone, __ATOMIC_RELAXED);
+  }
+  if (!Good) {
     // Bad data: forget it so it isn't read again. A later miss stores the stream anew.
     __atomic_fetch_add(&FEXUnpackCacheStats.Failures, 1, __ATOMIC_RELAXED);
     std::scoped_lock Guard {C->Lock};
@@ -270,6 +520,7 @@ bool Reserve(Cache* C, const uint64_t Key[2], uint32_t Produced, uint32_t Traile
   New.R.Offset = C->DataEnd;
   New.RecordOffset = C->IndexEnd;
   C->DataEnd = AlignUp(C->DataEnd + Produced, DataAlignment);
+  C->DataEndHint.store(C->DataEnd, std::memory_order_relaxed);
   C->IndexEnd += sizeof(Record);
   C->Entries.emplace(std::pair {Key[0], Key[1]}, Entry {New.R.Offset, 0, Produced, Trailer, false});
   if (UseRing) {
@@ -292,6 +543,7 @@ void Write(Cache* C, Job& J, const uint8_t* Data) {
   J.R.OutputHash = XXH3_64bits(Data, J.R.Produced);
   J.R.Check = RecordCheck(J.R);
   const bool Written = WriteExact(C->Data, Data, J.R.Produced, J.R.Offset) && WriteExact(C->Index, &J.R, sizeof(J.R), J.RecordOffset);
+  ForgetChunks(C, J.R.Offset, J.R.Produced);
   {
     std::scoped_lock Guard {C->Lock};
     if (Written) {
@@ -392,6 +644,123 @@ extern "C" void FEXUnpackCachePut(const uint64_t Key[2], const uint8_t* Out, uin
   __atomic_fetch_add(&FEXUnpackCacheStats.StoreTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
 }
 
+namespace {
+// MD5 cache, see NativeUnpackCache.h. md5.bin: a header, then one 64-byte record per stored state, appended in batches
+// of MD5Batch by the game thread that fills a batch (a batch not full at exit is lost, and stored again next time).
+constexpr char MD5Magic[8] = {'F', 'E', 'X', 'U', 'N', 'M', 'D', '5'};
+constexpr size_t MD5Batch = 64;
+constexpr uint64_t MD5MaxRecords = 1u << 20; // 64 MB of records
+
+struct MD5Record {
+  uint64_t Key[2];
+  uint64_t Bytes;
+  uint32_t State[4];
+  uint64_t Reserved[2];
+  uint64_t Check; // hash of everything above, never 0
+};
+static_assert(sizeof(MD5Record) == 64);
+
+uint64_t MD5RecordCheck(const MD5Record& R) {
+  return XXH3_64bits(&R, offsetof(MD5Record, Check)) | 1;
+}
+
+struct MD5Value {
+  uint64_t Bytes;
+  uint32_t State[4];
+};
+
+struct MD5Cache {
+  FEXCore::File::File F;
+  std::mutex Lock;
+  fextl::unordered_map<std::pair<uint64_t, uint64_t>, MD5Value, KeyHash> Map;
+  MD5Record Batch[MD5Batch];
+  size_t BatchCount {};
+  uint64_t FileEnd {};
+};
+MD5Cache* TheMD5 {};
+
+// Opens md5.bin in Dir and loads it. Returns a note for the log.
+fextl::string OpenMD5Cache(const fextl::string& Dir, bool Reset) {
+  auto* M = new MD5Cache;
+  uint64_t Size {};
+  auto Open = OpenFile(M->F, Dir + "md5.bin", MD5Magic, Reset, Size);
+  if (Open == OpenResult::Fresh) {
+    Open = OpenFile(M->F, Dir + "md5.bin", MD5Magic, true, Size);
+    if (Open == OpenResult::Failed || !Start(M->F, MD5Magic)) {
+      Open = OpenResult::Failed;
+    }
+    Size = HeaderSize;
+  }
+  if (Open == OpenResult::Failed) {
+    delete M;
+    return "md5 cache: off, can't open md5.bin";
+  }
+  const uint64_t Count = std::min((Size - HeaderSize) / sizeof(MD5Record), MD5MaxRecords);
+  uint64_t Skipped {};
+  if (Count) {
+    fextl::vector<MD5Record> Records(Count);
+    if (!ReadExact(M->F, Records.data(), Count * sizeof(MD5Record), HeaderSize)) {
+      Records.clear();
+      Skipped = Count;
+    }
+    M->Map.reserve(Records.size());
+    for (const auto& R : Records) {
+      if (R.Check != MD5RecordCheck(R)) {
+        ++Skipped;
+        continue;
+      }
+      M->Map.insert_or_assign(std::pair {R.Key[0], R.Key[1]}, MD5Value {R.Bytes, {R.State[0], R.State[1], R.State[2], R.State[3]}});
+    }
+  }
+  M->FileEnd = HeaderSize + Count * sizeof(MD5Record);
+  TheMD5 = M;
+  __atomic_store_n(&FEXMD5CacheEnabled, 1, __ATOMIC_RELEASE);
+  return fextl::fmt::format("md5 cache: on{}, {} states, {} records skipped", Reset ? " (reset)" : "", M->Map.size(), Skipped);
+}
+} // namespace
+
+extern "C" int FEXMD5CacheGet(const uint64_t Key[2], uint64_t Bytes, uint32_t State[4]) {
+  auto* M = TheMD5;
+  std::scoped_lock Guard {M->Lock};
+  const auto It = M->Map.find({Key[0], Key[1]});
+  if (It == M->Map.end() || It->second.Bytes != Bytes) {
+    return 0;
+  }
+  memcpy(State, It->second.State, sizeof(It->second.State));
+  return 1;
+}
+
+extern "C" void FEXMD5CachePut(const uint64_t Key[2], uint64_t Bytes, const uint32_t State[4]) {
+  auto* M = TheMD5;
+  MD5Record Out[MD5Batch];
+  uint64_t Offset {};
+  {
+    std::scoped_lock Guard {M->Lock};
+    if (M->Map.size() >= MD5MaxRecords) {
+      return;
+    }
+    if (!M->Map.try_emplace(std::pair {Key[0], Key[1]}, MD5Value {Bytes, {State[0], State[1], State[2], State[3]}}).second) {
+      return;
+    }
+    auto& R = M->Batch[M->BatchCount++];
+    R = {.Key = {Key[0], Key[1]}, .Bytes = Bytes, .State = {State[0], State[1], State[2], State[3]}};
+    R.Check = MD5RecordCheck(R);
+    if (M->BatchCount < MD5Batch) {
+      __atomic_fetch_add(&FEXUnpackCacheStats.MD5Stores, 1, __ATOMIC_RELAXED);
+      return;
+    }
+    memcpy(Out, M->Batch, sizeof(Out));
+    M->BatchCount = 0;
+    Offset = M->FileEnd;
+    M->FileEnd += sizeof(Out);
+  }
+  __atomic_fetch_add(&FEXUnpackCacheStats.MD5Stores, 1, __ATOMIC_RELAXED);
+  // A failed write leaves a gap whose records fail their check when loaded.
+  if (!WriteExact(M->F, Out, sizeof(Out), Offset)) {
+    __atomic_fetch_add(&FEXUnpackCacheStats.Failures, 1, __ATOMIC_RELAXED);
+  }
+}
+
 namespace NativeUnpackCache {
 void StartWriter() {
   uint64_t Frequency {};
@@ -401,9 +770,13 @@ void StartWriter() {
   if (!WriterThreadObject || !WriterThreadObject->joinable()) {
     FEX::Windows::StatsLogNote("unpack cache: can't start the writer thread, the game's threads will write");
   }
+  ReaderThreadObject = FEXCore::Threads::Thread::Create(ReaderThread, nullptr, {.LowPriority = false, .Internal = true}, "FEXUnpackRead");
+  if (!ReaderThreadObject || !ReaderThreadObject->joinable()) {
+    FEX::Windows::StatsLogNote("unpack cache: can't start the read-ahead thread, hits are read from disk");
+  }
 }
 
-bool Init() {
+bool Init(bool MD5Cache) {
   const char* ResetEnv = getenv("FEX_UNPACK_CACHE_RESET");
   const bool Reset = ResetEnv && ResetEnv[0] == '1';
   const char* MaxEnv = getenv("FEX_UNPACK_CACHE_MAX_GB");
@@ -411,6 +784,8 @@ bool Init() {
   if (!MaxGB) {
     MaxGB = 16;
   }
+  const char* AheadEnv = getenv("FEX_UNPACK_CACHE_READAHEAD_MB");
+  const uint64_t AheadMB = std::min<uint64_t>(AheadEnv && AheadEnv[0] ? strtoull(AheadEnv, nullptr, 10) : DefaultReadAheadMB, 1024);
 
   uint64_t Frequency {};
   __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Frequency));
@@ -471,6 +846,7 @@ bool Init() {
     }
   }
   C->DataEnd = std::max(DataEnd, AlignUp(DataSize, DataAlignment));
+  C->DataEndHint.store(C->DataEnd, std::memory_order_relaxed);
   C->IndexEnd = HeaderSize + RecordCount * sizeof(Record);
   C->MaxDataBytes = MaxGB << 30;
   C->Full = C->DataEnd >= C->MaxDataBytes;
@@ -481,6 +857,10 @@ bool Init() {
     delete C;
     return false;
   }
+  C->ReadAheadSlots = static_cast<uint32_t>(AheadMB * (1ull << 20) / ChunkSize);
+  if (C->ReadAheadSlots && C->ReadAheadSlots < AheadChunks + MaxHitChunks) {
+    C->ReadAheadSlots = AheadChunks + MaxHitChunks;
+  }
   OpenTicks = ReadTicks();
   TheCache = C;
   FEXUnpackCacheEnabled = 1;
@@ -489,9 +869,20 @@ bool Init() {
     WriterCache = C;
   }
   WriterWake.notify_all();
-  FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: on{}, {} streams ({} MB) in {}, {} records skipped, limit {} GB{}",
+  {
+    std::scoped_lock Guard {ReaderLock};
+    ReaderCache = C;
+  }
+  ReaderWake.notify_all();
+  if (MD5Cache) {
+    FEX::Windows::StatsLogNote(OpenMD5Cache(Dir, Reset));
+  } else {
+    FEX::Windows::StatsLogNote("md5 cache: off");
+  }
+  FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: on{}, {} streams ({} MB) in {}, {} records skipped, limit {} GB{}, read-ahead {}",
                                                 Reset ? " (reset)" : Started ? " (new)" : "", C->Entries.size(), (C->DataEnd - HeaderSize) >> 20, Dir,
-                                                Skipped, MaxGB, C->Full ? ", full" : ""));
+                                                Skipped, MaxGB, C->Full ? ", full" : "",
+                                                C->ReadAheadSlots ? fextl::fmt::format("{} MB", C->ReadAheadSlots * ChunkSize >> 20) : fextl::string("off")));
   return true;
 }
 
@@ -499,43 +890,42 @@ fextl::string StatsLine() {
   if (!FEXUnpackCacheEnabled) {
     return {};
   }
+  // Every field is a uint64_t counter.
+  constexpr size_t Fields = sizeof(FEXUnpackCacheCounters) / sizeof(uint64_t);
   FEXUnpackCacheCounters Now;
-  Now.Lookups = __atomic_load_n(&FEXUnpackCacheStats.Lookups, __ATOMIC_RELAXED);
-  Now.KeyTicks = __atomic_load_n(&FEXUnpackCacheStats.KeyTicks, __ATOMIC_RELAXED);
-  Now.Hits = __atomic_load_n(&FEXUnpackCacheStats.Hits, __ATOMIC_RELAXED);
-  Now.HitBytes = __atomic_load_n(&FEXUnpackCacheStats.HitBytes, __ATOMIC_RELAXED);
-  Now.HitTicks = __atomic_load_n(&FEXUnpackCacheStats.HitTicks, __ATOMIC_RELAXED);
-  Now.Stores = __atomic_load_n(&FEXUnpackCacheStats.Stores, __ATOMIC_RELAXED);
-  Now.StoreBytes = __atomic_load_n(&FEXUnpackCacheStats.StoreBytes, __ATOMIC_RELAXED);
-  Now.StoreTicks = __atomic_load_n(&FEXUnpackCacheStats.StoreTicks, __ATOMIC_RELAXED);
-  Now.Dropped = __atomic_load_n(&FEXUnpackCacheStats.Dropped, __ATOMIC_RELAXED);
-  Now.Written = __atomic_load_n(&FEXUnpackCacheStats.Written, __ATOMIC_RELAXED);
-  Now.WriteTicks = __atomic_load_n(&FEXUnpackCacheStats.WriteTicks, __ATOMIC_RELAXED);
-  Now.Failures = __atomic_load_n(&FEXUnpackCacheStats.Failures, __ATOMIC_RELAXED);
+  for (size_t i = 0; i < Fields; ++i) {
+    reinterpret_cast<uint64_t*>(&Now)[i] = __atomic_load_n(&reinterpret_cast<const uint64_t*>(&FEXUnpackCacheStats)[i], __ATOMIC_RELAXED);
+  }
+  FEXUnpackCacheCounters D;
+  for (size_t i = 0; i < Fields; ++i) {
+    reinterpret_cast<uint64_t*>(&D)[i] = reinterpret_cast<const uint64_t*>(&Now)[i] - reinterpret_cast<const uint64_t*>(&Prev)[i];
+  }
+  Prev = Now;
   const auto Ms = [](uint64_t Ticks) {
     return static_cast<double>(Ticks) * 1000.0 / static_cast<double>(TickFrequency);
   };
   const auto MB = [](uint64_t Bytes) {
     return static_cast<double>(Bytes) / (1024.0 * 1024.0);
   };
-  fextl::string Line;
-  if (Now.Lookups != Prev.Lookups || Now.Stores != Prev.Stores || Now.Written != Prev.Written || Now.Dropped != Prev.Dropped ||
-      Now.Failures != Prev.Failures) {
-    uint64_t Size, Waiting;
-    {
-      std::scoped_lock Guard {TheCache->Lock};
-      Size = TheCache->DataEnd - HeaderSize;
-      Waiting = TheCache->RingHead - TheCache->RingTail;
-    }
-    Line = fextl::fmt::format("  ucache lookups={} key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms stored={}/{:.1f}MB/{:.1f}ms written={}/{:.1f}ms "
-                              "waiting={:.1f}MB dropped={} failed={} size={}MB writer={}{}\n",
-                              Now.Lookups - Prev.Lookups, Ms(Now.KeyTicks - Prev.KeyTicks), Now.Hits - Prev.Hits,
-                              MB(Now.HitBytes - Prev.HitBytes), Ms(Now.HitTicks - Prev.HitTicks), Now.Stores - Prev.Stores,
-                              MB(Now.StoreBytes - Prev.StoreBytes), Ms(Now.StoreTicks - Prev.StoreTicks), Now.Written - Prev.Written,
-                              Ms(Now.WriteTicks - Prev.WriteTicks), MB(Waiting), Now.Dropped - Prev.Dropped, Now.Failures - Prev.Failures,
-                              Size >> 20, WriterState.load(std::memory_order_relaxed), TheCache->Full ? " full" : "");
+  if (!D.Lookups && !D.Stores && !D.Written && !D.Dropped && !D.Failures && !D.AheadChunks && !D.AdlerSkips && !D.MD5Lookups) {
+    return {};
   }
-  Prev = Now;
-  return Line;
+  uint64_t Size, Waiting;
+  {
+    std::scoped_lock Guard {TheCache->Lock};
+    Size = TheCache->DataEnd - HeaderSize;
+    Waiting = TheCache->RingHead - TheCache->RingTail;
+  }
+  // hit: total time per hit, then ram = hits copied from read-ahead memory, disk = time reading the others, verify =
+  // hashing all of them. ahead = chunks the read-ahead thread read (and how many it dropped unused). adler = checks of a
+  // hit's output answered without computing them.
+  return fextl::fmt::format("  ucache lookups={} key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms ram={}/{:.1f}ms disk={:.1f}ms verify={:.1f}ms "
+                            "ahead={}/{:.1f}MB/{:.1f}ms wasted={} adler={}/{:.1f}MB stored={}/{:.1f}MB/{:.1f}ms written={}/{:.1f}ms "
+                            "waiting={:.1f}MB dropped={} failed={} size={}MB writer={}{} md5cache={}/{}/{:.1f}MB/{:.1f}ms stored={}\n",
+                            D.Lookups, Ms(D.KeyTicks), D.Hits, MB(D.HitBytes), Ms(D.HitTicks), D.RamHits, Ms(D.RamTicks), Ms(D.DiskTicks),
+                            Ms(D.VerifyTicks), D.AheadChunks, MB(D.AheadBytes), Ms(D.AheadTicks), D.AheadWasted, D.AdlerSkips,
+                            MB(D.AdlerSkipBytes), D.Stores, MB(D.StoreBytes), Ms(D.StoreTicks), D.Written, Ms(D.WriteTicks), MB(Waiting),
+                            D.Dropped, D.Failures, Size >> 20, WriterState.load(std::memory_order_relaxed), TheCache->Full ? " full" : "",
+                            D.MD5Hits, D.MD5Lookups, MB(D.MD5HitBytes), Ms(D.MD5Ticks), D.MD5Stores);
 }
 } // namespace NativeUnpackCache

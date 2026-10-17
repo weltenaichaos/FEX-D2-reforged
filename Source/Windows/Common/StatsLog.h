@@ -14,7 +14,8 @@ class StatAlloc;
 //   FEX_STATSLOG=<directory>      enables it; writes <directory>\fexstats-<exe>-<HHMMSS>-<pid>.txt
 //   FEX_STATSLOG_APP=<exe name>   optional; only log this process (e.g. D2R.exe)
 //   FEX_STATSLOG_PROFILE=1        optional; also sample which JIT blocks the busiest threads run and log the hottest every 30s,
-//                                 with the full guest code of the hottest ones the first time they show up
+//                                 with the full guest code of the hottest ones the first time they show up, and which native
+//                                 functions they are in when outside emulated code (per-thread "native" lines)
 //
 // Returns true if the log should run in this process, in which case the caller must allocate stats slots for every
 // thread and then call StartStatsLog().
@@ -34,4 +35,7 @@ void StatsLogWatchImage(uint64_t Base);
 // Adds the lines Provider returns (each indented and ending in a newline, or nothing) to every per-second block.
 // Provider runs on the log thread.
 void StatsLogSetLineProvider(fextl::string (*Provider)());
+
+// Names a native function that isn't exported (FEX's own native redirects) for the native-call sampler's "native" lines.
+void StatsLogNameNative(uint64_t Address, std::string_view Name);
 } // namespace FEX::Windows

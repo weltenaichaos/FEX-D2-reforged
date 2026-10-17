@@ -4,8 +4,9 @@
 
 #include <stdint.h>
 
-// ARM64EC clang defines __arm64ec__ (and __x86_64__), not __aarch64__. The plain C fallbacks are for host tests only.
-#if defined(__aarch64__) || defined(__arm64ec__)
+// ARM64EC clang defines __arm64ec__ (and __x86_64__), not __aarch64__. The plain C fallbacks are for host tests only
+// (FEX_NATIVE_HOST_TEST also selects them on an ARM64 Linux host, where x18 holds no TEB).
+#if (defined(__aarch64__) || defined(__arm64ec__)) && !defined(FEX_NATIVE_HOST_TEST)
 #define FEX_NATIVE_ARM64 1
 #endif
 
@@ -68,6 +69,11 @@ extern int FEXNativeZlibTrackStreams;
 extern uint64_t FEXNativeImageBase;
 extern uint64_t FEXNativeTextBegin;
 extern uint64_t FEXNativeTextEnd;
+// FEX_UNPACK_CACHE_SKIP_ADLER (default 1): answer inflate()'s adler32 check of a cache hit's output with the stream's own
+// trailer instead of computing it (the output was already checked against its stored hash).
+extern int FEXNativeSkipHitAdler;
+// FEX_NATIVE_ADLER_NEON (default 1): compute adler32 with NEON instead of zlib's C code.
+extern int FEXNativeAdlerNeon;
 
 #ifdef __cplusplus
 }

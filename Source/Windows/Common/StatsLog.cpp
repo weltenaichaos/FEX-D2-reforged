@@ -64,6 +64,16 @@ namespace {
   constexpr size_t MaxDumps = 256;
   constexpr size_t MaxMainSamples = 1024;
 
+  // Native-call sampler (with FEX_STATSLOG_PROFILE=1): ExitFunctionEC (ARM64EC/Module.S) stores the native function it
+  // enters in the thread's CHPE CPU area (EmulatorDataInline). Samples of a thread outside emulated code count against the
+  // last native function it entered from x86 code: a Wine/Windows API (named by the module's exports), one of FEX's own
+  // native redirects, or the native code an x86 callback returned to. Waiting shows up as the wait function.
+  constexpr size_t CPUAreaNativeTargetOffset = 0x50;
+  constexpr size_t MaxNativeTargets = 12;
+  constexpr size_t NativePrinted = 5;
+  // Marks a native target among the Main thread's hitch samples, which otherwise hold JIT block headers.
+  constexpr uint64_t NativeSampleFlag = 1ull << 63;
+
   // Mirrors of FEXCore's CPUBackend::JITCodeHeader / JITCodeTail (Interface/Core/CPUBackend.h).
   struct JITCodeHeaderMirror {
     uint32_t OffsetToBlockTail;
@@ -115,6 +125,13 @@ namespace {
     bool IsMain;
     uint8_t BinSamples[TimelineBins];
     uint8_t BinInSimulation[TimelineBins];
+    // Native-call sampler, see CPUAreaNativeTargetOffset. Reset every second.
+    const volatile uint64_t* NativeTarget;
+    struct {
+      uint64_t Target;
+      uint32_t Count;
+    } Native[MaxNativeTargets];
+    uint32_t NativeOther;
   };
 
   struct ProfileCount {
@@ -247,6 +264,14 @@ namespace {
     uint32_t HitchSamples;
     fextl::unordered_map<uint64_t, uint32_t> HitchCounts;
     size_t HitchLines;
+
+    // Names of native functions seen by the native-call sampler, and the export tables of the modules they are in.
+    struct ModuleExports {
+      fextl::string Name;
+      fextl::vector<std::pair<uint32_t, uint32_t>> Functions; // RVA, name RVA; sorted by RVA
+    };
+    fextl::unordered_map<uint64_t, fextl::string> NativeNames;
+    fextl::unordered_map<uint64_t, ModuleExports> Modules;
   };
 
   std::atomic<fextl::string (*)()> LineProvider {};
@@ -367,6 +392,14 @@ namespace {
     return Frame ? &Frame->State.InlineJITBlockHeader : nullptr;
   }
 
+  const volatile uint64_t* NativeTargetPointer(const CHPE_V2_CPU_AREA_INFO* Area) {
+#ifdef ARCHITECTURE_arm64ec
+    return Area ? reinterpret_cast<const volatile uint64_t*>(reinterpret_cast<uintptr_t>(Area) + CPUAreaNativeTargetOffset) : nullptr;
+#else
+    return nullptr;
+#endif
+  }
+
   void ProfileTick(LogState* State) {
     for (size_t i = 0; i < std::min(State->SampledCount, ProfiledThreads); ++i) {
       const auto& T = State->Sampled[i];
@@ -417,6 +450,174 @@ namespace {
     Text += fextl::fmt::format("#B rip={:X} size={} bytes={}\n", RIP, Code.size(), CodeHex);
   }
 
+  // Names for native functions that aren't exported (FEX's own redirect targets), see StatsLogNameNative.
+  constexpr size_t MaxNamedNatives = 32;
+  struct NamedNative {
+    std::atomic<bool> Ready;
+    uint64_t Address;
+    char Name[48];
+  };
+  NamedNative NamedNatives[MaxNamedNatives];
+  std::atomic<size_t> NamedNativeCount {};
+
+  // Reads memory that may have gone away since it was seen (an unloaded module), failing safely.
+  bool ReadMemory(uint64_t Address, void* Out, size_t Size) {
+    SIZE_T Read {};
+    return Size && NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), Out, Size, &Read) == STATUS_SUCCESS && Read == Size;
+  }
+
+  fextl::string ReadCString(uint64_t Address, size_t Max) {
+    fextl::string Out;
+    char Chunk[16];
+    while (Out.size() < Max && ReadMemory(Address + Out.size(), Chunk, sizeof(Chunk))) {
+      for (const char c : Chunk) {
+        if (!c || Out.size() == Max) {
+          return Out;
+        }
+        Out.push_back(c > 0x20 && c < 0x7f ? c : '_');
+      }
+    }
+    return Out;
+  }
+
+  // The module's name and its exported functions, from its export directory.
+  const LogState::ModuleExports& ModuleExportsFor(LogState* State, uint64_t Base) {
+    auto [It, Inserted] = State->Modules.try_emplace(Base);
+    auto& M = It->second;
+    if (!Inserted) {
+      return M;
+    }
+    M.Name = fextl::fmt::format("{:X}", Base);
+    IMAGE_DOS_HEADER Dos {};
+    IMAGE_NT_HEADERS64 Nt {};
+    if (!ReadMemory(Base, &Dos, sizeof(Dos)) || Dos.e_magic != IMAGE_DOS_SIGNATURE || !ReadMemory(Base + Dos.e_lfanew, &Nt, sizeof(Nt)) ||
+        Nt.Signature != IMAGE_NT_SIGNATURE || Nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+      return M;
+    }
+    const auto Dir = Nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    IMAGE_EXPORT_DIRECTORY Exports {};
+    if (!Dir.VirtualAddress || !Dir.Size || !ReadMemory(Base + Dir.VirtualAddress, &Exports, sizeof(Exports))) {
+      return M;
+    }
+    if (auto Name = ReadCString(Base + Exports.Name, 64); !Name.empty()) {
+      auto Lower = [](char c) {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+      };
+      const size_t n = Name.size();
+      if (n > 4 && Name[n - 4] == '.' && Lower(Name[n - 3]) == 'd' && Lower(Name[n - 2]) == 'l' && Lower(Name[n - 1]) == 'l') {
+        Name.resize(n - 4);
+      }
+      M.Name = std::move(Name);
+    }
+    const uint32_t Names = std::min<uint32_t>(Exports.NumberOfNames, 32768);
+    const uint32_t Functions = std::min<uint32_t>(Exports.NumberOfFunctions, 65536);
+    fextl::vector<uint32_t> NameRVAs(Names), FunctionRVAs(Functions);
+    fextl::vector<uint16_t> Ordinals(Names);
+    if (!Names || !Functions || !ReadMemory(Base + Exports.AddressOfNames, NameRVAs.data(), Names * sizeof(uint32_t)) ||
+        !ReadMemory(Base + Exports.AddressOfNameOrdinals, Ordinals.data(), Names * sizeof(uint16_t)) ||
+        !ReadMemory(Base + Exports.AddressOfFunctions, FunctionRVAs.data(), Functions * sizeof(uint32_t))) {
+      return M;
+    }
+    for (uint32_t i = 0; i < Names; ++i) {
+      if (Ordinals[i] >= Functions) {
+        continue;
+      }
+      const uint32_t RVA = FunctionRVAs[Ordinals[i]];
+      // Forwarders point into the export directory itself.
+      if (!RVA || (RVA >= Dir.VirtualAddress && RVA < Dir.VirtualAddress + Dir.Size)) {
+        continue;
+      }
+      M.Functions.push_back({RVA, NameRVAs[i]});
+    }
+    std::sort(M.Functions.begin(), M.Functions.end());
+    return M;
+  }
+
+  // "module!export" (plus the offset when Address is inside the function rather than at its start), a name FEX gave it,
+  // or the address.
+  fextl::string NativeName(LogState* State, uint64_t Address) {
+    if (const auto It = State->NativeNames.find(Address); It != State->NativeNames.end()) {
+      return It->second;
+    }
+    fextl::string Name;
+    for (size_t i = 0; i < std::min(NamedNativeCount.load(std::memory_order_acquire), MaxNamedNatives); ++i) {
+      if (NamedNatives[i].Ready.load(std::memory_order_acquire) && NamedNatives[i].Address == Address) {
+        Name = NamedNatives[i].Name;
+        break;
+      }
+    }
+    if (Name.empty()) {
+      if (const uint64_t Base = AllocationBase(Address); !Base || Address - Base > 0xffffffffull) {
+        Name = fextl::fmt::format("{:X}", Address);
+      } else {
+        const auto& M = ModuleExportsFor(State, Base);
+        const uint32_t RVA = static_cast<uint32_t>(Address - Base);
+        auto It = std::upper_bound(M.Functions.begin(), M.Functions.end(), RVA, [](uint32_t Value, const auto& F) { return Value < F.first; });
+        if (It == M.Functions.begin()) {
+          Name = fextl::fmt::format("{}+{:X}", M.Name, RVA);
+        } else {
+          --It;
+          Name = fextl::fmt::format("{}!{}", M.Name, ReadCString(Base + It->second, 64));
+          if (RVA != It->first) {
+            Name += fextl::fmt::format("+{:X}", RVA - It->first);
+          }
+        }
+      }
+    }
+    if (State->NativeNames.size() < 4096) {
+      State->NativeNames.emplace(Address, Name);
+    }
+    return Name;
+  }
+
+  void CountNative(SampledThread& T, uint64_t Target) {
+    for (auto& N : T.Native) {
+      if (N.Target == Target) {
+        ++N.Count;
+        return;
+      }
+      if (!N.Target) {
+        N.Target = Target;
+        N.Count = 1;
+        return;
+      }
+    }
+    ++T.NativeOther;
+  }
+
+  // The native functions a thread was sampled in during the last second, as shares of all its samples.
+  fextl::string NativeLine(LogState* State, const SampledThread& T) {
+    if (!T.Samples) {
+      return {};
+    }
+    std::pair<uint32_t, uint64_t> Entries[MaxNativeTargets];
+    size_t Count {};
+    uint32_t Native {};
+    for (const auto& N : T.Native) {
+      if (N.Target) {
+        Entries[Count++] = {N.Count, N.Target};
+        Native += N.Count;
+      }
+    }
+    if (!Count) {
+      return {};
+    }
+    std::sort(Entries, Entries + Count, [](const auto& a, const auto& b) { return a.first > b.first; });
+    const auto Percent = [&T](uint32_t Samples) {
+      return (Samples * 100 + T.Samples / 2) / T.Samples;
+    };
+    fextl::string Out = "    native";
+    uint32_t Printed {};
+    for (size_t i = 0; i < std::min(Count, NativePrinted); ++i) {
+      Out += fextl::fmt::format(" {}={}%", NativeName(State, Entries[i].second), Percent(Entries[i].first));
+      Printed += Entries[i].first;
+    }
+    if (const uint32_t Rest = Native - Printed + T.NativeOther) {
+      Out += fextl::fmt::format(" other={}%", Percent(Rest));
+    }
+    return Out + "\n";
+  }
+
   void WriteProfile(LogState* State, uint64_t Seconds) {
     struct Entry {
       uint64_t Header;
@@ -462,9 +663,14 @@ namespace {
 
   fextl::string FormatHitch(LogState* State) {
     fextl::vector<std::pair<uint32_t, uint64_t>> Blocks;
+    fextl::vector<std::pair<uint32_t, uint64_t>> Natives;
     Blocks.reserve(State->HitchCounts.size());
     for (const auto& [Header, Count] : State->HitchCounts) {
-      Blocks.push_back({Count, Header});
+      if (Header & NativeSampleFlag) {
+        Natives.push_back({Count, Header & ~NativeSampleFlag});
+      } else {
+        Blocks.push_back({Count, Header});
+      }
     }
     const size_t Printed = std::min(Blocks.size(), HitchPrinted);
     std::partial_sort(Blocks.begin(), Blocks.begin() + Printed, Blocks.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
@@ -480,6 +686,16 @@ namespace {
       Text += fextl::fmt::format(" {:X}@{:X} x{}", Tail.RIP, AllocationBase(Tail.RIP), Blocks[i].first);
       if (i < HitchDumped) {
         DumpBlock(State, Tail.RIP, Tail.GuestSize, Dumps);
+      }
+    }
+    // Where the thread was outside emulated code during the hitch.
+    if (!Natives.empty()) {
+      const size_t NativesPrinted = std::min<size_t>(Natives.size(), 3);
+      std::partial_sort(Natives.begin(), Natives.begin() + NativesPrinted, Natives.end(),
+                        [](const auto& a, const auto& b) { return a.first > b.first; });
+      Text += " native:";
+      for (size_t i = 0; i < NativesPrinted; ++i) {
+        Text += fextl::fmt::format(" {} x{}", NativeName(State, Natives[i].second), Natives[i].first);
       }
     }
     return Text + "\n" + Dumps;
@@ -541,6 +757,8 @@ namespace {
     for (size_t i = 0; i < State->SampledCount; ++i) {
       memset(State->Sampled[i].BinSamples, 0, sizeof(State->Sampled[i].BinSamples));
       memset(State->Sampled[i].BinInSimulation, 0, sizeof(State->Sampled[i].BinInSimulation));
+      memset(State->Sampled[i].Native, 0, sizeof(State->Sampled[i].Native));
+      State->Sampled[i].NativeOther = 0;
     }
     LARGE_INTEGER Interval {.QuadPart = -SampleInterval100ns};
     do {
@@ -559,6 +777,14 @@ namespace {
         if (In && T.IsMain && T.BlockHeader && State->MainSampleCount < MaxMainSamples) {
           if (const uint64_t Header = *T.BlockHeader) {
             State->MainSamples[State->MainSampleCount++] = {static_cast<uint8_t>(Bin), Header};
+          }
+        }
+        if (!In && T.NativeTarget) {
+          if (const uint64_t Target = *T.NativeTarget) {
+            CountNative(T, Target);
+            if (T.IsMain && State->MainSampleCount < MaxMainSamples) {
+              State->MainSamples[State->MainSampleCount++] = {static_cast<uint8_t>(Bin), Target | NativeSampleFlag};
+            }
           }
         }
         if (T.BinSamples[Bin] < 255) {
@@ -763,6 +989,11 @@ namespace {
                                      D.DiskCacheKeyTime * MsPerTick, D.DiskCacheReadTime * MsPerTick, D.DiskCacheFileReadCount,
                                      D.DiskCacheRelocTime * MsPerTick, D.DiskCacheInstallTime * MsPerTick);
         }
+        if (State->Profile) {
+          if (const auto* T = FindSampled(State, D.TID)) {
+            Line += NativeLine(State, *T);
+          }
+        }
       }
 
       // Timeline of the busiest threads, see TimelineThreads. Per 10ms bin: ' ' not sampled, '.' all native (Wine, VKD3D,
@@ -845,6 +1076,7 @@ namespace {
         if (State->Profile) {
           N.BlockHeader = BlockHeaderPointer(Area);
           N.IsMain = QueryThreadName(N.TID) == "Main";
+          N.NativeTarget = NativeTargetPointer(Area);
         }
       }
       std::copy_n(Next, NextCount, State->Sampled);
@@ -940,9 +1172,11 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   };
   const auto Switches = fextl::fmt::format(
     "# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={} FEX_NATIVE_ZLIB={} FEX_NATIVE_MD5={} FEX_UNPACK_CACHE={} "
-    "FEX_UNPACK_CACHE_MAX_GB={} FEX_UNPACK_CACHE_RESET={}\n",
+    "FEX_UNPACK_CACHE_MAX_GB={} FEX_UNPACK_CACHE_RESET={} FEX_UNPACK_CACHE_READAHEAD_MB={} FEX_UNPACK_CACHE_SKIP_ADLER={} "
+    "FEX_NATIVE_ADLER_NEON={} FEX_NATIVE_MD5_CACHE={}\n",
     State->Profile ? 1 : 0, State->Timeline ? 1 : 0, Env("FEX_THREADPIN"), Env("FEX_NATIVE_ZLIB"), Env("FEX_NATIVE_MD5"), Env("FEX_UNPACK_CACHE"),
-    Env("FEX_UNPACK_CACHE_MAX_GB"), Env("FEX_UNPACK_CACHE_RESET"));
+    Env("FEX_UNPACK_CACHE_MAX_GB"), Env("FEX_UNPACK_CACHE_RESET"), Env("FEX_UNPACK_CACHE_READAHEAD_MB"), Env("FEX_UNPACK_CACHE_SKIP_ADLER"),
+    Env("FEX_NATIVE_ADLER_NEON"), Env("FEX_NATIVE_MD5_CACHE"));
   fwrite(Switches.data(), 1, Switches.size(), File);
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
@@ -973,6 +1207,19 @@ void StatsLogDiskCacheHit(uint64_t GuestRIP) {
 
 void StatsLogSetLineProvider(fextl::string (*Provider)()) {
   LineProvider.store(Provider, std::memory_order_release);
+}
+
+void StatsLogNameNative(uint64_t Address, std::string_view Name) {
+  const size_t Index = NamedNativeCount.fetch_add(1, std::memory_order_relaxed);
+  if (Index >= MaxNamedNatives) {
+    return;
+  }
+  auto& N = NamedNatives[Index];
+  N.Address = Address;
+  const size_t Length = std::min(Name.size(), sizeof(N.Name) - 1);
+  memcpy(N.Name, Name.data(), Length);
+  N.Name[Length] = 0;
+  N.Ready.store(true, std::memory_order_release);
 }
 
 void StatsLogNote(std::string_view Line) {

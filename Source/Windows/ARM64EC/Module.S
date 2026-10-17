@@ -61,6 +61,7 @@ ExitFunctionEC:
   msr fpcr, x17
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+  str x9, [x17, #0x50] // ChpeV2CpuAreaInfo->EmulatorDataInline: the native function being entered, for the stats log's sampler
   ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
   ldr w17, [x17]
   cbnz w17, ExitFunctionSuspendPoint
@@ -193,6 +194,7 @@ end:
   adr x9, \Name\()Target
   b ExitFunctionEC
   .word \Name\()Thunk - \Name\()Target
+.global \Name\()Target
 \Name\()Target:
   b "\Target"
 \Name\()Thunk:

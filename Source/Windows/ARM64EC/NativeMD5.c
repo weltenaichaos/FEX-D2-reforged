@@ -9,8 +9,17 @@
 // switching this on.
 
 #include "NativeStats.h"
+#include "NativeUnpackCache.h"
+
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 
 #include <stdint.h>
+
+// MD5 cache (NativeUnpackCache.h): an update over at least this many bytes that starts on a block boundary is looked up
+// by a hash of the starting state and the whole blocks it covers. A hit sets the state the blocks would have produced
+// and buffers the rest, exactly as the loop below does.
+#define MD5_CACHE_MIN_BYTES 4096u
 
 struct FEXNativeCallStats FEXNativeMD5UpdateStats;
 struct FEXNativeCallStats FEXNativeMD5TransformStats;
@@ -158,6 +167,33 @@ void FEXNativeMD5Update(uint8_t* Ctx, const uint8_t* Data, uint64_t Length) {
   }
   const uint64_t Start = ReadTicks();
   const uint64_t Total = Length;
+
+  uint64_t Key[2];
+  int Store = 0;
+  if (Length >= MD5_CACHE_MIN_BYTES && __atomic_load_n(&FEXMD5CacheEnabled, __ATOMIC_ACQUIRE) && Load32(Ctx + 0x18) == 0) {
+    const uint64_t Blocks = Length & ~(uint64_t)63;
+    const XXH128_hash_t Hash = XXH3_128bits_withSeed(Data, Blocks, XXH3_64bits(Ctx + 0x08, 16));
+    Key[0] = Hash.low64;
+    Key[1] = Hash.high64;
+    uint32_t State[4];
+    __atomic_fetch_add(&FEXUnpackCacheStats.MD5Lookups, 1, __ATOMIC_RELAXED);
+    if (FEXMD5CacheGet(Key, Blocks, State)) {
+      for (int i = 0; i < 4; ++i) {
+        Store32(Ctx + 0x08 + 4 * i, State[i]);
+      }
+      Store64(Ctx, Load64(Ctx) + Blocks * 8);
+      const uint32_t Rest = (uint32_t)(Length - Blocks);
+      __builtin_memcpy(Ctx + 0x1c, Data + Blocks, Rest);
+      Store32(Ctx + 0x18, Rest);
+      __atomic_fetch_add(&FEXUnpackCacheStats.MD5Hits, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&FEXUnpackCacheStats.MD5HitBytes, Blocks, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&FEXUnpackCacheStats.MD5Ticks, ReadTicks() - Start, __ATOMIC_RELAXED);
+      return;
+    }
+    __atomic_fetch_add(&FEXUnpackCacheStats.MD5Ticks, ReadTicks() - Start, __ATOMIC_RELAXED);
+    Store = 1;
+  }
+
   do {
     const uint32_t Fill = Load32(Ctx + 0x18);
     if (Fill == 0 && Length >= 64) {
@@ -180,5 +216,10 @@ void FEXNativeMD5Update(uint8_t* Ctx, const uint8_t* Data, uint64_t Length) {
       }
     }
   } while (Length != 0);
+  if (Store) {
+    // Started on a block boundary, so the state now is the one after the whole blocks; the rest is only buffered.
+    const uint32_t State[4] = {Load32(Ctx + 0x08), Load32(Ctx + 0x0c), Load32(Ctx + 0x10), Load32(Ctx + 0x14)};
+    FEXMD5CachePut(Key, Total & ~(uint64_t)63, State);
+  }
   Count(&FEXNativeMD5UpdateStats, Start, Total);
 }
