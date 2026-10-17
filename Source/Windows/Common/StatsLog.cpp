@@ -48,6 +48,10 @@ namespace {
   constexpr uint64_t ProfileWindowSeconds = 30;
   constexpr size_t ProfilePrinted = 40;
   constexpr size_t ProfileBytes = 128;
+  // The hottest ProfileDumped blocks of each window also get their whole guest code written once ("#B" lines), so the
+  // functions behind them can be identified offline.
+  constexpr size_t ProfileDumped = 8;
+  constexpr size_t ProfileDumpMaxBytes = 4096;
 
   // Mirrors of FEXCore's CPUBackend::JITCodeHeader / JITCodeTail (Interface/Core/CPUBackend.h).
   struct JITCodeHeaderMirror {
@@ -215,7 +219,10 @@ namespace {
     uint64_t SecondStart; // cycle counter when the current second's sampling began
     fextl::unordered_map<uint64_t, ProfileCount> ProfileCounts;
     uint32_t ProfileSamples[2];
+    fextl::vector<uint64_t> DumpedRIPs;
   };
+
+  std::atomic<fextl::string (*)()> LineProvider {};
 
   uint64_t GetCounter() {
     uint64_t Result {};
@@ -356,6 +363,21 @@ namespace {
       }
       Text += fextl::fmt::format("#P rip={:X} base={:X} guestsize={} hostsize={} main={} other={} bytes={}\n", Tail.RIP,
                                  reinterpret_cast<uintptr_t>(Info.AllocationBase), Tail.GuestSize, Tail.Size, E.C.Main, E.C.Other, Hex);
+
+      if (i < ProfileDumped && Tail.GuestSize > ProfileBytes &&
+          std::find(State->DumpedRIPs.begin(), State->DumpedRIPs.end(), Tail.RIP) == State->DumpedRIPs.end()) {
+        fextl::vector<uint8_t> Code(std::min(Tail.GuestSize, ProfileDumpMaxBytes));
+        SIZE_T CodeRead {};
+        NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Tail.RIP), Code.data(), Code.size(), &CodeRead);
+        if (CodeRead == Code.size()) {
+          State->DumpedRIPs.push_back(Tail.RIP);
+          fextl::string CodeHex;
+          for (const auto Byte : Code) {
+            CodeHex += fextl::fmt::format("{:02x}", Byte);
+          }
+          Text += fextl::fmt::format("#B rip={:X} size={} bytes={}\n", Tail.RIP, Code.size(), CodeHex);
+        }
+      }
     }
     fwrite(Text.data(), 1, Text.size(), State->File);
 
@@ -624,6 +646,10 @@ namespace {
         Line += "  clk=unreadable\n";
       }
 
+      if (const auto Provider = LineProvider.load(std::memory_order_acquire)) {
+        Line += Provider();
+      }
+
       fwrite(Line.data(), 1, Line.size(), State->File);
 
       if (State->Profile && Seconds % ProfileWindowSeconds == 0) {
@@ -743,8 +769,9 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   State->Profile = Profile && Profile[0] == '1';
   const char* Timeline = getenv("FEX_STATSLOG_TIMELINE");
   State->Timeline = !(Timeline && Timeline[0] == '0');
-  const auto Switches = fextl::fmt::format("# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={}\n",
-                                           State->Profile ? 1 : 0, State->Timeline ? 1 : 0, getenv("FEX_THREADPIN") ? getenv("FEX_THREADPIN") : "-");
+  const auto Switches = fextl::fmt::format("# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={} FEX_NATIVE_ZLIB={}\n",
+                                           State->Profile ? 1 : 0, State->Timeline ? 1 : 0, getenv("FEX_THREADPIN") ? getenv("FEX_THREADPIN") : "-",
+                                           getenv("FEX_NATIVE_ZLIB") ? getenv("FEX_NATIVE_ZLIB") : "-");
   fwrite(Switches.data(), 1, Switches.size(), File);
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
@@ -771,6 +798,10 @@ void StatsLogDiskCacheHit(uint64_t GuestRIP) {
   const uint32_t First = W->FirstReadable[(GuestRIP - W->Base) / 4096].load(std::memory_order_relaxed);
   const uint32_t Second = W->Second.load(std::memory_order_acquire);
   (First && First < Second ? HitsEarly : HitsLate).fetch_add(1, std::memory_order_relaxed);
+}
+
+void StatsLogSetLineProvider(fextl::string (*Provider)()) {
+  LineProvider.store(Provider, std::memory_order_release);
 }
 
 void StatsLogNote(std::string_view Line) {

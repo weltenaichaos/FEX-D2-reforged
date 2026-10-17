@@ -51,6 +51,7 @@ $end_info$
 #include "Windows/Common/SHMStats.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/ThreadPlacer.h"
+#include "NativeRedirect.h"
 
 #include <atomic>
 #include <cstdint>
@@ -761,6 +762,10 @@ public:
   void OnDiskCacheHit(uint64_t GuestRIP) override {
     FEX::Windows::StatsLogDiskCacheHit(GuestRIP);
   }
+
+  uintptr_t RedirectBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) override {
+    return NativeRedirect::Lookup(GuestRIP);
+  }
 };
 } // namespace Exception
 
@@ -856,6 +861,7 @@ NTSTATUS ProcessInit() {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
   FEX::Windows::StartThreadPlacer(AppConfigName);
+  NativeRedirect::Init(reinterpret_cast<uint64_t>(MainModule));
 
   if (StartupSleep() && (StartupSleepProcName().empty() || AppConfigName == StartupSleepProcName())) {
     LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), AppConfigName, StartupSleep());

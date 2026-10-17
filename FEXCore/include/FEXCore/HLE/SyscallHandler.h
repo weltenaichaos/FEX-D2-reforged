@@ -44,6 +44,14 @@ public:
   // Called after a block was installed from the disk cache, only while per-thread stats are being collected.
   virtual void OnDiskCacheHit(uint64_t GuestRIP) {}
 
+  // Lets the frontend run its own host code in place of the guest code at GuestRIP. Called on every block lookup that
+  // reaches the compiler, before the code caches are consulted; a non-zero result is jumped to instead of a compiled
+  // block, with the same register state a compiled block would get. The result is not cached, but direct branches to it
+  // are linked as usual.
+  virtual uintptr_t RedirectBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
+    return 0;
+  }
+
   virtual SourcecodeResolver* GetSourcecodeResolver() {
     return nullptr;
   }

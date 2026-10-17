@@ -173,3 +173,70 @@ end:
 "#JumpSetStack":
   mov sp, x1
   br x0
+
+  // Native redirects, see NativeRedirect.cpp. RedirectBlock hands out a <Name>Redirect stub in place of a compiled block
+  // for a guest function's entry point, so it runs with the register state of a JIT block entry: REG_CALLRET_SP in x17,
+  // the CPU state frame in x28, the guest RSP in x23 and sp on the emulator stack. It leaves the JIT exactly like a JIT
+  // branch to an ARM64EC function does (ExitFunction in BranchOps.cpp): ExitFunctionEC reads the entry thunk offset
+  // stored before <Name>Target, pops the x64 return address into lr and runs <Name>Thunk. The thunk saves what the x64
+  // ABI needs preserved beyond AAPCS64 (all of q6-q15), calls the native implementation with the guest's argument
+  // registers, puts the result in x8 (RAX) and returns to the x64 caller through RetToEntryThunk.
+.balign 16
+.global NativeInflateFastRedirect
+NativeInflateFastRedirect:
+  adrp x11, NativeRedirectCallRetSPOffset
+  ldr x11, [x11, #:lo12:NativeRedirectCallRetSPOffset]
+  str x17, [x28, x11]
+  mov sp, x23
+  adr x9, NativeInflateFastTarget
+  b ExitFunctionEC
+  .word NativeInflateFastThunk - NativeInflateFastTarget
+NativeInflateFastTarget:
+  b "#FEXNativeInflateFast"
+NativeInflateFastThunk:
+  stp x29, x30, [sp, #-176]!
+  mov x29, sp
+  stp q6, q7, [sp, #16]
+  stp q8, q9, [sp, #48]
+  stp q10, q11, [sp, #80]
+  stp q12, q13, [sp, #112]
+  stp q14, q15, [sp, #144]
+  bl "#FEXNativeInflateFast"
+  mov x8, x0
+  ldp q6, q7, [sp, #16]
+  ldp q8, q9, [sp, #48]
+  ldp q10, q11, [sp, #80]
+  ldp q12, q13, [sp, #112]
+  ldp q14, q15, [sp, #144]
+  ldp x29, x30, [sp], #176
+  b RetToEntryThunk
+
+.balign 16
+.global NativeAdler32ZRedirect
+NativeAdler32ZRedirect:
+  adrp x11, NativeRedirectCallRetSPOffset
+  ldr x11, [x11, #:lo12:NativeRedirectCallRetSPOffset]
+  str x17, [x28, x11]
+  mov sp, x23
+  adr x9, NativeAdler32ZTarget
+  b ExitFunctionEC
+  .word NativeAdler32ZThunk - NativeAdler32ZTarget
+NativeAdler32ZTarget:
+  b "#FEXNativeAdler32Z"
+NativeAdler32ZThunk:
+  stp x29, x30, [sp, #-176]!
+  mov x29, sp
+  stp q6, q7, [sp, #16]
+  stp q8, q9, [sp, #48]
+  stp q10, q11, [sp, #80]
+  stp q12, q13, [sp, #112]
+  stp q14, q15, [sp, #144]
+  bl "#FEXNativeAdler32Z"
+  mov x8, x0
+  ldp q6, q7, [sp, #16]
+  ldp q8, q9, [sp, #48]
+  ldp q10, q11, [sp, #80]
+  ldp q12, q13, [sp, #112]
+  ldp q14, q15, [sp, #144]
+  ldp x29, x30, [sp], #176
+  b RetToEntryThunk

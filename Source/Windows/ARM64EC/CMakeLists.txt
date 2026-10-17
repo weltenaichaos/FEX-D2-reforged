@@ -1,6 +1,8 @@
 add_library(arm64ecfex SHARED
   Module.cpp
   Module.S
+  NativeRedirect.cpp
+  NativeZlib.c
   libarm64ecfex.def
   $<TARGET_OBJECTS:FEXCore_object>)
 

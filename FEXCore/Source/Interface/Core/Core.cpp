@@ -879,6 +879,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   auto Thread = Frame->Thread;
+
+  // Single-instruction compiles (single stepping, inline SMC handling) always get real guest code.
+  if (MaxInst == 0) {
+    if (const auto Redirect = SyscallHandler->RedirectBlock(Thread, GuestRIP)) {
+      return Redirect;
+    }
+  }
+
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION_MAX(Thread, AccumulatedJITTime, MaxJITTime);
 
