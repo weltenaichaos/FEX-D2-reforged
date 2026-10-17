@@ -4,6 +4,11 @@
 
 #include <stdint.h>
 
+// ARM64EC clang defines __arm64ec__ (and __x86_64__), not __aarch64__. The plain C fallbacks are for host tests only.
+#if defined(__aarch64__) || defined(__arm64ec__)
+#define FEX_NATIVE_ARM64 1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,7 +30,7 @@ extern struct FEXNativeCallStats FEXNativeMD5TransformStats;
 #define FEX_NATIVE_ZLIB_SIZE_BUCKETS 8 // buffer size <1K, <4K, <16K, <64K, <256K, <1M, <4M, >=4M
 
 struct FEXNativeZlibMagic {
-  uint32_t Magic; // first 4 output bytes, little endian
+  uint32_t Magic; // first 4 output bytes, little endian, or 0 for all streams that don't start with 4 printable characters
   uint32_t Used;
   uint64_t Streams;
   uint64_t Repeats;
@@ -49,6 +54,7 @@ struct FEXNativeZlibStreams {
   uint64_t Bytes;
   uint64_t RepeatBytes;
   uint64_t Unlisted; // streams whose magic didn't fit in the table
+  uint64_t Oneshot;  // streams whose first inflate_fast call already produced all but the last 1 KiB of the buffer
   uint64_t SizeBuckets[FEX_NATIVE_ZLIB_SIZE_BUCKETS];
   struct FEXNativeZlibMagic Magics[FEX_NATIVE_ZLIB_MAGIC_SLOTS];
   struct FEXNativeZlibCaller Callers[FEX_NATIVE_ZLIB_CALLER_SLOTS];

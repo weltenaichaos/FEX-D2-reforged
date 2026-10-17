@@ -17,7 +17,7 @@ struct FEXNativeCallStats FEXNativeMD5TransformStats;
 
 static inline uint64_t ReadTicks(void) {
   uint64_t Value = 0;
-#ifdef __aarch64__
+#ifdef FEX_NATIVE_ARM64
   __asm__ volatile("mrs %0, cntvct_el0" : "=r"(Value));
 #endif
   return Value;

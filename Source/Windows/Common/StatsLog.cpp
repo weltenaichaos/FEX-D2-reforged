@@ -236,6 +236,37 @@ namespace {
     return Result ? Result : 1;
   }
 
+  // What the game is told about memory (GlobalMemoryStatusEx reads the same two system queries) and what the process
+  // uses. A game that sizes its caches from free memory may evict and reload data when this is low.
+  fextl::string MemoryLine() {
+    SYSTEM_BASIC_INFORMATION Basic {};
+    if (NtQuerySystemInformation(SystemBasicInformation, &Basic, sizeof(Basic), nullptr) != STATUS_SUCCESS) {
+      return {};
+    }
+    const uint64_t PageSize = Basic.PhysicalPageSize ? Basic.PhysicalPageSize : 4096;
+    const auto MB = [PageSize](uint64_t Pages) {
+      return Pages * PageSize / (1024 * 1024);
+    };
+    auto Line = fextl::fmt::format("  mem total={}MB", MB(Basic.NumberOfPhysicalPages));
+
+    // Larger than any version of the structure, so the query can't fail on its size.
+    union {
+      SYSTEM_PERFORMANCE_INFORMATION Info;
+      uint8_t Raw[2048];
+    } Perf {};
+    if (NtQuerySystemInformation(SystemPerformanceInformation, &Perf, sizeof(Perf), nullptr) == STATUS_SUCCESS) {
+      Line += fextl::fmt::format(" avail={}MB commit={}MB/{}MB", MB(Perf.Info.AvailablePages), MB(Perf.Info.TotalCommittedPages),
+                                 MB(Perf.Info.TotalCommitLimit));
+    }
+
+    VM_COUNTERS Counters {};
+    if (NtQueryInformationProcess(NtCurrentProcess(), ProcessVmCounters, &Counters, sizeof(Counters), nullptr) == STATUS_SUCCESS) {
+      Line += fextl::fmt::format(" | process ws={}MB peak={}MB pagefile={}MB virtual={}MB", Counters.WorkingSetSize >> 20,
+                                 Counters.PeakWorkingSetSize >> 20, Counters.PagefileUsage >> 20, Counters.VirtualSize >> 20);
+    }
+    return Line + "\n";
+  }
+
   HANDLE OpenThreadForQuery(uint32_t TID) {
     HANDLE Handle {};
     CLIENT_ID ClientId {
@@ -644,6 +675,10 @@ namespace {
         Line += fextl::fmt::format("  clk={}\n", Clocks);
       } else if (ClocksUnreadable && Seconds == 1) {
         Line += "  clk=unreadable\n";
+      }
+
+      if (Seconds % 10 == 1) {
+        Line += MemoryLine();
       }
 
       if (const auto Provider = LineProvider.load(std::memory_order_acquire)) {

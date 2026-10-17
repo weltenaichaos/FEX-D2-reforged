@@ -291,6 +291,9 @@ namespace {
       const char c = static_cast<char>((Magic >> (i * 8)) & 0xff);
       Text[i] = (c >= 0x20 && c < 0x7f && c != '\'') ? c : '.';
     }
+    if (!Magic) {
+      return "binary";
+    }
     return fextl::fmt::format("{:08x}'{}'", __builtin_bswap32(Magic), Text);
   }
 
@@ -311,9 +314,10 @@ namespace {
     }
     // Session totals too: distinctMB is how much memory a cache of every distinct stream seen so far would need.
     auto Lines = fextl::fmt::format("  zlib{}s streams={} repeats={} ({:.0f}%) MB={:.1f} repeatMB={:.1f} sizes(<1K/4K/16K/64K/256K/1M/4M/more)={} "
-                                    "| total streams={} repeats={} MB={:.0f} distinctMB={:.0f}\n",
+                                    "oneshot={} | total streams={} repeats={} MB={:.0f} distinctMB={:.0f}\n",
                                     WindowSeconds, Streams, Repeats, 100.0 * static_cast<double>(Repeats) / static_cast<double>(Streams), MB,
-                                    RepeatMB, Sizes, Now.Streams, Now.Repeats, static_cast<double>(Now.Bytes) / (1024.0 * 1024.0),
+                                    RepeatMB, Sizes, Now.Oneshot - Old.Oneshot, Now.Streams, Now.Repeats,
+                                    static_cast<double>(Now.Bytes) / (1024.0 * 1024.0),
                                     static_cast<double>(Now.Bytes - Now.RepeatBytes) / (1024.0 * 1024.0));
 
     struct Row {

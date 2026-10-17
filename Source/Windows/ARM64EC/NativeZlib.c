@@ -32,7 +32,7 @@ static uint64_t Seen[SEEN_SLOTS];
 
 static inline uint64_t ReadTicks(void) {
   uint64_t Value = 0;
-#ifdef __aarch64__
+#ifdef FEX_NATIVE_ARM64
   __asm__ volatile("mrs %0, cntvct_el0" : "=r"(Value));
 #endif
   return Value;
@@ -48,7 +48,7 @@ static inline void Count(struct FEXNativeCallStats* Stats, uint64_t Start, uint6
 static inline void Lock(void) {
   while (__atomic_exchange_n(&StreamLock, 1, __ATOMIC_ACQUIRE)) {
     while (__atomic_load_n(&StreamLock, __ATOMIC_RELAXED)) {
-#ifdef __aarch64__
+#ifdef FEX_NATIVE_ARM64
       __asm__ volatile("yield");
 #endif
     }
@@ -109,11 +109,17 @@ static inline int InText(uint64_t Value) {
 // The first three values on the guest stack above inflate_fast's frame that point into the executable's code: with
 // frame pointers absent these are, almost always, the return addresses of inflate() and the two functions above it.
 static void FindCallers(const uint64_t* Stack, uint64_t ReturnAddress, uint32_t Out[3]) {
-  uint64_t StackBase = 0;
-#ifdef __aarch64__
+  // Only read what is surely mapped: up to the thread's stack base when on the thread's stack, otherwise (a stack the
+  // game switched to itself) only to the end of the current page.
+  uint64_t End = ((uint64_t)Stack | 0xfff) + 1;
+#ifdef FEX_NATIVE_ARM64
   uint64_t Teb;
   __asm__ volatile("mov %0, x18" : "=r"(Teb));
-  StackBase = *(const uint64_t*)(Teb + 8); // NT_TIB.StackBase
+  const uint64_t StackBase = *(const uint64_t*)(Teb + 8);   // NT_TIB.StackBase
+  const uint64_t StackLimit = *(const uint64_t*)(Teb + 16); // NT_TIB.StackLimit
+  if ((uint64_t)Stack >= StackLimit && (uint64_t)Stack < StackBase) {
+    End = StackBase;
+  }
 #endif
   // In the case where ExitFunctionEC left the x64 return address on the stack, skip it: it's inflate_fast's caller.
   if (!InText(ReturnAddress)) {
@@ -121,7 +127,7 @@ static void FindCallers(const uint64_t* Stack, uint64_t ReturnAddress, uint32_t 
   }
   int Found = 0;
   for (int i = 0; i < 256 && Found < 3; ++i) {
-    if ((uint64_t)(Stack + i + 1) > StackBase) {
+    if ((uint64_t)(Stack + i + 1) > End) {
       break;
     }
     const uint64_t Value = Stack[i];
@@ -139,9 +145,22 @@ static uint32_t SizeBucket(uint32_t Size) {
   return Bucket;
 }
 
+static int Printable(uint32_t Magic) {
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t c = (Magic >> (i * 8)) & 0xff;
+    if (c < 0x20 || c >= 0x7f) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static void NoteStream(const unsigned char* Out, uint32_t Produced, uint32_t BufferSize, const uint64_t* Stack, uint64_t ReturnAddress) {
   uint32_t Magic;
   __builtin_memcpy(&Magic, Out, 4);
+  if (!Printable(Magic)) {
+    Magic = 0;
+  }
   const int Repeat = SeenBefore(Fingerprint(Out, Produced < 4096 ? Produced : 4096, BufferSize));
   uint32_t Callers[3] = {0, 0, 0};
   FindCallers(Stack, ReturnAddress, Callers);
@@ -154,6 +173,9 @@ static void NoteStream(const unsigned char* Out, uint32_t Produced, uint32_t Buf
     Streams.RepeatBytes += BufferSize;
   }
   Streams.SizeBuckets[SizeBucket(BufferSize)]++;
+  if (Produced + 1024 >= BufferSize) {
+    Streams.Oneshot++;
+  }
 
   struct FEXNativeZlibMagic* Slot = 0;
   for (int i = 0; i < FEX_NATIVE_ZLIB_MAGIC_SLOTS; ++i) {
