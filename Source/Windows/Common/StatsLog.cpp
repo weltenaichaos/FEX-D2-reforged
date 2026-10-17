@@ -53,6 +53,17 @@ namespace {
   constexpr size_t ProfileDumped = 8;
   constexpr size_t ProfileDumpMaxBytes = 4096;
 
+  // Main thread hitches (with FEX_STATSLOG_PROFILE=1): a run of at least HitchMinBins timeline bins in which the thread
+  // named "Main" ran emulated code without a break gets a "# hitch" line with the JIT blocks it was sampled in, so long
+  // frames in the game's own code can be traced to the functions behind them. The hottest blocks of each hitch get their
+  // guest code written once ("#B" lines).
+  constexpr size_t HitchMinBins = 10; // 100ms
+  constexpr size_t HitchPrinted = 6;
+  constexpr size_t HitchDumped = 3;
+  constexpr size_t MaxHitchLines = 400;
+  constexpr size_t MaxDumps = 256;
+  constexpr size_t MaxMainSamples = 1024;
+
   // Mirrors of FEXCore's CPUBackend::JITCodeHeader / JITCodeTail (Interface/Core/CPUBackend.h).
   struct JITCodeHeaderMirror {
     uint32_t OffsetToBlockTail;
@@ -220,6 +231,22 @@ namespace {
     fextl::unordered_map<uint64_t, ProfileCount> ProfileCounts;
     uint32_t ProfileSamples[2];
     fextl::vector<uint64_t> DumpedRIPs;
+
+    // Main thread hitch recorder, see HitchMinBins. Samples of the current second in bin order, and the run in progress,
+    // which can go on into the next second.
+    struct MainSample {
+      uint8_t Bin;
+      uint64_t Header;
+    };
+    MainSample MainSamples[MaxMainSamples];
+    size_t MainSampleCount;
+    size_t HitchBins;
+    size_t HitchFullBins;
+    uint64_t HitchStartSecond;
+    size_t HitchStartBin;
+    uint32_t HitchSamples;
+    fextl::unordered_map<uint64_t, uint32_t> HitchCounts;
+    size_t HitchLines;
   };
 
   std::atomic<fextl::string (*)()> LineProvider {};
@@ -356,6 +383,40 @@ namespace {
     }
   }
 
+  // Reads a JIT block's guest RIP and size from its header. The block may have been freed since it was sampled, so this
+  // goes through NtReadVirtualMemory, which fails safely.
+  bool ReadBlockTail(uint64_t HeaderAddress, JITCodeTailMirror& Tail) {
+    JITCodeHeaderMirror Header {};
+    return NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(HeaderAddress), &Header, sizeof(Header), nullptr) == STATUS_SUCCESS &&
+           NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(HeaderAddress + Header.OffsetToBlockTail), &Tail, sizeof(Tail),
+                               nullptr) == STATUS_SUCCESS;
+  }
+
+  uint64_t AllocationBase(uint64_t Address) {
+    MEMORY_BASIC_INFORMATION Info {};
+    NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
+    return reinterpret_cast<uintptr_t>(Info.AllocationBase);
+  }
+
+  // Writes a block's whole guest code once per session as a "#B" line.
+  void DumpBlock(LogState* State, uint64_t RIP, size_t GuestSize, fextl::string& Text) {
+    if (State->DumpedRIPs.size() >= MaxDumps || std::find(State->DumpedRIPs.begin(), State->DumpedRIPs.end(), RIP) != State->DumpedRIPs.end()) {
+      return;
+    }
+    fextl::vector<uint8_t> Code(std::min(GuestSize, ProfileDumpMaxBytes));
+    SIZE_T CodeRead {};
+    NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(RIP), Code.data(), Code.size(), &CodeRead);
+    if (Code.empty() || CodeRead != Code.size()) {
+      return;
+    }
+    State->DumpedRIPs.push_back(RIP);
+    fextl::string CodeHex;
+    for (const auto Byte : Code) {
+      CodeHex += fextl::fmt::format("{:02x}", Byte);
+    }
+    Text += fextl::fmt::format("#B rip={:X} size={} bytes={}\n", RIP, Code.size(), CodeHex);
+  }
+
   void WriteProfile(LogState* State, uint64_t Seconds) {
     struct Entry {
       uint64_t Header;
@@ -374,17 +435,11 @@ namespace {
                                    State->ProfileSamples[0], State->ProfileSamples[1], Entries.size());
     for (size_t i = 0; i < Printed; ++i) {
       const auto& E = Entries[i];
-      // The block may have been freed since it was sampled, so read it through NtReadVirtualMemory, which fails safely.
-      JITCodeHeaderMirror Header {};
       JITCodeTailMirror Tail {};
-      if (NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(E.Header), &Header, sizeof(Header), nullptr) != STATUS_SUCCESS ||
-          NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(E.Header + Header.OffsetToBlockTail), &Tail, sizeof(Tail), nullptr) !=
-            STATUS_SUCCESS) {
+      if (!ReadBlockTail(E.Header, Tail)) {
         Text += fextl::fmt::format("#P block={:X} main={} other={} (freed)\n", E.Header, E.C.Main, E.C.Other);
         continue;
       }
-      MEMORY_BASIC_INFORMATION Info {};
-      NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Tail.RIP), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
       uint8_t Bytes[ProfileBytes] {};
       SIZE_T Read {};
       NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Tail.RIP), Bytes, std::min(sizeof(Bytes), Tail.GuestSize), &Read);
@@ -393,27 +448,89 @@ namespace {
         Hex += fextl::fmt::format("{:02x}", Bytes[b]);
       }
       Text += fextl::fmt::format("#P rip={:X} base={:X} guestsize={} hostsize={} main={} other={} bytes={}\n", Tail.RIP,
-                                 reinterpret_cast<uintptr_t>(Info.AllocationBase), Tail.GuestSize, Tail.Size, E.C.Main, E.C.Other, Hex);
+                                 AllocationBase(Tail.RIP), Tail.GuestSize, Tail.Size, E.C.Main, E.C.Other, Hex);
 
-      if (i < ProfileDumped && Tail.GuestSize > ProfileBytes &&
-          std::find(State->DumpedRIPs.begin(), State->DumpedRIPs.end(), Tail.RIP) == State->DumpedRIPs.end()) {
-        fextl::vector<uint8_t> Code(std::min(Tail.GuestSize, ProfileDumpMaxBytes));
-        SIZE_T CodeRead {};
-        NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Tail.RIP), Code.data(), Code.size(), &CodeRead);
-        if (CodeRead == Code.size()) {
-          State->DumpedRIPs.push_back(Tail.RIP);
-          fextl::string CodeHex;
-          for (const auto Byte : Code) {
-            CodeHex += fextl::fmt::format("{:02x}", Byte);
-          }
-          Text += fextl::fmt::format("#B rip={:X} size={} bytes={}\n", Tail.RIP, Code.size(), CodeHex);
-        }
+      if (i < ProfileDumped && Tail.GuestSize > ProfileBytes) {
+        DumpBlock(State, Tail.RIP, Tail.GuestSize, Text);
       }
     }
     fwrite(Text.data(), 1, Text.size(), State->File);
 
     State->ProfileCounts.clear();
     State->ProfileSamples[0] = State->ProfileSamples[1] = 0;
+  }
+
+  fextl::string FormatHitch(LogState* State) {
+    fextl::vector<std::pair<uint32_t, uint64_t>> Blocks;
+    Blocks.reserve(State->HitchCounts.size());
+    for (const auto& [Header, Count] : State->HitchCounts) {
+      Blocks.push_back({Count, Header});
+    }
+    const size_t Printed = std::min(Blocks.size(), HitchPrinted);
+    std::partial_sort(Blocks.begin(), Blocks.begin() + Printed, Blocks.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    auto Text = fextl::fmt::format("# hitch t={}.{:02} {}ms full={}ms samples={} blocks={}:", State->HitchStartSecond, State->HitchStartBin,
+                                   State->HitchBins * 10, State->HitchFullBins * 10, State->HitchSamples, Blocks.size());
+    fextl::string Dumps;
+    for (size_t i = 0; i < Printed; ++i) {
+      JITCodeTailMirror Tail {};
+      if (!ReadBlockTail(Blocks[i].second, Tail)) {
+        Text += fextl::fmt::format(" freed x{}", Blocks[i].first);
+        continue;
+      }
+      Text += fextl::fmt::format(" {:X}@{:X} x{}", Tail.RIP, AllocationBase(Tail.RIP), Blocks[i].first);
+      if (i < HitchDumped) {
+        DumpBlock(State, Tail.RIP, Tail.GuestSize, Dumps);
+      }
+    }
+    return Text + "\n" + Dumps;
+  }
+
+  // Finds runs of emulated code on the Main thread in this second's timeline bins, see HitchMinBins.
+  fextl::string MainHitches(LogState* State, uint64_t Seconds) {
+    const SampledThread* Main = nullptr;
+    for (size_t i = 0; i < State->SampledCount; ++i) {
+      if (State->Sampled[i].IsMain) {
+        Main = &State->Sampled[i];
+        break;
+      }
+    }
+    fextl::string Out;
+    size_t s = 0;
+    for (size_t b = 0; b < TimelineBins; ++b) {
+      bool Busy = false;
+      bool Full = false;
+      if (Main && Main->BinSamples[b]) {
+        const uint32_t Tenths = (Main->BinInSimulation[b] * 10 + Main->BinSamples[b] / 2) / Main->BinSamples[b];
+        Busy = Tenths > 0;
+        Full = Tenths >= 10;
+      }
+      if (Busy) {
+        if (!State->HitchBins) {
+          State->HitchStartSecond = Seconds;
+          State->HitchStartBin = b;
+          State->HitchFullBins = 0;
+          State->HitchSamples = 0;
+          State->HitchCounts.clear();
+        }
+        ++State->HitchBins;
+        State->HitchFullBins += Full ? 1 : 0;
+        while (s < State->MainSampleCount && State->MainSamples[s].Bin < b) {
+          ++s;
+        }
+        for (; s < State->MainSampleCount && State->MainSamples[s].Bin == b; ++s) {
+          ++State->HitchCounts[State->MainSamples[s].Header];
+          ++State->HitchSamples;
+        }
+      } else if (State->HitchBins) {
+        if (State->HitchBins >= HitchMinBins && State->HitchLines < MaxHitchLines) {
+          ++State->HitchLines;
+          Out += FormatHitch(State);
+        }
+        State->HitchBins = 0;
+      }
+    }
+    State->MainSampleCount = 0;
+    return Out;
   }
 
   // Waits one second, polling the sampled threads' InSimulation flag every few milliseconds.
@@ -439,6 +556,11 @@ namespace {
         const bool In = *T.InSimulation;
         ++T.Samples;
         T.InSimulationSamples += In ? 1 : 0;
+        if (In && T.IsMain && T.BlockHeader && State->MainSampleCount < MaxMainSamples) {
+          if (const uint64_t Header = *T.BlockHeader) {
+            State->MainSamples[State->MainSampleCount++] = {static_cast<uint8_t>(Bin), Header};
+          }
+        }
         if (T.BinSamples[Bin] < 255) {
           ++T.BinSamples[Bin];
           T.BinInSimulation[Bin] += In ? 1 : 0;
@@ -664,6 +786,10 @@ namespace {
         }
       }
 
+      if (State->Profile) {
+        Line += MainHitches(State, Seconds);
+      }
+
       // Preload probe, see ImageWatch. boot = hits before the first scan (game start).
       uint64_t TotalPages {};
       const uint64_t ReadablePages = ScanImage(static_cast<uint32_t>(Seconds), TotalPages);
@@ -704,6 +830,10 @@ namespace {
         if (Reuse && Old->InSimulation && (!State->Profile || Old->BlockHeader)) {
           N = *Old;
           N.Samples = N.InSimulationSamples = 0;
+          // The game may name a thread after it was first sampled.
+          if (State->Profile && !N.IsMain) {
+            N.IsMain = QueryThreadName(N.TID) == "Main";
+          }
           continue;
         }
         const auto* Area = QueryCPUArea(Entry.D.TID);
