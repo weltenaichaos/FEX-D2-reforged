@@ -180,20 +180,23 @@ end:
   // branch to an ARM64EC function does (ExitFunction in BranchOps.cpp): ExitFunctionEC reads the entry thunk offset
   // stored before <Name>Target, pops the x64 return address into lr and runs <Name>Thunk. The thunk saves what the x64
   // ABI needs preserved beyond AAPCS64 (all of q6-q15), calls the native implementation with the guest's argument
-  // registers, puts the result in x8 (RAX) and returns to the x64 caller through RetToEntryThunk.
+  // registers, puts the result in x8 (RAX) and returns to the x64 caller through RetToEntryThunk. Extra runs first, to pass
+  // more arguments.
+.macro NATIVE_REDIRECT Name, Target, Extra=
 .balign 16
-.global NativeInflateFastRedirect
-NativeInflateFastRedirect:
+.global \Name\()Redirect
+\Name\()Redirect:
   adrp x11, NativeRedirectCallRetSPOffset
   ldr x11, [x11, #:lo12:NativeRedirectCallRetSPOffset]
   str x17, [x28, x11]
   mov sp, x23
-  adr x9, NativeInflateFastTarget
+  adr x9, \Name\()Target
   b ExitFunctionEC
-  .word NativeInflateFastThunk - NativeInflateFastTarget
-NativeInflateFastTarget:
-  b "#FEXNativeInflateFast"
-NativeInflateFastThunk:
+  .word \Name\()Thunk - \Name\()Target
+\Name\()Target:
+  b "\Target"
+\Name\()Thunk:
+  \Extra
   stp x29, x30, [sp, #-176]!
   mov x29, sp
   stp q6, q7, [sp, #16]
@@ -201,7 +204,7 @@ NativeInflateFastThunk:
   stp q10, q11, [sp, #80]
   stp q12, q13, [sp, #112]
   stp q14, q15, [sp, #144]
-  bl "#FEXNativeInflateFast"
+  bl "\Target"
   mov x8, x0
   ldp q6, q7, [sp, #16]
   ldp q8, q9, [sp, #48]
@@ -210,33 +213,11 @@ NativeInflateFastThunk:
   ldp q14, q15, [sp, #144]
   ldp x29, x30, [sp], #176
   b RetToEntryThunk
+.endm
 
-.balign 16
-.global NativeAdler32ZRedirect
-NativeAdler32ZRedirect:
-  adrp x11, NativeRedirectCallRetSPOffset
-  ldr x11, [x11, #:lo12:NativeRedirectCallRetSPOffset]
-  str x17, [x28, x11]
-  mov sp, x23
-  adr x9, NativeAdler32ZTarget
-  b ExitFunctionEC
-  .word NativeAdler32ZThunk - NativeAdler32ZTarget
-NativeAdler32ZTarget:
-  b "#FEXNativeAdler32Z"
-NativeAdler32ZThunk:
-  stp x29, x30, [sp, #-176]!
-  mov x29, sp
-  stp q6, q7, [sp, #16]
-  stp q8, q9, [sp, #48]
-  stp q10, q11, [sp, #80]
-  stp q12, q13, [sp, #112]
-  stp q14, q15, [sp, #144]
-  bl "#FEXNativeAdler32Z"
-  mov x8, x0
-  ldp q6, q7, [sp, #16]
-  ldp q8, q9, [sp, #48]
-  ldp q10, q11, [sp, #80]
-  ldp q12, q13, [sp, #112]
-  ldp q14, q15, [sp, #144]
-  ldp x29, x30, [sp], #176
-  b RetToEntryThunk
+  // inflate_fast also gets the guest stack above its return address (x2) and that return address (x3), to see who
+  // asked for the stream.
+NATIVE_REDIRECT NativeInflateFast, #FEXNativeInflateFast, "mov x2, sp; mov x3, x30"
+NATIVE_REDIRECT NativeAdler32Z, #FEXNativeAdler32Z
+NATIVE_REDIRECT NativeMD5Update, #FEXNativeMD5Update
+NATIVE_REDIRECT NativeMD5Transform, #FEXNativeMD5Transform

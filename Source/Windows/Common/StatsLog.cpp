@@ -769,9 +769,10 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   State->Profile = Profile && Profile[0] == '1';
   const char* Timeline = getenv("FEX_STATSLOG_TIMELINE");
   State->Timeline = !(Timeline && Timeline[0] == '0');
-  const auto Switches = fextl::fmt::format("# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={} FEX_NATIVE_ZLIB={}\n",
+  const auto Switches = fextl::fmt::format("# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={} FEX_NATIVE_ZLIB={} FEX_NATIVE_MD5={}\n",
                                            State->Profile ? 1 : 0, State->Timeline ? 1 : 0, getenv("FEX_THREADPIN") ? getenv("FEX_THREADPIN") : "-",
-                                           getenv("FEX_NATIVE_ZLIB") ? getenv("FEX_NATIVE_ZLIB") : "-");
+                                           getenv("FEX_NATIVE_ZLIB") ? getenv("FEX_NATIVE_ZLIB") : "-",
+                                           getenv("FEX_NATIVE_MD5") ? getenv("FEX_NATIVE_MD5") : "-");
   fwrite(Switches.data(), 1, Switches.size(), File);
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;

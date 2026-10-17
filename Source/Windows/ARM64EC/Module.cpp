@@ -861,7 +861,7 @@ NTSTATUS ProcessInit() {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
   FEX::Windows::StartThreadPlacer(AppConfigName);
-  NativeRedirect::Init(reinterpret_cast<uint64_t>(MainModule));
+  NativeRedirect::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
 
   if (StartupSleep() && (StartupSleepProcName().empty() || AppConfigName == StartupSleepProcName())) {
     LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), AppConfigName, StartupSleep());

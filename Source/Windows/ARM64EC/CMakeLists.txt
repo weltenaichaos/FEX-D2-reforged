@@ -1,6 +1,7 @@
 add_library(arm64ecfex SHARED
   Module.cpp
   Module.S
+  NativeMD5.c
   NativeRedirect.cpp
   NativeZlib.c
   libarm64ecfex.def
