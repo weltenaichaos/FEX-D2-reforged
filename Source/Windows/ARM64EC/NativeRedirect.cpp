@@ -16,7 +16,8 @@ $end_info$
 //   FEX_NATIVE_MD5=1    the MD5 update and block transform
 //   FEX_UNPACK_CACHE=1  with FEX_NATIVE_ZLIB=1: serve repeated zlib streams from disk (NativeUnpackCache.h)
 //   FEX_JOBWAIT=0       keep the job system getter emulated (see JobWait below; on by default)
-//   FEX_JOBWAIT_BACKOFF=N  microseconds the frame wait loop pauses when it has nothing to help with (default 2, 0 = none)
+//   FEX_JOBWAIT_BACKOFF=N  microseconds the frame wait loop pauses when it has nothing to help with (default 0 = no pause;
+//                          build 42 tests: 2 us left 0.3-0.4 s frame waits, 0 had none)
 //
 // A function is found by its offset in the main executable and the first bytes of its code, which are compared when the
 // JIT first asks for that address (and, for MD5, the game's round tables). Anything that doesn't match stays emulated.
@@ -605,7 +606,7 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
     const char* JobWaitSwitch = getenv("FEX_JOBWAIT");
     const char* Backoff = getenv("FEX_JOBWAIT_BACKOFF");
     JobWait::Enabled = !(JobWaitSwitch && JobWaitSwitch[0] == '0') && Invalidate;
-    JobWait::BackoffMicroseconds = Backoff && Backoff[0] ? std::min<uint64_t>(strtoull(Backoff, nullptr, 10), 1000) : 2;
+    JobWait::BackoffMicroseconds = Backoff && Backoff[0] ? std::min<uint64_t>(strtoull(Backoff, nullptr, 10), 1000) : 0;
     JobWait::Invalidate = Invalidate;
     JobWaitObject = MainImageBase + JobWait::ObjectRVA;
     JobWaitReturn = MainImageBase + JobWait::ReturnRVA;

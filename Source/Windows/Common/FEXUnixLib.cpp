@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: MIT
 #include <FEXCore/fextl/fmt.h>
+#include <FEXCore/fextl/memory.h>
+#include <FEXCore/fextl/vector.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/SpinWaitLock.h>
+#include <FEXCore/Utils/Threads.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <windef.h>
 #include <winbase.h>
 #define __WINESRC__
@@ -180,6 +186,55 @@ void DeleteSHMStatsFile() {
   Call(FEXUnixLibFunctions::DeleteSHMStatsFile, nullptr);
 }
 
+namespace {
+  // Disk cache prefetch: touch every page of the mapped cache file on a low-priority thread at startup, so lookups during
+  // play copy from memory that is already mapped. Without it each hit takes a page fault, which costs ~50-250 us during
+  // play (the game's protector keeps changing page protections, so faults wait on the kernel's memory map lock) and
+  // occasionally 50 ms. FEX_DISKCACHE_PREFETCH=0 turns it off, FEX_DISKCACHE_PREFETCH_MB=N caps it.
+  struct PrefetchJob {
+    const volatile uint8_t* Base;
+    uint64_t Size;
+  };
+
+  void* PrefetchMapping(void* Arg) {
+    const auto* Job = static_cast<const PrefetchJob*>(Arg);
+    uint64_t Frequency {};
+    __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Frequency));
+    const uint64_t Start = FEXCore::Utils::SpinWaitLock::GetCycleCounter();
+    uint64_t Sum {};
+    for (uint64_t Offset = 0; Offset < Job->Size; Offset += 4096) {
+      Sum += Job->Base[Offset];
+    }
+    const uint64_t End = FEXCore::Utils::SpinWaitLock::GetCycleCounter();
+    const uint64_t Ms = Frequency ? (End - Start) * 1000 / Frequency : 0;
+    static_cast<void>(Sum);
+    FEX::Windows::StatsLogNote(fextl::fmt::format("diskcache prefetch: {} MB in {} ms", Job->Size >> 20, Ms));
+    return nullptr;
+  }
+
+  void StartPrefetch(const void* Base, uint64_t Size) {
+    const char* Switch = getenv("FEX_DISKCACHE_PREFETCH");
+    if (!Base || !Size || (Switch && Switch[0] == '0')) {
+      FEX::Windows::StatsLogNote("diskcache prefetch: off");
+      return;
+    }
+    // FEX_DISKCACHE_PREFETCH_MB caps how much of the file is kept in memory (default 2048, from the start of the file).
+    const char* Cap = getenv("FEX_DISKCACHE_PREFETCH_MB");
+    const uint64_t CapMB = Cap && Cap[0] ? strtoull(Cap, nullptr, 10) : 2048;
+    Size = std::min<uint64_t>(Size, CapMB << 20);
+    if (!Size) {
+      FEX::Windows::StatsLogNote("diskcache prefetch: off (FEX_DISKCACHE_PREFETCH_MB=0)");
+      return;
+    }
+    // Both stay alive for the whole process: the thread reads the job after creation.
+    static fextl::vector<fextl::unique_ptr<PrefetchJob>> Jobs;
+    static fextl::vector<fextl::unique_ptr<FEXCore::Threads::Thread>> Threads;
+    auto& Job = Jobs.emplace_back(fextl::make_unique<PrefetchJob>(PrefetchJob {static_cast<const volatile uint8_t*>(Base), Size}));
+    Threads.emplace_back(FEXCore::Threads::Thread::Create(PrefetchMapping, Job.get(), {.LowPriority = true, .Internal = true},
+                                                          "FEXCachePrefetch"));
+  }
+} // namespace
+
 void* MapFile(HANDLE FileHandle, uint64_t MapSize, uint64_t* MappedSize) {
   if (Available() && WineServerHandleToFd) {
     FEXUnixLib_MapFile Args {
@@ -219,6 +274,12 @@ void* MapFile(HANDLE FileHandle, uint64_t MapSize, uint64_t* MappedSize) {
   }
   *MappedSize = ViewSize;
   FEX::Windows::StatsLogNote(fextl::fmt::format("diskcache file mapping: section, {} bytes", ViewSize));
+  // Only touch bytes the file holds: past the end of the file a mapped page may not be backed.
+  FILE_STANDARD_INFORMATION FileInfo {};
+  IO_STATUS_BLOCK IOSB {};
+  if (NT_SUCCESS(NtQueryInformationFile(FileHandle, &IOSB, &FileInfo, sizeof(FileInfo), FileStandardInformation))) {
+    StartPrefetch(View, std::min<uint64_t>(ViewSize, FileInfo.EndOfFile.QuadPart));
+  }
   return View;
 }
 

@@ -1565,10 +1565,10 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   const auto Switches = fextl::fmt::format(
     "# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={} FEX_NATIVE_ZLIB={} FEX_NATIVE_MD5={} FEX_UNPACK_CACHE={} "
     "FEX_UNPACK_CACHE_MAX_GB={} FEX_UNPACK_CACHE_RESET={} FEX_UNPACK_CACHE_READAHEAD_MB={} FEX_UNPACK_CACHE_SKIP_ADLER={} "
-    "FEX_NATIVE_ADLER_NEON={} FEX_NATIVE_MD5_CACHE={}\n",
+    "FEX_NATIVE_ADLER_NEON={} FEX_NATIVE_MD5_CACHE={} FEX_JOBWAIT={} FEX_JOBWAIT_BACKOFF={} FEX_DISKCACHE_PREFETCH={} FEX_DISKCACHE_PREFETCH_MB={}\n",
     State->Profile ? 1 : 0, State->Timeline ? 1 : 0, Env("FEX_THREADPIN"), Env("FEX_NATIVE_ZLIB"), Env("FEX_NATIVE_MD5"), Env("FEX_UNPACK_CACHE"),
     Env("FEX_UNPACK_CACHE_MAX_GB"), Env("FEX_UNPACK_CACHE_RESET"), Env("FEX_UNPACK_CACHE_READAHEAD_MB"), Env("FEX_UNPACK_CACHE_SKIP_ADLER"),
-    Env("FEX_NATIVE_ADLER_NEON"), Env("FEX_NATIVE_MD5_CACHE"));
+    Env("FEX_NATIVE_ADLER_NEON"), Env("FEX_NATIVE_MD5_CACHE"), Env("FEX_JOBWAIT"), Env("FEX_JOBWAIT_BACKOFF"), Env("FEX_DISKCACHE_PREFETCH"), Env("FEX_DISKCACHE_PREFETCH_MB"));
   fwrite(Switches.data(), 1, Switches.size(), File);
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
