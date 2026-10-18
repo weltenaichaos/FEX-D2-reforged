@@ -66,10 +66,10 @@ namespace {
   // A run of at least HitchMinBins bins in which Main was sampled only outside emulated code (waiting, or in Wine, VKD3D or
   // the driver) gets a "# stall" line the same way: at 30 FPS the game never waits that long between frames.
   // Both lines also name the other threads that ran emulated code for at least HitchOtherMinPercent of the run, with the
-  // blocks they were in: usually the job Main is waiting for.
-  constexpr uint32_t HitchOtherMinPercent = 50;
+  // blocks they were in: usually the job Main is waiting for, or the lock it is waiting on.
+  constexpr uint32_t HitchOtherMinPercent = 20;
   constexpr uint32_t HitchOtherMinSamples = 10;
-  constexpr size_t HitchOthersPrinted = 2;
+  constexpr size_t HitchOthersPrinted = 4;
   constexpr size_t HitchOtherBlocksPrinted = 3;
   constexpr size_t MaxOtherSamples = 8192;
 
@@ -843,7 +843,7 @@ namespace {
     // Where the thread was outside emulated code during the run.
     AppendNatives(State, Natives, 3, Text);
 
-    // Other threads that mostly ran emulated code meanwhile.
+    // Other threads that ran emulated code for a good part of the run meanwhile.
     fextl::vector<std::pair<uint32_t, const LogState::RunThread*>> Others;
     for (const auto& [TID, T] : R.Others) {
       if (T.InSim >= HitchOtherMinSamples && T.InSim * 100 >= T.Samples * HitchOtherMinPercent) {
@@ -1540,7 +1540,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "Wine, VKD3D, driver); dco = why compiles missed the disk cache and what happened to the code "
                                    "compiled instead; io = page faults that read storage, and storage reads; with FEX_STATSLOG_PROFILE=1, "
                                    "'# hitch' / '# stall' = Main ran emulated code / no emulated code for 100ms or more, with the other "
-                                   "threads that were busy in emulated code meanwhile\n",
+                                   "threads that were busy in emulated code meanwhile; jobwait = the game's frame wait loop: tries that found "
+                                   "nothing to run (idle) or found jobs, time paused, longest uninterrupted idle wait\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.

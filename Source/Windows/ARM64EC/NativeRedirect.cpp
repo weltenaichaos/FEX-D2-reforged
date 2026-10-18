@@ -15,6 +15,8 @@ $end_info$
 //   FEX_NATIVE_ZLIB=1   inflate_fast and adler32_z
 //   FEX_NATIVE_MD5=1    the MD5 update and block transform
 //   FEX_UNPACK_CACHE=1  with FEX_NATIVE_ZLIB=1: serve repeated zlib streams from disk (NativeUnpackCache.h)
+//   FEX_JOBWAIT=0       keep the job system getter emulated (see JobWait below; on by default)
+//   FEX_JOBWAIT_BACKOFF=N  microseconds the frame wait loop pauses when it has nothing to help with (default 2, 0 = none)
 //
 // A function is found by its offset in the main executable and the first bytes of its code, which are compared when the
 // JIT first asks for that address (and, for MD5, the game's round tables). Anything that doesn't match stays emulated.
@@ -56,6 +58,10 @@ extern void* NativeInflateFastTarget;
 extern void* NativeAdler32ZTarget;
 extern void* NativeMD5UpdateTarget;
 extern void* NativeMD5TransformTarget;
+extern void* NativeJobSystemGetRedirect;
+extern void* NativeJobSystemGetTarget;
+
+uint64_t FEXNativeJobSystemGet(uint64_t ReturnAddress);
 }
 
 namespace NativeRedirect {
@@ -402,6 +408,8 @@ namespace {
     return Lines;
   }
 
+  fextl::string JobWaitStatsLine();
+
   // Once per second in the stats log: calls, time and MB per function since the last line, plus stream starts.
   fextl::string StatsLine() {
     fextl::string Line;
@@ -434,11 +442,150 @@ namespace {
         WindowStart = Now;
       }
     }
-    return (Line.empty() ? Line : fextl::fmt::format("  native{}\n", Line)) + NativeUnpackCache::StatsLine() + Window;
+    return (Line.empty() ? Line : fextl::fmt::format("  native{}\n", Line)) + NativeUnpackCache::StatsLine() + JobWaitStatsLine() + Window;
+  }
+
+  // D2R's main thread waits for a frame's parallel tasks in a loop that never sleeps (D2R.exe 0x1408764A8):
+  //
+  //   do { JobSystem()->Queue->TryRunJob(priority 2) } while (finished task bits != all tasks)
+  //
+  // TryRunJob (0x1407B7700) takes the queue's spinlock (xchg + pause), looks at the priority 2 list and releases the
+  // lock. With nothing to run, the loop retakes the lock every few hundred nanoseconds. A worker that wants to queue a
+  // job (0x1407B7210) has to win the same lock between two of those, and on these cores it can lose for hundreds of
+  // milliseconds: build 41 logs show the worst frames (190-570 ms) as Main spinning here while one worker spends the
+  // whole time in that lock. The loop asks for the job system singleton (0x1407B75B0, an MSVC thread-safe static) right
+  // before each TryRunJob. Running that getter natively lets the wait loop's call pause for a moment when the priority 2
+  // list is empty, so the lock stays free for the workers; every other caller just gets the object back.
+  namespace JobWait {
+    constexpr uint32_t GetterRVA = 0x7B75B0;
+    constexpr uint32_t ObjectRVA = 0x2056B00;  // what the getter returns
+    constexpr uint32_t GuardRVA = 0x2056CD8;   // its init guard: 0 = not constructed, -1 = being constructed, else epoch
+    constexpr uint32_t CallSiteRVA = 0x8764A8; // the wait loop's call of the getter
+    constexpr uint32_t ReturnRVA = CallSiteRVA + 5;
+    constexpr uint32_t TryRunRVA = 0x7B7700;
+    constexpr uint64_t QueueOffset = 0x1A0; // job system -> queue the wait loop helps with
+    constexpr uint64_t ListOffset = 0x38;   // queue -> list head of priority 2 jobs (empty when it points to itself)
+
+    // The whole getter, the wait loop from the getter call to its loop branch, and TryRunJob up to where it reads the
+    // priority 2 list: they fix the addresses and offsets above.
+    constexpr uint8_t GetterCode[] = {
+      0x48, 0x83, 0xec, 0x28, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00, 0xba, 0x18, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x08,
+      0x8b, 0x04, 0x0a, 0x39, 0x05, 0x0a, 0xf7, 0x89, 0x01, 0x0f, 0x8e, 0x8a, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x0d, 0xfd, 0xf6, 0x89,
+      0x01, 0xe8, 0x0c, 0x76, 0xda, 0x00, 0x83, 0x3d, 0xf1, 0xf6, 0x89, 0x01, 0xff, 0x75, 0x75, 0x33, 0xd2, 0xc6, 0x05, 0x0e, 0xf5,
+      0x89, 0x01, 0x01, 0x48, 0x8d, 0x05, 0x27, 0xf5, 0x89, 0x01, 0x48, 0x89, 0x15, 0x10, 0xf5, 0x89, 0x01, 0x48, 0x89, 0x05, 0x01,
+      0xf5, 0x89, 0x01, 0x48, 0x8d, 0x0d, 0xc2, 0x2e, 0xdf, 0x00, 0x48, 0xb8, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x48,
+      0x89, 0x15, 0x81, 0xf6, 0x89, 0x01, 0x48, 0x89, 0x05, 0xf2, 0xf4, 0x89, 0x01, 0x0f, 0x57, 0xc0, 0x48, 0x8d, 0x05, 0x08, 0xd1,
+      0xf8, 0x00, 0x66, 0x0f, 0x7f, 0x05, 0x78, 0xf6, 0x89, 0x01, 0x48, 0x89, 0x05, 0x69, 0xf6, 0x89, 0x01, 0x48, 0x89, 0x15, 0x7a,
+      0xf6, 0x89, 0x01, 0x48, 0x89, 0x15, 0x83, 0xf6, 0x89, 0x01, 0xe8, 0xfa, 0x73, 0xda, 0x00, 0x48, 0x8d, 0x0d, 0x7f, 0xf6, 0x89,
+      0x01, 0xe8, 0x2e, 0x75, 0xda, 0x00, 0x48, 0x8d, 0x05, 0x9b, 0xf4, 0x89, 0x01, 0x48, 0x83, 0xc4, 0x28, 0xc3,
+    };
+    constexpr uint8_t CallSiteCode[] = {
+      0xe8, 0x03, 0x11, 0xf4, 0xff, 0x41, 0xb1, 0xff, 0x45, 0x8b, 0xc4, 0x48, 0x8b, 0x90, 0xa0, 0x01, 0x00, 0x00, 0xe8, 0x41, 0x12,
+      0xf4, 0xff, 0x8b, 0x97, 0xe8, 0x60, 0x00, 0x00, 0x48, 0x8b, 0x8f, 0xc0, 0x5e, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x48,
+      0xd3, 0xe0, 0xff, 0xc8, 0x3b, 0xd0, 0x75, 0xce,
+    };
+    constexpr uint8_t TryRunCode[] = {
+      0x48, 0x83, 0xec, 0x28, 0x48, 0x8d, 0x42, 0x10, 0x4c, 0x8b, 0xda, 0x48, 0x87, 0x42, 0x10, 0x48, 0x85, 0xc0, 0x74, 0x18, 0xf3,
+      0x90, 0x48, 0x8b, 0x42, 0x10, 0x48, 0x85, 0xc0, 0x75, 0xf5, 0x48, 0x8d, 0x42, 0x10, 0x48, 0x87, 0x42, 0x10, 0x48, 0x85, 0xc0,
+      0x75, 0xe8, 0x4d, 0x63, 0xc0, 0x48, 0x89, 0x7c, 0x24, 0x20, 0x49, 0x83, 0xf8, 0x02, 0x7f, 0x30, 0xba, 0x02, 0x00, 0x00, 0x00,
+      0x49, 0x8d, 0x4b, 0x38,
+    };
+
+    bool Enabled {};
+    uint64_t BackoffMicroseconds {};
+    std::atomic<TargetState> State {TargetState::Unchecked};
+    std::atomic<bool> Pending {};      // waiting for the object to be constructed or the code to be readable
+    std::atomic<uint64_t> NextRetry {}; // tick of the next PreCompile check while Pending
+    uint32_t Retries {};
+    void (*Invalidate)(uint64_t Address, uint64_t Size) {};
+  } // namespace JobWait
+
+  CheckResult CheckJobWait() {
+    uint8_t Getter[sizeof(JobWait::GetterCode)];
+    uint8_t CallSite[sizeof(JobWait::CallSiteCode)];
+    uint8_t TryRun[sizeof(JobWait::TryRunCode)];
+    int32_t Guard {};
+    if (!Read(ImageBase + JobWait::GetterRVA, Getter, sizeof(Getter)) || !Read(ImageBase + JobWait::CallSiteRVA, CallSite, sizeof(CallSite)) ||
+        !Read(ImageBase + JobWait::TryRunRVA, TryRun, sizeof(TryRun)) || !Read(ImageBase + JobWait::GuardRVA, &Guard, sizeof(Guard))) {
+      return CheckResult::Unreadable;
+    }
+    const bool GetterOk = memcmp(Getter, JobWait::GetterCode, sizeof(Getter)) == 0;
+    const bool CallSiteOk = memcmp(CallSite, JobWait::CallSiteCode, sizeof(CallSite)) == 0;
+    const bool TryRunOk = memcmp(TryRun, JobWait::TryRunCode, sizeof(TryRun)) == 0;
+    if (!GetterOk || !CallSiteOk || !TryRunOk) {
+      FEX::Windows::StatsLogNote(fextl::fmt::format("native jobwait: different code (getter {}, wait loop {}, TryRunJob {}), stays emulated",
+                                                    GetterOk ? "ok" : "differs", CallSiteOk ? "ok" : "differs", TryRunOk ? "ok" : "differs"));
+      return CheckResult::Mismatch;
+    }
+    // Not constructed yet: the getter would have to run the constructor, which only the guest code can do. Once it is,
+    // MSVC stores the global init epoch there, which counts up from INT_MIN.
+    return Guard != 0 && Guard != -1 ? CheckResult::Match : CheckResult::Unreadable;
+  }
+
+  uint64_t NowTicks() {
+    uint64_t Ticks;
+    __asm volatile("mrs %[Res], CNTVCT_EL0" : [Res] "=r"(Ticks));
+    return Ticks;
+  }
+
+  uintptr_t LookupJobWait() {
+    switch (JobWait::State.load(std::memory_order_acquire)) {
+    case TargetState::Armed: return reinterpret_cast<uintptr_t>(&NativeJobSystemGetRedirect);
+    case TargetState::Rejected: return 0;
+    case TargetState::Unchecked: break;
+    }
+    switch (CheckJobWait()) {
+    case CheckResult::Match: {
+      auto Expected = TargetState::Unchecked;
+      if (JobWait::State.compare_exchange_strong(Expected, TargetState::Armed, std::memory_order_acq_rel)) {
+        FEX::Windows::StatsLogNote(fextl::fmt::format("native jobwait: getter at {:X} matched, frame wait loop pauses {} us when idle",
+                                                      ImageBase + JobWait::GetterRVA, JobWait::BackoffMicroseconds));
+      }
+      return reinterpret_cast<uintptr_t>(&NativeJobSystemGetRedirect);
+    }
+    case CheckResult::Mismatch: JobWait::State.store(TargetState::Rejected, std::memory_order_release); return 0;
+    case CheckResult::Unreadable:
+      // The guest getter gets compiled now and stays in the code cache, so the JIT won't ask again by itself.
+      // PreCompile drops it once the check can pass.
+      JobWait::NextRetry.store(NowTicks() + TickFrequency / 20, std::memory_order_relaxed);
+      JobWait::Pending.store(true, std::memory_order_release);
+      return 0;
+    }
+    return 0;
+  }
+
+  // The wait loop's own counters. Only the thread running the loop writes the episode fields.
+  struct {
+    std::atomic<uint64_t> Waits;        // calls from the wait loop that found nothing to run
+    std::atomic<uint64_t> Busy;         // calls from the wait loop that found priority 2 jobs
+    std::atomic<uint64_t> BackoffTicks; // time spent pausing
+    std::atomic<uint64_t> Longest;      // longest stretch of uninterrupted idle waiting, in ticks
+    std::atomic<uint64_t> EpisodeStart;
+    std::atomic<uint64_t> LastWait;
+  } JobWaitStats;
+  uint64_t JobWaitObject {};
+  uint64_t JobWaitReturn {};
+  uint64_t JobWaitBackoff {};    // ticks
+  uint64_t JobWaitEpisodeGap {}; // ticks: idle waits further apart than this start a new stretch
+
+  fextl::string JobWaitStatsLine() {
+    if (JobWait::State.load(std::memory_order_relaxed) != TargetState::Armed) {
+      return {};
+    }
+    const uint64_t Waits = JobWaitStats.Waits.exchange(0, std::memory_order_relaxed);
+    const uint64_t Busy = JobWaitStats.Busy.exchange(0, std::memory_order_relaxed);
+    const uint64_t Backoff = JobWaitStats.BackoffTicks.exchange(0, std::memory_order_relaxed);
+    const uint64_t Longest = JobWaitStats.Longest.exchange(0, std::memory_order_relaxed);
+    if (!Waits && !Busy) {
+      return {};
+    }
+    const double MsPerTick = 1000.0 / static_cast<double>(TickFrequency);
+    return fextl::fmt::format("  jobwait idle={} jobs={} paused={:.1f}ms longest={:.1f}ms\n", Waits, Busy,
+                              static_cast<double>(Backoff) * MsPerTick, static_cast<double>(Longest) * MsPerTick);
   }
 } // namespace
 
-void Init(uint64_t MainImageBase, bool StatsLog) {
+void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Address, uint64_t Size)) {
   const char* Zlib = getenv("FEX_NATIVE_ZLIB");
   const char* MD5 = getenv("FEX_NATIVE_MD5");
   ZlibEnabled = Zlib && Zlib[0] == '1';
@@ -453,6 +600,21 @@ void Init(uint64_t MainImageBase, bool StatsLog) {
   uint64_t Frequency {};
   __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Frequency));
   TickFrequency = Frequency ? Frequency : 1;
+
+  {
+    const char* JobWaitSwitch = getenv("FEX_JOBWAIT");
+    const char* Backoff = getenv("FEX_JOBWAIT_BACKOFF");
+    JobWait::Enabled = !(JobWaitSwitch && JobWaitSwitch[0] == '0') && Invalidate;
+    JobWait::BackoffMicroseconds = Backoff && Backoff[0] ? std::min<uint64_t>(strtoull(Backoff, nullptr, 10), 1000) : 2;
+    JobWait::Invalidate = Invalidate;
+    JobWaitObject = MainImageBase + JobWait::ObjectRVA;
+    JobWaitReturn = MainImageBase + JobWait::ReturnRVA;
+    JobWaitBackoff = JobWait::BackoffMicroseconds ? std::max<uint64_t>(JobWait::BackoffMicroseconds * TickFrequency / 1000000, 1) : 0;
+    JobWaitEpisodeGap = std::max<uint64_t>(TickFrequency / 5000, 1); // 200 us
+    if (StatsLog) {
+      FEX::Windows::StatsLogNameNative(reinterpret_cast<uint64_t>(&NativeJobSystemGetTarget), "fex:jobsystem");
+    }
+  }
 
   if (StatsLog && ZlibEnabled) {
     FindText(MainImageBase);
@@ -475,6 +637,9 @@ void Init(uint64_t MainImageBase, bool StatsLog) {
                                                                           "computed (FEX_UNPACK_CACHE_SKIP_ADLER=0)"));
   }
   FEX::Windows::StatsLogNote(fextl::fmt::format("native md5: {}", MD5Enabled ? "on (FEX_NATIVE_MD5=1)" : "off"));
+  FEX::Windows::StatsLogNote(JobWait::Enabled ? fextl::fmt::format("native jobwait: on, pause {} us (FEX_JOBWAIT_BACKOFF), FEX_JOBWAIT=0 turns it off",
+                                                                   JobWait::BackoffMicroseconds) :
+                                                "native jobwait: off (FEX_JOBWAIT=0)");
   if (FEXNativeZlibTrackStreams) {
     FEX::Windows::StatsLogNote(fextl::fmt::format("native zlib: tracking streams, code range {:X}-{:X}", FEXNativeTextBegin, FEXNativeTextEnd));
   }
@@ -490,12 +655,43 @@ void Init(uint64_t MainImageBase, bool StatsLog) {
   } else {
     FEX::Windows::StatsLogNote("unpack cache: off");
   }
-  if (ZlibEnabled || MD5Enabled) {
+  if (ZlibEnabled || MD5Enabled || JobWait::Enabled) {
     FEX::Windows::StatsLogSetLineProvider(StatsLine);
   }
 }
 
+void PreCompile() {
+  if (!JobWait::Pending.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const uint64_t Now = NowTicks();
+  uint64_t Due = JobWait::NextRetry.load(std::memory_order_relaxed);
+  if (Now < Due || !JobWait::NextRetry.compare_exchange_strong(Due, Now + TickFrequency / 20, std::memory_order_relaxed)) {
+    return;
+  }
+  // Only this thread got past the exchange for this retry.
+  if (++JobWait::Retries > 2000) {
+    JobWait::Pending.store(false, std::memory_order_relaxed);
+    FEX::Windows::StatsLogNote("native jobwait: the job system never became ready, stays emulated");
+    return;
+  }
+  switch (CheckJobWait()) {
+  case CheckResult::Match: break;
+  case CheckResult::Mismatch:
+    JobWait::State.store(TargetState::Rejected, std::memory_order_release);
+    JobWait::Pending.store(false, std::memory_order_relaxed);
+    return;
+  case CheckResult::Unreadable: return;
+  }
+  // Drop the compiled guest getter, so the next call asks Lookup again and gets the native one.
+  JobWait::Pending.store(false, std::memory_order_relaxed);
+  JobWait::Invalidate(ImageBase + JobWait::GetterRVA, 1);
+}
+
 uintptr_t Lookup(uint64_t GuestRIP) {
+  if (JobWait::Enabled && GuestRIP == ImageBase + JobWait::GetterRVA) {
+    return LookupJobWait();
+  }
   if (!ZlibEnabled && !MD5Enabled) {
     return 0;
   }
@@ -515,3 +711,44 @@ uintptr_t Lookup(uint64_t GuestRIP) {
   return 0;
 }
 } // namespace NativeRedirect
+
+// The job system getter, run in place of D2R.exe 0x1407B75B0 once its object exists (see JobWait). Every caller gets the
+// object; the frame wait loop's call first pauses when the priority 2 list is empty.
+extern "C" uint64_t FEXNativeJobSystemGet(uint64_t ReturnAddress) {
+  using namespace NativeRedirect;
+  const uint64_t Object = JobWaitObject;
+  // No shared counter for the other callers: workers call this around every queue operation, and a contended counter
+  // is the kind of cache line traffic this redirect is meant to reduce.
+  if (ReturnAddress != JobWaitReturn) {
+    return Object;
+  }
+  const uint64_t Queue = __atomic_load_n(reinterpret_cast<const uint64_t*>(Object + JobWait::QueueOffset), __ATOMIC_RELAXED);
+  if (!Queue) {
+    return Object;
+  }
+  const uint64_t Head = Queue + JobWait::ListOffset;
+  if (__atomic_load_n(reinterpret_cast<const uint64_t*>(Head), __ATOMIC_ACQUIRE) != Head) {
+    JobWaitStats.Busy.fetch_add(1, std::memory_order_relaxed);
+    return Object;
+  }
+
+  const uint64_t Start = NowTicks();
+  if (Start - JobWaitStats.LastWait.load(std::memory_order_relaxed) > JobWaitEpisodeGap) {
+    JobWaitStats.EpisodeStart.store(Start, std::memory_order_relaxed);
+  }
+  uint64_t Now = Start;
+  if (JobWaitBackoff) {
+    do {
+      __asm volatile("yield" ::: "memory");
+      Now = NowTicks();
+    } while (Now - Start < JobWaitBackoff);
+    JobWaitStats.BackoffTicks.fetch_add(Now - Start, std::memory_order_relaxed);
+  }
+  JobWaitStats.LastWait.store(Now, std::memory_order_relaxed);
+  JobWaitStats.Waits.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t Episode = Now - JobWaitStats.EpisodeStart.load(std::memory_order_relaxed);
+  uint64_t Longest = JobWaitStats.Longest.load(std::memory_order_relaxed);
+  while (Episode > Longest && !JobWaitStats.Longest.compare_exchange_weak(Longest, Episode, std::memory_order_relaxed)) {
+  }
+  return Object;
+}

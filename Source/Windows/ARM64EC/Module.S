@@ -223,3 +223,5 @@ NATIVE_REDIRECT NativeInflateFast, #FEXNativeInflateFast, "mov x2, sp; mov x3, x
 NATIVE_REDIRECT NativeAdler32Z, #FEXNativeAdler32Z
 NATIVE_REDIRECT NativeMD5Update, #FEXNativeMD5Update
 NATIVE_REDIRECT NativeMD5Transform, #FEXNativeMD5Transform
+  // The job system getter takes no arguments; it gets its return address (x0) to tell the frame wait loop's call apart.
+NATIVE_REDIRECT NativeJobSystemGet, #FEXNativeJobSystemGet, "mov x0, x30"

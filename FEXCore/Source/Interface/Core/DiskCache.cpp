@@ -603,6 +603,20 @@ namespace DiskCache {
       return Miss(FEXCore::SHMStats::DC_MISS_RANGE);
     }
     uint64_t Available = RangeInfo.Base + RangeInfo.Size - GuestRIP;
+    // The decoder follows code into the next executable range (Decoder::CheckRangeExecutable), so a stored block can
+    // span several ranges, e.g. pages of an image a protector re-protects page by page. Look past the end of the first
+    // range the same way when an entry needs more bytes, instead of skipping that entry and recompiling the same code.
+    // A read fault while hashing restarts the compile like a decoder fault does (RestartCompileOnFault).
+    const auto ExtendAvailable = [&](uint64_t Needed) {
+      while (Available < Needed) {
+        const uint64_t End = GuestRIP + Available;
+        const auto Next = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, End);
+        if (Next.Size == 0 || Next.Base > End || Next.Base + Next.Size <= End) {
+          return;
+        }
+        Available = Next.Base + Next.Size - GuestRIP;
+      }
+    };
 
     uint64_t LookupKey =
       MakeLookupKey(Thread, *GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
@@ -696,7 +710,10 @@ namespace DiskCache {
 
       // do we have enough room in our live code to even hash GuestSize worth?
       if (Available < EntryUnderReview->GuestSize) {
-        continue;
+        ExtendAvailable(EntryUnderReview->GuestSize);
+        if (Available < EntryUnderReview->GuestSize) {
+          continue;
+        }
       }
 
       // if (Entry.GuestExtents.size()) {

@@ -757,6 +757,7 @@ public:
 
   void PreCompile() override {
     ProcessPendingCrossProcessEmulatorWork();
+    NativeRedirect::PreCompile();
   }
 
   void OnDiskCacheHit(uint64_t GuestRIP) override {
@@ -861,7 +862,9 @@ NTSTATUS ProcessInit() {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
   FEX::Windows::StartThreadPlacer(AppConfigName);
-  NativeRedirect::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
+  NativeRedirect::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog, [](uint64_t Address, uint64_t Size) {
+    InvalidationTracker->InvalidateAlignedInterval(Address, Size, false);
+  });
 
   if (StartupSleep() && (StartupSleepProcName().empty() || AppConfigName == StartupSleepProcName())) {
     LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), AppConfigName, StartupSleep());
