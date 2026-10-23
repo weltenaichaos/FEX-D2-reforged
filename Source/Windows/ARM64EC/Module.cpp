@@ -836,6 +836,12 @@ NTSTATUS ProcessInit() {
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
   CTX->InitCore();
+  // FEX_CODELOCK_POLITE=<ms>: writers of the code invalidation lock (memory protection changes, code invalidation) wait
+  // this long for compiles in progress to finish before queueing, so one slow compile and a queued writer can't stop
+  // every other thread's compiles. 0 queues them at once, like upstream.
+  const char* PoliteSwitch = FEX::Windows::Switch("FEX_CODELOCK_POLITE");
+  const uint32_t PoliteMs = PoliteSwitch ? std::min<uint32_t>(strtoul(PoliteSwitch, nullptr, 10), 5000) : 0;
+  CTX->GetCodeInvalidationMutex().SetPoliteWriteWait(PoliteMs);
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
   ImageTracker.emplace(*CTX, false);
@@ -864,6 +870,9 @@ NTSTATUS ProcessInit() {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC, true);
     FEX::Windows::StatsLogWatchImage(reinterpret_cast<uint64_t>(MainModule));
     FEX::Windows::StartStatsLog(StatAllocHandler.get(), AppConfigName);
+    CTX->GetCodeInvalidationMutex().SetContentionStats(FEX::Windows::StatsLogCodeLockStats());
+    FEX::Windows::StatsLogNote(PoliteMs ? fextl::fmt::format("codelock: writers wait up to {}ms without blocking compiles", PoliteMs) :
+                                          fextl::string("codelock: writers queue at once (upstream)"));
   } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }

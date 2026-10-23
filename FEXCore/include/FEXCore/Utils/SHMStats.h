@@ -101,7 +101,11 @@ struct ThreadStats {
   uint64_t DiskCacheRejectRIPs[16];
   uint64_t DiskCacheMissRIPCount;
   uint64_t DiskCacheRejectRIPCount;
-  uint64_t Pad[4];
+  // Time compiles spent waiting for the shared code invalidation lock, and the longest single wait with its end time.
+  uint64_t AccumulatedCodeLockWaitTime;
+  uint64_t MaxCodeLockWaitTime;
+  uint64_t MaxCodeLockWaitAt;
+  uint64_t Pad[1];
 };
 
 enum DiskCacheMissReason : uint8_t {

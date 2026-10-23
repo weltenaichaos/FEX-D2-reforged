@@ -20,7 +20,7 @@ namespace {
     {"FEX_STATSLOG", "D:\\"}, // where the tests' logs have gone so far
     {"FEX_STATSLOG_PROFILE", "1"},
 #endif
-    {"FEX_NATIVE_ZLIB", "1"},      {"FEX_NATIVE_MD5", "1"}, {"FEX_UNPACK_CACHE", "1"},
+    {"FEX_NATIVE_ZLIB", "1"},      {"FEX_NATIVE_MD5", "1"}, {"FEX_UNPACK_CACHE", "1"}, {"FEX_CODELOCK_POLITE", "500"},
   };
 
   // In the order the stats log lists them.
@@ -29,6 +29,7 @@ namespace {
     "FEX_STATSLOG_APP",
     "FEX_STATSLOG_PROFILE",
     "FEX_STATSLOG_TIMELINE",
+    "FEX_STATSLOG_SCAN",
     "FEX_THREADPIN",
     "FEX_NATIVE_ZLIB",
     "FEX_NATIVE_MD5",
@@ -44,6 +45,7 @@ namespace {
     "FEX_DISKCACHE_PREFETCH",
     "FEX_DISKCACHE_PREFETCH_MB",
     "FEX_FRAMETIMES",
+    "FEX_CODELOCK_POLITE",
   };
 
   bool UseD2RDefaults {};

@@ -11,6 +11,7 @@
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/Threads.h>
+#include <FEXCore/Utils/WritePriorityMutex.h>
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +27,9 @@
 extern "C" NTSTATUS WINAPI NtOpenThread(HANDLE* Handle, ACCESS_MASK Access, const OBJECT_ATTRIBUTES* Attr, const CLIENT_ID* Id);
 extern "C" NTSTATUS WINAPI RtlSystemTimeToLocalTime(const LARGE_INTEGER* SystemTime, LARGE_INTEGER* LocalTime);
 extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE Process, const void* Address, void* Buffer, SIZE_T Size, SIZE_T* BytesRead);
+extern "C" NTSTATUS WINAPI NtCreateEvent(HANDLE* Handle, ACCESS_MASK Access, const OBJECT_ATTRIBUTES* Attr, int Type, BOOLEAN State);
+extern "C" NTSTATUS WINAPI NtSetEvent(HANDLE Handle, LONG* PreviousState);
+extern "C" NTSTATUS WINAPI NtResetEvent(HANDLE Handle, LONG* PreviousState);
 
 namespace FEX::Windows {
 namespace {
@@ -128,6 +132,8 @@ namespace {
     uint64_t MaxSignalAt;
     uint64_t MaxDiskCacheLookupTime;
     uint64_t MaxDiskCacheLookupAt;
+    uint64_t MaxCodeLockWaitTime;
+    uint64_t MaxCodeLockWaitAt;
     // Disk cache outcomes (see FEXCore::SHMStats::DiskCacheMissReason / DiskCacheStoreResult) and how far the RIP rings got.
     uint64_t DCMisses[8];
     uint64_t DCStores[8];
@@ -266,6 +272,8 @@ namespace {
     size_t SampledCount;
     bool Profile;
     bool Timeline;
+    bool ScanImage;       // FEX_STATSLOG_SCAN=1: the preload probe's per-second scan of the executable
+    uint64_t WorkTicks;   // how long the log thread's work between two sampling seconds took last time
     uint64_t SecondStart; // cycle counter when the current second's sampling began
     fextl::unordered_map<uint64_t, ProfileCount> ProfileCounts;
     uint32_t ProfileSamples[2];
@@ -389,21 +397,49 @@ namespace {
     return Handle;
   }
 
+  // The log thread's Wine calls go through the wineserver, which also serves the game's own event, wait and file calls,
+  // so it keeps one handle per thread instead of opening and closing one every second, and caches thread names. Log
+  // thread only. A held handle keeps its thread ID from being reused; handles of threads that have ended are closed
+  // by CloseEndedThreadHandles.
+  fextl::unordered_map<uint32_t, HANDLE> ThreadHandles;
+
   uint64_t QueryThreadCPUTime(uint32_t TID) {
-    HANDLE Handle = OpenThreadForQuery(TID);
-    if (!Handle) {
+    auto [It, Inserted] = ThreadHandles.try_emplace(TID, nullptr);
+    if (Inserted) {
+      It->second = OpenThreadForQuery(TID);
+    }
+    if (!It->second) {
+      ThreadHandles.erase(It);
       return 0;
     }
     KERNEL_USER_TIMES Times {};
     uint64_t Result {};
-    if (NtQueryInformationThread(Handle, ThreadTimes, &Times, sizeof(Times), nullptr) == STATUS_SUCCESS) {
+    if (NtQueryInformationThread(It->second, ThreadTimes, &Times, sizeof(Times), nullptr) == STATUS_SUCCESS) {
       Result = Times.KernelTime.QuadPart + Times.UserTime.QuadPart;
     }
-    NtClose(Handle);
     return Result;
   }
 
-  fextl::string QueryThreadName(uint32_t TID) {
+  template<typename IsLive>
+  void CloseEndedThreadHandles(IsLive&& Live) {
+    for (auto It = ThreadHandles.begin(); It != ThreadHandles.end();) {
+      if (Live(It->first)) {
+        ++It;
+      } else {
+        NtClose(It->second);
+        It = ThreadHandles.erase(It);
+      }
+    }
+  }
+
+  struct CachedThreadName {
+    fextl::string Name;
+    uint64_t Second;
+  };
+  fextl::unordered_map<uint32_t, CachedThreadName> ThreadNames;
+  uint64_t LogSecond {}; // seconds logged so far, for the name cache
+
+  fextl::string QueryThreadNameUncached(uint32_t TID) {
     HANDLE Handle = OpenThreadForQuery(TID);
     if (!Handle) {
       return {};
@@ -421,6 +457,17 @@ namespace {
     }
     NtClose(Handle);
     return Result;
+  }
+
+  // Names are asked again after 30 seconds, or after 5 while a thread has none (the game names some threads late).
+  fextl::string QueryThreadName(uint32_t TID) {
+    auto [It, Inserted] = ThreadNames.try_emplace(TID);
+    auto& Cached = It->second;
+    if (Inserted || LogSecond - Cached.Second >= (Cached.Name.empty() ? 5 : 30)) {
+      Cached.Name = QueryThreadNameUncached(TID);
+      Cached.Second = LogSecond;
+    }
+    return Cached.Name;
   }
 
   const CHPE_V2_CPU_AREA_INFO* QueryCPUArea(uint32_t TID) {
@@ -1287,6 +1334,63 @@ namespace {
     return Out;
   }
 
+  // Exclusive locks of FEX's code invalidation lock (see FEX_CODELOCK_POLITE in ARM64EC/Module.cpp): taken, how many
+  // waited 1ms or more, polite waits that ran out, the longest wait and hold with the 10ms bin each ended in.
+  FEXCore::Utils::WritePriorityMutex::ContentionStats CodeLockStats;
+
+  fextl::string CodeLockLine(LogState* State, double MsPerTick) {
+    auto Take = [](std::atomic<uint64_t>& Field) {
+      return Field.exchange(0, std::memory_order_relaxed);
+    };
+    const uint64_t Locks = Take(CodeLockStats.Locks);
+    const uint64_t Slow = Take(CodeLockStats.SlowLocks);
+    const uint64_t GiveUps = Take(CodeLockStats.PoliteGiveUps);
+    const uint64_t MaxWait = Take(CodeLockStats.MaxWait);
+    const uint64_t MaxWaitAt = Take(CodeLockStats.MaxWaitAt);
+    const uint64_t MaxHold = Take(CodeLockStats.MaxHold);
+    const uint64_t MaxHoldAt = Take(CodeLockStats.MaxHoldAt);
+    if (!Locks && !GiveUps) {
+      return {};
+    }
+    auto Bin = [State](uint64_t At) {
+      return At > State->SecondStart ? static_cast<int64_t>((At - State->SecondStart) * TimelineBins / State->CounterFreq) : -1;
+    };
+    return fextl::fmt::format("  codelock writes={} slow={} giveup={} wait={:.1f}ms@{} hold={:.1f}ms@{}\n", Locks, Slow, GiveUps,
+                              MaxWait * MsPerTick, Bin(MaxWaitAt), MaxHold * MsPerTick, Bin(MaxHoldAt));
+  }
+
+  // Whether Wine's fast event paths (esync, fsync or ntsync) are on. Without them every event and wait call (SetEvent,
+  // ResetEvent, WaitForSingleObject, ...) is a round trip to the wineserver, which serves every thread and process in
+  // turn. Times setting and resetting an event: a few microseconds when the fast path works, tens or more otherwise.
+  fextl::string WineSyncLine() {
+    fextl::string Line = "# wine sync:";
+    for (const char* Name : {"WINEESYNC", "WINEFSYNC", "WINE_DISABLE_FAST_SYNC", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC"}) {
+      const char* Value = getenv(Name);
+      Line += fextl::fmt::format(" {}={}", Name, Value && Value[0] ? Value : "-");
+    }
+    HANDLE Event {};
+    OBJECT_ATTRIBUTES Attr {.Length = sizeof(Attr)};
+    if (NtCreateEvent(&Event, EVENT_ALL_ACCESS, &Attr, 0 /* NotificationEvent */, FALSE) != STATUS_SUCCESS) {
+      return Line + "; event test failed\n";
+    }
+    constexpr int Rounds = 200;
+    const uint64_t Freq = GetCounterFrequency();
+    uint64_t Total {}, Longest {};
+    for (int i = 0; i < Rounds; ++i) {
+      const uint64_t Begin = GetCounter();
+      NtSetEvent(Event, nullptr);
+      NtResetEvent(Event, nullptr);
+      const uint64_t Took = GetCounter() - Begin;
+      Total += Took;
+      Longest = std::max(Longest, Took);
+    }
+    NtClose(Event);
+    const double AvgUs = static_cast<double>(Total) * 1'000'000.0 / static_cast<double>(Freq) / Rounds;
+    return Line + fextl::fmt::format("; event set+reset avg={:.1f}us max={:.1f}us ({})\n", AvgUs,
+                                     static_cast<double>(Longest) * 1'000'000.0 / static_cast<double>(Freq),
+                                     AvgUs < 10.0 ? "fast path on" : "goes through the wineserver");
+  }
+
   void* LogThread(void* Arg) {
     auto* State = static_cast<LogState*>(Arg);
     const double MsPerTick = 1000.0 / static_cast<double>(State->CounterFreq);
@@ -1300,6 +1404,8 @@ namespace {
     for (;;) {
       SampleFor1s(State);
       ++Seconds;
+      LogSecond = Seconds;
+      const uint64_t WorkStart = GetCounter();
 
       Current.clear();
       Slots.clear();
@@ -1341,6 +1447,8 @@ namespace {
         Cur.MaxSignalAt = Take(Mutable->MaxSignalAt);
         Cur.MaxDiskCacheLookupTime = Take(Mutable->MaxDiskCacheLookupTime);
         Cur.MaxDiskCacheLookupAt = Take(Mutable->MaxDiskCacheLookupAt);
+        Cur.MaxCodeLockWaitTime = Take(Mutable->MaxCodeLockWaitTime);
+        Cur.MaxCodeLockWaitAt = Take(Mutable->MaxCodeLockWaitAt);
         Cur.DCMissRIPCount = std::atomic_ref<uint64_t>(Mutable->DiskCacheMissRIPCount).load(std::memory_order_acquire);
         Cur.DCRejectRIPCount = std::atomic_ref<uint64_t>(Mutable->DiskCacheRejectRIPCount).load(std::memory_order_acquire);
         for (int i = 0; i < 8; ++i) {
@@ -1406,6 +1514,8 @@ namespace {
               .MaxSignalAt = Cur.MaxSignalAt,
               .MaxDiskCacheLookupTime = Cur.MaxDiskCacheLookupTime,
               .MaxDiskCacheLookupAt = Cur.MaxDiskCacheLookupAt,
+              .MaxCodeLockWaitTime = Cur.MaxCodeLockWaitTime,
+              .MaxCodeLockWaitAt = Cur.MaxCodeLockWaitAt,
             },
         };
         Entry.Slot = Slots[CurIndex];
@@ -1482,6 +1592,8 @@ namespace {
         AddMax("jit", D.MaxJITTime, D.MaxJITAt);
         AddMax("sig", D.MaxSignalTime, D.MaxSignalAt);
         AddMax("dcl", D.MaxDiskCacheLookupTime, D.MaxDiskCacheLookupAt);
+        // A compile waiting for the code invalidation lock (included in jit).
+        AddMax("codelock", D.MaxCodeLockWaitTime, D.MaxCodeLockWaitAt);
         if (!Max.empty()) {
           Line += fextl::fmt::format("    max{}\n", Max);
         }
@@ -1526,18 +1638,27 @@ namespace {
         Line += MainHitches(State, Seconds);
       }
 
-      // Preload probe, see ImageWatch. boot = hits before the first scan (game start).
-      uint64_t TotalPages {};
-      const uint64_t ReadablePages = ScanImage(static_cast<uint32_t>(Seconds), TotalPages);
-      Line += fextl::fmt::format("  pre exe early={} late={} other={} boot={} readable={}/{}\n", HitsEarly.exchange(0),
-                                 HitsLate.exchange(0), HitsOther.exchange(0), HitsBoot.exchange(0), ReadablePages, TotalPages);
-
-      // CPU clocks in MHz per core 0-7 (0-2 little, 3-6 middle, 7 the X3 on a Snapdragon 8 Gen 2).
-      if (const auto Clocks = ReadCoreClocks(); !Clocks.empty()) {
-        Line += fextl::fmt::format("  clk={}\n", Clocks);
-      } else if (ClocksUnreadable && Seconds == 1) {
-        Line += "  clk=unreadable\n";
+      // Preload probe, see ImageWatch. boot = hits before the first scan (game start). Off unless FEX_STATSLOG_SCAN=1:
+      // the scan asks Wine about every region of the executable each second, which competes with the game's own memory calls.
+      if (State->ScanImage) {
+        uint64_t TotalPages {};
+        const uint64_t ReadablePages = ScanImage(static_cast<uint32_t>(Seconds), TotalPages);
+        Line += fextl::fmt::format("  pre exe early={} late={} other={} boot={} readable={}/{}\n", HitsEarly.exchange(0),
+                                   HitsLate.exchange(0), HitsOther.exchange(0), HitsBoot.exchange(0), ReadablePages, TotalPages);
       }
+
+      // CPU clocks in MHz per core 0-7 (0-2 little, 3-6 middle, 7 the X3 on a Snapdragon 8 Gen 2), every 10 seconds.
+      if (Seconds % 10 == 1) {
+        if (const auto Clocks = ReadCoreClocks(); !Clocks.empty()) {
+          Line += fextl::fmt::format("  clk={}\n", Clocks);
+        } else if (ClocksUnreadable && Seconds == 1) {
+          Line += "  clk=unreadable\n";
+        }
+      }
+
+      Line += CodeLockLine(State, MsPerTick);
+      // How long the log thread's own work between the last two sampling seconds took (nothing is sampled meanwhile).
+      Line += fextl::fmt::format("  logger work={:.1f}ms\n", State->WorkTicks * MsPerTick);
 
       // Disk cache outcomes: why compiles missed, what happened to the compiled code, and what the writer did with it.
       {
@@ -1622,6 +1743,10 @@ namespace {
       }
       std::copy_n(Next, NextCount, State->Sampled);
       State->SampledCount = NextCount;
+
+      CloseEndedThreadHandles(
+        [&](uint32_t TID) { return std::any_of(Current.begin(), Current.end(), [TID](const Sample& S) { return S.TID == TID; }); });
+      State->WorkTicks = GetCounter() - WorkStart;
     }
 
     return nullptr;
@@ -1723,7 +1848,10 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "one game frame "
                                    "start to the next (count, average, median, 90th/99th percentile, longest, how many took 40/50/67/100ms "
                                    "or more), frames10s = the same over 10 seconds; '# frame' = a frame of 50ms or more with what Main and "
-                                   "the busy threads were doing in it\n",
+                                   "the busy threads were doing in it; codelock = FEX's code invalidation lock: exclusive locks taken, how "
+                                   "many waited 1ms "
+                                   "or more, polite waits that ran out, longest wait and hold (max codelock = a compile's longest wait "
+                                   "for it); logger work = the log thread's own work between two sampled seconds\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
@@ -1742,11 +1870,19 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   State->Profile = Profile && Profile[0] == '1';
   const char* Timeline = Switch("FEX_STATSLOG_TIMELINE");
   State->Timeline = !(Timeline && Timeline[0] == '0');
+  const char* Scan = Switch("FEX_STATSLOG_SCAN");
+  State->ScanImage = Scan && Scan[0] == '1';
   const auto Switches = fextl::fmt::format("# switches:{}\n", SwitchSummary());
   fwrite(Switches.data(), 1, Switches.size(), File);
+  const auto WineSync = WineSyncLine();
+  fwrite(WineSync.data(), 1, WineSync.size(), File);
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
   Thread = FEXCore::Threads::Thread::Create(LogThread, State, {.LowPriority = false, .Internal = true}, "FEXStatsLog");
+}
+
+FEXCore::Utils::WritePriorityMutex::ContentionStats* StatsLogCodeLockStats() {
+  return &CodeLockStats;
 }
 
 void StatsLogWatchImage(uint64_t Base) {

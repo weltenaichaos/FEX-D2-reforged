@@ -893,7 +893,10 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
-  auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
+  auto lk = [&] {
+    FEXCORE_PROFILE_ACCUMULATION_MAX(Thread, AccumulatedCodeLockWaitTime, MaxCodeLockWaitTime);
+    return GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
+  }();
 
   // Is the code in the cache?
   // The backends only check L1 and L2, not L3

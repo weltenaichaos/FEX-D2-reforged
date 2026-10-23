@@ -22,6 +22,23 @@
 
 namespace FEXCore::Utils::WritePriorityMutex {
 
+// Polite writers and contention stats are only built for Windows on ARM64 (ARM64EC and WOW64).
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+#define FEX_WRITE_PRIORITY_MUTEX_EXTRAS 1
+#endif
+
+// Exclusive lock timings for one mutex, read and reset by the stats log. Durations and times are in cycle counter
+// ticks; each "At" is the cycle counter when that longest one ended.
+struct ContentionStats {
+  std::atomic<uint64_t> Locks;         // exclusive locks taken
+  std::atomic<uint64_t> SlowLocks;     // of those, how many waited 1ms or more
+  std::atomic<uint64_t> PoliteGiveUps; // polite waits that ran out and queued the writer, blocking new readers
+  std::atomic<uint64_t> MaxWait;
+  std::atomic<uint64_t> MaxWaitAt;
+  std::atomic<uint64_t> MaxHold;
+  std::atomic<uint64_t> MaxHoldAt;
+};
+
 // A custom mutex that prioritizes exclusive locks.
 // In highly contested scenarios, this can help minimize overall contention time.
 //
@@ -51,10 +68,31 @@ public:
       return;
     }
 
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+    const uint64_t WaitBegin = Stats ? FEXCore::Utils::SpinWaitLock::GetCycleCounter() : 0;
+    LockSlow();
+    if (Stats) {
+      NoteAcquired(WaitBegin);
+    }
+  }
+
+private:
+  void LockSlow() {
     // Try a quick WFE write-lock.
     if (Attempt_WFE_WriteLock()) {
       return;
     }
+
+    // Wait without queueing first, so readers keep going while this writer waits for the current ones to finish.
+    if (PoliteWaitCycles && Attempt_PoliteWriteLock()) {
+      return;
+    }
+#else
+    // Try a quick WFE write-lock.
+    if (Attempt_WFE_WriteLock()) {
+      return;
+    }
+#endif
 
     // Still couldn't get it. Start waiting.
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
@@ -122,6 +160,9 @@ public:
     }
   }
 
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+public:
+#endif
   void lock_shared() {
     // Try an uncontended lock first.
     if (try_lock_shared()) {
@@ -175,6 +216,12 @@ public:
   void unlock() {
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
 
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+    if (Stats && HeldSince) {
+      NoteReleased();
+    }
+#endif
+
     uint32_t Expected = AtomicFutex.load(std::memory_order_relaxed);
     uint32_t Desired {};
     do {
@@ -201,6 +248,10 @@ public:
       // Handle write-reader handoff.
       FutexWakeReaders();
     }
+
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+    WakePoliteWriters();
+#endif
   }
 
   void unlock_shared() {
@@ -229,6 +280,12 @@ public:
     if ((Desired & WRITE_WAITER_COUNT_MASK) && (Desired & READ_OWNER_COUNT_MASK) == 0) {
       FutexWakeWriter();
     }
+
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+    if ((Desired & READ_OWNER_COUNT_MASK) == 0) {
+      WakePoliteWriters();
+    }
+#endif
   }
 
   bool try_lock() {
@@ -240,7 +297,13 @@ public:
     uint32_t Desired = WRITE_OWNED_BIT;
 
     // try to CAS immediately.
-    return AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
+    const bool Acquired = AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+    if (Acquired && Stats) {
+      NoteAcquired(0);
+    }
+#endif
+    return Acquired;
   }
 
   // Can race with other threads trying to lock shared!
@@ -260,6 +323,20 @@ public:
     // Uncontended mutex check
     return AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
   }
+
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+  // How long a writer that can't get the lock right away waits without queueing. Queued writers block new readers,
+  // so one slow reader plus a queued writer stops every other reader; a polite writer lets them carry on and takes
+  // the lock the moment no reader holds it. After this long it queues as usual. 0 (the default) never waits politely.
+  void SetPoliteWriteWait(uint32_t Milliseconds) {
+    PoliteWaitCycles = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency * Milliseconds / 1000;
+  }
+
+  // Exclusive lock timings go to Stats from now on (nullptr stops them). Stats must outlive the mutex's use.
+  void SetContentionStats(ContentionStats* NewStats) {
+    Stats = NewStats;
+  }
+#endif
 
 #if !defined(_WIN32)
   // Initialize the internal mutex object to its default initializer state.
@@ -382,6 +459,94 @@ private:
 
     return false;
   }
+
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+  // Return: true if the lock was acquired within PoliteWaitCycles, false to queue as usual.
+  bool Attempt_PoliteWriteLock() {
+    const auto Begin = FEXCore::Utils::SpinWaitLock::GetCycleCounter();
+    const auto SpinCycles = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency / POLITE_SPIN_DIVISOR;
+    auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+
+    // Readers and writers that drop the lock check this count after releasing and wake PoliteWaitSequence if it's
+    // non-zero. Both sides use sequentially consistent operations, so either this writer sees the lock free below or
+    // the releasing thread sees this count and wakes it. Each sleep also ends after 1ms in case a wake is missed.
+    std::atomic_ref<uint32_t>(PoliteWaiters).fetch_add(1);
+    bool Acquired = false;
+    while (true) {
+      uint32_t Sequence = std::atomic_ref<uint32_t>(PoliteWaitSequence).load();
+      uint32_t Expected = AtomicFutex.load();
+      if ((Expected & (WRITE_OWNED_BIT | READ_OWNER_COUNT_MASK)) == 0) {
+        // Free: take it without touching the other bits, so queued writers and waiting readers are still woken on unlock.
+        if (AtomicFutex.compare_exchange_strong(Expected, Expected | WRITE_OWNED_BIT, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          Acquired = true;
+          break;
+        }
+        continue;
+      }
+
+      const auto Waited = FEXCore::Utils::SpinWaitLock::GetCycleCounter() - Begin;
+      if (Waited >= PoliteWaitCycles) {
+        break;
+      }
+      if (Waited < SpinCycles) {
+        // Most reader holds are short: wait for the lock word to change.
+        FEXCore::Utils::SpinWaitLock::OneShotWFEBitComparison(&Futex, WRITE_OWNED_BIT | READ_OWNER_COUNT_MASK, 0U);
+      } else {
+        WaitOnAddress(&PoliteWaitSequence, &Sequence, sizeof(Sequence), 1);
+      }
+    }
+    std::atomic_ref<uint32_t>(PoliteWaiters).fetch_sub(1);
+
+    if (!Acquired && Stats) {
+      Stats->PoliteGiveUps.fetch_add(1, std::memory_order_relaxed);
+    }
+    return Acquired;
+  }
+
+  void WakePoliteWriters() {
+    if (std::atomic_ref<uint32_t>(PoliteWaiters).load() != 0) {
+      std::atomic_ref<uint32_t>(PoliteWaitSequence).fetch_add(1);
+      WakeByAddressAll(&PoliteWaitSequence);
+    }
+  }
+
+  void NoteAcquired(uint64_t WaitBegin) {
+    const auto Now = FEXCore::Utils::SpinWaitLock::GetCycleCounter();
+    HeldSince = Now;
+    Stats->Locks.fetch_add(1, std::memory_order_relaxed);
+    if (!WaitBegin) {
+      return;
+    }
+    const auto Waited = Now - WaitBegin;
+    if (Waited >= FEXCore::Utils::SpinWaitLock::CycleCounterFrequency / 1000) {
+      Stats->SlowLocks.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (Waited > Stats->MaxWait.load(std::memory_order_relaxed)) {
+      Stats->MaxWait.store(Waited, std::memory_order_relaxed);
+      Stats->MaxWaitAt.store(Now, std::memory_order_relaxed);
+    }
+  }
+
+  void NoteReleased() {
+    const auto Now = FEXCore::Utils::SpinWaitLock::GetCycleCounter();
+    const auto Held = Now - HeldSince;
+    HeldSince = 0;
+    if (Held > Stats->MaxHold.load(std::memory_order_relaxed)) {
+      Stats->MaxHold.store(Held, std::memory_order_relaxed);
+      Stats->MaxHoldAt.store(Now, std::memory_order_relaxed);
+    }
+  }
+
+  // Polite writers spin on WFE for the first 0.2ms (200k ns), then sleep in 1ms steps.
+  constexpr static uint64_t POLITE_SPIN_DIVISOR = 1'000'000'000ULL / 200'000U;
+
+  uint64_t PoliteWaitCycles {};
+  ContentionStats* Stats {};
+  // Written only by the thread holding the exclusive lock.
+  uint64_t HeldSince {};
+  uint32_t PoliteWaiters {};
+  uint32_t PoliteWaitSequence {};
+#endif
 
   constexpr static uint32_t WRITE_OWNED_BIT = 1U << 31;
   constexpr static uint32_t READ_WAITER_BIT = 1U << 30;

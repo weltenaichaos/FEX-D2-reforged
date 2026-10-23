@@ -6,6 +6,10 @@
 
 #include <FEXCore/fextl/string.h>
 
+namespace FEXCore::Utils::WritePriorityMutex {
+struct ContentionStats;
+}
+
 namespace FEX::Windows {
 class StatAlloc;
 
@@ -13,6 +17,7 @@ class StatAlloc;
 //
 //   FEX_STATSLOG=<directory>      enables it; writes <directory>\fexstats-<exe>-<HHMMSS>-<pid>.txt
 //   FEX_STATSLOG_APP=<exe name>   optional; only log this process (e.g. D2R.exe)
+//   FEX_STATSLOG_SCAN=1           optional; scan the main executable every second for the preload probe ("pre exe" lines)
 //   FEX_STATSLOG_PROFILE=1        optional; also sample which JIT blocks the busiest threads run and log the hottest every 30s,
 //                                 with the full guest code of the hottest ones the first time they show up, and which native
 //                                 functions they are in when outside emulated code (per-thread "native" lines)
@@ -44,4 +49,7 @@ void StatsLogNameNative(uint64_t Address, std::string_view Name);
 // The log then says every second how long the frames took and, with FEX_STATSLOG_PROFILE=1, what the main thread was doing
 // in every slow one.
 void StatsLogSetFrameMarks(const uint64_t* Marks, size_t RingSize);
+
+// Where FEX's code invalidation lock records its exclusive lock timings, printed every second as a "codelock" line.
+FEXCore::Utils::WritePriorityMutex::ContentionStats* StatsLogCodeLockStats();
 } // namespace FEX::Windows
