@@ -54,6 +54,7 @@ $end_info$
 #include "Windows/Common/PriorityGuard.h"
 #include "Windows/Common/Switches.h"
 #include "FrameLatency.h"
+#include "Rumble.h"
 #include "NativeRedirect.h"
 
 #include <atomic>
@@ -935,6 +936,7 @@ NTSTATUS ProcessInit() {
   FEX::Windows::StartThreadPlacer(AppConfigName);
   FEX::Windows::StartPriorityGuard(AppConfigName);
   FrameLatency::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
+  Rumble::Init(StatsLog);
   NativeRedirect::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog, [](uint64_t Address, uint64_t Size) {
     InvalidationTracker->InvalidateAlignedInterval(Address, Size, false);
   });

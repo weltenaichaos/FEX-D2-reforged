@@ -28,16 +28,17 @@ namespace FEX::Windows {
 //                      container doesn't allow the fastest core.
 //                      The main thread's Linux cores are also checked 4 times a second and set back when
 //                      something outside Wine changed them (build 50 lost the pin to Android or the launcher after 34
-//                      seconds).
+//                      seconds). CPUs the kernel pauses for a while (core control, heat) only get a "# cores: CPUs ...
+//                      paused" line: the thread's own mask is unchanged then.
 //   FEX_MAINCORE=big   the main thread on the same cores as the game's other threads
 //   FEX_MAINCORE=off   leave affinities alone
 //   FEX_MAINCORE_WAIT=N  with "fast": while the main thread waits N ms or more a second for its one core (login and
 //                      loading, where the wineserver and other threads share that core), it may also use the game's
 //                      other big cores until it waits under 10 ms a second for 5 seconds (longer if it keeps bouncing).
 //                      D2R default 40; "off" or 0 keeps it on its core at all times.
-//   FEX_HELPER_CORES=little  the stats log thread (a 2ms sampler) and this guard on the slowest cores, off the game's
-//                      (the D2R default), when the process may use them. The stall probe, disk cache and unpack cache
-//                      threads stay on the game's cores.
+//   FEX_HELPER_CORES=little  the stats log thread (a 2ms sampler), this guard and the rumble sender (FEXRumble) on the
+//                      slowest cores, off the game's (the D2R default), when the process may use them. The stall probe,
+//                      disk cache and unpack cache threads stay on the game's cores.
 //
 // Wineserver. Every file, pipe, controller and window message request of every Wine process goes through the one
 // wineserver thread; under load the build 48 probe saw single round trips take up to 27 ms.

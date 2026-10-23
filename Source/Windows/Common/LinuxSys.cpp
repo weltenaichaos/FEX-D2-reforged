@@ -158,6 +158,31 @@ uint64_t GetAffinity(int Tid) {
   return Result < 0 ? 0 : Mask[0];
 }
 
+uint64_t ReadAllowedMask(const char* StatusPath) {
+  char Buffer[4096];
+  if (ReadSmallFile(StatusPath, Buffer, sizeof(Buffer)) <= 0) {
+    return 0;
+  }
+  const char* Line = strstr(Buffer, "\nCpus_allowed:");
+  if (!Line) {
+    return 0;
+  }
+  Line += 14;
+  // Hex digits, in 32-bit groups separated by commas, most significant first.
+  uint64_t Mask {};
+  for (; *Line && *Line != '\n'; ++Line) {
+    const char c = *Line;
+    if (c >= '0' && c <= '9') {
+      Mask = Mask << 4 | static_cast<uint64_t>(c - '0');
+    } else if (c >= 'a' && c <= 'f') {
+      Mask = Mask << 4 | static_cast<uint64_t>(c - 'a' + 10);
+    } else if (c >= 'A' && c <= 'F') {
+      Mask = Mask << 4 | static_cast<uint64_t>(c - 'A' + 10);
+    }
+  }
+  return Mask;
+}
+
 int SetAffinity(int Tid, uint64_t Mask) {
   uint64_t Masks[1] {Mask};
   return static_cast<int>(Syscall(NR_sched_setaffinity, Tid, sizeof(Masks), reinterpret_cast<intptr_t>(Masks)));

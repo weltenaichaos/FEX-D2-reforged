@@ -442,6 +442,14 @@ namespace {
   }
 } // namespace
 
+size_t FindExportEntries(uint64_t Base, const char* Name, uint64_t (&Out)[3]) {
+  return ExportTargets(Base, Name, Out);
+}
+
+uint64_t FindModule(const wchar_t* Name) {
+  return ModuleBase(Name);
+}
+
 bool WantsFrameMarks() {
   return Requested;
 }

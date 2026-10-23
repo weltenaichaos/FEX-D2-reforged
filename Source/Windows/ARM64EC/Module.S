@@ -68,6 +68,27 @@ ExitFunctionEC:
 
 .global ExitFunctionSuspendResumePoint
 ExitFunctionSuspendResumePoint:
+  // A call from x64 code into XInputSetState (one of FEXRumbleTargets[0..2], all 0 until Rumble.cpp finds xinput): run
+  // FEX's replacement (NativeRumbleTarget, see Rumble.h) instead. The entry the game called goes to FEXRumbleTargets[3]
+  // for it. A return address is never a function's first instruction, so returns never match. x16 and x17 are free here.
+  adrp x16, FEXRumbleTargets
+  add x16, x16, #:lo12:FEXRumbleTargets
+  ldr x17, [x16]
+  cbz x17, rumble_done
+  cmp x17, x9
+  b.eq rumble_hit
+  ldr x17, [x16, #8]
+  cmp x17, x9
+  b.eq rumble_hit
+  ldr x17, [x16, #16]
+  cmp x17, x9
+  b.ne rumble_done
+rumble_hit:
+  str x9, [x16, #24]
+  adrp x9, NativeRumbleTarget
+  add x9, x9, #:lo12:NativeRumbleTarget
+rumble_done:
+
   // Either return to an exit thunk (return to ARM64EC function) or call an entry thunk (call to ARM64EC function).
   // It is assumed that a 'blr x16' instruction is only ever used to call into x86 code from an exit thunk, and that all
   // exported ARM64EC functions have a 4-byte offset to their entry thunk immediately before their first instruction.
@@ -278,3 +299,5 @@ NATIVE_REDIRECT NativeMD5Update, #FEXNativeMD5Update
 NATIVE_REDIRECT NativeMD5Transform, #FEXNativeMD5Transform
   // The job system getter takes no arguments; it gets its return address (x0) to tell the frame wait loop's call apart.
 NATIVE_REDIRECT NativeJobSystemGet, #FEXNativeJobSystemGet, "mov x0, x30"
+  // XInputSetState(index, vibration), entered from ExitFunctionEC above (the Redirect stub is unused).
+NATIVE_REDIRECT NativeRumble, #FEXNativeRumbleSetState

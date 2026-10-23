@@ -23,8 +23,12 @@ int GetTid();
 int GetNice(int Tid);
 // 0 or a negative errno.
 int SetNice(int Tid, int Nice);
-// CPUs a Linux thread may run on (the first 64), or 0 on failure.
+// CPUs a Linux thread may run on now (the first 64; the kernel leaves out paused CPUs), or 0 on failure.
 uint64_t GetAffinity(int Tid);
+// The CPUs a thread's own mask allows (the "Cpus_allowed" line of its /proc status file, e.g. "/proc/self/task/<tid>/status"),
+// or 0. Unlike GetAffinity, which leaves out CPUs the kernel has paused (taken out of use while still online: core control,
+// heat), this is the mask as set.
+uint64_t ReadAllowedMask(const char* StatusPath);
 // sched_setaffinity for CPUs 0-63; 0 or -errno.
 int SetAffinity(int Tid, uint64_t Mask);
 

@@ -345,6 +345,9 @@ namespace {
     uint64_t LastSeen; // the last mask found that neither of them set
     uint32_t Resets;
     uint32_t Widens;
+    fextl::string StatusPath; // /proc/self/task/<tid>/status
+    uint64_t PausedSeen;      // CPUs of its mask the kernel had paused at the last check
+    uint32_t Pauses;
   };
 
   void KeepMainCore(MainKeeper& K, uint64_t FastMask, uint64_t WideMask) {
@@ -394,26 +397,46 @@ namespace {
 
     const uint64_t Want = K.Widened ? WideMask : FastMask;
     const uint64_t Now = Linux::GetAffinity(K.Tid);
-    if (!Now) {
-      return;
-    }
     if (Now == Want) {
       K.Applied = Want;
+      K.PausedSeen = 0;
       return;
     }
-    // Neither this keeper nor the round set what it has now: Android or the launcher changed it outside Wine.
-    const bool Outside = Now != K.Applied && Now != K.LastSeen;
-    if (Now != K.Applied) {
-      K.LastSeen = Now;
+    // sched_getaffinity leaves out CPUs the kernel has paused (core control or heat take a CPU out of use without
+    // switching it off). When the thread's own mask is still what was set, that is all it is: nothing to set back. The
+    // "changed to 0xb8" and "0x78" of the build 52 log (cores 6 and 7 missing for a moment) look like this.
+    const uint64_t Own = Linux::ReadAllowedMask(K.StatusPath.c_str());
+    if (Own == Want) {
+      K.Applied = Want;
+      const uint64_t Paused = Want & ~Now;
+      if (Paused != K.PausedSeen) {
+        K.PausedSeen = Paused;
+        if (Paused && (++K.Pauses <= 5 || K.Pauses % 50 == 0)) {
+          StatsLogNote(fextl::fmt::format("cores: CPUs {:#x} of the main thread's {:#x} are paused by the kernel for now (core control or heat), "
+                                          "its own mask is unchanged, #{}",
+                                          Paused, Want, K.Pauses));
+        }
+      }
+      return;
+    }
+    if (!Now && !Own) {
+      return;
+    }
+    // Its own mask changed: Android or the launcher outside Wine, or the kernel moving it elsewhere because every CPU it was
+    // allowed was paused (the build 50 log's "changed to all 8").
+    const uint64_t Seen = Own ? Own : Now;
+    const bool Outside = Seen != K.Applied && Seen != K.LastSeen;
+    if (Seen != K.Applied) {
+      K.LastSeen = Seen;
     }
     const int Result = Linux::SetAffinity(K.Tid, Want);
     if (Result == 0) {
       K.Applied = Want;
     }
     if (Outside && (++K.Resets <= 3 || K.Resets % 50 == 0)) {
-      StatsLogNote(fextl::fmt::format("cores: main thread's Linux cores were changed to {:#x} outside Wine (Android or the launcher); set back "
-                                      "to {:#x}, result {}, change #{}",
-                                      Now, Want, Result, K.Resets));
+      StatsLogNote(fextl::fmt::format("cores: main thread's Linux cores were changed to {:#x} (usable now {:#x}) outside Wine (Android, the "
+                                      "launcher, or the kernel when all of its cores were paused); set back to {:#x}, result {}, change #{}",
+                                      Seen, Now, Want, Result, K.Resets));
     }
   }
 
@@ -440,6 +463,7 @@ namespace {
     int ServerPid {};
     uint32_t ServerCoreReports {};
     MainKeeper Keeper {.Tid = C->Cores == CoreMode::Fast ? C->MainLinuxTid : 0, .EaseMs = C->EaseWaitMs};
+    Keeper.StatusPath = fextl::fmt::format("/proc/self/task/{}/status", Keeper.Tid);
     uint64_t KeepFast {}, KeepWide {};
 
     for (;;) {
@@ -488,10 +512,11 @@ namespace {
           T.Name = QueryName(Next);
           T.Named = true;
           T.FEX = T.Name.size() >= 3 && T.Name.compare(0, 3, "FEX") == 0;
-          // Only the stats log (its 2ms sampler and per-second work) and this guard move: the stall probe measures what
-          // game threads see, and the disk cache writer, prefetcher and unpack cache threads hold locks or feed loads the
-          // game waits on.
-          T.KeepCores = !(T.Name == "FEXStatsLog" || T.Name == "FEXPrioGuard" || T.Name == "FEXThreadPin" || T.Name == "FEXFrameLatency");
+          // Only the stats log (its 2ms sampler and per-second work), this guard and the rumble sender move: the stall
+          // probe measures what game threads see, and the disk cache writer, prefetcher and unpack cache threads hold locks
+          // or feed loads the game waits on.
+          T.KeepCores = !(T.Name == "FEXStatsLog" || T.Name == "FEXPrioGuard" || T.Name == "FEXThreadPin" || T.Name == "FEXFrameLatency" ||
+                          T.Name == "FEXRumble");
         }
         Entries.push_back({Next, TID, Basic, &T, TID == C->MainTID || T.Name == "Main"});
       }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 // Frame latency (FEX_FRAMELATENCY). In the build 49 log every D2R frame took the main thread's own work plus an almost fixed
@@ -34,4 +35,11 @@ void Init(uint64_t MainImageBase, bool StatsLog);
 
 // Whether the frame clock (NativeRedirect.cpp) should run so frames can be counted, even without the stats log.
 bool WantsFrameMarks();
+
+// The entries ExitFunctionEC can see for export Name of the module at Base (its entry, the code a hybrid-patchable entry's
+// x64 thunk jumps to, the ARM64EC code the CHPE redirection table maps it to); how many were written to Out. 0 for a
+// forwarded export. Also used by Rumble.cpp.
+size_t FindExportEntries(uint64_t Base, const char* Name, uint64_t (&Out)[3]);
+// The base of a loaded module (LdrGetDllHandle), 0 if it isn't loaded.
+uint64_t FindModule(const wchar_t* Name);
 } // namespace FrameLatency

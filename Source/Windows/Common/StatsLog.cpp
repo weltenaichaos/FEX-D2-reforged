@@ -339,6 +339,342 @@ namespace {
     Sched.Server = {};
   }
 
+  uint64_t GetCounter();
+  uint64_t GetCounterFrequency();
+
+  // Per-core load (with the scheduler view), for load from outside the game, which /proc doesn't show by process (other
+  // users' processes are hidden from apps): how busy each CPU was in the last second, whoever ran there, from /proc/stat
+  // when Android lets apps read it, otherwise from each CPU's idle time in its cpuidle states (sysfs stateN/time, us). A
+  // CPU's time in an idle state is only added when it wakes up, so a CPU that slept through the whole second looks busy:
+  // with no idle state entered in the second and not paused, it shows as "?" and is left out of the sums. Busy on the
+  // game's CPUs minus this process's and the wineserver's run time is what other processes and the kernel used there
+  // (Wine's other processes included, see "sched procs"). Paused: the share of 10 ms samples in which the kernel had a
+  // CPU out of use (core control or heat), from sched_getaffinity of the main and log threads against their own masks.
+  // Also the number of runnable tasks of the whole system (/proc/loadavg) and the share of the second some task waited
+  // for a CPU (/proc/pressure/cpu), when readable.
+  constexpr int MaxIdleStates = 10;
+  struct CoreLoadState {
+    bool On;
+    int Cpus;
+    bool ProcStat;
+    int StatFd = -1;
+    int TimeFds[Linux::MaxCPUs][MaxIdleStates];
+    int UsageFds[Linux::MaxCPUs][MaxIdleStates];
+    int States[Linux::MaxCPUs];
+    uint64_t PrevIdle[Linux::MaxCPUs];  // /proc/stat: idle+iowait ticks; cpuidle: us
+    uint64_t PrevTotal[Linux::MaxCPUs]; // /proc/stat: all ticks
+    uint64_t PrevUsage[Linux::MaxCPUs]; // cpuidle: idle states entered
+    bool PrevOk[Linux::MaxCPUs];
+    uint64_t PrevCounter;
+    bool Have;
+    int LogTid;
+    fextl::string MainStatus, LogStatus;
+    uint64_t Allowed; // the main and log threads' own masks
+    uint32_t PauseSamples;
+    uint32_t Paused[Linux::MaxCPUs];
+    int LoadavgFd = -1;
+    int PsiFd = -1;
+    uint64_t PrevPsiUs;
+    bool HavePsi;
+    fextl::string MainCgroup, ServerCgroup;
+    uint32_t CgroupNotes;
+  };
+  CoreLoadState Core;
+
+  // Reads one CPU's counters; false when they can't be read (offline CPU, or no access).
+  bool CoreRead(int Cpu, const char* ProcStat, uint64_t& Idle, uint64_t& Total, uint64_t& Usage) {
+    if (Core.ProcStat) {
+      // "cpuN user nice system idle iowait irq softirq steal ..." in ticks.
+      const auto Name = fextl::fmt::format("\ncpu{} ", Cpu);
+      const char* Line = ProcStat ? strstr(ProcStat, Name.c_str()) : nullptr;
+      if (!Line) {
+        return false;
+      }
+      char* P = const_cast<char*>(Line + Name.size());
+      uint64_t Fields[8] {};
+      for (auto& F : Fields) {
+        F = strtoull(P, &P, 10);
+      }
+      Idle = Fields[3] + Fields[4];
+      Total = 0;
+      for (const auto F : Fields) {
+        Total += F;
+      }
+      return true;
+    }
+    if (!Core.States[Cpu]) {
+      return false;
+    }
+    Idle = Usage = Total = 0;
+    for (int i = 0; i < Core.States[Cpu]; ++i) {
+      char Buffer[32];
+      int64_t Len = Linux::Pread(Core.TimeFds[Cpu][i], Buffer, sizeof(Buffer) - 1, 0);
+      if (Len <= 0) {
+        return false;
+      }
+      Buffer[Len] = 0;
+      Idle += strtoull(Buffer, nullptr, 10);
+      Len = Linux::Pread(Core.UsageFds[Cpu][i], Buffer, sizeof(Buffer) - 1, 0);
+      if (Len > 0) {
+        Buffer[Len] = 0;
+        Usage += strtoull(Buffer, nullptr, 10);
+      }
+    }
+    return true;
+  }
+
+  void CoreLoadInit() {
+    Core.On = true;
+    Core.LogTid = Linux::GetTid();
+    Core.MainStatus = fextl::fmt::format("/proc/self/task/{}/status", Sched.Pid);
+    Core.LogStatus = fextl::fmt::format("/proc/self/task/{}/status", Core.LogTid);
+    uint32_t KHz[Linux::MaxCPUs];
+    Linux::ReadMaxClocks(KHz);
+    while (Core.Cpus < Linux::MaxCPUs && KHz[Core.Cpus]) {
+      ++Core.Cpus;
+    }
+    char Probe[256];
+    Core.StatFd = Linux::Open("/proc/stat");
+    const int64_t StatLen = Core.StatFd >= 0 ? Linux::Pread(Core.StatFd, Probe, sizeof(Probe) - 1, 0) : Core.StatFd;
+    Core.ProcStat = StatLen > 0;
+    if (!Core.ProcStat) {
+      Linux::Close(Core.StatFd);
+      Core.StatFd = -1;
+    }
+    int StateTotal {};
+    if (!Core.ProcStat) {
+      for (int Cpu = 0; Cpu < Core.Cpus; ++Cpu) {
+        for (int i = 0; i < MaxIdleStates; ++i) {
+          const int TimeFd = Linux::Open(fextl::fmt::format("/sys/devices/system/cpu/cpu{}/cpuidle/state{}/time", Cpu, i).c_str());
+          if (TimeFd < 0) {
+            break;
+          }
+          Core.TimeFds[Cpu][i] = TimeFd;
+          Core.UsageFds[Cpu][i] = Linux::Open(fextl::fmt::format("/sys/devices/system/cpu/cpu{}/cpuidle/state{}/usage", Cpu, i).c_str());
+          ++Core.States[Cpu];
+          ++StateTotal;
+        }
+      }
+    }
+    Core.LoadavgFd = Linux::Open("/proc/loadavg");
+    if (Core.LoadavgFd >= 0 && Linux::Pread(Core.LoadavgFd, Probe, sizeof(Probe) - 1, 0) <= 0) {
+      Linux::Close(Core.LoadavgFd);
+      Core.LoadavgFd = -1;
+    }
+    Core.PsiFd = Linux::Open("/proc/pressure/cpu");
+    if (Core.PsiFd >= 0 && Linux::Pread(Core.PsiFd, Probe, sizeof(Probe) - 1, 0) <= 0) {
+      Linux::Close(Core.PsiFd);
+      Core.PsiFd = -1;
+    }
+    StatsLogNote(fextl::fmt::format("cores: per-core load of {} CPUs from {}; system runnable tasks {}; cpu pressure {}", Core.Cpus,
+                                    Core.ProcStat  ? fextl::string("/proc/stat") :
+                                    StateTotal     ? fextl::fmt::format("cpuidle ({} idle states; /proc/stat not readable, error {})", StateTotal, StatLen) :
+                                                     fextl::fmt::format("nothing: /proc/stat (error {}) and cpuidle not readable", StatLen),
+                                    Core.LoadavgFd >= 0 ? "from /proc/loadavg" : "not readable",
+                                    Core.PsiFd >= 0 ? "from /proc/pressure/cpu" : "not readable"));
+  }
+
+  // Every 10ms: which of the game's CPUs the kernel has out of use.
+  void CorePauseSample() {
+    if (!Core.On || !Core.Allowed) {
+      return;
+    }
+    const uint64_t Usable = Linux::GetAffinity(Sched.Pid) | Linux::GetAffinity(Core.LogTid);
+    const uint64_t Paused = Core.Allowed & ~Usable;
+    ++Core.PauseSamples;
+    for (int i = 0; Paused && i < Linux::MaxCPUs; ++i) {
+      if (Paused & (1ull << i)) {
+        ++Core.Paused[i];
+      }
+    }
+  }
+
+  fextl::string CoreLine(double GameRunMs, double ServerRunMs) {
+    if (!Core.On || !Core.Cpus) {
+      return {};
+    }
+    const uint64_t Counter = GetCounter();
+    char StatBuffer[4096];
+    const char* StatText {};
+    if (Core.ProcStat) {
+      const int64_t Len = Linux::Pread(Core.StatFd, StatBuffer + 1, sizeof(StatBuffer) - 2, 0);
+      StatBuffer[0] = '\n';
+      StatBuffer[Len > 0 ? Len + 1 : 1] = 0;
+      StatText = StatBuffer;
+    }
+    uint64_t Idle[Linux::MaxCPUs] {}, Total[Linux::MaxCPUs] {}, Usage[Linux::MaxCPUs] {};
+    bool Ok[Linux::MaxCPUs] {};
+    for (int Cpu = 0; Cpu < Core.Cpus; ++Cpu) {
+      Ok[Cpu] = CoreRead(Cpu, StatText, Idle[Cpu], Total[Cpu], Usage[Cpu]);
+    }
+    fextl::string Out;
+    if (Core.Have) {
+      const double Wall = static_cast<double>(Counter - Core.PrevCounter) / static_cast<double>(GetCounterFrequency());
+      fextl::string Text;
+      double GameCpusBusy {};
+      int Known {}, InGame {};
+      for (int Cpu = 0; Cpu < Core.Cpus; ++Cpu) {
+        const bool Game = Core.Allowed & (1ull << Cpu);
+        InGame += Game;
+        const uint32_t PausedPct = Core.PauseSamples ? (Core.Paused[Cpu] * 100 + Core.PauseSamples / 2) / Core.PauseSamples : 0;
+        double Busy = -1.0;
+        if (Ok[Cpu] && Core.PrevOk[Cpu]) {
+          if (Core.ProcStat) {
+            const uint64_t Dt = Total[Cpu] - Core.PrevTotal[Cpu];
+            Busy = Dt ? 1.0 - static_cast<double>(Idle[Cpu] - Core.PrevIdle[Cpu]) / static_cast<double>(Dt) : -1.0;
+          } else if (Usage[Cpu] != Core.PrevUsage[Cpu] || Idle[Cpu] != Core.PrevIdle[Cpu]) {
+            Busy = 1.0 - static_cast<double>(Idle[Cpu] - Core.PrevIdle[Cpu]) / (Wall * 1e6);
+          } else if (PausedPct >= 90) {
+            Busy = 0.0; // asleep the whole second because it was paused
+          }
+        }
+        if (Busy >= 0.0) {
+          Busy = std::clamp(Busy, 0.0, 1.0);
+          Text += fextl::fmt::format(" {}:{:.0f}", Cpu, Busy * 100.0);
+          if (Game) {
+            GameCpusBusy += Busy;
+            ++Known;
+          }
+        } else {
+          Text += fextl::fmt::format(" {}:?", Cpu);
+        }
+      }
+      Out = fextl::fmt::format("  cores busy%:{}", Text);
+      if (Core.Allowed) {
+        const double Game = GameRunMs / 1000.0 / Wall;
+        const double Server = ServerRunMs / 1000.0 / Wall;
+        Out += fextl::fmt::format(" | game cpus {:#x} busy {:.2f}{} = game {:.2f} + server {:.2f} + others ~{:.2f}", Core.Allowed,
+                                  GameCpusBusy, Known < InGame ? fextl::fmt::format(" ({} of {} known)", Known, InGame) : fextl::string {},
+                                  Game, Server, std::max(GameCpusBusy - Game - Server, 0.0));
+      }
+      fextl::string PausedText;
+      for (int Cpu = 0; Cpu < Core.Cpus; ++Cpu) {
+        if (Core.Paused[Cpu]) {
+          PausedText += fextl::fmt::format(" {}:{}%", Cpu, (Core.Paused[Cpu] * 100 + Core.PauseSamples / 2) / std::max<uint32_t>(Core.PauseSamples, 1));
+        }
+      }
+      if (!PausedText.empty()) {
+        Out += fextl::fmt::format(" | paused{}", PausedText);
+      }
+    }
+    if (Core.LoadavgFd >= 0) {
+      char Buffer[128];
+      const int64_t Len = Linux::Pread(Core.LoadavgFd, Buffer, sizeof(Buffer) - 1, 0);
+      if (Len > 0) {
+        Buffer[Len] = 0;
+        // "0.50 0.60 0.70 3/1234 5678": the fourth field is runnable/all.
+        const char* P = Buffer;
+        for (int Field = 0; Field < 3 && P; ++Field) {
+          P = strchr(P, ' ');
+          P = P ? P + 1 : nullptr;
+        }
+        if (P && Core.Have) {
+          Out += fextl::fmt::format(" | runnable {}", strtoull(P, nullptr, 10));
+        }
+      }
+    }
+    if (Core.PsiFd >= 0) {
+      char Buffer[256];
+      const int64_t Len = Linux::Pread(Core.PsiFd, Buffer, sizeof(Buffer) - 1, 0);
+      if (Len > 0) {
+        Buffer[Len] = 0;
+        // "some avg10=1.23 avg60=... avg300=... total=<us>"
+        if (const char* T = strstr(Buffer, "total=")) {
+          const uint64_t TotalUs = strtoull(T + 6, nullptr, 10);
+          if (Core.HavePsi && Core.Have) {
+            const double Wall = static_cast<double>(Counter - Core.PrevCounter) / static_cast<double>(GetCounterFrequency());
+            Out += fextl::fmt::format(" | cpu pressure {:.0f}%", static_cast<double>(TotalUs - Core.PrevPsiUs) / (Wall * 1e4));
+          }
+          Core.PrevPsiUs = TotalUs;
+          Core.HavePsi = true;
+        }
+      }
+    }
+    for (int Cpu = 0; Cpu < Core.Cpus; ++Cpu) {
+      Core.PrevIdle[Cpu] = Idle[Cpu];
+      Core.PrevTotal[Cpu] = Total[Cpu];
+      Core.PrevUsage[Cpu] = Usage[Cpu];
+      Core.PrevOk[Cpu] = Ok[Cpu];
+    }
+    Core.PrevCounter = Counter;
+    Core.Have = true;
+    Core.Allowed = Linux::ReadAllowedMask(Core.MainStatus.c_str()) | Linux::ReadAllowedMask(Core.LogStatus.c_str());
+    Core.PauseSamples = 0;
+    memset(Core.Paused, 0, sizeof(Core.Paused));
+    return Out.empty() ? Out : Out + "\n";
+  }
+
+  // The first line of a small file, or "-".
+  fextl::string FirstLine(const fextl::string& Path) {
+    char Buffer[128];
+    if (Linux::ReadSmallFile(Path.c_str(), Buffer, sizeof(Buffer)) <= 0) {
+      return "-";
+    }
+    char* End = strchr(Buffer, '\n');
+    if (End) {
+      *End = 0;
+    }
+    return Buffer;
+  }
+
+  // Which cgroups a task is in ("ctrl:/path ..."), with the CPUs of its cpuset and the limits of its cpu group when
+  // readable. Android sorts apps into groups (top-app, foreground, background, ...) with their own CPUs and CPU share; a
+  // launcher's child processes stay in the group they started in.
+  fextl::string CgroupText(const fextl::string& Path, bool Details) {
+    char Buffer[1024];
+    if (Linux::ReadSmallFile(Path.c_str(), Buffer, sizeof(Buffer)) <= 0) {
+      return {};
+    }
+    fextl::string Out;
+    for (char* Line = Buffer; Line && *Line;) {
+      char* Next = strchr(Line, '\n');
+      if (Next) {
+        *Next++ = 0;
+      }
+      // "N:controllers:/path"
+      const char* Ctrl = strchr(Line, ':');
+      const char* GroupPath = Ctrl ? strchr(Ctrl + 1, ':') : nullptr;
+      if (Ctrl && GroupPath) {
+        const fextl::string Controllers(Ctrl + 1, GroupPath - Ctrl - 1);
+        const fextl::string Group(GroupPath + 1);
+        Out += fextl::fmt::format(" {}:{}", Controllers.empty() ? "v2" : Controllers.c_str(), Group);
+        if (Details) {
+          const fextl::string Sub = Group == "/" ? fextl::string {} : Group;
+          if (Controllers == "cpuset") {
+            Out += fextl::fmt::format("(cpus {})", FirstLine(fextl::fmt::format("/dev/cpuset{}/cpus", Sub)));
+          } else if (Controllers == "cpu" || Controllers == "cpu,cpuacct" || Controllers == "cpuctl") {
+            Out += fextl::fmt::format("(uclamp.min {} max {} shares {})", FirstLine(fextl::fmt::format("/dev/cpuctl{}/cpu.uclamp.min", Sub)),
+                                      FirstLine(fextl::fmt::format("/dev/cpuctl{}/cpu.uclamp.max", Sub)),
+                                      FirstLine(fextl::fmt::format("/dev/cpuctl{}/cpu.shares", Sub)));
+          }
+        }
+      }
+      Line = Next;
+    }
+    return Out;
+  }
+
+  // Every second: notes when the main thread's or the wineserver's cgroups change (and once at the start).
+  void CgroupCheck() {
+    if (!Core.On) {
+      return;
+    }
+    auto Check = [](const char* Who, const fextl::string& Path, fextl::string& Last) {
+      fextl::string Now = CgroupText(Path, false);
+      if (Now.empty() || Now == Last) {
+        return;
+      }
+      Last = Now;
+      if (++Core.CgroupNotes <= 20 || Core.CgroupNotes % 50 == 0) {
+        StatsLogNote(fextl::fmt::format("cgroup: {}{}", Who, CgroupText(Path, true)));
+      }
+    };
+    Check("main thread", fextl::fmt::format("/proc/self/task/{}/cgroup", Sched.Pid), Core.MainCgroup);
+    if (Sched.ServerPid) {
+      Check("wineserver", fextl::fmt::format("/proc/{}/cgroup", Sched.ServerPid), Core.ServerCgroup);
+    }
+  }
+
   void SchedInit() {
     const char* Value = Switch("FEX_SCHEDLOG");
     Sched.On = !(Value && Value[0] == '0');
@@ -348,6 +684,7 @@ namespace {
     Sched.Pid = Linux::GetPid();
     Sched.MainFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/stat", Sched.Pid).c_str());
     SchedOpenServer();
+    CoreLoadInit();
   }
 
   void SchedSampleOne(int Fd, uint32_t& Samples, uint32_t& Runnable, uint32_t (&Cores)[Linux::MaxCPUs]) {
@@ -490,6 +827,7 @@ namespace {
     SchedSampleOne(Sched.MainFd, Sched.MainSamples, Sched.MainRunnable, Sched.MainCores);
     SchedSampleOne(Sched.ServerFd, Sched.ServerSamples, Sched.ServerRunnable, Sched.ServerCores);
     SchedSampleQueue();
+    CorePauseSample();
   }
 
   fextl::string SchedCores(uint32_t Runnable, const uint32_t (&Cores)[Linux::MaxCPUs]) {
@@ -635,6 +973,7 @@ namespace {
     }
     Sched.Second = Seconds;
     fextl::string Out;
+    double GameRunMs {}, ServerRunMs {};
 
     // The main thread.
     {
@@ -658,6 +997,7 @@ namespace {
       const auto Dir = fextl::fmt::format("/proc/{}", Sched.ServerPid);
       double RunMs {}, WaitMs {};
       const bool Have = SchedDelta(Dir, Sched.Server, RunMs, WaitMs, Seconds);
+      ServerRunMs = RunMs;
       Linux::TaskStat S {};
       if (!Linux::ReadTaskStat((Dir + "/stat").c_str(), S)) {
         Out += fextl::fmt::format("  sched server pid {} gone\n", Sched.ServerPid);
@@ -721,6 +1061,7 @@ namespace {
         TotalRun += R.RunMs;
         TotalWait += R.WaitMs;
       }
+      GameRunMs = TotalRun;
       std::sort(Rows.begin(), Rows.end(), [](const Row& a, const Row& b) { return a.RunMs + a.WaitMs > b.RunMs + b.WaitMs; });
       fextl::string Text;
       for (size_t i = 0; i < std::min<size_t>(Rows.size(), 10); ++i) {
@@ -824,6 +1165,9 @@ namespace {
       }
       Out += fextl::fmt::format("  sched procs 5s (name/pid % of a core):{}\n", Text.empty() ? " -" : Text.c_str());
     }
+
+    Out += CoreLine(GameRunMs, ServerRunMs);
+    CgroupCheck();
 
     Sched.MainSamples = Sched.MainRunnable = Sched.ServerSamples = Sched.ServerRunnable = 0;
     memset(Sched.MainCores, 0, sizeof(Sched.MainCores));
@@ -2616,7 +2960,13 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "10ms: running, or the Linux call it waited in (ioctl(request) = a GPU driver call, ppoll/futex = waiting "
                                    "for another thread, a fence or the display server); gpu = GPU clock (average, lowest and highest of 50ms "
                                    "samples), busy = the GPU's busy share in the driver's last window, cap = highest clock allowed now, levels = "
-                                   "the power levels allowed (0 = fastest; a launcher's power control or heat raises the first), temperature\n",
+                                   "the power levels allowed (0 = fastest; a launcher's power control or heat raises the first), temperature; "
+                                   "cores busy% = how busy each CPU was, whoever ran there (? = can't tell), the game's CPUs' busy time split "
+                                   "into this process, the wineserver and others (other apps, Android, the launcher, the kernel), paused = "
+                                   "share of the second the kernel had a CPU out of use, runnable = runnable tasks of the whole system, cpu "
+                                   "pressure = share of the second some task waited for a CPU; '# cgroup' = the Android groups the main "
+                                   "thread and the wineserver are in; rumble = the game's XInputSetState calls (FEX_RUMBLE): calls, changes "
+                                   "of strength, changes sent to the controller and how long Wine took for each\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.

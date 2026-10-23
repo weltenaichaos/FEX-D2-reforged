@@ -6,6 +6,7 @@ add_library(arm64ecfex SHARED
   NativeRedirect.cpp
   NativeUnpackCache.cpp
   NativeZlib.c
+  Rumble.cpp
   libarm64ecfex.def
   $<TARGET_OBJECTS:FEXCore_object>)
 

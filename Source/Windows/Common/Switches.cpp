@@ -35,6 +35,8 @@ namespace {
     // Build 52: vkd3d-proton submits without its queue thread waiting for the GPU between batches (see
     // EnvironmentVariablesHandling.h).
     {"FEX_VKD3D_NOSTAGGER", "1"},
+    // Build 53: the game's rumble calls return at once and a FEX thread passes the changes on (see ARM64EC/Rumble.h).
+    {"FEX_RUMBLE", "async"},
   };
 
   // In the order the stats log lists them.
@@ -71,6 +73,8 @@ namespace {
     "FEX_GPULOG",
     "FEX_FRAMELATENCY",
     "FEX_VKD3D_NOSTAGGER",
+    "FEX_RUMBLE",
+    "FEX_RUMBLE_MS",
   };
 
   bool UseD2RDefaults {};
