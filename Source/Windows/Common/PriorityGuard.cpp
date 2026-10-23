@@ -65,6 +65,24 @@ namespace {
     LONG BasePriority; // relative to the class: -2..2, or -15 (IDLE) / 15 (TIME_CRITICAL)
   };
 
+  // Same layout as Windows' PROCESS_BASIC_INFORMATION (the bundled headers hide the affinity in a reserved field).
+  struct ProcessBasicInfo {
+    NTSTATUS ExitStatus;
+    PVOID PebBaseAddress;
+    ULONG_PTR AffinityMask;
+    LONG BasePriority;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR InheritedFromUniqueProcessId;
+  };
+
+  // The CPUs Wine lets this process's threads use (GameNative narrows it after start), 0 if unknown.
+  uint64_t ProcessAffinity() {
+    ProcessBasicInfo Info {};
+    return NtQueryInformationProcess(NtCurrentProcess(), ProcessBasicInformation, &Info, sizeof(Info), nullptr) == STATUS_SUCCESS ?
+             Info.AffinityMask :
+             0;
+  }
+
   enum class PrioMode { Keep, Clamp, Normal };
   enum class CoreMode { Off, Big, Fast };
 
@@ -177,9 +195,20 @@ namespace {
   }
 
   // The affinity a thread should have, or its current one. T.Orig is what the game or Wine last gave it.
-  uint64_t WantedAffinity(const Config& C, const Tracked& T, bool IsMain, uint64_t Current, uint64_t GameMask, bool FastUsable) {
+  uint64_t WantedAffinity(const Config& C, const Tracked& T, bool IsMain, uint64_t Current, uint64_t GameMask, bool FastUsable,
+                          uint64_t ProcessMask) {
+    const bool MainAlone = C.Cores == CoreMode::Fast && FastUsable;
     if (T.FEX) {
-      return C.HelpersLittle && C.LittleMask && !T.KeepCores ? C.LittleMask : Current;
+      // The slowest cores only when Wine allows them (with GameNative's "cores 3-7" it doesn't; build 49 then retried and
+      // failed every 2 seconds while the stats log thread kept running next to the main thread).
+      if (C.HelpersLittle && C.LittleMask && !T.KeepCores && (!ProcessMask || (C.LittleMask & ProcessMask) == C.LittleMask)) {
+        return C.LittleMask;
+      }
+      // Off the main thread's core like the game's own threads: in build 49 FEX's threads still ran there.
+      if (MainAlone && (T.Orig & ~C.FastMask)) {
+        return T.Orig & ~C.FastMask;
+      }
+      return Current;
     }
     if (C.Cores == CoreMode::Off || !GameMask) {
       return Current;
@@ -191,6 +220,38 @@ namespace {
       return T.Orig & ~C.FastMask;
     }
     return T.Orig;
+  }
+
+  // Keeps every thread of the wineserver off the main thread's core. In build 49 the wineserver (at nice -10, above the main
+  // thread's -2) still ran on that core 10-20% of the time while loading, and the main thread then waited 150-270 ms a
+  // second for its only core.
+  void KeepServerOff(int Pid, uint64_t Mask, uint32_t& Reports) {
+    struct Args {
+      uint64_t Mask;
+      uint32_t* Reports;
+      int Pid;
+    } A {.Mask = Mask, .Reports = &Reports, .Pid = Pid};
+    const auto Path = fextl::fmt::format("/proc/{}/task", Pid);
+    Linux::ForEachEntry(
+      Path.c_str(),
+      [](const char* Name, void* Arg) {
+        auto* A = static_cast<Args*>(Arg);
+        const int Tid = atoi(Name);
+        if (Tid <= 0) {
+          return;
+        }
+        const uint64_t Before = Linux::GetAffinity(Tid);
+        if (Before == A->Mask) {
+          return;
+        }
+        const int Result = Linux::SetAffinity(Tid, A->Mask);
+        if (++*A->Reports <= 3 || *A->Reports % 50 == 0) {
+          StatsLogNote(fextl::fmt::format("server: wineserver pid {} thread {} cores {:#x} -> {:#x} (off the main thread's core), result {}, "
+                                          "change #{}",
+                                          A->Pid, Tid, Before, A->Mask, Result, *A->Reports));
+        }
+      },
+      &A);
   }
 
   // Lifts every thread of the wineserver to nice C.ServerNice. Returns the pid (0 if not found).
@@ -278,6 +339,7 @@ namespace {
     bool ReportedWalkFailure {};
     uint64_t ReportedGameMask {};
     int ServerPid {};
+    uint32_t ServerCoreReports {};
 
     for (;;) {
       const LONG Base = C->Prio != PrioMode::Keep ? CheckClass(Round == 0) : 8;
@@ -285,7 +347,10 @@ namespace {
 
       if (C->ServerNiceOn && (Round == 1 || Round % 30 == 0)) {
         ServerPid = BoostServer(*C, ServerPid, Round == 1);
+      } else if (!C->ServerNiceOn && C->Cores == CoreMode::Fast && !ServerPid && (Round == 1 || Round % 30 == 0)) {
+        ServerPid = Linux::FindProcess("wineserver");
       }
+      const uint64_t ProcessMask = ProcessAffinity();
 
       // NtGetNextThread continues from the previous handle, so all handles stay open until the end of this round.
       Handles.clear();
@@ -325,7 +390,7 @@ namespace {
           // Only the stats log (its 2ms sampler and per-second work) and this guard move: the stall probe measures what
           // game threads see, and the disk cache writer, prefetcher and unpack cache threads hold locks or feed loads the
           // game waits on.
-          T.KeepCores = !(T.Name == "FEXStatsLog" || T.Name == "FEXPrioGuard" || T.Name == "FEXThreadPin");
+          T.KeepCores = !(T.Name == "FEXStatsLog" || T.Name == "FEXPrioGuard" || T.Name == "FEXThreadPin" || T.Name == "FEXFrameLatency");
         }
         Entries.push_back({Next, TID, Basic, &T, TID == C->MainTID || T.Name == "Main"});
       }
@@ -347,6 +412,9 @@ namespace {
         }
       }
       const bool FastUsable = C->FastMask && GameMask && (GameMask & C->FastMask) == C->FastMask && GameMask != C->FastMask;
+      if (ServerPid && C->Cores == CoreMode::Fast && FastUsable) {
+        KeepServerOff(ServerPid, GameMask & ~C->FastMask, ServerCoreReports);
+      }
       if (GameMask && GameMask != ReportedGameMask && C->Cores != CoreMode::Off) {
         ReportedGameMask = GameMask;
         StatsLogNote(fextl::fmt::format(
@@ -382,7 +450,7 @@ namespace {
         }
 
         const uint64_t Current = Basic.AffinityMask;
-        const uint64_t Want = WantedAffinity(*C, T, E.IsMain, Current, GameMask, FastUsable);
+        const uint64_t Want = WantedAffinity(*C, T, E.IsMain, Current, GameMask, FastUsable, ProcessMask);
         if (Want && Want != Current) {
           KAFFINITY Value = Want;
           const NTSTATUS Status = NtSetInformationThread(E.Handle, ThreadAffinityMaskClass, &Value, sizeof(Value));

@@ -11,6 +11,7 @@ namespace {
   constexpr int64_t NR_close = 57;
   constexpr int64_t NR_getdents64 = 61;
   constexpr int64_t NR_pread64 = 67;
+  constexpr int64_t NR_sched_setaffinity = 122;
   constexpr int64_t NR_sched_getaffinity = 123;
   constexpr int64_t NR_setpriority = 140;
   constexpr int64_t NR_getpriority = 141;
@@ -150,6 +151,11 @@ uint64_t GetAffinity(int Tid) {
   uint64_t Mask[16] {};
   const int64_t Result = Syscall(NR_sched_getaffinity, Tid, sizeof(Mask), reinterpret_cast<intptr_t>(Mask));
   return Result < 0 ? 0 : Mask[0];
+}
+
+int SetAffinity(int Tid, uint64_t Mask) {
+  uint64_t Masks[1] {Mask};
+  return static_cast<int>(Syscall(NR_sched_setaffinity, Tid, sizeof(Masks), reinterpret_cast<intptr_t>(Masks)));
 }
 
 bool ForEachEntry(const char* Path, void (*Fn)(const char* Name, void* Arg), void* Arg) {

@@ -86,6 +86,16 @@ ExitFunctionSuspendResumePoint:
   cbnz x16, frame_mark_check
 frame_mark_done:
 
+  // If it is one of the wait functions FEXWaitWatchTargets names (FrameLatency.cpp), record the call in FEXWaitWatch when
+  // it comes from the watched thread. Same registers as above.
+  adrp x16, FEXWaitWatchTargets
+  add x16, x16, #:lo12:FEXWaitWatchTargets
+  ldp x16, x4, [x16]
+  cmp x16, x9
+  ccmp x4, x9, #4, ne
+  b.eq wait_watch_check
+wait_watch_done:
+
   and x23, x23, #-0x4
   add x17, x17, x23 // Resolve entry thunk address.
 
@@ -121,6 +131,24 @@ frame_mark_check:
   stlr lr, [x16]
   ldursw x23, [x17, #-0x4]
   b frame_mark_done
+
+wait_watch_check:
+  adrp x16, FEXWaitWatch
+  add x16, x16, #:lo12:FEXWaitWatch
+  ldr x4, [x16, #8] // FEXWaitWatch[1]: the watched thread's TEB
+  cmp x4, x18
+  b.ne wait_watch_done
+  ldr lr, [x16] // FEXWaitWatch[0]: calls recorded so far, then from [4] a ring of 256 (handle, timeout, function, caller)
+  and x23, lr, #0xff
+  add x23, x16, x23, lsl #5
+  mov x4, sp // sp may be only 8-byte aligned here, see frame_mark_check
+  ldr x4, [x4] // the x64 return address
+  stp x0, x1, [x23, #32]
+  stp x9, x4, [x23, #48]
+  add lr, lr, #1
+  stlr lr, [x16]
+  ldursw x23, [x17, #-0x4]
+  b wait_watch_done
 
 .global ExitFunctionSuspendPoint
 ExitFunctionSuspendPoint:

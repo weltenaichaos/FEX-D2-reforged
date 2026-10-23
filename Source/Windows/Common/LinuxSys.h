@@ -23,6 +23,8 @@ int GetNice(int Tid);
 int SetNice(int Tid, int Nice);
 // CPUs a Linux thread may run on (the first 64), or 0 on failure.
 uint64_t GetAffinity(int Tid);
+// sched_setaffinity for CPUs 0-63; 0 or -errno.
+int SetAffinity(int Tid, uint64_t Mask);
 
 // Calls Fn(const char* Name) for each entry of a directory except "." and "..". False when the directory can't be read.
 bool ForEachEntry(const char* Path, void (*Fn)(const char* Name, void* Arg), void* Arg);

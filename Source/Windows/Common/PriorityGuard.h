@@ -23,12 +23,14 @@ namespace FEX::Windows {
 // frame's work alone, and in fights the stall probe saw threads wait up to 26 ms for a CPU, so it gets the fastest core
 // (the Cortex-X3) to itself:
 //
-//   FEX_MAINCORE=fast  the main thread alone on the fastest core; the game's other threads keep their cores minus that
-//                      one (the D2R default). Falls back to "big" when the container doesn't allow the fastest core.
+//   FEX_MAINCORE=fast  the main thread alone on the fastest core; the game's other threads, FEX's threads and the
+//                      wineserver keep their cores minus that one (the D2R default). Falls back to "big" when the
+//                      container doesn't allow the fastest core.
 //   FEX_MAINCORE=big   the main thread on the same cores as the game's other threads
 //   FEX_MAINCORE=off   leave affinities alone
 //   FEX_HELPER_CORES=little  the stats log thread (a 2ms sampler) and this guard on the slowest cores, off the game's
-//                      (the D2R default). The stall probe, disk cache and unpack cache threads stay where they are.
+//                      (the D2R default), when the process may use them. The stall probe, disk cache and unpack cache
+//                      threads stay on the game's cores.
 //
 // Wineserver. Every file, pipe, controller and window message request of every Wine process goes through the one
 // wineserver thread; under load the build 48 probe saw single round trips take up to 27 ms.

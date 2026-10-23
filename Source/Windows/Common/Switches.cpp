@@ -26,6 +26,8 @@ namespace {
     // Build 49: the main thread alone on the fastest core, FEX's helpers on the slowest, the wineserver above the game
     // (see PriorityGuard.h).
     {"FEX_MAINCORE", "fast"},      {"FEX_HELPER_CORES", "little"}, {"FEX_SERVER_NICE", "-10"},
+    // Build 50: one more frame in flight on the swapchain's frame latency handle (see ARM64EC/FrameLatency.h).
+    {"FEX_FRAMELATENCY", "2"},
   };
 
   // In the order the stats log lists them.
@@ -58,6 +60,7 @@ namespace {
     "FEX_HELPER_CORES",
     "FEX_SERVER_NICE",
     "FEX_SCHEDLOG",
+    "FEX_FRAMELATENCY",
   };
 
   bool UseD2RDefaults {};

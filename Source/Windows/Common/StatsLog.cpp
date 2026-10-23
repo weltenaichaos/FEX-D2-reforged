@@ -644,7 +644,11 @@ namespace {
     fextl::vector<ProbeEvent> ProbeEvents;
   };
 
-  std::atomic<fextl::string (*)()> LineProvider {};
+  // Up to four, see StatsLogSetLineProvider.
+  constexpr size_t MaxLineProviders = 4;
+  std::atomic<fextl::string (*)()> LineProviders[MaxLineProviders] {};
+  // Called with every sample of the main thread, see StatsLogSetMainSampleHook.
+  std::atomic<void (*)(uint64_t)> MainSampleHook {};
 
   uint64_t GetCounter() {
     uint64_t Result {};
@@ -1652,6 +1656,11 @@ namespace {
             }
           }
         }
+        if (T.IsMain) {
+          if (const auto Hook = MainSampleHook.load(std::memory_order_relaxed)) {
+            Hook(NativeTarget);
+          }
+        }
         if (State->Profile && !T.IsMain && State->OtherSampleCount < MaxOtherSamples) {
           const uint64_t Value = In ? (T.BlockHeader ? *T.BlockHeader : 0) : (NativeTarget ? NativeTarget | NativeSampleFlag : 0);
           State->OtherSamples[State->OtherSampleCount++] = {static_cast<uint8_t>(Bin), In, T.TID, static_cast<uint32_t>(Now - Start), Value};
@@ -2169,8 +2178,10 @@ namespace {
         Line += MemoryLine();
       }
 
-      if (const auto Provider = LineProvider.load(std::memory_order_acquire)) {
-        Line += Provider();
+      for (const auto& Slot : LineProviders) {
+        if (const auto Provider = Slot.load(std::memory_order_acquire)) {
+          Line += Provider();
+        }
       }
 
       fwrite(Line.data(), 1, Line.size(), State->File);
@@ -2327,7 +2338,9 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "FEX_HELPER_CORES); '# server' = wineserver nice (FEX_SERVER_NICE); sched main/server = Linux view of "
                                    "the main thread and the wineserver: CPU time (run), time ready but without a CPU (wait), nice, allowed "
                                    "CPUs, and which CPU it was on while runnable (sampled every 10ms); sched threads = the busiest threads "
-                                   "(Linux name/tid run+wait ms @last CPU); sched procs 5s = other processes of this user by CPU use\n",
+                                   "(Linux name/tid run+wait ms @last CPU); sched procs 5s = other processes of this user by CPU use; waits main = handles the "
+                                   "main thread waited on this second (kind, /latency = a swapchain frame latency handle, +N = released N more "
+                                   "times, calls, ms sampled waiting @caller, timeout ms); '# latency' = what FEX_FRAMELATENCY found and did\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
@@ -2397,7 +2410,16 @@ void StatsLogDiskCacheHit(uint64_t GuestRIP) {
 }
 
 void StatsLogSetLineProvider(fextl::string (*Provider)()) {
-  LineProvider.store(Provider, std::memory_order_release);
+  for (auto& Slot : LineProviders) {
+    fextl::string (*Empty)() = nullptr;
+    if (Slot.compare_exchange_strong(Empty, Provider, std::memory_order_release)) {
+      return;
+    }
+  }
+}
+
+void StatsLogSetMainSampleHook(void (*Hook)(uint64_t NativeTarget)) {
+  MainSampleHook.store(Hook, std::memory_order_release);
 }
 
 void StatsLogSetFrameMarks(const uint64_t* Marks, size_t RingSize) {

@@ -38,8 +38,12 @@ void StatsLogDiskCacheHit(uint64_t GuestRIP);
 void StatsLogWatchImage(uint64_t Base);
 
 // Adds the lines Provider returns (each indented and ending in a newline, or nothing) to every per-second block.
-// Provider runs on the log thread.
+// Provider runs on the log thread. Up to four providers, in the order they were set.
 void StatsLogSetLineProvider(fextl::string (*Provider)());
+
+// Hook gets every sample (one per 2ms) of the main thread on the log thread: the native function it is in, or 0 while it
+// runs emulated code or nothing is known.
+void StatsLogSetMainSampleHook(void (*Hook)(uint64_t NativeTarget));
 
 // Names a native function that isn't exported (FEX's own native redirects) for the native-call sampler's "native" lines.
 void StatsLogNameNative(uint64_t Address, std::string_view Name);
