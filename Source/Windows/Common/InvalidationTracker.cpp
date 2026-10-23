@@ -11,6 +11,7 @@
 #include <winternl.h>
 
 #include <algorithm>
+#include <iterator>
 #include <atomic>
 
 namespace FEX::Windows {
@@ -31,6 +32,18 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
 
     Address = BaseAddress + Info.RegionSize;
   }
+}
+
+static uint64_t ReadCounter() {
+  uint64_t Result {};
+  __asm volatile("mrs %[Res], CNTVCT_EL0" : [Res] "=r"(Result));
+  return Result;
+}
+
+static uint64_t ReadCounterFrequency() {
+  uint64_t Result {};
+  __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Result));
+  return Result ? Result : 1;
 }
 
 static bool ProtHasExec(ULONG Prot) {
@@ -58,6 +71,10 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
     const bool HasExec = ProtHasExec(Prot);
     const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
     const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
+    if (!EffectiveRWX) {
+      // Code there can't be written without another protection change (which invalidates it), so no need to check itself.
+      ForgetHotPagesLocked(AlignedBase, AlignedBase + AlignedSize);
+    }
 
     if (EffectiveExec) {
       XIntervals.Insert(ProtInterval);
@@ -192,6 +209,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    ForgetHotPagesLocked(SectionBase, SectionBase + SectionSize);
   }
 
   return {SectionBase, SectionSize};
@@ -212,6 +230,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+    ForgetHotPagesLocked(AlignedBase, AlignedBase + AlignedSize);
   }
 }
 
@@ -234,6 +253,9 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
 
       InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      // A page that keeps faulting stays writable from now on (ProtectRWXIntervalsInternal skips it), and its code is
+      // compiled to check itself. Done under the exclusive lock, so no compile sees the page change state mid-way.
+      NoteWriteFaultLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK);
 
       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
       ULONG TmpProt;
@@ -461,10 +483,29 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
         }
         HitRWXInterval = true;
       }
-      void* TmpAddress = reinterpret_cast<void*>(Address);
-      SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
-      ULONG TmpProt;
-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address), &TmpProt);
+      const uint64_t ChunkEnd = std::min(End, Address + Query.Size);
+      const ULONG Prot = ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address);
+      const auto Protect = [Prot](uint64_t From, uint64_t To) {
+        void* TmpAddress = reinterpret_cast<void*>(From);
+        SIZE_T TmpSize = static_cast<SIZE_T>(To - From);
+        ULONG TmpProt;
+        NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, Prot, &TmpProt);
+      };
+      if (ForWriteLocked || !AnyHotPages.load(std::memory_order_acquire)) {
+        Protect(Address, ChunkEnd);
+      } else {
+        // Trap everything but the hot pages: their code checks itself.
+        uint64_t Cursor = Address;
+        for (auto It = HotPages.lower_bound(Address & FEXCore::Utils::FEX_PAGE_MASK); It != HotPages.end() && *It < ChunkEnd; ++It) {
+          if (*It > Cursor) {
+            Protect(Cursor, *It);
+          }
+          Cursor = std::max(Cursor, *It + FEXCore::Utils::FEX_PAGE_SIZE);
+        }
+        if (Cursor < ChunkEnd) {
+          Protect(Cursor, ChunkEnd);
+        }
+      }
     } else if (!Query.Size) {
       // No more regions past `Address` in the interval list
       break;
@@ -474,6 +515,82 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
   } while (Address < End);
 
   return HitRWXInterval;
+}
+
+void InvalidationTracker::SetHotPageThreshold(uint32_t Faults, uint32_t WindowMs) {
+  CounterFrequency = ReadCounterFrequency();
+  HotPageFaults = Faults;
+  HotPageWindowTicks = std::max<uint64_t>(WindowMs, 1) * CounterFrequency / 1000;
+}
+
+bool InvalidationTracker::IsFullSMCRange(uint64_t Address, uint64_t Size) {
+  if (!AnyHotPages.load(std::memory_order_acquire)) {
+    return false;
+  }
+  std::shared_lock Lock(IntervalsLock);
+  const auto It = HotPages.lower_bound(Address & FEXCore::Utils::FEX_PAGE_MASK);
+  return It != HotPages.end() && *It < Address + Size;
+}
+
+bool InvalidationTracker::NoteWriteFaultLocked(uint64_t Page) {
+  if (!HotPageFaults) {
+    return false;
+  }
+  const uint64_t Now = ReadCounter();
+  FaultCounter* Counter = nullptr;
+  for (auto& C : FaultCounters) {
+    if (C.Page == Page && C.Count) {
+      Counter = &C;
+      break;
+    }
+  }
+  if (!Counter) {
+    Counter = &FaultCounters[NextFaultCounter++ % std::size(FaultCounters)];
+    *Counter = {Page, Now, 0};
+  }
+  if (Now - Counter->WindowStart > HotPageWindowTicks) {
+    Counter->WindowStart = Now;
+    Counter->Count = 0;
+  }
+  if (++Counter->Count < HotPageFaults) {
+    return false;
+  }
+
+  const uint32_t Faults = Counter->Count;
+  const double WindowMs = static_cast<double>(Now - Counter->WindowStart) * 1000.0 / static_cast<double>(CounterFrequency);
+  *Counter = {};
+  uint64_t Total {};
+  {
+    std::unique_lock Lock(IntervalsLock);
+    HotPages.insert(Page);
+    Total = HotPages.size();
+  }
+  AnyHotPages.store(true, std::memory_order_release);
+  {
+    std::scoped_lock Lock(HotPageEventsLock);
+    if (HotPageEventCount < std::size(HotPageEvents)) {
+      HotPageEvents[HotPageEventCount++] = {Page, Faults, WindowMs, Total};
+    }
+  }
+  return true;
+}
+
+void InvalidationTracker::ForgetHotPagesLocked(uint64_t Start, uint64_t End) {
+  if (!AnyHotPages.load(std::memory_order_relaxed)) {
+    return;
+  }
+  HotPages.erase(HotPages.lower_bound(Start), HotPages.lower_bound(End));
+  if (HotPages.empty()) {
+    AnyHotPages.store(false, std::memory_order_release);
+  }
+}
+
+size_t InvalidationTracker::TakeHotPageEvents(HotPageEvent* Out, size_t Max) {
+  std::scoped_lock Lock(HotPageEventsLock);
+  const size_t N = std::min(Max, HotPageEventCount);
+  std::copy(HotPageEvents, HotPageEvents + N, Out);
+  HotPageEventCount = 0;
+  return N;
 }
 
 } // namespace FEX::Windows

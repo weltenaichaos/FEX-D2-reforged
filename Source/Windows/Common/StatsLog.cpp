@@ -1256,8 +1256,8 @@ namespace {
     fextl::vector<ProbeEvent> ProbeEvents;
   };
 
-  // Up to four, see StatsLogSetLineProvider.
-  constexpr size_t MaxLineProviders = 4;
+  // Up to six, see StatsLogSetLineProvider.
+  constexpr size_t MaxLineProviders = 6;
   std::atomic<fextl::string (*)()> LineProviders[MaxLineProviders] {};
   // Called with every sample of the main thread, see StatsLogSetMainSampleHook.
   std::atomic<void (*)(uint64_t)> MainSampleHook {};
@@ -2955,7 +2955,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "CPUs, and which CPU it was on while runnable (sampled every 10ms); sched threads = the busiest threads "
                                    "(Linux name/tid run+wait ms @last CPU); sched procs 5s = other processes of this user by CPU use; waits main = handles the "
                                    "main thread waited on this second (kind, /latency = a swapchain frame latency handle, +N = released N more "
-                                   "times, calls, ms sampled waiting @caller, timeout ms); '# latency' = what FEX_FRAMELATENCY found and did; sched queue = what "
+                                   "times, calls, ms sampled waiting @caller, timeout ms); '# latency' = what FEX_FRAMELATENCY found and did; '# smc' = a page whose own code kept writing to it, "
+                                   "so it stays writable and its code checks itself (FEX_SMC_HOTPAGE); sched queue = what "
                                    "vkd3d's queue thread (it hands the game's GPU work and each present to the driver) was doing, sampled every "
                                    "10ms: running, or the Linux call it waited in (ioctl(request) = a GPU driver call, ppoll/futex = waiting "
                                    "for another thread, a fence or the display server); gpu = GPU clock (average, lowest and highest of 50ms "

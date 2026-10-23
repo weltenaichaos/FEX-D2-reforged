@@ -37,6 +37,10 @@ namespace {
     {"FEX_VKD3D_NOSTAGGER", "1"},
     // Build 53: the game's rumble calls return at once and a FEX thread passes the changes on (see ARM64EC/Rumble.h).
     {"FEX_RUMBLE", "async"},
+    // Build 54: a page whose own code keeps writing to it (a protector's decryption loop, 6,000-10,000 write faults a
+    // second for 5-20 s every ~45 s in the build 48-52 logs) stops being write-protected; its code checks itself instead
+    // (see Common/InvalidationTracker.h).
+    {"FEX_SMC_HOTPAGE", "16"},
   };
 
   // In the order the stats log lists them.
@@ -75,6 +79,7 @@ namespace {
     "FEX_VKD3D_NOSTAGGER",
     "FEX_RUMBLE",
     "FEX_RUMBLE_MS",
+    "FEX_SMC_HOTPAGE",
   };
 
   bool UseD2RDefaults {};

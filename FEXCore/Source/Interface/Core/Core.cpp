@@ -600,6 +600,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, Block.Entry - GuestRIP));
       }
 
+      // Code on a page the frontend no longer write-protects checks its own bytes instead.
+      const bool FullSMCBlock = Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection ||
+                                (InstsInBlock && SyscallHandler->IsFullSMCRange(Thread, Block.Entry, std::max<uint64_t>(Block.Size, 1)));
+
       uint64_t BlockInstructionsLength {};
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
@@ -641,7 +645,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+        if (FullSMCBlock) {
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
 
@@ -928,7 +932,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   {
     FEXCORE_PROFILE_ACCUMULATION_MAX(Thread, AccumulatedDiskCacheLookupTime, MaxDiskCacheLookupTime);
     Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
-    if (Hit && !DiskCache.IsValidating()) {
+    // Cached code doesn't check its own bytes, so it can't run from a page that is no longer write-protected.
+    bool HitTouchesFullSMC = false;
+    for (size_t i = 0; Hit && i < Hit->GuestPages.size() && !HitTouchesFullSMC; ++i) {
+      HitTouchesFullSMC = SyscallHandler->IsFullSMCRange(Thread, Hit->GuestPages[i], FEXCore::Utils::FEX_PAGE_SIZE);
+    }
+    if (Hit && !DiskCache.IsValidating() && !HitTouchesFullSMC) {
       FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheInstallTime);
       auto LoadedCode = Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
       if (LoadedCode.BlockBegin) {
@@ -1043,7 +1052,10 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // Disk Cache
   if (!CodeCache.IsGeneratingCache) {
-    if (DiskCacheGuestCodeKey) {
+    if (DiskCacheGuestCodeKey && SyscallHandler->IsFullSMCRange(Thread, StartAddr, std::max<uint64_t>(Length, 1))) {
+      // Self-checking code from a page that is no longer write-protected: keep it out of the cache (the frontend counts
+      // these compiles itself).
+    } else if (DiskCacheGuestCodeKey) {
       std::span<const FEXCore::CPU::Relocation> Relocations;
       if (DebugData && DebugData->Relocations) {
         Relocations = *DebugData->Relocations;

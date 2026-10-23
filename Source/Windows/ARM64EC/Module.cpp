@@ -780,6 +780,10 @@ public:
     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
   }
 
+  bool IsFullSMCRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+    return InvalidationTracker->IsFullSMCRange(Start, Length);
+  }
+
   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
     OvercommitTracker->MarkRange(Start, Length);
   }
@@ -897,6 +901,12 @@ NTSTATUS ProcessInit() {
   CTX->GetCodeInvalidationMutex().SetPoliteWriteWait(PoliteMs);
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
+  // FEX_SMC_HOTPAGE=<faults>: a page with that many write faults within 100 ms stops being write-protected and its code
+  // checks itself (see InvalidationTracker.h); 0 or unset keeps upstream behaviour.
+  const char* HotPageSwitch = FEX::Windows::Switch("FEX_SMC_HOTPAGE");
+  const bool HotPageNumber = HotPageSwitch && HotPageSwitch[0] >= '0' && HotPageSwitch[0] <= '9';
+  const uint32_t HotPageFaults = HotPageNumber ? std::min<uint64_t>(strtoull(HotPageSwitch, nullptr, 10), 100000) : 0;
+  InvalidationTracker->SetHotPageThreshold(HotPageFaults, 100);
   ImageTracker.emplace(*CTX, false);
 
   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
@@ -937,6 +947,27 @@ NTSTATUS ProcessInit() {
   FEX::Windows::StartPriorityGuard(AppConfigName);
   FrameLatency::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
   Rumble::Init(StatsLog);
+  if (StatsLog) {
+    if (!HotPageFaults) {
+      FEX::Windows::StatsLogNote("smc: every write to translated code faults and invalidates its page (upstream; FEX_SMC_HOTPAGE=16 "
+                                 "stops that for pages that keep faulting)");
+    } else {
+      FEX::Windows::StatsLogNote(fextl::fmt::format("smc: a page written {} times within 100 ms by code on it stops being write-protected, "
+                                                    "its code checks itself instead (FEX_SMC_HOTPAGE=0 turns this off)",
+                                                    HotPageFaults));
+      FEX::Windows::StatsLogSetLineProvider([]() -> fextl::string {
+        FEX::Windows::InvalidationTracker::HotPageEvent Events[8];
+        const size_t N = InvalidationTracker->TakeHotPageEvents(Events, std::size(Events));
+        fextl::string Out;
+        for (size_t i = 0; i < N; ++i) {
+          Out += fextl::fmt::format("# smc: page {:X} turned hot ({} write faults in {:.1f} ms, {} hot pages now); it stays writable and "
+                                    "its code checks itself\n",
+                                    Events[i].Page, Events[i].Faults, Events[i].WindowMs, Events[i].HotPages);
+        }
+        return Out;
+      });
+    }
+  }
   NativeRedirect::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog, [](uint64_t Address, uint64_t Size) {
     InvalidationTracker->InvalidateAlignedInterval(Address, Size, false);
   });

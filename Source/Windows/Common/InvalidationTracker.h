@@ -3,6 +3,8 @@
 
 #include <FEXCore/Utils/IntervalList.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/fextl/set.h>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -41,6 +43,22 @@ public:
 
   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
 
+  // Hot SMC pages (FEX_SMC_HOTPAGE). A page that takes Faults write faults within WindowMs is a page whose own code keeps
+  // writing to it (a decryption loop next to the bytes it decrypts, data next to the code using it): every write faults,
+  // invalidates the page, and the code is fetched again, one write at a time. Such a page stops being write-protected,
+  // and code compiled from it checks its own bytes before each instruction instead (FEXCore asks IsFullSMCRange). 0 Faults
+  // (the default) keeps upstream behaviour. Call before any guest code runs.
+  void SetHotPageThreshold(uint32_t Faults, uint32_t WindowMs);
+  bool IsFullSMCRange(uint64_t Address, uint64_t Size);
+  struct HotPageEvent {
+    uint64_t Page;
+    uint32_t Faults;
+    double WindowMs;
+    uint64_t HotPages; // in total, after this one
+  };
+  // The pages that turned hot since the last call (at most a few kept), for the stats log.
+  size_t TakeHotPageEvents(HotPageEvent* Out, size_t Max);
+
 private:
   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
   void DisableSMCDetection();
@@ -66,6 +84,27 @@ private:
   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
   bool DEPDisabled {false};                             // Protected by IntervalsLock
   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+
+  // Counts a write fault on Page; true when it turns the page hot. NOTE: CodeInvalidationMutex must be held exclusively.
+  bool NoteWriteFaultLocked(uint64_t Page);
+  // NOTE: Must be called with IntervalsLock held exclusively.
+  void ForgetHotPagesLocked(uint64_t Start, uint64_t End);
+
+  struct FaultCounter {
+    uint64_t Page;
+    uint64_t WindowStart;
+    uint32_t Count;
+  };
+  FaultCounter FaultCounters[8] {}; // Protected by CodeInvalidationMutex (exclusive)
+  uint32_t NextFaultCounter {};     // Protected by CodeInvalidationMutex (exclusive)
+  uint32_t HotPageFaults {};
+  uint64_t HotPageWindowTicks {};
+  uint64_t CounterFrequency {1};
+  std::atomic<bool> AnyHotPages {false};
+  fextl::set<uint64_t> HotPages;    // Protected by IntervalsLock
+  HotPageEvent HotPageEvents[8] {}; // Protected by HotPageEventsLock
+  size_t HotPageEventCount {};
+  std::mutex HotPageEventsLock;
 
   bool MonoBackpatcherDetectionPending {false};
   uint64_t MonoBase {0};

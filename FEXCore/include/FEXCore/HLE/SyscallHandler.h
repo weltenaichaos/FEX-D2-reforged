@@ -39,6 +39,14 @@ public:
   virtual ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;
   virtual std::optional<ExecutableFileSectionInfo> LookupExecutableFileSection(Core::InternalThreadState* Thread, uint64_t GuestAddr) = 0;
 
+  // Whether guest code in [Start, Start + Length) must check its own bytes before each instruction (the per-block form of
+  // SMCChecks=full), because the frontend no longer write-protects a page in it. Asked for every block compiled, and
+  // for every disk cache hit (a hit touching such a page is compiled instead, since cached code doesn't check itself).
+  // It must not change while the caller holds the code invalidation lock shared.
+  virtual bool IsFullSMCRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+    return false;
+  }
+
   virtual void PreCompile() {}
 
   // Called after a block was installed from the disk cache, only while per-thread stats are being collected.
