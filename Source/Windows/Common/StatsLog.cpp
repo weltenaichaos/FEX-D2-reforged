@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "Windows/Common/StatsLog.h"
+#include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/SHMStats.h"
 #include "Windows/Common/Switches.h"
 
@@ -90,7 +91,7 @@ namespace {
   // last native function it entered from x86 code: a Wine/Windows API (named by the module's exports), one of FEX's own
   // native redirects, or the native code an x86 callback returned to. Waiting shows up as the wait function.
   constexpr size_t CPUAreaNativeTargetOffset = 0x50;
-  constexpr size_t MaxNativeTargets = 12;
+  constexpr size_t MaxNativeTargets = 32;
   constexpr size_t NativePrinted = 5;
   // Marks a native target among the Main thread's hitch samples, which otherwise hold JIT block headers.
   constexpr uint64_t NativeSampleFlag = 1ull << 63;
@@ -286,6 +287,281 @@ namespace {
   };
   ProbeShared* Probe {};
   std::atomic<void (*)()> LockProbe {};
+
+  // Scheduler view (on with the stats log; FEX_SCHEDLOG=0 turns it off), read straight from Linux /proc so it costs no
+  // wineserver round trips: where the main thread and the wineserver run (sampled every 10ms while runnable), how long
+  // each of this process's threads ran and waited for a CPU in the last second (schedstat), and every 5 seconds which
+  // other processes of this user used the CPU. "wait" is time a thread was ready to run but had no CPU.
+  struct SchedPrev {
+    uint64_t RunNs;
+    uint64_t WaitNs;
+    uint64_t Ticks;
+    uint64_t Seen;
+  };
+  struct SchedState {
+    bool On;
+    int Pid;           // Linux pid = the main thread's Linux tid
+    int MainFd = -1;   // /proc/self/task/<pid>/stat
+    int ServerPid;
+    int ServerFd = -1; // /proc/<wineserver>/stat
+    uint32_t MainSamples, MainRunnable, MainCores[Linux::MaxCPUs];
+    uint32_t ServerSamples, ServerRunnable, ServerCores[Linux::MaxCPUs];
+    uint32_t Tick;
+    uint64_t Second;
+    SchedPrev Main, Server;
+    fextl::unordered_map<int, SchedPrev> Tasks;
+    fextl::unordered_map<int, SchedPrev> Procs;
+    fextl::unordered_map<int, fextl::string> ProcNames;
+  };
+  SchedState Sched;
+
+  void SchedOpenServer() {
+    Linux::Close(Sched.ServerFd);
+    Sched.ServerFd = -1;
+    Sched.ServerPid = Linux::FindProcess("wineserver");
+    if (Sched.ServerPid) {
+      Sched.ServerFd = Linux::Open(fextl::fmt::format("/proc/{}/stat", Sched.ServerPid).c_str());
+    }
+    Sched.Server = {};
+  }
+
+  void SchedInit() {
+    const char* Value = Switch("FEX_SCHEDLOG");
+    Sched.On = !(Value && Value[0] == '0');
+    if (!Sched.On) {
+      return;
+    }
+    Sched.Pid = Linux::GetPid();
+    Sched.MainFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/stat", Sched.Pid).c_str());
+    SchedOpenServer();
+  }
+
+  void SchedSampleOne(int Fd, uint32_t& Samples, uint32_t& Runnable, uint32_t (&Cores)[Linux::MaxCPUs]) {
+    if (Fd < 0) {
+      return;
+    }
+    char Buffer[1024];
+    const int64_t Len = Linux::Pread(Fd, Buffer, sizeof(Buffer) - 1, 0);
+    if (Len <= 0) {
+      return;
+    }
+    Buffer[Len] = 0;
+    Linux::TaskStat S {};
+    if (!Linux::ParseTaskStat(Buffer, S)) {
+      return;
+    }
+    ++Samples;
+    if (S.State == 'R') {
+      ++Runnable;
+      if (S.Processor >= 0 && S.Processor < Linux::MaxCPUs) {
+        ++Cores[S.Processor];
+      }
+    }
+  }
+
+  // From the 2ms sampler: every 10ms, the CPU the main thread and the wineserver are on.
+  void SchedSampleTick() {
+    if (!Sched.On || ++Sched.Tick % 5) {
+      return;
+    }
+    SchedSampleOne(Sched.MainFd, Sched.MainSamples, Sched.MainRunnable, Sched.MainCores);
+    SchedSampleOne(Sched.ServerFd, Sched.ServerSamples, Sched.ServerRunnable, Sched.ServerCores);
+  }
+
+  fextl::string SchedCores(uint32_t Runnable, const uint32_t (&Cores)[Linux::MaxCPUs]) {
+    fextl::string Out;
+    for (int i = 0; i < Linux::MaxCPUs; ++i) {
+      if (Cores[i]) {
+        Out += fextl::fmt::format(" {}:{}%", i, (Cores[i] * 100 + Runnable / 2) / std::max<uint32_t>(Runnable, 1));
+      }
+    }
+    return Out.empty() ? fextl::string(" -") : Out;
+  }
+
+  // Run and wait time of a task since the last call, in ms; false when its schedstat can't be read.
+  bool SchedDelta(const fextl::string& Dir, SchedPrev& Prev, double& RunMs, double& WaitMs, uint64_t Second) {
+    Linux::SchedStat S {};
+    if (!Linux::ReadSchedStat((Dir + "/schedstat").c_str(), S)) {
+      return false;
+    }
+    const bool Fresh = Prev.Seen == 0 || Prev.Seen + 1 != Second;
+    RunMs = Fresh ? 0.0 : static_cast<double>(S.RunNs - Prev.RunNs) / 1e6;
+    WaitMs = Fresh ? 0.0 : static_cast<double>(S.WaitNs - Prev.WaitNs) / 1e6;
+    Prev.RunNs = S.RunNs;
+    Prev.WaitNs = S.WaitNs;
+    Prev.Seen = Second;
+    return !Fresh;
+  }
+
+  fextl::string SchedLines(uint64_t Seconds) {
+    if (!Sched.On) {
+      return {};
+    }
+    Sched.Second = Seconds;
+    fextl::string Out;
+
+    // The main thread.
+    {
+      const auto Dir = fextl::fmt::format("/proc/self/task/{}", Sched.Pid);
+      double RunMs {}, WaitMs {};
+      const bool Have = SchedDelta(Dir, Sched.Main, RunMs, WaitMs, Seconds);
+      Linux::TaskStat S {};
+      const bool HaveStat = Linux::ReadTaskStat((Dir + "/stat").c_str(), S);
+      Out += fextl::fmt::format("  sched main {} run={} wait={} nice={} allowed={:#x} on{} (runnable {}/{} samples)\n",
+                                HaveStat ? S.Comm : "?", Have ? fextl::fmt::format("{:.0f}ms", RunMs) : fextl::string("-"),
+                                Have ? fextl::fmt::format("{:.1f}ms", WaitMs) : fextl::string("-"), HaveStat ? S.Nice : 0,
+                                Linux::GetAffinity(Sched.Pid), SchedCores(Sched.MainRunnable, Sched.MainCores), Sched.MainRunnable,
+                                Sched.MainSamples);
+    }
+
+    // The wineserver.
+    if (!Sched.ServerPid && Seconds % 10 == 1) {
+      SchedOpenServer();
+    }
+    if (Sched.ServerPid) {
+      const auto Dir = fextl::fmt::format("/proc/{}", Sched.ServerPid);
+      double RunMs {}, WaitMs {};
+      const bool Have = SchedDelta(Dir, Sched.Server, RunMs, WaitMs, Seconds);
+      Linux::TaskStat S {};
+      if (!Linux::ReadTaskStat((Dir + "/stat").c_str(), S)) {
+        Out += fextl::fmt::format("  sched server pid {} gone\n", Sched.ServerPid);
+        SchedOpenServer();
+      } else {
+        Out += fextl::fmt::format("  sched server pid={} run={} wait={} nice={} allowed={:#x} on{} (runnable {}/{} samples)\n",
+                                  Sched.ServerPid, Have ? fextl::fmt::format("{:.0f}ms", RunMs) : fextl::string("-"),
+                                  Have ? fextl::fmt::format("{:.1f}ms", WaitMs) : fextl::string("-"), S.Nice,
+                                  Linux::GetAffinity(Sched.ServerPid), SchedCores(Sched.ServerRunnable, Sched.ServerCores),
+                                  Sched.ServerRunnable, Sched.ServerSamples);
+      }
+    } else if (Seconds == 1) {
+      Out += "  sched server not found\n";
+    }
+
+    // This process's threads: the busiest by CPU time, with how long each waited for a CPU.
+    {
+      struct Row {
+        int Tid;
+        double RunMs;
+        double WaitMs;
+        int Processor;
+        int Nice;
+        char Comm[17];
+      };
+      struct Args {
+        fextl::vector<Row>* Rows;
+        uint64_t Second;
+      };
+      fextl::vector<Row> Rows;
+      Args A {&Rows, Seconds};
+      Linux::ForEachEntry(
+        "/proc/self/task",
+        [](const char* Name, void* Arg) {
+          auto* A = static_cast<Args*>(Arg);
+          const int Tid = atoi(Name);
+          if (Tid <= 0) {
+            return;
+          }
+          const auto Dir = fextl::fmt::format("/proc/self/task/{}", Tid);
+          Row R {.Tid = Tid};
+          auto& Prev = Sched.Tasks[Tid];
+          if (!SchedDelta(Dir, Prev, R.RunMs, R.WaitMs, A->Second)) {
+            return;
+          }
+          Linux::TaskStat S {};
+          if (!Linux::ReadTaskStat((Dir + "/stat").c_str(), S)) {
+            return;
+          }
+          memcpy(R.Comm, S.Comm, sizeof(R.Comm));
+          R.Processor = S.Processor;
+          R.Nice = S.Nice;
+          A->Rows->push_back(R);
+        },
+        &A);
+      for (auto It = Sched.Tasks.begin(); It != Sched.Tasks.end();) {
+        It = It->second.Seen + 1 < Seconds ? Sched.Tasks.erase(It) : std::next(It);
+      }
+      double TotalRun {}, TotalWait {};
+      for (const auto& R : Rows) {
+        TotalRun += R.RunMs;
+        TotalWait += R.WaitMs;
+      }
+      std::sort(Rows.begin(), Rows.end(), [](const Row& a, const Row& b) { return a.RunMs + a.WaitMs > b.RunMs + b.WaitMs; });
+      fextl::string Text;
+      for (size_t i = 0; i < std::min<size_t>(Rows.size(), 10); ++i) {
+        const auto& R = Rows[i];
+        if (R.RunMs + R.WaitMs < 5.0) {
+          break;
+        }
+        Text += fextl::fmt::format(" {}/{} {:.0f}+{:.0f}@{}{}", R.Comm, R.Tid, R.RunMs, R.WaitMs, R.Processor,
+                                   R.Nice ? fextl::fmt::format("n{}", R.Nice) : fextl::string {});
+      }
+      if (!Rows.empty()) {
+        Out += fextl::fmt::format("  sched threads run={:.0f}ms wait={:.0f}ms (name/tid run+wait ms @last cpu):{}\n", TotalRun, TotalWait, Text);
+      }
+    }
+
+    // Every 5 seconds: the other processes of this user that used the CPU (Wine's other processes, the wineserver, the
+    // launcher's own).
+    if (Seconds % 5 == 0) {
+      struct Row {
+        int Pid;
+        uint64_t Ticks;
+      };
+      struct Args {
+        fextl::vector<Row>* Rows;
+        uint64_t Second;
+      };
+      fextl::vector<Row> Rows;
+      Args A {&Rows, Seconds};
+      Linux::ForEachEntry(
+        "/proc",
+        [](const char* Name, void* Arg) {
+          auto* A = static_cast<Args*>(Arg);
+          if (Name[0] < '1' || Name[0] > '9') {
+            return;
+          }
+          const int Pid = atoi(Name);
+          if (Pid <= 0 || Pid == Sched.Pid) {
+            return;
+          }
+          Linux::TaskStat S {};
+          if (!Linux::ReadTaskStat(fextl::fmt::format("/proc/{}/stat", Pid).c_str(), S)) {
+            return;
+          }
+          auto& Prev = Sched.Procs[Pid];
+          const uint64_t Ticks = S.UserTicks + S.SystemTicks;
+          const bool Fresh = Prev.Seen == 0 || Prev.Seen + 5 != A->Second;
+          const uint64_t Delta = Fresh ? 0 : Ticks - Prev.Ticks;
+          Prev.Ticks = Ticks;
+          Prev.Seen = A->Second;
+          Sched.ProcNames[Pid] = S.Comm;
+          if (Delta) {
+            A->Rows->push_back({Pid, Delta});
+          }
+        },
+        &A);
+      for (auto It = Sched.Procs.begin(); It != Sched.Procs.end();) {
+        if (It->second.Seen != Seconds) {
+          Sched.ProcNames.erase(It->first);
+          It = Sched.Procs.erase(It);
+        } else {
+          It = std::next(It);
+        }
+      }
+      std::sort(Rows.begin(), Rows.end(), [](const Row& a, const Row& b) { return a.Ticks > b.Ticks; });
+      fextl::string Text;
+      for (size_t i = 0; i < std::min<size_t>(Rows.size(), 8); ++i) {
+        // Clock ticks are 10ms; over 5 seconds one tick is 0.2% of a core.
+        Text += fextl::fmt::format(" {}/{} {}%", Sched.ProcNames[Rows[i].Pid], Rows[i].Pid, Rows[i].Ticks * 10 / 50);
+      }
+      Out += fextl::fmt::format("  sched procs 5s (name/pid % of a core):{}\n", Text.empty() ? " -" : Text.c_str());
+    }
+
+    Sched.MainSamples = Sched.MainRunnable = Sched.ServerSamples = Sched.ServerRunnable = 0;
+    memset(Sched.MainCores, 0, sizeof(Sched.MainCores));
+    memset(Sched.ServerCores, 0, sizeof(Sched.ServerCores));
+    return Out;
+  }
 
   struct LogState {
     const StatAlloc* Stats;
@@ -1388,6 +1664,7 @@ namespace {
       if (State->Profile) {
         ProfileTick(State);
       }
+      SchedSampleTick();
     } while (GetCounter() < End);
   }
 
@@ -1584,6 +1861,7 @@ namespace {
     Current.reserve(MaxTracked);
     fextl::vector<const FEXCore::SHMStats::ThreadStats*> Slots;
     Slots.reserve(MaxTracked);
+    SchedInit();
 
     for (;;) {
       SampleFor1s(State);
@@ -1822,6 +2100,7 @@ namespace {
         }
       }
 
+      Line += SchedLines(Seconds);
       Line += ProbeLine(State, MsPerTick);
       Line += FrameLines(State, Seconds);
       if (State->Profile) {
@@ -2044,7 +2323,11 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "for it); logger work = the log thread's own work between two sampled seconds; susp = times threads stopped "
                                    "for a suspend request in emulated code (time suspended shows as fex:suspended); probe = the stall "
                                    "probe's longest waits this second, stalls[...] on a '# frame' line = its waits of 2ms or more during "
-                                   "that frame; '# prio' = thread priority changes (FEX_PRIO)\n",
+                                   "that frame; '# prio' = thread priority changes (FEX_PRIO); '# cores' = thread core changes (FEX_MAINCORE, "
+                                   "FEX_HELPER_CORES); '# server' = wineserver nice (FEX_SERVER_NICE); sched main/server = Linux view of "
+                                   "the main thread and the wineserver: CPU time (run), time ready but without a CPU (wait), nice, allowed "
+                                   "CPUs, and which CPU it was on while runnable (sampled every 10ms); sched threads = the busiest threads "
+                                   "(Linux name/tid run+wait ms @last CPU); sched procs 5s = other processes of this user by CPU use\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.

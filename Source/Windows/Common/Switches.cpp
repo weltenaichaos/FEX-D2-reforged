@@ -23,6 +23,9 @@ namespace {
     {"FEX_NATIVE_ZLIB", "1"},      {"FEX_NATIVE_MD5", "1"}, {"FEX_UNPACK_CACHE", "1"},
     // Build 48: no thread at extreme Linux nice values (see PriorityGuard.h, Threads.cpp).
     {"FEX_PRIO", "normal"},        {"FEX_HELPER_PRIO", "normal"},
+    // Build 49: the main thread alone on the fastest core, FEX's helpers on the slowest, the wineserver above the game
+    // (see PriorityGuard.h).
+    {"FEX_MAINCORE", "fast"},      {"FEX_HELPER_CORES", "little"}, {"FEX_SERVER_NICE", "-10"},
   };
 
   // In the order the stats log lists them.
@@ -51,6 +54,10 @@ namespace {
     "FEX_PRIO",
     "FEX_HELPER_PRIO",
     "FEX_STALLPROBE",
+    "FEX_MAINCORE",
+    "FEX_HELPER_CORES",
+    "FEX_SERVER_NICE",
+    "FEX_SCHEDLOG",
   };
 
   bool UseD2RDefaults {};

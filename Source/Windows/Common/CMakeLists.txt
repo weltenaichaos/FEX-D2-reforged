@@ -16,6 +16,7 @@ add_library(CommonWindows STATIC
   Switches.cpp
   ThreadPlacer.cpp
   PriorityGuard.cpp
+  LinuxSys.cpp
   InvalidationTracker.cpp
   ImageTracker.cpp
   Logging.cpp
