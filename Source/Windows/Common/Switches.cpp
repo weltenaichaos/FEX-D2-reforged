@@ -32,6 +32,9 @@ namespace {
     // were no faster: the wait moved into vkd3d-proton's Present, the GPU or present path being the limit there. It only
     // added input lag, so build 51 leaves the handle as the game set it (see ARM64EC/FrameLatency.h).
     {"FEX_FRAMELATENCY", "off"},
+    // Build 52: vkd3d-proton submits without its queue thread waiting for the GPU between batches (see
+    // EnvironmentVariablesHandling.h).
+    {"FEX_VKD3D_NOSTAGGER", "1"},
   };
 
   // In the order the stats log lists them.
@@ -67,6 +70,7 @@ namespace {
     "FEX_SCHEDLOG",
     "FEX_GPULOG",
     "FEX_FRAMELATENCY",
+    "FEX_VKD3D_NOSTAGGER",
   };
 
   bool UseD2RDefaults {};
