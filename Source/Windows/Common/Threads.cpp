@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Threads.h"
 #include "CRT/CRT.h"
+#include "Switches.h"
 
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/Threads.h>
@@ -80,9 +81,17 @@ namespace WinThreadImpl {
     }
 
   private:
+    static bool HelpersAtNormal() {
+      const char* Value = Switch("FEX_HELPER_PRIO");
+      return Value && Value[0] == 'n';
+    }
+
     static void RunThread(Thread* This) {
       This->TID = GetCurrentThreadId();
-      if (This->GetFlags().LowPriority) {
+      // Upstream runs low priority helpers (disk cache writer, cache prefetch) at IDLE. Wine on Linux turns that into nice
+      // 19, about 1.5% of a core next to busy game threads, while the writer holds locks every compile needs.
+      // FEX_HELPER_PRIO=normal (the D2R default) runs them at normal priority instead.
+      if (This->GetFlags().LowPriority && !HelpersAtNormal()) {
         LONG Priority = THREAD_BASE_PRIORITY_IDLE;
         NtSetInformationThread(NtCurrentThread(), ThreadBasePriority, &Priority, sizeof(Priority));
       }

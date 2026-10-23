@@ -52,4 +52,10 @@ void StatsLogSetFrameMarks(const uint64_t* Marks, size_t RingSize);
 
 // Where FEX's code invalidation lock records its exclusive lock timings, printed every second as a "codelock" line.
 FEXCore::Utils::WritePriorityMutex::ContentionStats* StatsLogCodeLockStats();
+
+// Stall probe (FEX_STALLPROBE, on with FEX_STATSLOG_PROFILE=1 unless set to 0): a helper thread that every 4ms times how
+// late its own sleep wakes up (CPU starvation), a VirtualQuery (Wine's memory lock), touching a fresh page (the kernel's
+// memory map lock), Probe (FEX's global memory/SMC lock), and every 16ms a wineserver round trip. Each second's longest
+// of each goes on a "probe" line, and every "# frame" line gets the longest ones that overlapped that frame.
+void StatsLogSetLockProbe(void (*Probe)());
 } // namespace FEX::Windows

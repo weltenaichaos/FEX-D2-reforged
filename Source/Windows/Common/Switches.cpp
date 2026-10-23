@@ -21,6 +21,8 @@ namespace {
     {"FEX_STATSLOG_PROFILE", "1"},
 #endif
     {"FEX_NATIVE_ZLIB", "1"},      {"FEX_NATIVE_MD5", "1"}, {"FEX_UNPACK_CACHE", "1"},
+    // Build 48: no thread at extreme Linux nice values (see PriorityGuard.h, Threads.cpp).
+    {"FEX_PRIO", "normal"},        {"FEX_HELPER_PRIO", "normal"},
   };
 
   // In the order the stats log lists them.
@@ -46,6 +48,9 @@ namespace {
     "FEX_DISKCACHE_PREFETCH_MB",
     "FEX_FRAMETIMES",
     "FEX_CODELOCK_POLITE",
+    "FEX_PRIO",
+    "FEX_HELPER_PRIO",
+    "FEX_STALLPROBE",
   };
 
   bool UseD2RDefaults {};

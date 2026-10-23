@@ -51,6 +51,7 @@ $end_info$
 #include "Windows/Common/SHMStats.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/ThreadPlacer.h"
+#include "Windows/Common/PriorityGuard.h"
 #include "Windows/Common/Switches.h"
 #include "NativeRedirect.h"
 
@@ -158,6 +159,9 @@ std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
 
 std::recursive_mutex ThreadCreationMutex;
+// Where a thread that stops for a suspend request at a block start points the stats log's native-call sampler (CPU area
+// +0x50, see ExitFunctionEC), so the time it spends suspended shows as "fex:suspended" rather than its last native call.
+alignas(16) const uint8_t SuspendedMarker[16] {};
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
 std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
 
@@ -918,12 +922,17 @@ NTSTATUS ProcessInit() {
     FEX::Windows::StatsLogWatchImage(reinterpret_cast<uint64_t>(MainModule));
     FEX::Windows::StartStatsLog(StatAllocHandler.get(), AppConfigName);
     CTX->GetCodeInvalidationMutex().SetContentionStats(FEX::Windows::StatsLogCodeLockStats());
+    FEX::Windows::StatsLogNameNative(reinterpret_cast<uint64_t>(&SuspendedMarker), "fex:suspended");
+    // The stall probe's "fexlock": how long taking FEX's global memory/SMC lock takes (every VirtualProtect, VirtualAlloc,
+    // VirtualFree and code write by the game holds it).
+    FEX::Windows::StatsLogSetLockProbe([] { std::scoped_lock Lock(ThreadCreationMutex); });
     FEX::Windows::StatsLogNote(PoliteMs ? fextl::fmt::format("codelock: writers wait up to {}ms without blocking compiles", PoliteMs) :
                                           fextl::string("codelock: writers queue at once (upstream)"));
   } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
   FEX::Windows::StartThreadPlacer(AppConfigName);
+  FEX::Windows::StartPriorityGuard(AppConfigName);
   NativeRedirect::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog, [](uint64_t Address, uint64_t Size) {
     InvalidationTracker->InvalidateAlignedInterval(Address, Size, false);
   });
@@ -970,6 +979,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     // unsetting InSimulation a brk #0xCAFE instruction will be raised that we can handle here.
     NativeContext->Pc = reinterpret_cast<uintptr_t>(&ExitFunctionSuspendResumePoint); // Jump to the suspend resume point.
     *CPUArea.Area->SuspendDoorbell = 0;
+    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSuspendCount, 1);
     return true;
   }
 
@@ -1033,6 +1043,9 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     LogMan::Msg::DFmt("Suspending: RIP: {:X} SP: {:X}", NativeContext->Pc, NativeContext->Sp);
     CPUArea.Area->InSimulation = 0;
     *CPUArea.Area->SuspendDoorbell = 0;
+    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSuspendCount, 1);
+    // Entering emulated code again after the resume makes the sampler ignore this until the next native call sets it.
+    *reinterpret_cast<volatile uint64_t*>(reinterpret_cast<uint8_t*>(CPUArea.Area) + 0x50) = reinterpret_cast<uint64_t>(&SuspendedMarker);
     return true;
   }
 

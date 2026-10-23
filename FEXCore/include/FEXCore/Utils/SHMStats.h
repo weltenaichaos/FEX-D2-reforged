@@ -105,7 +105,8 @@ struct ThreadStats {
   uint64_t AccumulatedCodeLockWaitTime;
   uint64_t MaxCodeLockWaitTime;
   uint64_t MaxCodeLockWaitAt;
-  uint64_t Pad[1];
+  // Times the thread stopped for a suspend request (SuspendThread, GetThreadContext) while in emulated code.
+  uint64_t AccumulatedSuspendCount;
 };
 
 enum DiskCacheMissReason : uint8_t {

@@ -125,6 +125,7 @@ namespace {
     uint64_t DiskCacheFileReadCount;
     uint64_t DiskCacheRelocTime;
     uint64_t DiskCacheInstallTime;
+    uint64_t SuspendCount;
     // Longest single events of the last second (cycles) and when they ended (cycle counter), see ThreadStats.
     uint64_t MaxJITTime;
     uint64_t MaxJITAt;
@@ -262,6 +263,30 @@ namespace {
     return Out;
   }
 
+  // Stall probe, see StatsLogSetLockProbe.
+  enum ProbeKind : uint8_t { ProbeSleep, ProbeVQ, ProbeFault, ProbeLock, ProbeServer, ProbeKinds };
+  constexpr const char* ProbeNames[ProbeKinds] = {"sleep", "vq", "fault", "fexlock", "server"};
+  constexpr int64_t ProbeSleep100ns = 40'000; // 4ms between rounds
+  constexpr uint64_t ProbeServerEvery = 4;    // wineserver round trip every 4th round
+  constexpr size_t ProbeFaultPages = 4096;    // 16MB, one fresh page per round, then decommitted and committed again
+  constexpr double ProbeKeepMs = 2.0;         // events at least this long are kept for "# frame" lines
+  constexpr size_t ProbeRingSize = 4096;
+  struct ProbeEvent {
+    uint64_t End;   // counter value when it ended
+    uint64_t Ticks; // how long it took; for sleep, how much later than asked the thread woke up
+    uint8_t Kind;
+  };
+  // Written by the probe thread only.
+  struct ProbeShared {
+    ProbeEvent Ring[ProbeRingSize];
+    std::atomic<uint64_t> Written;
+    std::atomic<uint64_t> Max[ProbeKinds]; // longest since the log thread last took them
+    std::atomic<uint64_t> MaxAt[ProbeKinds];
+    std::atomic<uint64_t> Rounds;
+  };
+  ProbeShared* Probe {};
+  std::atomic<void (*)()> LockProbe {};
+
   struct LogState {
     const StatAlloc* Stats;
     FILE* File;
@@ -337,6 +362,10 @@ namespace {
     };
     fextl::unordered_map<uint64_t, fextl::string> NativeNames;
     fextl::unordered_map<uint64_t, ModuleExports> Modules;
+
+    // Stall probe events of 2ms or more from this and the previous second, for "# frame" lines.
+    uint64_t ProbeRead;
+    fextl::vector<ProbeEvent> ProbeEvents;
   };
 
   std::atomic<fextl::string (*)()> LineProvider {};
@@ -351,6 +380,88 @@ namespace {
     uint64_t Result {};
     __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Result));
     return Result ? Result : 1;
+  }
+
+  void* ProbeThread(void*) {
+    auto* P = Probe;
+    const uint64_t Freq = GetCounterFrequency();
+    const uint64_t SleepTicks = Freq * static_cast<uint64_t>(ProbeSleep100ns) / 10'000'000;
+    const uint64_t KeepTicks = static_cast<uint64_t>(ProbeKeepMs * static_cast<double>(Freq) / 1000.0);
+    auto Record = [&](ProbeKind Kind, uint64_t End, uint64_t Ticks) {
+      if (Ticks > P->Max[Kind].load(std::memory_order_relaxed)) {
+        P->Max[Kind].store(Ticks, std::memory_order_relaxed);
+        P->MaxAt[Kind].store(End, std::memory_order_relaxed);
+      }
+      if (Ticks >= KeepTicks) {
+        const uint64_t W = P->Written.load(std::memory_order_relaxed);
+        P->Ring[W % ProbeRingSize] = {End, Ticks, Kind};
+        P->Written.store(W + 1, std::memory_order_release);
+      }
+    };
+
+    void* Region {};
+    SIZE_T RegionSize = ProbeFaultPages * 4096;
+    if (NtAllocateVirtualMemory(NtCurrentProcess(), &Region, 0, &RegionSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != STATUS_SUCCESS) {
+      Region = nullptr;
+    }
+    size_t Page {};
+    for (uint64_t Round = 0;; ++Round) {
+      // Sleep: how much later than asked a normal priority thread gets the CPU back.
+      LARGE_INTEGER Interval {.QuadPart = -ProbeSleep100ns};
+      uint64_t T0 = GetCounter();
+      NtDelayExecution(FALSE, &Interval);
+      uint64_t T1 = GetCounter();
+      Record(ProbeSleep, T1, T1 - T0 > SleepTicks ? T1 - T0 - SleepTicks : 0);
+
+      // VirtualQuery: Wine's process-wide memory lock (virtual_mutex), taken by every memory call and Wine fault.
+      MEMORY_BASIC_INFORMATION Info {};
+      T0 = GetCounter();
+      NtQueryVirtualMemory(NtCurrentProcess(), Region ? Region : static_cast<void*>(&Info), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
+      T1 = GetCounter();
+      Record(ProbeVQ, T1, T1 - T0);
+
+      // First touch of a page: the kernel's per-process memory map lock, held for writing by every mprotect/mmap/munmap.
+      if (Region) {
+        if (Page == ProbeFaultPages) {
+          void* Base = Region;
+          SIZE_T Size = RegionSize;
+          NtFreeVirtualMemory(NtCurrentProcess(), &Base, &Size, MEM_DECOMMIT);
+          Base = Region;
+          Size = RegionSize;
+          if (NtAllocateVirtualMemory(NtCurrentProcess(), &Base, 0, &Size, MEM_COMMIT, PAGE_READWRITE) != STATUS_SUCCESS) {
+            Region = nullptr;
+          }
+          Page = 0;
+        }
+        if (Region) {
+          auto* Touch = static_cast<volatile uint8_t*>(Region) + Page++ * 4096;
+          T0 = GetCounter();
+          *Touch = 1;
+          T1 = GetCounter();
+          Record(ProbeFault, T1, T1 - T0);
+        }
+      }
+
+      // FEX's global memory/SMC lock.
+      if (auto* Lock = LockProbe.load(std::memory_order_acquire)) {
+        T0 = GetCounter();
+        Lock();
+        T1 = GetCounter();
+        Record(ProbeLock, T1, T1 - T0);
+      }
+
+      // A wineserver round trip (this thread's suspend count).
+      if (Round % ProbeServerEvery == 0) {
+        ULONG SuspendCount {};
+        T0 = GetCounter();
+        NtQueryInformationThread(NtCurrentThread(), static_cast<THREADINFOCLASS>(35) /* ThreadSuspendCount */, &SuspendCount,
+                                 sizeof(SuspendCount), nullptr);
+        T1 = GetCounter();
+        Record(ProbeServer, T1, T1 - T0);
+      }
+      P->Rounds.fetch_add(1, std::memory_order_relaxed);
+    }
+    return nullptr;
   }
 
   // What the game is told about memory (GlobalMemoryStatusEx reads the same two system queries) and what the process
@@ -724,8 +835,32 @@ namespace {
         ++Thunks;
       }
     }
+
+    // ARM64EC modules: the CHPE redirection table maps an export's x64 entry (Source) to the ARM64EC code behind it
+    // (Destination). x86 code that calls an ntdll syscall stub ends up there through Wine's syscall dispatch, so give the
+    // destination the export's name too.
+    size_t Redirected = 0;
+    const auto LoadConfigDir = Nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    IMAGE_LOAD_CONFIG_DIRECTORY64 LoadConfig {};
+    constexpr size_t CHPEFieldEnd = offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, CHPEMetadataPointer) + sizeof(LoadConfig.CHPEMetadataPointer);
+    IMAGE_ARM64EC_METADATA Metadata {};
+    if (LoadConfigDir.VirtualAddress && LoadConfigDir.Size >= CHPEFieldEnd &&
+        ReadMemory(Base + LoadConfigDir.VirtualAddress, &LoadConfig, CHPEFieldEnd) && LoadConfig.Size >= CHPEFieldEnd &&
+        LoadConfig.CHPEMetadataPointer && ReadMemory(LoadConfig.CHPEMetadataPointer, &Metadata, sizeof(Metadata)) &&
+        Metadata.RedirectionMetadata && Metadata.RedirectionMetadataCount && Metadata.RedirectionMetadataCount <= 65536) {
+      fextl::vector<IMAGE_ARM64EC_REDIRECTION_ENTRY> Entries(Metadata.RedirectionMetadataCount);
+      if (ReadMemoryChunked(Base + Metadata.RedirectionMetadata, Entries.data(), Entries.size() * sizeof(Entries[0]))) {
+        for (const auto& E : Entries) {
+          auto It = std::lower_bound(M.Functions.begin(), M.Functions.begin() + Exported, std::pair<uint32_t, uint32_t> {E.Source, 0});
+          if (It != M.Functions.begin() + Exported && It->first == E.Source && E.Destination && E.Destination < Nt.OptionalHeader.SizeOfImage) {
+            M.Functions.push_back({E.Destination, It->second});
+            ++Redirected;
+          }
+        }
+      }
+    }
     std::sort(M.Functions.begin(), M.Functions.end());
-    StatsLogNote(fextl::fmt::format("native names: {} at {:X}: {} exports, {} patchable", M.Name, Base, Exported, Thunks));
+    StatsLogNote(fextl::fmt::format("native names: {} at {:X}: {} exports, {} patchable, {} redirected", M.Name, Base, Exported, Thunks, Redirected));
     return M;
   }
 
@@ -1040,6 +1175,54 @@ namespace {
     return fextl::fmt::format("{}.{:02}", Current ? Seconds : State->PrevSeconds, Bin);
   }
 
+  // The stall probe's events of 2ms or more that overlapped Begin..End, longest of each kind: " stalls[sleep=40ms server=38ms]",
+  // " stalls[-]" when there were none, nothing when the probe is off.
+  fextl::string ProbeDuring(const LogState* State, uint64_t Begin, uint64_t End) {
+    if (!Probe) {
+      return {};
+    }
+    uint64_t Max[ProbeKinds] {};
+    for (const auto& E : State->ProbeEvents) {
+      if (E.End > Begin && E.End - E.Ticks < End) {
+        Max[E.Kind] = std::max(Max[E.Kind], E.Ticks);
+      }
+    }
+    fextl::string Out;
+    const double MsPerTick = 1000.0 / static_cast<double>(State->CounterFreq);
+    for (size_t k = 0; k < ProbeKinds; ++k) {
+      if (Max[k]) {
+        Out += fextl::fmt::format("{}{}={:.0f}ms", Out.empty() ? "" : " ", ProbeNames[k], static_cast<double>(Max[k]) * MsPerTick);
+      }
+    }
+    return fextl::fmt::format(" stalls[{}]", Out.empty() ? "-" : Out);
+  }
+
+  // Takes the probe's new events (dropping those that ended before the previous second) and returns the second's
+  // "probe" line: rounds done and the longest of each kind with the 10ms bin it ended in.
+  fextl::string ProbeLine(LogState* State, double MsPerTick) {
+    if (!Probe) {
+      return {};
+    }
+    const uint64_t Written = Probe->Written.load(std::memory_order_acquire);
+    if (Written - State->ProbeRead > ProbeRingSize) {
+      State->ProbeRead = Written - ProbeRingSize;
+    }
+    const uint64_t KeepFrom = State->PrevSecondStart ? State->PrevSecondStart : State->SecondStart;
+    State->ProbeEvents.erase(std::remove_if(State->ProbeEvents.begin(), State->ProbeEvents.end(), [&](const ProbeEvent& E) { return E.End < KeepFrom; }),
+                             State->ProbeEvents.end());
+    for (; State->ProbeRead < Written; ++State->ProbeRead) {
+      State->ProbeEvents.push_back(Probe->Ring[State->ProbeRead % ProbeRingSize]);
+    }
+    auto Line = fextl::fmt::format("  probe rounds={} max", Probe->Rounds.exchange(0, std::memory_order_relaxed));
+    for (size_t k = 0; k < ProbeKinds; ++k) {
+      const uint64_t Ticks = Probe->Max[k].exchange(0, std::memory_order_relaxed);
+      const uint64_t At = Probe->MaxAt[k].exchange(0, std::memory_order_relaxed);
+      const int64_t Bin = At > State->SecondStart ? static_cast<int64_t>((At - State->SecondStart) * TimelineBins / State->CounterFreq) : -1;
+      Line += fextl::fmt::format(" {}={:.1f}ms@{}", ProbeNames[k], static_cast<double>(Ticks) * MsPerTick, Bin);
+    }
+    return Line + "\n";
+  }
+
   // A "# frame" line: what Main was sampled doing from frame start Begin to the next frame start End, from this and the
   // previous second's samples (an older start is noted as such).
   fextl::string FormatSlowFrame(LogState* State, uint64_t Seconds, uint64_t Begin, uint64_t End, double Ms) {
@@ -1077,8 +1260,9 @@ namespace {
     }
     const bool Older = State->PrevSecondStart ? Begin < State->PrevSecondStart : Begin < State->SecondStart;
     auto Text =
-      fextl::fmt::format("# frame t={} {:.0f}ms{} main samples={} emu={}%:", Older ? fextl::string("<") : FrameTime(State, Seconds, Begin),
-                         Ms, Older ? " (began before the samples kept)" : "", R.Samples, R.Samples ? Emulated * 100 / R.Samples : 0);
+      fextl::fmt::format("# frame t={} {:.0f}ms{} main samples={} emu={}%{}:", Older ? fextl::string("<") : FrameTime(State, Seconds, Begin),
+                         Ms, Older ? " (began before the samples kept)" : "", R.Samples, R.Samples ? Emulated * 100 / R.Samples : 0,
+                         ProbeDuring(State, Begin, End));
     return Text + RunBody(State, R, Blocks, Natives);
   }
 
@@ -1434,6 +1618,7 @@ namespace {
           .DiskCacheFileReadCount = Slot.AccumulatedDiskCacheFileReadCount,
           .DiskCacheRelocTime = Slot.AccumulatedDiskCacheRelocTime,
           .DiskCacheInstallTime = Slot.AccumulatedDiskCacheInstallTime,
+          .SuspendCount = Slot.AccumulatedSuspendCount,
         });
         // Take the longest single events and reset them for the next second.
         auto& Cur = Current.back();
@@ -1508,6 +1693,7 @@ namespace {
               .DiskCacheFileReadCount = Diff(Cur.DiskCacheFileReadCount, Old->DiskCacheFileReadCount),
               .DiskCacheRelocTime = Diff(Cur.DiskCacheRelocTime, Old->DiskCacheRelocTime),
               .DiskCacheInstallTime = Diff(Cur.DiskCacheInstallTime, Old->DiskCacheInstallTime),
+              .SuspendCount = Diff(Cur.SuspendCount, Old->SuspendCount),
               .MaxJITTime = Cur.MaxJITTime,
               .MaxJITAt = Cur.MaxJITAt,
               .MaxSignalTime = Cur.MaxSignalTime,
@@ -1547,6 +1733,7 @@ namespace {
         Total.DiskCacheHitCount += Entry.D.DiskCacheHitCount;
         Total.DiskCacheMissCount += Entry.D.DiskCacheMissCount;
         Total.DiskCacheLookupTime += Entry.D.DiskCacheLookupTime;
+        Total.SuspendCount += Entry.D.SuspendCount;
         Deltas.push_back(Entry);
       }
 
@@ -1556,15 +1743,16 @@ namespace {
       std::sort(Deltas.begin(), Deltas.end(), [](const Delta& a, const Delta& b) { return a.CPUPercent > b.CPUPercent; });
 
       auto Line = fextl::fmt::format("t={} threads={} cpu={:.0f}% jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} x87fb={} "
-                                     "dc={}/{} dcl={:.1f}ms\n",
+                                     "dc={}/{} dcl={:.1f}ms susp={}\n",
                                      Seconds, Current.size(), TotalCPU, Total.JITTime * MsPerTick, Total.JITCount, Total.SMCCount,
                                      Total.SIGBUSCount, Total.SignalTime * MsPerTick, Total.CacheMissCount, Total.FloatFallbackCount,
-                                     Total.DiskCacheHitCount, Total.DiskCacheMissCount, Total.DiskCacheLookupTime * MsPerTick);
+                                     Total.DiskCacheHitCount, Total.DiskCacheMissCount, Total.DiskCacheLookupTime * MsPerTick,
+                                     Total.SuspendCount);
 
       size_t Printed {};
       for (const auto& Entry : Deltas) {
         const auto& D = Entry.D;
-        const bool Interesting = Entry.CPUPercent >= 3.0 || D.JITCount || D.SMCCount || D.SIGBUSCount || D.DiskCacheHitCount;
+        const bool Interesting = Entry.CPUPercent >= 3.0 || D.JITCount || D.SMCCount || D.SIGBUSCount || D.DiskCacheHitCount || D.SuspendCount;
         if (!Interesting || Printed == MaxPrinted) {
           continue;
         }
@@ -1575,10 +1763,11 @@ namespace {
           Emu = fextl::fmt::format("{}%", (T->InSimulationSamples * 100 + T->Samples / 2) / T->Samples);
         }
         Line += fextl::fmt::format("  tid={} {} cpu={:.0f}% emu={} jit={:.1f}ms/{} smc={} sigbus={} sig={:.1f}ms miss={} lock={:.1f}ms "
-                                   "x87fb={} dc={}\n",
+                                   "x87fb={} dc={}{}\n",
                                    D.TID, QueryThreadName(D.TID), Entry.CPUPercent, Emu, D.JITTime * MsPerTick, D.JITCount, D.SMCCount,
                                    D.SIGBUSCount, D.SignalTime * MsPerTick, D.CacheMissCount, D.CacheLockTime * MsPerTick,
-                                   D.FloatFallbackCount, D.DiskCacheHitCount);
+                                   D.FloatFallbackCount, D.DiskCacheHitCount,
+                                   D.SuspendCount ? fextl::fmt::format(" susp={}", D.SuspendCount) : fextl::string {});
         // Longest single events of the second: duration and the 10ms timeline bin in which each one ended.
         fextl::string Max;
         auto AddMax = [&](const char* Name, uint64_t Time, uint64_t At) {
@@ -1633,6 +1822,7 @@ namespace {
         }
       }
 
+      Line += ProbeLine(State, MsPerTick);
       Line += FrameLines(State, Seconds);
       if (State->Profile) {
         Line += MainHitches(State, Seconds);
@@ -1851,7 +2041,10 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "the busy threads were doing in it; codelock = FEX's code invalidation lock: exclusive locks taken, how "
                                    "many waited 1ms "
                                    "or more, polite waits that ran out, longest wait and hold (max codelock = a compile's longest wait "
-                                   "for it); logger work = the log thread's own work between two sampled seconds\n",
+                                   "for it); logger work = the log thread's own work between two sampled seconds; susp = times threads stopped "
+                                   "for a suspend request in emulated code (time suspended shows as fex:suspended); probe = the stall "
+                                   "probe's longest waits this second, stalls[...] on a '# frame' line = its waits of 2ms or more during "
+                                   "that frame; '# prio' = thread priority changes (FEX_PRIO)\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
@@ -1876,6 +2069,15 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   fwrite(Switches.data(), 1, Switches.size(), File);
   const auto WineSync = WineSyncLine();
   fwrite(WineSync.data(), 1, WineSync.size(), File);
+  const char* StallProbe = Switch("FEX_STALLPROBE");
+  static fextl::unique_ptr<FEXCore::Threads::Thread> ProbeThreadObject;
+  if (State->Profile && !(StallProbe && StallProbe[0] == '0')) {
+    Probe = new ProbeShared {};
+    ProbeThreadObject = FEXCore::Threads::Thread::Create(ProbeThread, nullptr, {.LowPriority = false, .Internal = true}, "FEXStallProbe");
+    const char* ProbeNote = "# stall probe: on, every 4ms: sleep (late wakeup), vq (Wine memory lock), fault (kernel memory map lock), "
+                            "fexlock (FEX memory/SMC lock), every 16ms server (wineserver round trip); FEX_STALLPROBE=0 turns it off\n";
+    fwrite(ProbeNote, 1, strlen(ProbeNote), File);
+  }
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
   Thread = FEXCore::Threads::Thread::Create(LogThread, State, {.LowPriority = false, .Internal = true}, "FEXStatsLog");
@@ -1883,6 +2085,10 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
 
 FEXCore::Utils::WritePriorityMutex::ContentionStats* StatsLogCodeLockStats() {
   return &CodeLockStats;
+}
+
+void StatsLogSetLockProbe(void (*ProbeFunction)()) {
+  LockProbe.store(ProbeFunction, std::memory_order_release);
 }
 
 void StatsLogWatchImage(uint64_t Base) {

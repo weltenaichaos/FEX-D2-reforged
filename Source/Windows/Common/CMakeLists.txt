@@ -15,6 +15,7 @@ add_library(CommonWindows STATIC
   StatsLog.cpp
   Switches.cpp
   ThreadPlacer.cpp
+  PriorityGuard.cpp
   InvalidationTracker.cpp
   ImageTracker.cpp
   Logging.cpp

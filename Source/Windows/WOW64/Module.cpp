@@ -51,6 +51,7 @@ $end_info$
 #include "BTInterface.h"
 #include "Windows/Common/SHMStats.h"
 #include "Windows/Common/ThreadPlacer.h"
+#include "Windows/Common/PriorityGuard.h"
 #include "Windows/Common/Switches.h"
 
 #include <cstdint>
@@ -573,6 +574,7 @@ void BTCpuProcessInit() {
   }
 
   FEX::Windows::StartThreadPlacer(ExecutableName);
+  FEX::Windows::StartPriorityGuard(ExecutableName);
 
   if (StartupSleep() && (StartupSleepProcName().empty() || ExecutableName == StartupSleepProcName())) {
     LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), ExecutableName, StartupSleep());
