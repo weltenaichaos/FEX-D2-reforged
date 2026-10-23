@@ -388,6 +388,52 @@ void HandleImageUnmap(uint64_t Address, uint64_t Size) {
 }
 } // namespace
 
+// The last exceptions that FEX passed on (to the game's handlers, or to Wine for native code and other threads),
+// written to the stats log when the process exits so a crash log says what happened last. FEX's own SMC, unaligned
+// atomic and compile restart faults are not passed on and not recorded.
+namespace CrashRecord {
+enum class Kind : uint8_t { Guest, Native, JITUnexpected, OtherThread };
+
+struct Entry {
+  uint32_t Code;
+  uint32_t TID;
+  uint64_t HostPc;
+  uint64_t Fault;
+  uint64_t RIP;
+  Kind Where;
+};
+
+constexpr size_t RingSize = 32;
+Entry Ring[RingSize];
+std::atomic<uint64_t> Count;
+std::atomic<bool> Written;
+
+void Note(Kind Where, uint32_t Code, uint64_t HostPc, uint64_t Fault, uint64_t RIP) {
+  const uint64_t Index = Count.fetch_add(1, std::memory_order_relaxed);
+  Ring[Index % RingSize] = {.Code = Code, .TID = GetCurrentThreadId(), .HostPc = HostPc, .Fault = Fault, .RIP = RIP, .Where = Where};
+}
+
+uint64_t FaultAddress(const EXCEPTION_RECORD& Rec) {
+  return Rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && Rec.NumberParameters >= 2 ? Rec.ExceptionInformation[1] : 0;
+}
+
+void Write(NTSTATUS Status) {
+  if (Written.exchange(true)) {
+    return;
+  }
+  const uint64_t Total = Count.load(std::memory_order_relaxed);
+  FEX::Windows::StatsLogNote(fextl::fmt::format("process exit: status {:X} by tid {}, {} exceptions passed on; the last ones, oldest "
+                                                "first:",
+                                                static_cast<uint32_t>(Status), GetCurrentThreadId(), Total));
+  constexpr const char* Names[] = {"guest code", "native code", "JIT, unexpected", "non-emulated thread"};
+  for (uint64_t i = Total > RingSize ? Total - RingSize : 0; i < Total; ++i) {
+    const auto& E = Ring[i % RingSize];
+    FEX::Windows::StatsLogNote(fextl::fmt::format("  exception #{}: code {:X} in {} tid {} pc {:X} rip {:X} fault {:X}", i, E.Code,
+                                                  Names[static_cast<uint8_t>(E.Where)], E.TID, E.HostPc, E.RIP, E.Fault));
+  }
+}
+} // namespace CrashRecord
+
 namespace Exception {
 static std::optional<FEX::Windows::TSOHandlerConfig> HandlerConfig;
 static uintptr_t KiUserExceptionDispatcher;
@@ -595,6 +641,7 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
 
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
+  CrashRecord::Note(CrashRecord::Kind::Guest, GuestRec.ExceptionCode, Context.Pc, CrashRecord::FaultAddress(GuestRec), GuestContext.Pc);
   if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
     GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
   } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {
@@ -889,7 +936,11 @@ NTSTATUS ProcessInit() {
   return STATUS_SUCCESS;
 }
 
-void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
+  if (!After) {
+    CrashRecord::Write(Status);
+  }
+}
 
 class ScopedCallbackDisable {
 private:
@@ -970,6 +1021,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 
   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
     LogMan::Msg::DFmt("Passing through exception");
+    CrashRecord::Note(CrashRecord::Kind::Native, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0);
     return false;
   }
 
@@ -994,6 +1046,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     return true;
   } else {
     LogMan::Msg::EFmt("Unexpected exception in JIT code on guest stack");
+    CrashRecord::Note(CrashRecord::Kind::JITUnexpected, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0);
     return false;
   }
 }
@@ -1016,6 +1069,7 @@ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestConte
 
   const auto CPUArea = GetCPUArea();
   if (!CPUArea.ThreadState()) {
+    CrashRecord::Note(CrashRecord::Kind::OtherThread, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0);
     return STATUS_SUCCESS;
   }
 
