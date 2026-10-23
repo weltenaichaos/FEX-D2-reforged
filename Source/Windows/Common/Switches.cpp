@@ -43,6 +43,7 @@ namespace {
     "FEX_JOBWAIT_BACKOFF",
     "FEX_DISKCACHE_PREFETCH",
     "FEX_DISKCACHE_PREFETCH_MB",
+    "FEX_FRAMETIMES",
   };
 
   bool UseD2RDefaults {};

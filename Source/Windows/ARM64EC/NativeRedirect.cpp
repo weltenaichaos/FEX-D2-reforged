@@ -54,6 +54,13 @@ extern "C" {
 // Read by the stubs in Module.S, which store the call-ret stack pointer the way a JIT exit does.
 uint64_t NativeRedirectCallRetSPOffset = offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp);
 
+// Frame times (see FrameClock): ExitFunctionEC compares the x64 return address of every call into native code with
+// FEXFrameMarkReturn (0 = off) and on a match stores the counter in FEXFrameMarks: [0] = marks written so far, then a
+// ring of FrameMarkRing times.
+constexpr size_t FrameMarkRing = 1024;
+uint64_t FEXFrameMarkReturn;
+alignas(64) uint64_t FEXFrameMarks[1 + FrameMarkRing];
+
 // Module.S
 extern void* NativeInflateFastRedirect;
 extern void* NativeAdler32ZRedirect;
@@ -667,6 +674,27 @@ namespace {
     void (*Invalidate)(uint64_t Address, uint64_t Size) {};
   } // namespace JobWait
 
+  // D2R's main thread starts every frame in one function (0x1408764C0 in the 2026-10 version) that first reads the clock:
+  // lea rcx, [rsp+0x20]; call [QueryPerformanceCounter]. Where that call returns to marks a frame start, so the stats
+  // log can time every frame without touching the game's code (Module.S, ExitFunctionEC). FEX_FRAMETIMES=0 turns it off.
+  namespace FrameClock {
+    constexpr uint8_t Code[] = {
+      0x40, 0x53, 0x55, 0x56, 0x57, 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xf9, 0x4c, 0x89, 0xa4, 0x24, 0xb8,
+      0x00, 0x00, 0x00, 0x48, 0x8d, 0x4c, 0x24, 0x20, 0xff, 0x15, 0xbe, 0x93, 0xd5, 0x00, 0x48, 0x8b, 0x5c, 0x24, 0x20, 0xff,
+      0x15, 0xe3, 0x73, 0x49, 0x01, 0x33, 0xd2, 0x48, 0x8d, 0x2d, 0xd2, 0x5f, 0x48, 0x01, 0x4c, 0x8b, 0xc0, 0x33, 0xf6, 0x48,
+      0x8b, 0xc3, 0x49, 0xf7, 0xf0, 0x44, 0x8d, 0x66, 0x02, 0x48, 0x8b, 0xc8, 0x48, 0x69, 0xc2, 0x00, 0xca, 0x9a, 0x3b, 0x33,
+      0xd2, 0x49, 0xf7, 0xf0, 0x48, 0x8b, 0xd8, 0x48, 0x69, 0xc1, 0x00, 0xca, 0x9a, 0x3b, 0x48, 0x03, 0xd8,
+    };
+    // call [QueryPerformanceCounter]; call [the counter frequency]; lea rbp, [...]
+    constexpr uint8_t Rel32[] = {0x1e, 0x29, 0x32};
+    constexpr Pattern Function {Code, sizeof(Code), Rel32, sizeof(Rel32)};
+    constexpr uint64_t ClockCallReturn = 0x22;
+    constexpr uint32_t KnownRVA = 0x8764C0;
+
+    bool Enabled {};
+    std::atomic<uint64_t> Address {};
+  } // namespace FrameClock
+
   uint64_t JobWaitObject {}; // what the getter returns, from its code
   uint64_t JobWaitReturn {}; // the wait loop's return address from its call of the getter; 0 if not found
 
@@ -824,7 +852,13 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
   if (StatsLog && ZlibEnabled) {
     FEXNativeZlibTrackStreams = 1;
   }
-  Searching.store(ZlibEnabled || MD5Enabled || JobWait::Enabled, std::memory_order_relaxed);
+  if (const char* FrameTimes = FEX::Windows::Switch("FEX_FRAMETIMES"); StatsLog && !(FrameTimes && FrameTimes[0] == '0')) {
+    FrameClock::Enabled = true;
+  }
+  if (FrameClock::Enabled) {
+    FEX::Windows::StatsLogSetFrameMarks(FEXFrameMarks, FrameMarkRing);
+  }
+  Searching.store(ZlibEnabled || MD5Enabled || JobWait::Enabled || FrameClock::Enabled, std::memory_order_relaxed);
 
   // On unless set to 0.
   auto DefaultOn = [](const char* Name) {
@@ -842,6 +876,9 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
                                                                           "computed (FEX_UNPACK_CACHE_SKIP_ADLER=0)"));
   }
   FEX::Windows::StatsLogNote(fextl::fmt::format("native md5: {}", MD5Enabled ? "on (FEX_NATIVE_MD5=1)" : "off"));
+  if (StatsLog) {
+    FEX::Windows::StatsLogNote(FrameClock::Enabled ? "frames: on, FEX_FRAMETIMES=0 turns it off" : "frames: off (FEX_FRAMETIMES=0)");
+  }
   FEX::Windows::StatsLogNote(JobWait::Enabled ? fextl::fmt::format("native jobwait: on, pause {} us (FEX_JOBWAIT_BACKOFF), FEX_JOBWAIT=0 turns it off",
                                                                    JobWait::BackoffMicroseconds) :
                                                 "native jobwait: off (FEX_JOBWAIT=0)");
@@ -955,6 +992,9 @@ namespace {
     if (JobWait::Enabled && !JobWait::GetterAddress.load(std::memory_order_relaxed)) {
       Names += fextl::fmt::format("{}job system getter", Names.empty() ? "" : ", ");
     }
+    if (FrameClock::Enabled && !FrameClock::Address.load(std::memory_order_relaxed)) {
+      Names += fextl::fmt::format("{}frame function", Names.empty() ? "" : ", ");
+    }
     return Names;
   }
 
@@ -1049,6 +1089,15 @@ uintptr_t LookupByCode(uint64_t GuestRIP, uint64_t FaultPage) {
   }
   if (JobWait::Enabled && !JobWait::GetterAddress.load(std::memory_order_acquire) && Found(JobWait::Getter)) {
     return FoundGetter(GuestRIP, Code);
+  }
+  if (FrameClock::Enabled && !FrameClock::Address.load(std::memory_order_acquire) && Found(FrameClock::Function)) {
+    uint64_t Expected = 0;
+    if (FrameClock::Address.compare_exchange_strong(Expected, GuestRIP, std::memory_order_acq_rel)) {
+      __atomic_store_n(&FEXFrameMarkReturn, GuestRIP + FrameClock::ClockCallReturn, __ATOMIC_RELEASE);
+      FEX::Windows::StatsLogNote(
+        fextl::fmt::format("frames: timing every frame from the clock read at {:X}", GuestRIP + FrameClock::ClockCallReturn - 6));
+      FoundOne("frames", "frame function", GuestRIP, ImageBase + FrameClock::KnownRVA);
+    }
   }
   return 0;
 }

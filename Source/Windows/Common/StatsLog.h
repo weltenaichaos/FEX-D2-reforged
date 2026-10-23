@@ -38,4 +38,10 @@ void StatsLogSetLineProvider(fextl::string (*Provider)());
 
 // Names a native function that isn't exported (FEX's own native redirects) for the native-call sampler's "native" lines.
 void StatsLogNameNative(uint64_t Address, std::string_view Name);
+
+// Frame times: Marks[0] counts the frame starts written so far and Marks[1..RingSize] holds the last RingSize of them as
+// CNTVCT_EL0 values (RingSize a power of two), written by the game's main thread (FrameClock in ARM64EC/NativeRedirect.cpp).
+// The log then says every second how long the frames took and, with FEX_STATSLOG_PROFILE=1, what the main thread was doing
+// in every slow one.
+void StatsLogSetFrameMarks(const uint64_t* Marks, size_t RingSize);
 } // namespace FEX::Windows

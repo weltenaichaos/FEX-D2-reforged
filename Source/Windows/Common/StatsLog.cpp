@@ -74,6 +74,13 @@ namespace {
   constexpr size_t HitchOtherBlocksPrinted = 3;
   constexpr size_t MaxOtherSamples = 8192;
 
+  // Frame times (see StatsLogSetFrameMarks): a "frames" line every second, a "frames10s" line every FrameSummarySeconds,
+  // and with FEX_STATSLOG_PROFILE=1 a "# frame" line for every frame of SlowFrameMs or more with what Main was sampled
+  // doing during it, read from this and the previous second's samples.
+  constexpr double SlowFrameMs = 50.0;
+  constexpr size_t MaxSlowFrameLines = 1500;
+  constexpr uint64_t FrameSummarySeconds = 10;
+
   // Native-call sampler (with FEX_STATSLOG_PROFILE=1): ExitFunctionEC (ARM64EC/Module.S) stores the native function it
   // enters in the thread's CHPE CPU area (EmulatorDataInline). Samples of a thread outside emulated code count against the
   // last native function it entered from x86 code: a Wine/Windows API (named by the module's exports), one of FEX's own
@@ -268,6 +275,7 @@ namespace {
     // which can go on into the next second.
     struct MainSample {
       uint8_t Bin;
+      uint32_t At; // counter ticks since SecondStart
       uint64_t Header;
     };
     MainSample MainSamples[MaxMainSamples];
@@ -278,6 +286,7 @@ namespace {
       uint8_t Bin;
       bool In;
       uint32_t TID;
+      uint32_t At; // counter ticks since SecondStart
       uint64_t Value;
     };
     OtherSample OtherSamples[MaxOtherSamples];
@@ -300,6 +309,18 @@ namespace {
     };
     Run Busy;
     Run Idle;
+
+    // Frame times, see SlowFrameMs. The previous second's samples, for slow frames that began in it.
+    MainSample PrevMainSamples[MaxMainSamples];
+    size_t PrevMainSampleCount;
+    OtherSample PrevOtherSamples[MaxOtherSamples];
+    size_t PrevOtherSampleCount;
+    uint64_t PrevSecondStart;
+    uint64_t PrevSeconds;
+    uint64_t FramesRead;                // frame marks processed
+    uint64_t LastFrameStart;            // counter value of the last frame start, 0 before the first
+    fextl::vector<float> SummaryFrames; // frame times (ms) since the last frames10s line
+    size_t SlowFrameLines;
 
     // Names of native functions seen by the native-call sampler, and the export tables of the modules they are in.
     struct ModuleExports {
@@ -834,11 +855,10 @@ namespace {
     }
   }
 
-  fextl::string FormatRun(LogState* State, const LogState::Run& R, const char* Kind) {
-    fextl::vector<std::pair<uint32_t, uint64_t>> Blocks, Natives;
-    SplitCounts(R.Counts, Blocks, Natives);
-    auto Text = fextl::fmt::format("# {} t={}.{:02} {}ms full={}ms samples={} blocks={}:", Kind, R.StartSecond, R.StartBin, R.Bins * 10,
-                                   R.FullBins * 10, R.Samples, Blocks.size());
+  // The blocks and native functions of a run or slow frame, and the other threads busy in emulated code meanwhile.
+  fextl::string RunBody(LogState* State, const LogState::Run& R, const fextl::vector<std::pair<uint32_t, uint64_t>>& Blocks,
+                        const fextl::vector<std::pair<uint32_t, uint64_t>>& Natives) {
+    fextl::string Text;
     fextl::string Dumps;
     AppendBlocks(State, Blocks, HitchPrinted, HitchDumped, Text, Dumps);
     // Where the thread was outside emulated code during the run.
@@ -864,6 +884,14 @@ namespace {
       Text += fextl::fmt::format(" | +{} busy", Others.size() - HitchOthersPrinted);
     }
     return Text + "\n" + Dumps;
+  }
+
+  fextl::string FormatRun(LogState* State, const LogState::Run& R, const char* Kind) {
+    fextl::vector<std::pair<uint32_t, uint64_t>> Blocks, Natives;
+    SplitCounts(R.Counts, Blocks, Natives);
+    auto Text = fextl::fmt::format("# {} t={}.{:02} {}ms full={}ms samples={} blocks={}:", Kind, R.StartSecond, R.StartBin, R.Bins * 10,
+                                   R.FullBins * 10, R.Samples, Blocks.size());
+    return Text + RunBody(State, R, Blocks, Natives);
   }
 
   void StartRun(LogState::Run& R, uint64_t Seconds, size_t Bin) {
@@ -954,6 +982,128 @@ namespace {
     return Out;
   }
 
+  std::atomic<const uint64_t*> FrameMarks {};
+  size_t FrameMarkRingSize {};
+
+  // Where a counter value falls in the log's seconds, as "S.BB" (second, 10ms bin), for this or the previous second.
+  fextl::string FrameTime(const LogState* State, uint64_t Seconds, uint64_t At) {
+    const bool Current = At >= State->SecondStart;
+    const uint64_t Start = Current ? State->SecondStart : State->PrevSecondStart;
+    const uint64_t Bin = At > Start ? std::min<uint64_t>((At - Start) * TimelineBins / State->CounterFreq, TimelineBins - 1) : 0;
+    return fextl::fmt::format("{}.{:02}", Current ? Seconds : State->PrevSeconds, Bin);
+  }
+
+  // A "# frame" line: what Main was sampled doing from frame start Begin to the next frame start End, from this and the
+  // previous second's samples (an older start is noted as such).
+  fextl::string FormatSlowFrame(LogState* State, uint64_t Seconds, uint64_t Begin, uint64_t End, double Ms) {
+    LogState::Run R {};
+    auto Add = [&](const LogState::MainSample* Main, size_t MainCount, const LogState::OtherSample* Other, size_t OtherCount, uint64_t Start) {
+      for (size_t i = 0; i < MainCount; ++i) {
+        const uint64_t At = Start + Main[i].At;
+        if (At >= Begin && At < End) {
+          ++R.Counts[Main[i].Header];
+          ++R.Samples;
+        }
+      }
+      for (size_t i = 0; i < OtherCount; ++i) {
+        const uint64_t At = Start + Other[i].At;
+        if (At >= Begin && At < End) {
+          auto& T = R.Others[Other[i].TID];
+          ++T.Samples;
+          T.InSim += Other[i].In ? 1 : 0;
+          if (Other[i].Value) {
+            ++T.Counts[Other[i].Value];
+          }
+        }
+      }
+    };
+    if (State->PrevSecondStart) {
+      Add(State->PrevMainSamples, State->PrevMainSampleCount, State->PrevOtherSamples, State->PrevOtherSampleCount, State->PrevSecondStart);
+    }
+    Add(State->MainSamples, State->MainSampleCount, State->OtherSamples, State->OtherSampleCount, State->SecondStart);
+
+    fextl::vector<std::pair<uint32_t, uint64_t>> Blocks, Natives;
+    SplitCounts(R.Counts, Blocks, Natives);
+    uint32_t Emulated {};
+    for (const auto& B : Blocks) {
+      Emulated += B.first;
+    }
+    const bool Older = State->PrevSecondStart ? Begin < State->PrevSecondStart : Begin < State->SecondStart;
+    auto Text =
+      fextl::fmt::format("# frame t={} {:.0f}ms{} main samples={} emu={}%:", Older ? fextl::string("<") : FrameTime(State, Seconds, Begin),
+                         Ms, Older ? " (began before the samples kept)" : "", R.Samples, R.Samples ? Emulated * 100 / R.Samples : 0);
+    return Text + RunBody(State, R, Blocks, Natives);
+  }
+
+  // Frame times from the frame starts written up to the end of this second's sampling window, see SlowFrameMs.
+  fextl::string FrameLines(LogState* State, uint64_t Seconds) {
+    const uint64_t* Marks = FrameMarks.load(std::memory_order_acquire);
+    if (!Marks) {
+      return {};
+    }
+    const uint64_t Count = __atomic_load_n(&Marks[0], __ATOMIC_ACQUIRE);
+    const uint64_t WindowEnd = State->SecondStart + State->CounterFreq;
+    if (Count - State->FramesRead > FrameMarkRingSize) {
+      State->FramesRead = Count - FrameMarkRingSize;
+    }
+    const double MsPerTick = 1000.0 / static_cast<double>(State->CounterFreq);
+    fextl::vector<float> Frames;
+    fextl::string Slow;
+    while (State->FramesRead < Count) {
+      const uint64_t Start = __atomic_load_n(&Marks[1 + (State->FramesRead & (FrameMarkRingSize - 1))], __ATOMIC_RELAXED);
+      if (Start > WindowEnd) {
+        break; // after this second's samples, next second
+      }
+      ++State->FramesRead;
+      if (State->LastFrameStart && Start > State->LastFrameStart) {
+        const double Ms = static_cast<double>(Start - State->LastFrameStart) * MsPerTick;
+        Frames.push_back(static_cast<float>(Ms));
+        if (State->Profile && Ms >= SlowFrameMs && State->SlowFrameLines < MaxSlowFrameLines) {
+          ++State->SlowFrameLines;
+          Slow += FormatSlowFrame(State, Seconds, State->LastFrameStart, Start, Ms);
+        }
+      }
+      State->LastFrameStart = Start;
+    }
+
+    // Keep this second's samples for frames that end in the next one.
+    std::copy_n(State->MainSamples, State->MainSampleCount, State->PrevMainSamples);
+    State->PrevMainSampleCount = State->MainSampleCount;
+    std::copy_n(State->OtherSamples, State->OtherSampleCount, State->PrevOtherSamples);
+    State->PrevOtherSampleCount = State->OtherSampleCount;
+    State->PrevSecondStart = State->SecondStart;
+    State->PrevSeconds = Seconds;
+
+    auto Summary = [](fextl::vector<float>& F) {
+      std::sort(F.begin(), F.end());
+      double Sum {};
+      size_t Over[4] {};
+      for (const float Ms : F) {
+        Sum += Ms;
+        Over[0] += Ms >= 40.0f;
+        Over[1] += Ms >= 50.0f;
+        Over[2] += Ms >= 67.0f;
+        Over[3] += Ms >= 100.0f;
+      }
+      const auto At = [&F](double Fraction) {
+        return F[std::min(F.size() - 1, static_cast<size_t>(Fraction * static_cast<double>(F.size())))];
+      };
+      return fextl::fmt::format("n={} avg={:.1f} p50={:.1f} p90={:.1f} p99={:.1f} max={:.1f}ms >=40ms:{} >=50ms:{} >=67ms:{} >=100ms:{}",
+                                F.size(), Sum / static_cast<double>(F.size()), At(0.5), At(0.9), At(0.99), F.back(), Over[0], Over[1],
+                                Over[2], Over[3]);
+    };
+    fextl::string Out;
+    if (!Frames.empty()) {
+      State->SummaryFrames.insert(State->SummaryFrames.end(), Frames.begin(), Frames.end());
+      Out += fextl::fmt::format("  frames {}\n", Summary(Frames));
+    }
+    if (Seconds % FrameSummarySeconds == 0 && !State->SummaryFrames.empty()) {
+      Out += fextl::fmt::format("  frames{}s {}\n", FrameSummarySeconds, Summary(State->SummaryFrames));
+      State->SummaryFrames.clear();
+    }
+    return Out + Slow;
+  }
+
   // Waits one second, polling the sampled threads' InSimulation flag every few milliseconds.
   void SampleFor1s(LogState* State) {
     const uint64_t Start = GetCounter();
@@ -981,7 +1131,7 @@ namespace {
         T.InSimulationSamples += In ? 1 : 0;
         if (In && T.IsMain && T.BlockHeader && State->MainSampleCount < MaxMainSamples) {
           if (const uint64_t Header = *T.BlockHeader) {
-            State->MainSamples[State->MainSampleCount++] = {static_cast<uint8_t>(Bin), Header};
+            State->MainSamples[State->MainSampleCount++] = {static_cast<uint8_t>(Bin), static_cast<uint32_t>(Now - Start), Header};
           }
         }
         uint64_t NativeTarget {};
@@ -990,13 +1140,14 @@ namespace {
             NativeTarget = Target;
             CountNative(T, Target);
             if (T.IsMain && State->MainSampleCount < MaxMainSamples) {
-              State->MainSamples[State->MainSampleCount++] = {static_cast<uint8_t>(Bin), Target | NativeSampleFlag};
+              State->MainSamples[State->MainSampleCount++] = {static_cast<uint8_t>(Bin), static_cast<uint32_t>(Now - Start),
+                                                              Target | NativeSampleFlag};
             }
           }
         }
         if (State->Profile && !T.IsMain && State->OtherSampleCount < MaxOtherSamples) {
           const uint64_t Value = In ? (T.BlockHeader ? *T.BlockHeader : 0) : (NativeTarget ? NativeTarget | NativeSampleFlag : 0);
-          State->OtherSamples[State->OtherSampleCount++] = {static_cast<uint8_t>(Bin), In, T.TID, Value};
+          State->OtherSamples[State->OtherSampleCount++] = {static_cast<uint8_t>(Bin), In, T.TID, static_cast<uint32_t>(Now - Start), Value};
         }
         if (T.BinSamples[Bin] < 255) {
           ++T.BinSamples[Bin];
@@ -1370,6 +1521,7 @@ namespace {
         }
       }
 
+      Line += FrameLines(State, Seconds);
       if (State->Profile) {
         Line += MainHitches(State, Seconds);
       }
@@ -1565,8 +1717,13 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "Wine, VKD3D, driver); dco = why compiles missed the disk cache and what happened to the code "
                                    "compiled instead; io = page faults that read storage, and storage reads; with FEX_STATSLOG_PROFILE=1, "
                                    "'# hitch' / '# stall' = Main ran emulated code / no emulated code for 100ms or more, with the other "
-                                   "threads that were busy in emulated code meanwhile; jobwait = the game's frame wait loop: tries that found "
-                                   "nothing to run (idle) or found jobs, time paused, longest uninterrupted idle wait\n",
+                                   "threads that were busy in emulated code meanwhile; jobwait = the game's frame wait loop: tries that "
+                                   "found "
+                                   "nothing to run (idle) or found jobs, time paused, longest uninterrupted idle wait; frames = time from "
+                                   "one game frame "
+                                   "start to the next (count, average, median, 90th/99th percentile, longest, how many took 40/50/67/100ms "
+                                   "or more), frames10s = the same over 10 seconds; '# frame' = a frame of 50ms or more with what Main and "
+                                   "the busy threads were doing in it\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
@@ -1616,6 +1773,11 @@ void StatsLogDiskCacheHit(uint64_t GuestRIP) {
 
 void StatsLogSetLineProvider(fextl::string (*Provider)()) {
   LineProvider.store(Provider, std::memory_order_release);
+}
+
+void StatsLogSetFrameMarks(const uint64_t* Marks, size_t RingSize) {
+  FrameMarkRingSize = RingSize;
+  FrameMarks.store(Marks, std::memory_order_release);
 }
 
 void StatsLogNameNative(uint64_t Address, std::string_view Name) {

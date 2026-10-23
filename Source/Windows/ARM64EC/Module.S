@@ -78,6 +78,14 @@ ExitFunctionSuspendResumePoint:
   cmp w23, w16
   beq ret_sp_aligned
 
+  // A call into native code. If its x64 return address is the game's once-per-frame clock read (FEXFrameMarkReturn, set
+  // by NativeRedirect.cpp once found), store the time in the FEXFrameMarks ring for the stats log's frame times. x4 and lr
+  // are set again below before use, x16 is not used again, and frame_mark_check reloads x23.
+  adrp x16, FEXFrameMarkReturn
+  ldr x16, [x16, #:lo12:FEXFrameMarkReturn]
+  cbnz x16, frame_mark_check
+frame_mark_done:
+
   and x23, x23, #-0x4
   add x17, x17, x23 // Resolve entry thunk address.
 
@@ -96,6 +104,23 @@ ret_sp_misaligned:
   adrp lr, X64ReturnInstr
   ldr lr, [lr, #:lo12:X64ReturnInstr]
   br x17
+
+frame_mark_check:
+  mov x4, sp // sp may be only 8-byte aligned here, and loads through a misaligned sp fault
+  ldr x4, [x4]
+  cmp x4, x16
+  b.ne frame_mark_done
+  mrs x4, cntvct_el0
+  adrp x16, FEXFrameMarks
+  add x16, x16, #:lo12:FEXFrameMarks
+  ldr lr, [x16] // FEXFrameMarks[0]: marks written so far, then a ring of 1024 times
+  and x23, lr, #0x3ff
+  add x23, x16, x23, lsl #3
+  str x4, [x23, #8]
+  add lr, lr, #1
+  stlr lr, [x16]
+  ldursw x23, [x17, #-0x4]
+  b frame_mark_done
 
 .global ExitFunctionSuspendPoint
 ExitFunctionSuspendPoint:
