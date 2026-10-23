@@ -22,9 +22,9 @@ $end_info$
 // A function is found by its code, not by its address: game updates move code and data around (the 2026-10 update moved
 // these functions by 0x390-0x700 bytes and the data by 0x2000), so until everything is found the first bytes of every
 // block the JIT compiles in the main executable are compared with each function's first bytes. Fields that hold a
-// RIP-relative displacement or a call's target are skipped in that comparison; the data those fields point at is found
-// from the matched code (job system) or searched for near where the last known version had it (MD5 round tables).
-// Anything that isn't found stays emulated.
+// RIP-relative displacement, a call's target or a table's offset are skipped in that comparison; the data those fields
+// point at is found from the matched code (job system, MD5 round tables) or searched for near where the last known
+// version had it (the frame wait loop's call). Anything that isn't found stays emulated.
 
 #include "NativeRedirect.h"
 #include "NativeStats.h"
@@ -91,13 +91,19 @@ namespace {
     0x83, 0xe8, 0x01, 0x75, 0xed, 0x81, 0xf9, 0xf1, 0xff, 0x00, 0x00, 0x44, 0x8d, 0x81, 0x0f, 0x00, 0xff, 0xff,
   };
 
+  // The MD5 transform up to the end of its first round loop, which shows where the round tables are (offsets below).
   constexpr uint8_t MD5TransformSignature[] = {
     0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
-    0x41, 0x57, 0x48, 0x83, 0xec, 0x50, 0x48, 0x8b, 0x05, 0xd5, 0x92, 0xdb, 0x00, 0x48, 0x33, 0xc4, 0x48, 0x89, 0x44, 0x24, 0x40, 0x8b,
-    0x02, 0x4c, 0x8d, 0x25, 0x4c, 0xf1, 0x43, 0xff, 0x8b, 0x71, 0x08, 0x41, 0xbe, 0x10, 0x00, 0x00, 0x00, 0x8b, 0x59, 0x0c, 0x4c, 0x8b,
+    0x41, 0x57, 0x48, 0x83, 0xec, 0x50, 0x48, 0x8b, 0x05, 0xd5, 0xab, 0xdb, 0x00, 0x48, 0x33, 0xc4, 0x48, 0x89, 0x44, 0x24, 0x40, 0x8b,
+    0x02, 0x4c, 0x8d, 0x25, 0x4c, 0xea, 0x43, 0xff, 0x8b, 0x71, 0x08, 0x41, 0xbe, 0x10, 0x00, 0x00, 0x00, 0x8b, 0x59, 0x0c, 0x4c, 0x8b,
     0xf9, 0x44, 0x8b, 0x51, 0x10, 0x45, 0x33, 0xc9, 0x44, 0x8b, 0x59, 0x14, 0x41, 0x8b, 0xfe, 0x89, 0x04, 0x24, 0x8b, 0x42, 0x04, 0x89,
     0x44, 0x24, 0x04, 0x8b, 0x42, 0x08, 0x89, 0x44, 0x24, 0x08, 0x8b, 0x42, 0x0c, 0x89, 0x44, 0x24, 0x0c, 0x8b, 0x42, 0x10, 0x89, 0x44,
-    0x24, 0x10, 0x8b, 0x42, 0x14, 0x89, 0x44, 0x24, 0x14, 0x8b, 0x42, 0x18, 0x89, 0x44, 0x24, 0x18, 0x8b, 0x42,
+    0x24, 0x10, 0x8b, 0x42, 0x14, 0x89, 0x44, 0x24, 0x14, 0x8b, 0x42, 0x18, 0x89, 0x44, 0x24, 0x18, 0x8b, 0x42, 0x1c, 0x89, 0x44, 0x24,
+    0x1c, 0x8b, 0x42, 0x20, 0x89, 0x44, 0x24, 0x20, 0x8b, 0x42, 0x24, 0x89, 0x44, 0x24, 0x24, 0x8b, 0x42, 0x28, 0x89, 0x44, 0x24, 0x28,
+    0x8b, 0x42, 0x2c, 0x89, 0x44, 0x24, 0x2c, 0x8b, 0x42, 0x30, 0x89, 0x44, 0x24, 0x30, 0x8b, 0x42, 0x34, 0x89, 0x44, 0x24, 0x34, 0x8b,
+    0x42, 0x38, 0x89, 0x44, 0x24, 0x38, 0x8b, 0x42, 0x3c, 0x89, 0x44, 0x24, 0x3c, 0x0f, 0x1f, 0x00, 0x43, 0x0f, 0xb6, 0x84, 0x21, 0xd0,
+    0x97, 0x69, 0x01, 0x41, 0x8b, 0xd3, 0x43, 0x0f, 0xb6, 0x8c, 0x21, 0x90, 0x97, 0x69, 0x01, 0x4d, 0x8d, 0x49, 0x01, 0x41, 0x33, 0xd2,
+    0x23, 0xd3, 0x44, 0x8b, 0x04, 0x84, 0x41, 0x33, 0xd3, 0x44, 0x03, 0xc2, 0x47, 0x03, 0x84, 0x8c, 0x8c, 0x96, 0x69, 0x01,
   };
 
   constexpr uint8_t MD5UpdateSignature[] = {
@@ -109,9 +115,17 @@ namespace {
     0xca, 0x44, 0x8b, 0xc0, 0x48, 0x8b, 0xd5, 0x8b, 0xf8, 0xe8, 0x94, 0x0c, 0x9a, 0x00, 0x01, 0x7b, 0x18, 0x48,
   };
 
-  // Offsets of the 4-byte fields skipped when comparing: RIP-relative displacements and call targets.
-  constexpr uint8_t MD5TransformRel32[] = {0x1f, 0x30}; // security cookie; lea r12, [image base]
-  constexpr uint8_t MD5UpdateRel32[] = {0x44, 0x78};    // call md5block; call memcpy
+  // Offsets of the 4-byte fields skipped when comparing: RIP-relative displacements, call targets and table offsets.
+  // The MD5 transform loads the image base into r12 (lea at 0x2d), then its first round loop reads the round tables at
+  // offsets from it: movzx eax, byte [r9+r12+order]; movzx ecx, byte [r9+r12+shifts]; add r8d, [r12+r9*4+sines-4] (r9
+  // already counts the next step there).
+  constexpr uint8_t MD5TransformImageBase = 0x30;
+  constexpr uint8_t MD5TransformOrder = 0xc5;
+  constexpr uint8_t MD5TransformShifts = 0xd1;
+  constexpr uint8_t MD5TransformSines = 0xec;
+  constexpr uint8_t MD5TransformRel32[] = {0x1f, MD5TransformImageBase, MD5TransformOrder, MD5TransformShifts, MD5TransformSines};
+  constexpr uint8_t MD5UpdateCallTransform = 0x44;
+  constexpr uint8_t MD5UpdateRel32[] = {MD5UpdateCallTransform, 0x78}; // call md5block; call memcpy
 
   struct Pattern {
     const uint8_t* Bytes;
@@ -119,6 +133,8 @@ namespace {
     const uint8_t* Rel32;
     size_t Rel32Count;
   };
+
+  constexpr Pattern MD5TransformPattern {MD5TransformSignature, sizeof(MD5TransformSignature), MD5TransformRel32, sizeof(MD5TransformRel32)};
 
   // Compares the first Size bytes of Code with the pattern (Size <= P.Size).
   bool Matches(const Pattern& P, const uint8_t* Code, size_t Size) {
@@ -142,12 +158,9 @@ namespace {
 
   // Bytes always read for a compiled block, even when its page ends sooner.
   constexpr size_t PrefixSize = 16;
-  constexpr size_t MaxPatternSize = 192;
+  constexpr size_t MaxPatternSize = 256;
 
-  // Where the last known version of the game had things (D2R.exe base 0x140000000, before the 2026-10 update). Only used
-  // as the starting point of searches and in notes.
-  constexpr uint32_t KnownMD5TablesRVA = 0x16976A0;
-  // How far from the last known place the MD5 tables and the frame wait loop's call are searched for.
+  // How far from the last known place the frame wait loop's call is searched for.
   constexpr uint64_t SearchRadius = 4 * 1024 * 1024;
   // Compiled blocks looked at before giving up on functions that weren't found.
   constexpr uint32_t MaxSearchedBlocks = 300000;
@@ -191,7 +204,7 @@ namespace {
   struct Target {
     const char* Name;
     Group Group;
-    uint32_t KnownRVA;
+    uint32_t KnownRVA; // where the last known version had it (2026-10 update), for notes
     Pattern Code;
     void* Stub;
     FEXNativeCallStats* Stats;
@@ -205,30 +218,30 @@ namespace {
   Target Targets[] = {
     {"inflate_fast",
      Group::Zlib,
-     0xBD2090,
+     0xBD2790,
      {InflateFastSignature, sizeof(InflateFastSignature), nullptr, 0},
      &NativeInflateFastRedirect,
      &FEXNativeInflateFastStats,
      &NativeInflateFastTarget},
-    {"adler32_z", Group::Zlib, 0xBD17F0, {Adler32ZSignature, sizeof(Adler32ZSignature), nullptr, 0}, &NativeAdler32ZRedirect, &FEXNativeAdler32ZStats, &NativeAdler32ZTarget},
+    {"adler32_z", Group::Zlib, 0xBD1EF0, {Adler32ZSignature, sizeof(Adler32ZSignature), nullptr, 0}, &NativeAdler32ZRedirect, &FEXNativeAdler32ZStats, &NativeAdler32ZTarget},
     {"md5",
      Group::MD5,
-     0xBC10F0,
+     0xBC17F0,
      {MD5UpdateSignature, sizeof(MD5UpdateSignature), MD5UpdateRel32, sizeof(MD5UpdateRel32)},
      &NativeMD5UpdateRedirect,
      &FEXNativeMD5UpdateStats,
      &NativeMD5UpdateTarget},
-    {"md5block",
-     Group::MD5,
-     0xBC0E80,
-     {MD5TransformSignature, sizeof(MD5TransformSignature), MD5TransformRel32, sizeof(MD5TransformRel32)},
-     &NativeMD5TransformRedirect,
-     &FEXNativeMD5TransformStats,
-     &NativeMD5TransformTarget},
+    {"md5block", Group::MD5, 0xBC1580, MD5TransformPattern, &NativeMD5TransformRedirect, &FEXNativeMD5TransformStats, &NativeMD5TransformTarget},
   };
 
   bool ZlibEnabled {};
   bool MD5Enabled {};
+  // Drops the JIT's code for a guest range, so the next call asks Lookup again.
+  void (*InvalidateCode)(uint64_t Address, uint64_t Size) {};
+  // An MD5 target was found but its round tables couldn't be read yet: PreCompile checks again every 50 ms.
+  std::atomic<bool> MD5Pending {};
+  std::atomic<uint64_t> MD5NextRetry {};
+  uint32_t MD5Retries {};
   bool UnpackCacheRequested {};
   std::mutex UnpackCacheLock;
   std::atomic<bool> UnpackCacheOpened {};
@@ -312,52 +325,72 @@ namespace {
     return Unreadable ? ScanResult::Unreadable : ScanResult::NotFound;
   }
 
-  // The MD5 round tables: shifts, message word order and sines, back to back.
-  struct MD5Tables {
-    uint8_t Shifts[64];
-    uint8_t Order[64];
-    uint32_t Sines[64];
-  };
-  static_assert(sizeof(MD5Tables) == 384);
-
+  // Checks the round tables the game's MD5 transform at Transform reads; NativeMD5.c hard-codes the standard ones, so
+  // they must match. The 2026-10 update reordered the three tables, so their places are read from the transform's code.
+  // Remembers the answer for the first transform whose tables it could read; Unreadable leaves the target unchecked, and
+  // PreCompile tries again. Reads with NtReadVirtualMemory.
   std::mutex MD5TablesLock;
-  bool MD5TablesSearched {};
-  uint64_t MD5TablesAddress {};
+  uint64_t MD5TablesTransform {};
+  bool MD5TablesStandard {};
+  uint32_t MD5TablesUnreadable {};
 
-  // Finds the game's MD5 round tables near where the last known version had them. Searched once.
-  uint64_t FindMD5Tables() {
+  CheckResult CheckMD5Tables(uint64_t Transform) {
     std::scoped_lock Guard {MD5TablesLock};
-    if (MD5TablesSearched) {
-      return MD5TablesAddress;
+    if (MD5TablesTransform) {
+      return MD5TablesTransform == Transform && MD5TablesStandard ? CheckResult::Match : CheckResult::Mismatch;
     }
-    MD5TablesSearched = true;
-    const auto Result =
-      ScanNear(ImageBase + KnownMD5TablesRVA, ImageBase, ImageEnd, sizeof(MD5Tables), [](uint64_t At, const uint8_t* Data, size_t Size) {
-        for (size_t i = 0; i + sizeof(MD5Tables) <= Size; ++i) {
-          if (Data[i] == MD5Shifts[0] && memcmp(Data + i + offsetof(MD5Tables, Shifts), MD5Shifts, sizeof(MD5Shifts)) == 0 &&
-              memcmp(Data + i + offsetof(MD5Tables, Order), MD5Order, sizeof(MD5Order)) == 0 &&
-              memcmp(Data + i + offsetof(MD5Tables, Sines), MD5Sines, sizeof(MD5Sines)) == 0) {
-            MD5TablesAddress = At + i;
-            return true;
-          }
-        }
-        return false;
-      });
+    const auto Unreadable = [&](const char* What, uint64_t Address) {
+      if (MD5TablesUnreadable++ == 0) {
+        FEX::Windows::StatsLogNote(fextl::fmt::format("native md5: can't read {} at {:X} yet, tries again later", What, Address));
+      }
+      return CheckResult::Unreadable;
+    };
+    uint8_t Code[sizeof(MD5TransformSignature)];
+    if (!Read(Transform, Code, sizeof(Code))) {
+      return Unreadable("md5block's code", Transform);
+    }
+    if (!Matches(MD5TransformPattern, Code, sizeof(Code))) {
+      FEX::Windows::StatsLogNote(fextl::fmt::format("native md5: md5 calls {:X}, which isn't md5block's code, md5 stays emulated: {}",
+                                                    Transform, Hex(Code, sizeof(Code))));
+      return CheckResult::Mismatch;
+    }
+    const uint64_t Base = Transform + MD5TransformImageBase + 4 + Rel32At(Code, MD5TransformImageBase);
+    const uint64_t Shifts = Base + Rel32At(Code, MD5TransformShifts);
+    const uint64_t Order = Base + Rel32At(Code, MD5TransformOrder);
+    const uint64_t Sines = Base + Rel32At(Code, MD5TransformSines) + 4;
+    uint8_t GameShifts[64], GameOrder[64];
+    uint32_t GameSines[64];
+    if (!Read(Shifts, GameShifts, sizeof(GameShifts)) || !Read(Order, GameOrder, sizeof(GameOrder)) || !Read(Sines, GameSines, sizeof(GameSines))) {
+      return Unreadable("md5block's round tables", Shifts);
+    }
+    const bool ShiftsOk = memcmp(GameShifts, MD5Shifts, sizeof(MD5Shifts)) == 0;
+    const bool OrderOk = memcmp(GameOrder, MD5Order, sizeof(MD5Order)) == 0;
+    const bool SinesOk = memcmp(GameSines, MD5Sines, sizeof(MD5Sines)) == 0;
+    MD5TablesTransform = Transform;
+    MD5TablesStandard = ShiftsOk && OrderOk && SinesOk;
     FEX::Windows::StatsLogNote(
-      Result == ScanResult::Found ?
-        fextl::fmt::format("native md5: standard MD5 round tables at {:X} (last known at {:X})", MD5TablesAddress, ImageBase + KnownMD5TablesRVA) :
-        fextl::fmt::format("native md5: no standard MD5 round tables within {} MB of {:X}{}, MD5 stays emulated", SearchRadius >> 20,
-                           ImageBase + KnownMD5TablesRVA, Result == ScanResult::Unreadable ? " (some pages unreadable)" : ""));
-    return MD5TablesAddress;
+      MD5TablesStandard ?
+        fextl::fmt::format("native md5: md5block reads standard MD5 round tables (shifts {:X}, order {:X}, sines {:X})", Shifts, Order, Sines) :
+        fextl::fmt::format("native md5: md5block's round tables are not standard MD5 (shifts {:X} {}, order {:X} {}, sines {:X} {}), MD5 "
+                           "stays emulated",
+                           Shifts, ShiftsOk ? "ok" : "differ", Order, OrderOk ? "ok" : "differ", Sines, SinesOk ? "ok" : "differ"));
+    return MD5TablesStandard ? CheckResult::Match : CheckResult::Mismatch;
   }
 
-  // Checks the parts of a target beyond its code: NativeMD5.c hard-codes the standard round tables, so the game's must
-  // be the standard ones.
+  // Checks the parts of a target beyond its code: the round tables of the MD5 transform it is or calls.
   CheckResult CheckExtra(Target& T) {
     if (T.Group != Group::MD5) {
       return CheckResult::Match;
     }
-    return FindMD5Tables() ? CheckResult::Match : CheckResult::Mismatch;
+    const uint64_t RIP = T.GuestRIP.load(std::memory_order_relaxed);
+    if (T.Stub == &NativeMD5TransformRedirect) {
+      return CheckMD5Tables(RIP);
+    }
+    int32_t Call;
+    if (!Read(RIP + MD5UpdateCallTransform, &Call, sizeof(Call))) {
+      return CheckResult::Unreadable;
+    }
+    return CheckMD5Tables(RIP + MD5UpdateCallTransform + 4 + Call);
   }
 
   // Opens the unpack cache once the game's inflate_fast is found, so other processes started with the same settings
@@ -377,6 +410,10 @@ namespace {
   // Arms a target whose code was found.
   uintptr_t Check(Target& T) {
     const auto Result = CheckExtra(T);
+    if (Result == CheckResult::Unreadable) {
+      MD5Pending.store(true, std::memory_order_relaxed);
+      return 0;
+    }
     if (Result != CheckResult::Match) {
       T.State.store(TargetState::Rejected, std::memory_order_release);
       return 0;
@@ -562,18 +599,18 @@ namespace {
   //
   //   do { JobSystem()->Queue->TryRunJob(priority 2) } while (finished task bits != all tasks)
   //
-  // TryRunJob (0x1407B7700) takes the queue's spinlock (xchg + pause), looks at the priority 2 list and releases the
+  // TryRunJob (0x1407B7A90) takes the queue's spinlock (xchg + pause), looks at the priority 2 list and releases the
   // lock. With nothing to run, the loop retakes the lock every few hundred nanoseconds. A worker that wants to queue a
-  // job (0x1407B7210) has to win the same lock between two of those, and on these cores it can lose for hundreds of
+  // job (0x1407B75A0) has to win the same lock between two of those, and on these cores it can lose for hundreds of
   // milliseconds: build 41 logs show the worst frames (190-570 ms) as Main spinning here while one worker spends the
-  // whole time in that lock. The loop asks for the job system singleton (0x1407B75B0, an MSVC thread-safe static) right
+  // whole time in that lock. The loop asks for the job system singleton (0x1407B7940, an MSVC thread-safe static) right
   // before each TryRunJob. Running that getter natively lets the wait loop's call pause for a moment when the priority 2
   // list is empty, so the lock stays free for the workers; every other caller just gets the object back.
   namespace JobWait {
     // Where the last known version had the getter and the wait loop's call of it: the call is searched for starting
     // there (moved by as much as the getter moved).
-    constexpr uint32_t KnownGetterRVA = 0x7B75B0;
-    constexpr uint32_t KnownCallSiteRVA = 0x8764A8;
+    constexpr uint32_t KnownGetterRVA = 0x7B7940;
+    constexpr uint32_t KnownCallSiteRVA = 0x876948;
     constexpr uint64_t QueueOffset = 0x1A0; // job system -> queue the wait loop helps with
     constexpr uint64_t ListOffset = 0x38;   // queue -> list head of priority 2 jobs (empty when it points to itself)
 
@@ -760,6 +797,7 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
   ZlibEnabled = Zlib && Zlib[0] == '1';
   MD5Enabled = MD5 && MD5[0] == '1';
   ImageBase = MainImageBase;
+  InvalidateCode = Invalidate;
   for (auto& T : Targets) {
     if (StatsLog) {
       FEX::Windows::StatsLogNameNative(reinterpret_cast<uint64_t>(T.Entry), fextl::fmt::format("fex:{}", T.Name));
@@ -827,7 +865,36 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
   }
 }
 
+namespace {
+  // Checks the MD5 targets waiting for readable round tables again, and drops the emulated code of those that now match.
+  void RetryMD5() {
+    const uint64_t Now = NowTicks();
+    uint64_t Due = MD5NextRetry.load(std::memory_order_relaxed);
+    if (Now < Due || !MD5NextRetry.compare_exchange_strong(Due, Now + TickFrequency / 20, std::memory_order_relaxed)) {
+      return;
+    }
+    // Only this thread got past the exchange for this retry.
+    MD5Pending.store(false, std::memory_order_relaxed);
+    const bool GiveUp = ++MD5Retries > 2000;
+    for (auto& T : Targets) {
+      const uint64_t RIP = T.GuestRIP.load(std::memory_order_acquire);
+      if (T.Group != Group::MD5 || !RIP || T.State.load(std::memory_order_acquire) != TargetState::Unchecked) {
+        continue;
+      }
+      if (GiveUp) {
+        T.State.store(TargetState::Rejected, std::memory_order_release);
+        FEX::Windows::StatsLogNote(fextl::fmt::format("native md5: the round tables never became readable, {} stays emulated", T.Name));
+      } else if (Check(T) && InvalidateCode) {
+        InvalidateCode(RIP, 1);
+      }
+    }
+  }
+} // namespace
+
 void PreCompile() {
+  if (MD5Pending.load(std::memory_order_relaxed)) {
+    RetryMD5();
+  }
   if (!JobWait::Pending.load(std::memory_order_relaxed)) {
     return;
   }
