@@ -7,18 +7,23 @@
 #
 # vkd3d-proton ships no ARM64EC cross file, so both are written here. Uses the
 # same bylaws llvm-mingw as build-fexcore-wcp.yml.
+#
+# vkd3d-patches/*.patch from this repo go on top of the tag, in name order
+# (build 55: clear folding, GPU pass meter, present timeline; FEX's switches
+# turn them on, see Source/Windows/Common/EnvironmentVariablesHandling.h).
 name: Build VKD3D ARM64EC WCP
 
 on:
   push:
     branches: [ d2r/clean ]
-    paths: [ .github/workflows/build-vkd3d-arm64ec-wcp.yml ]
+    paths: [ .github/workflows/build-vkd3d-arm64ec-wcp.yml, vkd3d-patches/** ]
   workflow_dispatch:
 
 env:
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
   VKD3D_TAG: v3.0b
-  WCP_VERSION: 3.0b-arm64ec
+  WCP_VERSION: 3.0b-arm64ec-fex1
+  WCP_VERSION_CODE: 2
 
 jobs:
   build:
@@ -32,6 +37,20 @@ jobs:
           repository: HansKristian-Work/vkd3d-proton
           ref: ${{ env.VKD3D_TAG }}
           submodules: recursive
+
+      - name: Checkout FEX patches
+        uses: actions/checkout@v4
+        with:
+          path: fex-src
+          sparse-checkout: vkd3d-patches
+
+      - name: Apply FEX patches
+        run: |
+          for p in fex-src/vkd3d-patches/*.patch; do
+            echo "Applying $p"
+            git apply --verbose "$p"
+          done
+          git diff --stat
 
       - name: Install build dependencies
         run: |
@@ -104,8 +123,8 @@ jobs:
           {
             "type": "VKD3D",
             "versionName": "${WCP_VERSION}",
-            "versionCode": 1,
-            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64). FEX-D2-reforged build from ${GITHUB_SHA}.",
+            "versionCode": ${WCP_VERSION_CODE},
+            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline). Build from ${GITHUB_SHA}.",
             "files": [
               {"source": "system32/d3d12.dll",     "target": "\${system32}/d3d12.dll"},
               {"source": "system32/d3d12core.dll", "target": "\${system32}/d3d12core.dll"},
@@ -134,7 +153,9 @@ jobs:
           prerelease: true
           body: |
             vkd3d-proton ${{ env.VKD3D_TAG }} compiled as ARM64EC, so D3D12 translation runs
-            natively instead of through FEX. Install in GameNative as a VKD3D content profile;
-            it appears as `${{ env.WCP_VERSION }}`.
+            natively instead of through FEX, with this repo's vkd3d-patches: full clears folded
+            into the next render pass, a GPU pass meter and a present timeline for FEX's stats log
+            (all off unless FEX's switches set their variables). Install in GameNative as a VKD3D
+            content profile; it appears as `${{ env.WCP_VERSION }}`.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

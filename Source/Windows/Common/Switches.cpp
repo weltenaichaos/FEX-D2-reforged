@@ -20,12 +20,17 @@ namespace {
     {"FEX_STATSLOG", "D:\\"}, // where the tests' logs have gone so far
     {"FEX_STATSLOG_PROFILE", "1"},
 #endif
-    {"FEX_NATIVE_ZLIB", "1"},      {"FEX_NATIVE_MD5", "1"}, {"FEX_UNPACK_CACHE", "1"},
+    {"FEX_NATIVE_ZLIB", "1"},
+    {"FEX_NATIVE_MD5", "1"},
+    {"FEX_UNPACK_CACHE", "1"},
     // Build 48: no thread at extreme Linux nice values (see PriorityGuard.h, Threads.cpp).
-    {"FEX_PRIO", "normal"},        {"FEX_HELPER_PRIO", "normal"},
+    {"FEX_PRIO", "normal"},
+    {"FEX_HELPER_PRIO", "normal"},
     // Build 49: the main thread alone on the fastest core, FEX's helpers on the slowest, the wineserver above the game
     // (see PriorityGuard.h).
-    {"FEX_MAINCORE", "fast"},      {"FEX_HELPER_CORES", "little"}, {"FEX_SERVER_NICE", "-10"},
+    {"FEX_MAINCORE", "fast"},
+    {"FEX_HELPER_CORES", "little"},
+    {"FEX_SERVER_NICE", "-10"},
     // Build 51: the main thread may leave its core while it waits 40 ms a second or more for it (see PriorityGuard.h).
     {"FEX_MAINCORE_WAIT", "40"},
     // Build 50 tried one more frame in flight on the swapchain's frame latency handle (FEX_FRAMELATENCY=2). Heavy scenes
@@ -41,6 +46,12 @@ namespace {
     // second for 5-20 s every ~45 s in the build 48-52 logs) stops being write-protected; its code checks itself instead
     // (see Common/InvalidationTracker.h).
     {"FEX_SMC_HOTPAGE", "16"},
+    // Build 55: FEX's vkd3d-proton build folds full clears into the next render pass (the build 54 heavy scenes were GPU
+    // bound at its top clock), times every render pass on the GPU and each frame's way from Present() to the window
+    // system (see EnvironmentVariablesHandling.h).
+    {"FEX_VKD3D_FOLD_CLEARS", "1"},
+    {"FEX_VKD3D_PASSES", "1"},
+    {"FEX_VKD3D_TIMELINE", "1"},
   };
 
   // In the order the stats log lists them.
@@ -80,6 +91,9 @@ namespace {
     "FEX_RUMBLE",
     "FEX_RUMBLE_MS",
     "FEX_SMC_HOTPAGE",
+    "FEX_VKD3D_FOLD_CLEARS",
+    "FEX_VKD3D_PASSES",
+    "FEX_VKD3D_TIMELINE",
   };
 
   bool UseD2RDefaults {};

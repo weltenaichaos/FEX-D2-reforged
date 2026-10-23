@@ -1,0 +1,2076 @@
+diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
+index abd56d6..7ac5e89 100644
+--- a/libs/d3d12core/d3d12core.def
++++ b/libs/d3d12core/d3d12core.def
+@@ -3,3 +3,5 @@ LIBRARY d3d12core.dll
+ EXPORTS
+     D3D12GetInterface
+     D3D12SDKVersion DATA PRIVATE
++    vkd3d_fex_pass_report DATA
++    vkd3d_fex_present_report DATA
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 7396504..1680fc3 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2097,6 +2097,10 @@ static HRESULT d3d12_command_list_begin_command_buffer(struct d3d12_command_list
+     list->is_recording = true;
+     list->is_valid = true;
+ 
++    vkd3d_fex_pass_meter_begin_list(list);
++    list->fex_clears.count = 0;
++    list->fex_clears.keep = false;
++
+     return S_OK;
+ }
+ 
+@@ -3879,6 +3883,196 @@ void d3d12_command_list_debug_mark_end_region(struct d3d12_command_list *list)
+     }
+ }
+ 
++/* FEX clear folding, see struct vkd3d_fex_pending_clear. Only full clears of a whole 2D view (all of its aspects) wait;
++ * anything else that may touch a waiting clear's image first emits it as the render pass it would have been. */
++static bool d3d12_command_list_fex_can_defer_clear(struct d3d12_command_list *list, const struct d3d12_resource *resource,
++        const struct vkd3d_view *view, VkImageAspectFlags clear_aspects, UINT rect_count, VkAttachmentLoadOp load_op)
++{
++    unsigned int i;
++
++    if (!list->device->fex_fold_clears || load_op != VK_ATTACHMENT_LOAD_OP_CLEAR || rect_count)
++        return false;
++    /* Only between render passes; a suspended pass must resume next with nothing in between. */
++    if (list->rendering_info.state_flags & (VKD3D_RENDERING_ACTIVE | VKD3D_RENDERING_SUSPENDED))
++        return false;
++    if (resource->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
++            (resource->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY) ||
++            clear_aspects != view->format->vk_aspect_mask)
++        return false;
++
++    for (i = 0; i < list->fex_clears.count; i++)
++    {
++        if (list->fex_clears.entries[i].resource == resource)
++            return list->fex_clears.entries[i].view == view;
++    }
++
++    return list->fex_clears.count < VKD3D_FEX_MAX_PENDING_CLEARS;
++}
++
++static void d3d12_command_list_fex_defer_clear(struct d3d12_command_list *list, struct d3d12_resource *resource,
++        struct vkd3d_view *view, VkImageAspectFlags clear_aspects, const VkClearValue *clear_value, VkImageLayout layout)
++{
++    struct vkd3d_fex_pending_clear *clear = NULL;
++    unsigned int i;
++
++    for (i = 0; i < list->fex_clears.count; i++)
++    {
++        if (list->fex_clears.entries[i].view == view)
++            clear = &list->fex_clears.entries[i];
++    }
++    if (!clear)
++        clear = &list->fex_clears.entries[list->fex_clears.count++];
++
++    clear->resource = resource;
++    clear->view = view;
++    clear->aspects = clear_aspects;
++    clear->layout = layout;
++    clear->value = *clear_value;
++}
++
++/* The render pass load_attachment() would have recorded for this clear. Its barriers already ran at clear time. */
++static void d3d12_command_list_fex_emit_clear_pass(struct d3d12_command_list *list,
++        const struct vkd3d_fex_pending_clear *clear)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkRenderingAttachmentInfo attachment_info;
++    VkRenderingInfo rendering_info;
++    VkExtent3D view_extent;
++
++    memset(&attachment_info, 0, sizeof(attachment_info));
++    attachment_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++    attachment_info.imageView = clear->view->vk_image_view;
++    attachment_info.imageLayout = clear->layout;
++    attachment_info.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++    attachment_info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    attachment_info.clearValue = clear->value;
++
++    view_extent = d3d12_resource_get_view_subresource_extent(clear->resource, clear->view);
++
++    memset(&rendering_info, 0, sizeof(rendering_info));
++    rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++    rendering_info.renderArea.extent.width = view_extent.width;
++    rendering_info.renderArea.extent.height = view_extent.height;
++    rendering_info.layerCount = clear->view->info.texture.layer_count;
++
++    if (clear->aspects & VK_IMAGE_ASPECT_COLOR_BIT)
++    {
++        rendering_info.colorAttachmentCount = 1;
++        rendering_info.pColorAttachments = &attachment_info;
++    }
++    if (clear->aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
++        rendering_info.pDepthAttachment = &attachment_info;
++    if (clear->aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
++        rendering_info.pStencilAttachment = &attachment_info;
++
++    d3d12_command_list_debug_mark_begin_region(list, "Clear");
++
++    if (list->device->fex_pass_meter)
++    {
++        const struct vkd3d_format *fex_color_formats[1] = { clear->view->format };
++        bool fex_color = !!(clear->aspects & VK_IMAGE_ASPECT_COLOR_BIT);
++
++        vkd3d_fex_pass_meter_begin_pass(list, &rendering_info, fex_color_formats,
++                clear->resource->desc.SampleDesc.Count, fex_color ? NULL : clear->view->format, VKD3D_FEX_PASS_KIND_CLEAR);
++    }
++
++    VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, &rendering_info));
++    VK_CALL(vkCmdEndRendering(list->cmd.vk_command_buffer));
++    vkd3d_fex_pass_meter_end_pass(list, __LINE__);
++    d3d12_command_list_sync_tiler_renderpass_writes(list, &rendering_info);
++
++    d3d12_command_list_debug_mark_end_region(list);
++}
++
++/* Emits every waiting clear as its own render pass, in the order they were made. No render pass may be active. */
++static void d3d12_command_list_fex_flush_clears(struct d3d12_command_list *list)
++{
++    uint32_t i, count = list->fex_clears.count;
++
++    list->fex_clears.count = 0;
++    for (i = 0; i < count; i++)
++        d3d12_command_list_fex_emit_clear_pass(list, &list->fex_clears.entries[i]);
++    vkd3d_fex_pass_meter_count_clears(list->device, 0, count);
++}
++
++static bool d3d12_command_list_fex_clears_touch(const struct d3d12_command_list *list, const struct d3d12_resource *resource)
++{
++    unsigned int i;
++
++    for (i = 0; i < list->fex_clears.count; i++)
++    {
++        if (list->fex_clears.entries[i].resource == resource)
++            return true;
++    }
++    return false;
++}
++
++/* Called right before a render pass begins: a waiting clear whose view is an attachment of this pass, and which the
++ * pass covers whole and in the same layout, becomes that attachment's load op (restored by the caller after
++ * vkCmdBeginRendering). Every other waiting clear is emitted now, before the pass, as it would have been. */
++static void d3d12_command_list_fex_fold_clears(struct d3d12_command_list *list, uint32_t *rt_mask, bool *ds)
++{
++    struct vkd3d_rendering_info *ri = &list->rendering_info;
++    uint32_t i, j, folded = 0, own_pass = 0;
++    VkExtent3D extent;
++    bool fits;
++
++    *rt_mask = 0;
++    *ds = false;
++
++    for (i = 0; i < list->fex_clears.count; i++)
++    {
++        const struct vkd3d_fex_pending_clear *clear = &list->fex_clears.entries[i];
++
++        fits = false;
++        extent = d3d12_resource_get_view_subresource_extent(clear->resource, clear->view);
++
++        if (!ri->info.viewMask && !ri->info.renderArea.offset.x && !ri->info.renderArea.offset.y &&
++                ri->info.renderArea.extent.width == extent.width &&
++                ri->info.renderArea.extent.height == extent.height &&
++                ri->info.layerCount == clear->view->info.texture.layer_count)
++        {
++            if (clear->aspects & VK_IMAGE_ASPECT_COLOR_BIT)
++            {
++                for (j = 0; j < ri->info.colorAttachmentCount && j < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; j++)
++                {
++                    if ((ri->rtv_mask & (1u << j)) && !(*rt_mask & (1u << j)) &&
++                            ri->rtv[j].imageView == clear->view->vk_image_view &&
++                            ri->rtv[j].imageLayout == clear->layout)
++                    {
++                        ri->rtv[j].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++                        ri->rtv[j].clearValue = clear->value;
++                        *rt_mask |= 1u << j;
++                        fits = true;
++                        break;
++                    }
++                }
++            }
++            else if (!*ds && (ri->info.pDepthAttachment || ri->info.pStencilAttachment) &&
++                    ri->dsv.imageView == clear->view->vk_image_view && ri->dsv.imageLayout == clear->layout)
++            {
++                ri->dsv.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++                ri->dsv.clearValue = clear->value;
++                *ds = true;
++                fits = true;
++            }
++        }
++
++        if (fits)
++        {
++            folded++;
++        }
++        else
++        {
++            d3d12_command_list_fex_emit_clear_pass(list, clear);
++            own_pass++;
++        }
++    }
++
++    list->fex_clears.count = 0;
++    vkd3d_fex_pass_meter_count_clears(list->device, folded, own_pass);
++}
++
+ static void d3d12_command_list_load_attachment(struct d3d12_command_list *list, struct d3d12_resource *resource,
+         struct vkd3d_view *view, VkImageAspectFlags clear_aspects, const VkClearValue *clear_value, UINT rect_count,
+         const D3D12_RECT *rects, VkAttachmentLoadOp load_op)
+@@ -3897,9 +4091,16 @@ static void d3d12_command_list_load_attachment(struct d3d12_command_list *list,
+     VkAccessFlags2 access;
+     bool clear_op;
+ 
++    bool fex_defer;
++
+     /* This does not get called with LOAD_OP_LOAD */
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_LOW;
+ 
++    /* A waiting clear of this image must land before anything else touches it. */
++    fex_defer = d3d12_command_list_fex_can_defer_clear(list, resource, view, clear_aspects, rect_count, load_op);
++    if (!fex_defer && list->fex_clears.count && d3d12_command_list_fex_clears_touch(list, resource))
++        d3d12_command_list_fex_flush_clears(list);
++
+     memset(initial_layouts, 0, sizeof(initial_layouts));
+     memset(final_layouts, 0, sizeof(final_layouts));
+ 
+@@ -4098,8 +4299,22 @@ static void d3d12_command_list_load_attachment(struct d3d12_command_list *list,
+         VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+     }
+ 
+-    if (load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
++    if (fex_defer && !separate_ds_layouts)
++    {
++        /* Barriers above ran now, as they would have; the clear itself waits for the next render pass. */
++        d3d12_command_list_fex_defer_clear(list, resource, view, clear_aspects, clear_value, attachment_info.imageLayout);
++    }
++    else if (load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
+     {
++        if (list->device->fex_pass_meter)
++        {
++            const struct vkd3d_format *fex_color_formats[1] = { view->format };
++            bool fex_color = !!(view->format->vk_aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT);
++
++            vkd3d_fex_pass_meter_begin_pass(list, &rendering_info, fex_color_formats,
++                    resource->desc.SampleDesc.Count, fex_color ? NULL : view->format, VKD3D_FEX_PASS_KIND_CLEAR);
++        }
++
+         VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, &rendering_info));
+ 
+         if (!clear_op)
+@@ -4109,6 +4324,7 @@ static void d3d12_command_list_load_attachment(struct d3d12_command_list *list,
+         }
+ 
+         VK_CALL(vkCmdEndRendering(list->cmd.vk_command_buffer));
++        vkd3d_fex_pass_meter_end_pass(list, __LINE__);
+         d3d12_command_list_sync_tiler_renderpass_writes(list, &rendering_info);
+     }
+ 
+@@ -4979,12 +5195,18 @@ cleanup:
+     return result;
+ }
+ 
+-void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list, bool suspend)
++void d3d12_command_list_end_current_render_pass_line(struct d3d12_command_list *list, bool suspend, unsigned int line)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+     VkMemoryBarrier2 vk_barrier;
+     VkDependencyInfo dep_info;
+ 
++    /* Whatever comes next may touch an image a waiting clear is for. Only OMSetRenderTargets, a pipeline change
++     * while starting a pass and a clear that waits itself keep them waiting. No render pass is active while
++     * clears wait: starting one takes them all. */
++    if (list->fex_clears.count && !list->fex_clears.keep)
++        d3d12_command_list_fex_flush_clears(list);
++
+     d3d12_command_list_handle_active_queries(list, true);
+ 
+ #ifdef VKD3D_ENABLE_PROFILING
+@@ -5000,6 +5222,7 @@ void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list,
+     if (list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE)
+     {
+         VK_CALL(vkCmdEndRendering(list->cmd.vk_command_buffer));
++        vkd3d_fex_pass_meter_end_pass(list, line);
+         d3d12_command_list_sync_tiler_renderpass_writes(list, &list->rendering_info.info);
+         d3d12_command_list_debug_mark_end_region(list);
+     }
+@@ -5469,6 +5692,7 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *ifa
+         vkd3d_free(list->timestamp_profiler.work);
+ #endif
+ 
++        vkd3d_fex_pass_meter_free_list(list);
+         vkd3d_free(list->rtv_resolves);
+         vkd3d_free(list->rtv_resolve_regions);
+         vkd3d_free(list->init_transitions);
+@@ -5698,6 +5922,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_ifa
+     if (FAILED(hr = d3d12_command_list_build_init_commands(list)))
+         return hr;
+ 
++    vkd3d_fex_pass_meter_close_list(list);
++
+     if ((vr = VK_CALL(vkEndCommandBuffer(list->cmd.vk_command_buffer))) < 0)
+     {
+         WARN("Failed to end command buffer, vr %d.\n", vr);
+@@ -7293,12 +7519,20 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+     struct d3d12_graphics_pipeline_state *graphics;
++    uint32_t fex_fold_rt_mask = 0;
++    bool fex_fold_ds = false;
++    uint32_t fex_pass_kind;
++    bool pipeline_ok;
+ 
+     d3d12_command_list_end_transfer_batch(list);
+     d3d12_command_list_flush_rtas_batch(list);
+ 
+     d3d12_command_list_promote_dsv_layout(list);
+-    if (!d3d12_command_list_update_graphics_pipeline(list, pipeline_type))
++    /* A pipeline that binds other targets ends the pass, which touches no image: waiting clears stay. */
++    list->fex_clears.keep = true;
++    pipeline_ok = d3d12_command_list_update_graphics_pipeline(list, pipeline_type);
++    list->fex_clears.keep = false;
++    if (!pipeline_ok)
+         return false;
+     if (!d3d12_command_list_update_rendering_info(list))
+         return false;
+@@ -7314,18 +7548,52 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+ #ifdef VKD3D_ENABLE_PROFILING
+         vkd3d_timestamp_profiler_mark_pre_command(list->device->timestamp_profiler, list);
+ #endif
++        vkd3d_fex_pass_meter_draw(list);
+         return true;
+     }
+ 
++    fex_pass_kind = (list->rendering_info.state_flags & VKD3D_RENDERING_SUSPENDED) ?
++            VKD3D_FEX_PASS_KIND_RESUMED : VKD3D_FEX_PASS_KIND_DRAW;
++
++    if (list->fex_clears.count)
++        d3d12_command_list_fex_fold_clears(list, &fex_fold_rt_mask, &fex_fold_ds);
++
+     if (!(list->rendering_info.state_flags & VKD3D_RENDERING_SUSPENDED))
+     {
+         d3d12_command_list_check_render_pass_barrier(list);
+         d3d12_command_list_emit_render_pass_transition(list, VKD3D_RENDER_PASS_TRANSITION_MODE_BEGIN);
+     }
+ 
++    if (list->device->fex_pass_meter)
++    {
++        const struct vkd3d_format *fex_color_formats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
++        VkSampleCountFlagBits fex_samples = VK_SAMPLE_COUNT_1_BIT;
++        unsigned int fex_i;
++
++        for (fex_i = 0; fex_i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; fex_i++)
++        {
++            fex_color_formats[fex_i] = NULL;
++            if ((list->rendering_info.rtv_mask & (1u << fex_i)) && list->rtvs[fex_i].view)
++            {
++                fex_color_formats[fex_i] = list->rtvs[fex_i].format;
++                fex_samples = list->rtvs[fex_i].sample_count;
++            }
++        }
++        if (d3d12_command_list_has_depth_stencil_view(list))
++            fex_samples = list->dsv.sample_count;
++        vkd3d_fex_pass_meter_begin_pass(list, &list->rendering_info.info, fex_color_formats, fex_samples,
++                d3d12_command_list_has_depth_stencil_view(list) ? list->dsv.format : NULL, fex_pass_kind);
++    }
++
+     d3d12_command_list_debug_mark_begin_region(list, "RenderPass");
+     VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, &list->rendering_info.info));
+ 
++    /* Folded clears only apply to this begin; a resumed pass must load what this one stored. */
++    while (fex_fold_rt_mask)
++        list->rendering_info.rtv[vkd3d_bitmask_iter32(&fex_fold_rt_mask)].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++    if (fex_fold_ds)
++        list->rendering_info.dsv.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++
+     list->rendering_info.state_flags |= VKD3D_RENDERING_ACTIVE;
+     list->rendering_info.state_flags &= ~VKD3D_RENDERING_SUSPENDED;
+ 
+@@ -12399,7 +12667,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_OMSetRenderTargets(d3d12_comman
+         d3d12_command_list_mark_as_invalid(list, "OMSetRenderTargets called within a render pass.\n");
+ 
+     d3d12_command_list_invalidate_rendering_info(list);
++    /* Binding targets touches no image: waiting clears stay for the pass that uses these targets. */
++    list->fex_clears.keep = true;
+     d3d12_command_list_end_current_render_pass(list, false);
++    list->fex_clears.keep = false;
+ 
+     if (render_target_descriptor_count > ARRAY_SIZE(list->rtvs))
+     {
+@@ -12558,7 +12829,10 @@ static void d3d12_command_list_clear_attachment(struct d3d12_command_list *list,
+          * the render pass isn't active and we're only going to clear
+          * a sub-region of the image, or one of the aspects to clear
+          * uses a read-only layout in the current render pass */
++        list->fex_clears.keep = d3d12_command_list_fex_can_defer_clear(list, resource, view,
++                clear_aspects, rect_count, VK_ATTACHMENT_LOAD_OP_CLEAR);
+         d3d12_command_list_end_current_render_pass(list, false);
++        list->fex_clears.keep = false;
+         d3d12_command_list_load_attachment(list, resource, view,
+                 clear_aspects, clear_value, rect_count, rects,
+                 VK_ATTACHMENT_LOAD_OP_CLEAR);
+@@ -19026,6 +19300,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
+ #ifdef VKD3D_ENABLE_PROFILING
+         vkd3d_timestamp_profiler_submit_command_list(command_queue->device->timestamp_profiler, cmd_list);
+ #endif
++        vkd3d_fex_pass_meter_submit_list(cmd_list);
+ 
+         for (iter = 0; iter < cmd_list->cmd.iteration_count; iter++)
+         {
+@@ -21079,7 +21354,9 @@ static void d3d12_command_queue_add_submission_locked(struct d3d12_command_queue
+ {
+     vkd3d_array_reserve((void**)&queue->submissions, &queue->submissions_size,
+                         queue->submissions_count + 1, sizeof(*queue->submissions));
+-    queue->submissions[queue->submissions_count++] = *sub;
++    queue->submissions[queue->submissions_count] = *sub;
++    queue->submissions[queue->submissions_count++].fex_enqueue_ns =
++            vkd3d_fex_timeline_on ? vkd3d_get_current_time_ns() : 0;
+     pthread_cond_signal(&queue->queue_cond);
+ }
+ 
+@@ -21135,6 +21412,9 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
+     struct d3d12_command_queue *queue = userdata;
+     VkSemaphoreSubmitInfo transition_semaphore;
+     VkCommandBufferSubmitInfo transition_cmd;
++    uint64_t fex_t0 = 0, fex_t1;
++    enum vkd3d_fex_queue_op fex_op;
++    uint32_t fex_depth;
+     VKD3D_UNUSED unsigned int i;
+     HRESULT hr;
+ 
+@@ -21144,21 +21424,37 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
+ 
+     vkd3d_set_thread_name("vkd3d_queue");
+     queue->submission_thread_tid = vkd3d_get_current_thread_id();
++    queue->fex_timeline_slot = vkd3d_fex_timeline_queue_slot(queue->desc.Type);
+ 
+     if (FAILED(hr = d3d12_command_queue_transition_pool_init(&pool, queue)))
+         ERR("Failed to initialize transition pool.\n");
+ 
+     for (;;)
+     {
++        if (queue->fex_timeline_slot != VKD3D_FEX_NO_SLOT)
++            fex_t0 = vkd3d_get_current_time_ns();
++
+         pthread_mutex_lock(&queue->queue_lock);
+         while (queue->submissions_count == 0)
+             pthread_cond_wait(&queue->queue_cond, &queue->queue_lock);
+ 
++        fex_depth = queue->submissions_count;
+         queue->submissions_count--;
+         submission = queue->submissions[0];
+         memmove(queue->submissions, queue->submissions + 1, queue->submissions_count * sizeof(submission));
+         pthread_mutex_unlock(&queue->queue_lock);
+ 
++        if (queue->fex_timeline_slot != VKD3D_FEX_NO_SLOT)
++        {
++            /* Time spent waiting for work, and how long this item sat in the queue. */
++            fex_t1 = vkd3d_get_current_time_ns();
++            vkd3d_fex_timeline_queue_op(queue->fex_timeline_slot, VKD3D_FEX_QOP_IDLE, fex_t1 - fex_t0);
++            if (submission.type == VKD3D_SUBMISSION_EXECUTE && submission.fex_enqueue_ns &&
++                    fex_t1 > submission.fex_enqueue_ns)
++                vkd3d_fex_timeline_queue_lag(queue->fex_timeline_slot, fex_t1 - submission.fex_enqueue_ns, fex_depth);
++            fex_t0 = fex_t1;
++        }
++
+         if (submission.type != VKD3D_SUBMISSION_BIND_SPARSE)
+             d3d12_command_queue_flush_bind_sparse(queue);
+ 
+@@ -21282,9 +21578,26 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
+         }
+ 
+         vkd3d_queue_timeline_trace_complete_execute(&queue->device->queue_timeline_trace, &queue->fence_worker, cookie);
++
++        if (queue->fex_timeline_slot != VKD3D_FEX_NO_SLOT)
++        {
++            switch (submission.type)
++            {
++                case VKD3D_SUBMISSION_EXECUTE: fex_op = VKD3D_FEX_QOP_EXECUTE; break;
++                case VKD3D_SUBMISSION_WAIT: fex_op = VKD3D_FEX_QOP_WAIT; break;
++                case VKD3D_SUBMISSION_SIGNAL: fex_op = VKD3D_FEX_QOP_SIGNAL; break;
++                case VKD3D_SUBMISSION_QUEUE_USING_CALLBACK: fex_op = VKD3D_FEX_QOP_PRESENT; break;
++                default: fex_op = VKD3D_FEX_QOP_OTHER; break;
++            }
++            fex_t1 = vkd3d_get_current_time_ns();
++            vkd3d_fex_timeline_queue_op(queue->fex_timeline_slot, fex_op, fex_t1 - fex_t0);
++            vkd3d_fex_timeline_tick(fex_t1);
++        }
+     }
+ 
+ cleanup:
++    vkd3d_fex_timeline_queue_free_slot(queue->fex_timeline_slot);
++    queue->fex_timeline_slot = VKD3D_FEX_NO_SLOT;
+     d3d12_command_queue_wait_idle(queue);
+     d3d12_command_queue_transition_pool_deinit(&pool, queue->device);
+     d3d12_command_queue_destroy_serializing_semaphore(queue);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 1240d17..ab8e9ce 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4281,6 +4281,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
+ #ifdef VKD3D_ENABLE_PROFILING
+     vkd3d_timestamp_profiler_deinit(device->timestamp_profiler);
+ #endif
++    vkd3d_fex_pass_meter_deinit(device->fex_pass_meter);
+ #ifdef VKD3D_ENABLE_BREADCRUMBS
+     vkd3d_breadcrumb_tracer_cleanup_barrier_hashes(&device->breadcrumb_tracer);
+     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS)
+@@ -10046,6 +10047,9 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+ #ifdef VKD3D_ENABLE_PROFILING
+     device->timestamp_profiler = vkd3d_timestamp_profiler_init(device);
+ #endif
++    device->fex_fold_clears = vkd3d_fex_fold_clears_enabled();
++    vkd3d_fex_timeline_init();
++    device->fex_pass_meter = vkd3d_fex_pass_meter_init(device);
+ 
+     hash_map_init(&device->vertex_input_pipelines,
+             vkd3d_vertex_input_pipeline_desc_hash,
+diff --git a/libs/vkd3d/fex_pass_meter.c b/libs/vkd3d/fex_pass_meter.c
+new file mode 100644
+index 0000000..dc02e02
+--- /dev/null
++++ b/libs/vkd3d/fex_pass_meter.c
+@@ -0,0 +1,783 @@
++/*
++ * FEX pass meter: measures how long the GPU spends in each Vulkan render pass and in each command list, and which
++ * attachments every pass loads, clears and stores. Once a second it formats a short report into an exported buffer
++ * (vkd3d_fex_pass_report) that FEX's stats log picks up. Off unless VKD3D_FEX_PASSES=1.
++ *
++ * Every pass gets a pair of timestamp queries written outside the pass (top of pipe before vkCmdBeginRendering, all
++ * commands after vkCmdEndRendering); command lists get a pair around their whole recording. Results are read back by a
++ * thread without waiting on the GPU.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "vkd3d_private.h"
++#include "vkd3d_threads.h"
++#include <stdio.h>
++#include <string.h>
++#include <inttypes.h>
++
++#define FEX_PASS_QUERY_PAIRS 65536u
++#define FEX_PASS_BLOCK_PAIRS 32u /* pairs a command list takes at once, reset with one command */
++#define FEX_PASS_PENDING 65536u
++#define FEX_PASS_MAX_SIGS 1024u
++#define FEX_PASS_MAX_LINES 256u
++
++/* Read by FEX (found by export name in d3d12core.dll). */
++struct vkd3d_fex_report vkd3d_fex_pass_report = { 0x50584546u /* 'FEXP' */, 1u, 0u, 0u, { 0 } };
++
++struct fex_pass_sig
++{
++    uint32_t hash;
++    uint32_t width, height, layers;
++    uint32_t kind; /* VKD3D_FEX_PASS_KIND_* */
++    uint32_t color_count;
++    uint32_t color_dxgi[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
++    uint32_t color_bytes[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
++    uint8_t color_load[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
++    uint8_t color_store[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
++    uint32_t ds_dxgi, ds_bytes;
++    uint8_t has_depth, has_stencil, depth_load, depth_store, stencil_load, stencil_store, samples, pad;
++};
++
++struct fex_pass_sig_stats
++{
++    uint64_t count, gpu_ticks, draws;
++    uint32_t last_end_line;
++};
++
++struct fex_pass_line_stats
++{
++    uint32_t line;
++    uint64_t count, gpu_ticks;
++};
++
++struct fex_pass_pending
++{
++    struct vkd3d_fex_pass_record rec;
++    uint64_t submit_ns;
++};
++
++struct vkd3d_fex_pass_meter
++{
++    struct d3d12_device *device;
++    VkQueryPool pool;
++    double ns_per_tick;
++    uint32_t next_block;
++
++    pthread_mutex_t sig_lock;
++    struct fex_pass_sig sigs[FEX_PASS_MAX_SIGS];
++    uint32_t sig_count;
++
++    pthread_mutex_t pending_lock;
++    struct fex_pass_pending *pending;
++    uint64_t pending_head, pending_tail; /* tail = next to resolve */
++    uint64_t dropped;
++
++    pthread_t thread;
++    uint32_t dead;
++
++    /* Owned by the thread. */
++    struct fex_pass_sig_stats sig_stats[FEX_PASS_MAX_SIGS];
++    struct fex_pass_line_stats line_stats[FEX_PASS_MAX_LINES];
++    uint32_t line_count;
++    uint64_t lists, list_ticks, passes, pass_ticks, draws, clears, clear_ticks, lost, unordered;
++    uint64_t load_bytes, store_bytes, clear_bytes, loads, stores, cleared;
++    uint64_t window_start_ns;
++
++    /* Counted by recording threads. */
++    uint32_t clears_folded, clears_own_pass;
++};
++
++static const char *fex_pass_op_name(uint8_t op)
++{
++    switch (op)
++    {
++        case VK_ATTACHMENT_LOAD_OP_LOAD: return "L";
++        case VK_ATTACHMENT_LOAD_OP_CLEAR: return "C";
++        case VK_ATTACHMENT_LOAD_OP_DONT_CARE: return "D";
++        default: return "N";
++    }
++}
++
++static const char *fex_pass_store_name(uint8_t op)
++{
++    switch (op)
++    {
++        case VK_ATTACHMENT_STORE_OP_STORE: return "S";
++        case VK_ATTACHMENT_STORE_OP_DONT_CARE: return "D";
++        default: return "N";
++    }
++}
++
++/* VkAttachmentStoreOp NONE is 1000301000; squeeze ops into a byte. */
++static uint8_t fex_pass_pack_load(VkAttachmentLoadOp op)
++{
++    return op <= VK_ATTACHMENT_LOAD_OP_DONT_CARE ? (uint8_t)op : 3;
++}
++
++static uint8_t fex_pass_pack_store(VkAttachmentStoreOp op)
++{
++    return op <= VK_ATTACHMENT_STORE_OP_DONT_CARE ? (uint8_t)op : 2;
++}
++
++static uint32_t fex_pass_hash(const struct fex_pass_sig *sig)
++{
++    const uint8_t *p = (const uint8_t *)sig + sizeof(sig->hash);
++    size_t n = sizeof(*sig) - sizeof(sig->hash);
++    uint32_t h = 2166136261u;
++    size_t i;
++
++    for (i = 0; i < n; i++)
++        h = (h ^ p[i]) * 16777619u;
++    return h;
++}
++
++static uint16_t fex_pass_intern_sig(struct vkd3d_fex_pass_meter *meter, struct fex_pass_sig *sig)
++{
++    uint32_t i;
++    uint16_t index = 0xffff;
++
++    sig->hash = fex_pass_hash(sig);
++
++    pthread_mutex_lock(&meter->sig_lock);
++    for (i = 0; i < meter->sig_count; i++)
++    {
++        if (meter->sigs[i].hash == sig->hash && !memcmp(&meter->sigs[i], sig, sizeof(*sig)))
++        {
++            index = i;
++            break;
++        }
++    }
++    if (index == 0xffff && meter->sig_count < FEX_PASS_MAX_SIGS)
++    {
++        meter->sigs[meter->sig_count] = *sig;
++        index = meter->sig_count++;
++    }
++    pthread_mutex_unlock(&meter->sig_lock);
++    return index;
++}
++
++/* Must be called outside a render pass: taking a new block resets its queries in the command buffer. */
++static uint32_t fex_pass_alloc_pair(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    uint32_t base;
++
++    if (list->fex_pass.block_next == list->fex_pass.block_end)
++    {
++        base = vkd3d_atomic_uint32_increment(&meter->next_block, vkd3d_memory_order_relaxed) - 1;
++        base = (base * FEX_PASS_BLOCK_PAIRS) % FEX_PASS_QUERY_PAIRS;
++        VK_CALL(vkCmdResetQueryPool(list->cmd.vk_command_buffer, meter->pool, 2 * base, 2 * FEX_PASS_BLOCK_PAIRS));
++        list->fex_pass.block_next = base;
++        list->fex_pass.block_end = base + FEX_PASS_BLOCK_PAIRS;
++    }
++    return list->fex_pass.block_next++;
++}
++
++static void fex_pass_write_begin(struct d3d12_command_list *list, uint32_t pair)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++
++    VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
++            meter->pool, 2 * pair));
++}
++
++static void fex_pass_write_end(struct d3d12_command_list *list, uint32_t pair)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++
++    VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++            meter->pool, 2 * pair + 1));
++}
++
++static void fex_pass_add_record(struct d3d12_command_list *list, const struct vkd3d_fex_pass_record *rec)
++{
++    if (!vkd3d_array_reserve((void **)&list->fex_pass.records, &list->fex_pass.records_size,
++            list->fex_pass.records_count + 1, sizeof(*list->fex_pass.records)))
++        return;
++    list->fex_pass.records[list->fex_pass.records_count++] = *rec;
++}
++
++void vkd3d_fex_pass_meter_begin_list(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++
++    list->fex_pass.records_count = 0;
++    list->fex_pass.pass_active = false;
++    list->fex_pass.list_active = false;
++    list->fex_pass.block_next = list->fex_pass.block_end = 0;
++    if (!meter || !(list->vk_queue_flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)))
++        return;
++
++    list->fex_pass.list_pair = fex_pass_alloc_pair(list);
++    list->fex_pass.list_active = true;
++    fex_pass_write_begin(list, list->fex_pass.list_pair);
++}
++
++void vkd3d_fex_pass_meter_close_list(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_pass_record rec;
++
++    if (!list->device->fex_pass_meter || !list->fex_pass.list_active)
++        return;
++
++    fex_pass_write_end(list, list->fex_pass.list_pair);
++    memset(&rec, 0, sizeof(rec));
++    rec.pair = list->fex_pass.list_pair;
++    rec.sig = 0xffff;
++    rec.kind = VKD3D_FEX_PASS_KIND_LIST;
++    fex_pass_add_record(list, &rec);
++    list->fex_pass.list_active = false;
++}
++
++void vkd3d_fex_pass_meter_begin_pass(struct d3d12_command_list *list, const VkRenderingInfo *info,
++        const struct vkd3d_format *const *color_formats, VkSampleCountFlagBits samples,
++        const struct vkd3d_format *ds_format, uint32_t kind)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    struct fex_pass_sig sig;
++    unsigned int i;
++
++    if (!meter)
++        return;
++
++    /* Callers end the previous pass first; a stale one (no end timestamp) is dropped. */
++    list->fex_pass.pass_active = false;
++
++    memset(&sig, 0, sizeof(sig));
++    sig.width = info->renderArea.extent.width;
++    sig.height = info->renderArea.extent.height;
++    sig.layers = info->layerCount;
++    sig.kind = kind;
++    sig.samples = (uint8_t)samples;
++    for (i = 0; i < info->colorAttachmentCount && i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
++    {
++        if (!info->pColorAttachments[i].imageView || !color_formats[i])
++            continue;
++        sig.color_count = i + 1;
++        sig.color_dxgi[i] = color_formats[i]->dxgi_format;
++        sig.color_bytes[i] = color_formats[i]->byte_count;
++        sig.color_load[i] = fex_pass_pack_load(info->pColorAttachments[i].loadOp);
++        sig.color_store[i] = fex_pass_pack_store(info->pColorAttachments[i].storeOp);
++    }
++    if (ds_format && ((info->pDepthAttachment && info->pDepthAttachment->imageView) ||
++            (info->pStencilAttachment && info->pStencilAttachment->imageView)))
++    {
++        sig.ds_dxgi = ds_format->dxgi_format;
++        sig.ds_bytes = ds_format->byte_count;
++        if (info->pDepthAttachment && info->pDepthAttachment->imageView)
++        {
++            sig.has_depth = 1;
++            sig.depth_load = fex_pass_pack_load(info->pDepthAttachment->loadOp);
++            sig.depth_store = fex_pass_pack_store(info->pDepthAttachment->storeOp);
++        }
++        if (info->pStencilAttachment && info->pStencilAttachment->imageView)
++        {
++            sig.has_stencil = 1;
++            sig.stencil_load = fex_pass_pack_load(info->pStencilAttachment->loadOp);
++            sig.stencil_store = fex_pass_pack_store(info->pStencilAttachment->storeOp);
++        }
++    }
++
++    memset(&list->fex_pass.current, 0, sizeof(list->fex_pass.current));
++    list->fex_pass.current.pair = fex_pass_alloc_pair(list);
++    list->fex_pass.current.sig = fex_pass_intern_sig(meter, &sig);
++    list->fex_pass.current.kind = kind;
++    list->fex_pass.current.draws = kind == VKD3D_FEX_PASS_KIND_CLEAR ? 0 : 1;
++    list->fex_pass.pass_active = true;
++    fex_pass_write_begin(list, list->fex_pass.current.pair);
++}
++
++void vkd3d_fex_pass_meter_draw(struct d3d12_command_list *list)
++{
++    if (list->fex_pass.pass_active)
++        list->fex_pass.current.draws++;
++}
++
++void vkd3d_fex_pass_meter_end_pass(struct d3d12_command_list *list, unsigned int line)
++{
++    if (!list->device->fex_pass_meter || !list->fex_pass.pass_active)
++        return;
++
++    fex_pass_write_end(list, list->fex_pass.current.pair);
++    list->fex_pass.current.end_line = line > 0xffff ? 0xffff : line;
++    fex_pass_add_record(list, &list->fex_pass.current);
++    list->fex_pass.pass_active = false;
++}
++
++void vkd3d_fex_pass_meter_submit_list(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    uint64_t now;
++    size_t i;
++
++    if (!meter || !list->fex_pass.records_count)
++        return;
++
++    now = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&meter->pending_lock);
++    for (i = 0; i < list->fex_pass.records_count; i++)
++    {
++        struct fex_pass_pending *p;
++
++        if (meter->pending_head - meter->pending_tail >= FEX_PASS_PENDING)
++        {
++            meter->dropped += list->fex_pass.records_count - i;
++            break;
++        }
++        p = &meter->pending[meter->pending_head++ % FEX_PASS_PENDING];
++        p->rec = list->fex_pass.records[i];
++        p->submit_ns = now;
++    }
++    pthread_mutex_unlock(&meter->pending_lock);
++}
++
++void vkd3d_fex_pass_meter_free_list(struct d3d12_command_list *list)
++{
++    vkd3d_free(list->fex_pass.records);
++    list->fex_pass.records = NULL;
++    list->fex_pass.records_size = 0;
++    list->fex_pass.records_count = 0;
++}
++
++static void fex_pass_note_line(struct vkd3d_fex_pass_meter *meter, uint32_t line, uint64_t ticks)
++{
++    uint32_t i;
++
++    for (i = 0; i < meter->line_count; i++)
++    {
++        if (meter->line_stats[i].line == line)
++        {
++            meter->line_stats[i].count++;
++            meter->line_stats[i].gpu_ticks += ticks;
++            return;
++        }
++    }
++    if (meter->line_count < FEX_PASS_MAX_LINES)
++    {
++        meter->line_stats[meter->line_count].line = line;
++        meter->line_stats[meter->line_count].count = 1;
++        meter->line_stats[meter->line_count].gpu_ticks = ticks;
++        meter->line_count++;
++    }
++}
++
++static void fex_pass_account(struct vkd3d_fex_pass_meter *meter, const struct vkd3d_fex_pass_record *rec, uint64_t ticks)
++{
++    const struct fex_pass_sig *sig;
++    uint64_t area;
++    unsigned int i;
++
++    if (rec->kind == VKD3D_FEX_PASS_KIND_LIST)
++    {
++        meter->lists++;
++        meter->list_ticks += ticks;
++        return;
++    }
++
++    if (rec->kind == VKD3D_FEX_PASS_KIND_CLEAR)
++    {
++        meter->clears++;
++        meter->clear_ticks += ticks;
++    }
++    else
++    {
++        meter->passes++;
++        meter->pass_ticks += ticks;
++        meter->draws += rec->draws;
++    }
++
++    fex_pass_note_line(meter, rec->end_line, ticks);
++
++    if (rec->sig >= FEX_PASS_MAX_SIGS)
++        return;
++
++    /* Signatures are only appended, never changed, so reading below sig_count without the lock is fine. */
++    sig = &meter->sigs[rec->sig];
++    meter->sig_stats[rec->sig].count++;
++    meter->sig_stats[rec->sig].gpu_ticks += ticks;
++    meter->sig_stats[rec->sig].draws += rec->draws;
++    meter->sig_stats[rec->sig].last_end_line = rec->end_line;
++
++    area = (uint64_t)sig->width * sig->height * (sig->layers ? sig->layers : 1) * (sig->samples ? sig->samples : 1);
++    for (i = 0; i < sig->color_count; i++)
++    {
++        if (!sig->color_bytes[i])
++            continue;
++        if (sig->color_load[i] == VK_ATTACHMENT_LOAD_OP_LOAD)
++        {
++            meter->loads++;
++            meter->load_bytes += area * sig->color_bytes[i];
++        }
++        else if (sig->color_load[i] == VK_ATTACHMENT_LOAD_OP_CLEAR)
++        {
++            meter->cleared++;
++            meter->clear_bytes += area * sig->color_bytes[i];
++        }
++        if (sig->color_store[i] == VK_ATTACHMENT_STORE_OP_STORE)
++        {
++            meter->stores++;
++            meter->store_bytes += area * sig->color_bytes[i];
++        }
++    }
++    if (sig->has_depth || sig->has_stencil)
++    {
++        uint8_t load = sig->has_depth ? sig->depth_load : sig->stencil_load;
++        uint8_t store = sig->has_depth ? sig->depth_store : sig->stencil_store;
++
++        if (load == VK_ATTACHMENT_LOAD_OP_LOAD)
++        {
++            meter->loads++;
++            meter->load_bytes += area * sig->ds_bytes;
++        }
++        else if (load == VK_ATTACHMENT_LOAD_OP_CLEAR)
++        {
++            meter->cleared++;
++            meter->clear_bytes += area * sig->ds_bytes;
++        }
++        if (store == VK_ATTACHMENT_STORE_OP_STORE)
++        {
++            meter->stores++;
++            meter->store_bytes += area * sig->ds_bytes;
++        }
++    }
++}
++
++size_t vkd3d_fex_report_append(char *buf, size_t size, size_t len, const char *fmt, ...)
++{
++    va_list args;
++    int n;
++
++    if (len >= size)
++        return len;
++    va_start(args, fmt);
++    n = vsnprintf(buf + len, size - len, fmt, args);
++    va_end(args);
++    if (n < 0)
++        return len;
++    return (size_t)n >= size - len ? size - 1 : len + (size_t)n;
++}
++
++static size_t fex_pass_describe_sig(const struct fex_pass_sig *sig, char *buf, size_t size, size_t len)
++{
++    unsigned int i;
++    bool first = true;
++
++    len = vkd3d_fex_report_append(buf, size, len, "%ux%u", sig->width, sig->height);
++    if (sig->layers > 1)
++        len = vkd3d_fex_report_append(buf, size, len, "x%u", sig->layers);
++    if (sig->samples > 1)
++        len = vkd3d_fex_report_append(buf, size, len, " %uxMS", sig->samples);
++    if (sig->kind == VKD3D_FEX_PASS_KIND_CLEAR)
++        len = vkd3d_fex_report_append(buf, size, len, " clear-pass");
++    else if (sig->kind == VKD3D_FEX_PASS_KIND_RESUMED)
++        len = vkd3d_fex_report_append(buf, size, len, " resumed");
++    for (i = 0; i < sig->color_count; i++)
++    {
++        if (!sig->color_bytes[i])
++            continue;
++        len = vkd3d_fex_report_append(buf, size, len, "%sc%u:fmt%u/%uB %s%s", first ? " " : " + ", i, sig->color_dxgi[i],
++                sig->color_bytes[i], fex_pass_op_name(sig->color_load[i]), fex_pass_store_name(sig->color_store[i]));
++        first = false;
++    }
++    if (sig->has_depth || sig->has_stencil)
++    {
++        len = vkd3d_fex_report_append(buf, size, len, "%sds:fmt%u/%uB", first ? " " : " + ", sig->ds_dxgi, sig->ds_bytes);
++        if (sig->has_depth)
++            len = vkd3d_fex_report_append(buf, size, len, " d%s%s", fex_pass_op_name(sig->depth_load),
++                    fex_pass_store_name(sig->depth_store));
++        if (sig->has_stencil)
++            len = vkd3d_fex_report_append(buf, size, len, " s%s%s", fex_pass_op_name(sig->stencil_load),
++                    fex_pass_store_name(sig->stencil_store));
++    }
++    return len;
++}
++
++void vkd3d_fex_report_publish(struct vkd3d_fex_report *report, const char *text, size_t len)
++{
++    if (len >= VKD3D_FEX_REPORT_SIZE)
++        len = VKD3D_FEX_REPORT_SIZE - 1;
++
++    /* Seqlock: seq is odd while the text changes. */
++    vkd3d_atomic_uint32_increment((uint32_t *)&report->seq, vkd3d_memory_order_seq_cst);
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    memcpy(report->text, text, len);
++    report->text[len] = '\0';
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    vkd3d_atomic_uint32_increment((uint32_t *)&report->seq, vkd3d_memory_order_seq_cst);
++}
++
++bool vkd3d_fex_fold_clears_enabled(void)
++{
++    char env[16];
++
++    return vkd3d_get_env_var("VKD3D_FEX_FOLD_CLEARS", env, sizeof(env)) && !strcmp(env, "1");
++}
++
++void vkd3d_fex_pass_meter_count_clears(struct d3d12_device *device, uint32_t folded, uint32_t own_pass)
++{
++    struct vkd3d_fex_pass_meter *meter = device->fex_pass_meter;
++
++    if (!meter)
++        return;
++    if (folded)
++        vkd3d_atomic_uint32_add(&meter->clears_folded, folded, vkd3d_memory_order_relaxed);
++    if (own_pass)
++        vkd3d_atomic_uint32_add(&meter->clears_own_pass, own_pass, vkd3d_memory_order_relaxed);
++}
++
++static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
++{
++    static char text[VKD3D_FEX_REPORT_SIZE];
++    uint32_t clears_folded, clears_own_pass;
++    const double ms = meter->ns_per_tick / 1e6;
++    uint32_t top_sigs[8], top_lines[12];
++    unsigned int top_sig_count = 0, top_line_count = 0;
++    uint32_t i, j, sig_count;
++    size_t len = 0;
++
++    {
++        const VkPhysicalDeviceVulkan12Properties *props = &meter->device->device_info.vulkan_1_2_properties;
++
++        len = vkd3d_fex_report_append(text, sizeof(text), len,
++                "# gpu passes: driver %s (%s), id %u, timestamp tick %.2f ns, clear folding %s; command.c lines are from"
++                " vkd3d-proton 3.0b + FEX patches\n",
++                props->driverName, props->driverInfo, props->driverID, meter->ns_per_tick,
++                meter->device->fex_fold_clears ? "on" : "off");
++    }
++
++    clears_folded = vkd3d_atomic_uint32_exchange_explicit(&meter->clears_folded, 0, vkd3d_memory_order_relaxed);
++    clears_own_pass = vkd3d_atomic_uint32_exchange_explicit(&meter->clears_own_pass, 0, vkd3d_memory_order_relaxed);
++
++    len = vkd3d_fex_report_append(text, sizeof(text), len,
++            "  gpu lists=%"PRIu64" gpu=%.1fms | passes=%"PRIu64" gpu=%.1fms draws=%"PRIu64" | clear passes=%"PRIu64" gpu=%.1fms"
++            " | clears folded=%u own pass=%u | attachments loaded=%"PRIu64" %.0fMB cleared=%"PRIu64" stored=%"PRIu64" %.0fMB"
++            " | lost=%"PRIu64" dropped=%"PRIu64" over %.2fs\n",
++            meter->lists, meter->list_ticks * ms, meter->passes, meter->pass_ticks * ms, meter->draws,
++            meter->clears, meter->clear_ticks * ms, clears_folded, clears_own_pass, meter->loads,
++            meter->load_bytes / 1048576.0, meter->cleared, meter->stores, meter->store_bytes / 1048576.0, meter->lost,
++            meter->dropped, seconds);
++
++    /* Top passes by GPU time. */
++    sig_count = vkd3d_atomic_uint32_load_explicit(&meter->sig_count, vkd3d_memory_order_acquire);
++    for (i = 0; i < sig_count; i++)
++    {
++        if (!meter->sig_stats[i].count)
++            continue;
++        for (j = top_sig_count; j > 0 && meter->sig_stats[top_sigs[j - 1]].gpu_ticks < meter->sig_stats[i].gpu_ticks; j--)
++        {
++            if (j < ARRAY_SIZE(top_sigs))
++                top_sigs[j] = top_sigs[j - 1];
++        }
++        if (j < ARRAY_SIZE(top_sigs))
++        {
++            top_sigs[j] = i;
++            if (top_sig_count < ARRAY_SIZE(top_sigs))
++                top_sig_count++;
++        }
++    }
++    if (top_sig_count)
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "  gpu top passes (gpu ms, count, draws, size, attachments: fmt=DXGI format/bytes per pixel, load L/C/D + store S/D, ended at command.c line):\n");
++    for (i = 0; i < top_sig_count; i++)
++    {
++        const struct fex_pass_sig_stats *st = &meter->sig_stats[top_sigs[i]];
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "    %.2fms n=%"PRIu64" draws=%"PRIu64" ", st->gpu_ticks * ms, st->count,
++                st->draws);
++        len = fex_pass_describe_sig(&meter->sigs[top_sigs[i]], text, sizeof(text), len);
++        len = vkd3d_fex_report_append(text, sizeof(text), len, " end@%u\n", st->last_end_line);
++    }
++
++    /* What ended the passes. */
++    for (i = 0; i < meter->line_count; i++)
++    {
++        for (j = top_line_count; j > 0 && meter->line_stats[top_lines[j - 1]].count < meter->line_stats[i].count; j--)
++        {
++            if (j < ARRAY_SIZE(top_lines))
++                top_lines[j] = top_lines[j - 1];
++        }
++        if (j < ARRAY_SIZE(top_lines))
++        {
++            top_lines[j] = i;
++            if (top_line_count < ARRAY_SIZE(top_lines))
++                top_line_count++;
++        }
++    }
++    if (top_line_count)
++    {
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "  gpu pass ends (command.c line xcount gpu ms):");
++        for (i = 0; i < top_line_count; i++)
++        {
++            const struct fex_pass_line_stats *st = &meter->line_stats[top_lines[i]];
++            len = vkd3d_fex_report_append(text, sizeof(text), len, " %u x%"PRIu64" %.1fms;", st->line, st->count, st->gpu_ticks * ms);
++        }
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "\n");
++    }
++
++    vkd3d_fex_report_publish(&vkd3d_fex_pass_report, text, len);
++
++    memset(meter->sig_stats, 0, sizeof(meter->sig_stats));
++    meter->line_count = 0;
++    meter->lists = meter->list_ticks = meter->passes = meter->pass_ticks = meter->draws = 0;
++    meter->clears = meter->clear_ticks = meter->lost = meter->unordered = 0;
++    meter->load_bytes = meter->store_bytes = meter->clear_bytes = meter->loads = meter->stores = meter->cleared = 0;
++    pthread_mutex_lock(&meter->pending_lock);
++    meter->dropped = 0;
++    pthread_mutex_unlock(&meter->pending_lock);
++}
++
++/* Reads the results of up to 64 pending records at a time. Returns false when the oldest record isn't ready yet. */
++static bool fex_pass_resolve_some(struct vkd3d_fex_pass_meter *meter)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &meter->device->vk_procs;
++    struct fex_pass_pending batch[64];
++    uint64_t head, tail, now;
++    size_t count, i, done;
++
++    pthread_mutex_lock(&meter->pending_lock);
++    head = meter->pending_head;
++    tail = meter->pending_tail;
++    count = head - tail < ARRAY_SIZE(batch) ? (size_t)(head - tail) : ARRAY_SIZE(batch);
++    for (i = 0; i < count; i++)
++        batch[i] = meter->pending[(tail + i) % FEX_PASS_PENDING];
++    pthread_mutex_unlock(&meter->pending_lock);
++
++    if (!count)
++        return false;
++
++    now = vkd3d_get_current_time_ns();
++    for (done = 0; done < count; done++)
++    {
++        uint64_t data[4];
++        VkResult vr;
++
++        vr = VK_CALL(vkGetQueryPoolResults(meter->device->vk_device, meter->pool, 2 * batch[done].rec.pair, 2,
++                sizeof(data), data, 2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT));
++        if (vr >= 0 && data[1] && data[3])
++        {
++            if (data[2] >= data[0])
++                fex_pass_account(meter, &batch[done].rec, data[2] - data[0]);
++            else
++                meter->unordered++;
++        }
++        else if (now - batch[done].submit_ns > 2000000000ull)
++            meter->lost++;
++        else
++            break;
++    }
++
++    pthread_mutex_lock(&meter->pending_lock);
++    meter->pending_tail += done;
++    pthread_mutex_unlock(&meter->pending_lock);
++    return done == count;
++}
++
++static void *fex_pass_meter_thread(void *arg)
++{
++    struct vkd3d_fex_pass_meter *meter = arg;
++    uint64_t now;
++
++    vkd3d_set_thread_name("vkd3d-fex-passes");
++    meter->window_start_ns = vkd3d_get_current_time_ns();
++
++    while (!vkd3d_atomic_uint32_load_explicit(&meter->dead, vkd3d_memory_order_acquire))
++    {
++#ifdef _WIN32
++        Sleep(50);
++#else
++        struct timespec dur = { 0, 50000000 };
++        nanosleep(&dur, NULL);
++#endif
++
++        while (fex_pass_resolve_some(meter))
++            ;
++
++        now = vkd3d_get_current_time_ns();
++        if (now - meter->window_start_ns >= 1000000000ull)
++        {
++            fex_pass_publish(meter, (now - meter->window_start_ns) / 1e9);
++            meter->window_start_ns = now;
++        }
++    }
++
++    return NULL;
++}
++
++struct vkd3d_fex_pass_meter *vkd3d_fex_pass_meter_init(struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_fex_pass_meter *meter;
++    VkQueryPoolCreateInfo pool_info;
++    char env[16];
++
++    vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_pass_report.flags, VKD3D_FEX_REPORT_FLAG_DEVICE |
++            (device->fex_fold_clears ? VKD3D_FEX_REPORT_FLAG_FOLD_CLEARS : 0), vkd3d_memory_order_release);
++
++    if (!vkd3d_get_env_var("VKD3D_FEX_PASSES", env, sizeof(env)) || strcmp(env, "1"))
++        return NULL;
++
++    if (!(meter = vkd3d_calloc(1, sizeof(*meter))))
++        return NULL;
++    if (!(meter->pending = vkd3d_calloc(FEX_PASS_PENDING, sizeof(*meter->pending))))
++    {
++        vkd3d_free(meter);
++        return NULL;
++    }
++
++    meter->device = device;
++    meter->ns_per_tick = device->device_info.properties2.properties.limits.timestampPeriod;
++
++    memset(&pool_info, 0, sizeof(pool_info));
++    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++    pool_info.queryCount = 2 * FEX_PASS_QUERY_PAIRS;
++    if (VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &meter->pool)) != VK_SUCCESS)
++    {
++        ERR("FEX pass meter: failed to create timestamp query pool.\n");
++        vkd3d_free(meter->pending);
++        vkd3d_free(meter);
++        return NULL;
++    }
++
++    pthread_mutex_init(&meter->sig_lock, NULL);
++    pthread_mutex_init(&meter->pending_lock, NULL);
++
++    if (pthread_create(&meter->thread, NULL, fex_pass_meter_thread, meter))
++    {
++        VK_CALL(vkDestroyQueryPool(device->vk_device, meter->pool, NULL));
++        pthread_mutex_destroy(&meter->sig_lock);
++        pthread_mutex_destroy(&meter->pending_lock);
++        vkd3d_free(meter->pending);
++        vkd3d_free(meter);
++        return NULL;
++    }
++
++    vkd3d_atomic_uint32_or((uint32_t *)&vkd3d_fex_pass_report.flags, VKD3D_FEX_REPORT_FLAG_ON, vkd3d_memory_order_release);
++    INFO("FEX pass meter on.\n");
++    return meter;
++}
++
++void vkd3d_fex_pass_meter_deinit(struct vkd3d_fex_pass_meter *meter)
++{
++    const struct vkd3d_vk_device_procs *vk_procs;
++
++    if (!meter)
++        return;
++
++    vk_procs = &meter->device->vk_procs;
++    vkd3d_atomic_uint32_store_explicit(&meter->dead, 1, vkd3d_memory_order_release);
++    pthread_join(meter->thread, NULL);
++
++    VK_CALL(vkDestroyQueryPool(meter->device->vk_device, meter->pool, NULL));
++    pthread_mutex_destroy(&meter->sig_lock);
++    pthread_mutex_destroy(&meter->pending_lock);
++    vkd3d_free(meter->pending);
++    vkd3d_free(meter);
++}
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+new file mode 100644
+index 0000000..7a92722
+--- /dev/null
++++ b/libs/vkd3d/fex_timeline.c
+@@ -0,0 +1,292 @@
++/*
++ * FEX timeline: where each frame's time goes between the game's Present() and the image going to the window system,
++ * and what every queue thread spends its time on (submitting, waiting on fences, presenting, idle), plus how long
++ * ExecuteCommandLists work sat in the queue before the queue thread got to it. Once a second the numbers go into an
++ * exported buffer (vkd3d_fex_present_report) that FEX's stats log picks up. Off unless VKD3D_FEX_TIMELINE=1.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "vkd3d_private.h"
++#include <stdio.h>
++#include <string.h>
++#include <inttypes.h>
++
++#define FEX_TIMELINE_MAX_QUEUES 8u
++#define FEX_TIMELINE_CONFIG_SIZE 512u
++
++/* Read by FEX (found by export name in d3d12core.dll). */
++struct vkd3d_fex_report vkd3d_fex_present_report = { 0x54584546u /* 'FEXT' */, 1u, 0u, 0u, { 0 } };
++
++bool vkd3d_fex_timeline_on;
++
++struct fex_timeline_stat
++{
++    uint32_t count;
++    uint64_t sum_ns, max_ns;
++};
++
++struct fex_timeline_queue
++{
++    bool used;
++    D3D12_COMMAND_LIST_TYPE type;
++    struct fex_timeline_stat ops[VKD3D_FEX_QOP_COUNT];
++    struct fex_timeline_stat lag;
++    uint32_t max_depth;
++};
++
++static struct
++{
++    spinlock_t lock;
++    struct fex_timeline_stat steps[VKD3D_FEX_STEP_COUNT];
++    struct fex_timeline_queue queues[FEX_TIMELINE_MAX_QUEUES];
++    uint32_t presents, last_sync_interval, max_queued;
++    char config[FEX_TIMELINE_CONFIG_SIZE];
++} fex_timeline;
++
++static UINT64 fex_timeline_last_publish_ns;
++static UINT64 fex_timeline_last_release_ns;
++static uint32_t fex_timeline_init_done;
++
++static const char *const fex_step_names[VKD3D_FEX_STEP_COUNT] =
++{
++    "in Present()",
++    "Present->queue",
++    "acquire",
++    "blit",
++    "QueuePresent",
++    "acquire ahead",
++    "limiter",
++    "Present->gpu done",
++    "release->next Present",
++};
++
++static const char *const fex_op_names[VKD3D_FEX_QOP_COUNT] =
++{
++    "execute",
++    "fence wait",
++    "signal",
++    "present",
++    "other",
++    "idle",
++};
++
++static void fex_timeline_add(struct fex_timeline_stat *stat, uint64_t ns)
++{
++    stat->count++;
++    stat->sum_ns += ns;
++    if (ns > stat->max_ns)
++        stat->max_ns = ns;
++}
++
++void vkd3d_fex_timeline_init(void)
++{
++    char env[16];
++
++    if (vkd3d_atomic_uint32_exchange_explicit(&fex_timeline_init_done, 1, vkd3d_memory_order_acq_rel))
++        return;
++
++    spinlock_init(&fex_timeline.lock);
++    vkd3d_fex_timeline_on = vkd3d_get_env_var("VKD3D_FEX_TIMELINE", env, sizeof(env)) && !strcmp(env, "1");
++    vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_present_report.flags, VKD3D_FEX_REPORT_FLAG_DEVICE |
++            (vkd3d_fex_timeline_on ? VKD3D_FEX_REPORT_FLAG_ON : 0), vkd3d_memory_order_release);
++    vkd3d_atomic_uint64_store_explicit(&fex_timeline_last_publish_ns, vkd3d_get_current_time_ns(),
++            vkd3d_memory_order_relaxed);
++    if (vkd3d_fex_timeline_on)
++        INFO("FEX timeline on.\n");
++}
++
++uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type)
++{
++    uint32_t i, slot = VKD3D_FEX_NO_SLOT;
++
++    if (!vkd3d_fex_timeline_on)
++        return VKD3D_FEX_NO_SLOT;
++
++    spinlock_acquire(&fex_timeline.lock);
++    for (i = 0; i < FEX_TIMELINE_MAX_QUEUES; i++)
++    {
++        if (!fex_timeline.queues[i].used)
++        {
++            memset(&fex_timeline.queues[i], 0, sizeof(fex_timeline.queues[i]));
++            fex_timeline.queues[i].used = true;
++            fex_timeline.queues[i].type = type;
++            slot = i;
++            break;
++        }
++    }
++    spinlock_release(&fex_timeline.lock);
++    return slot;
++}
++
++void vkd3d_fex_timeline_queue_free_slot(uint32_t slot)
++{
++    if (slot >= FEX_TIMELINE_MAX_QUEUES)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    fex_timeline.queues[slot].used = false;
++    spinlock_release(&fex_timeline.lock);
++}
++
++void vkd3d_fex_timeline_queue_op(uint32_t slot, enum vkd3d_fex_queue_op op, uint64_t ns)
++{
++    if (slot >= FEX_TIMELINE_MAX_QUEUES)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    fex_timeline_add(&fex_timeline.queues[slot].ops[op], ns);
++    spinlock_release(&fex_timeline.lock);
++}
++
++void vkd3d_fex_timeline_queue_lag(uint32_t slot, uint64_t ns, uint32_t depth)
++{
++    if (slot >= FEX_TIMELINE_MAX_QUEUES)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    fex_timeline_add(&fex_timeline.queues[slot].lag, ns);
++    if (depth > fex_timeline.queues[slot].max_depth)
++        fex_timeline.queues[slot].max_depth = depth;
++    spinlock_release(&fex_timeline.lock);
++}
++
++void vkd3d_fex_timeline_step(enum vkd3d_fex_present_step step, uint64_t ns)
++{
++    if (!vkd3d_fex_timeline_on)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    fex_timeline_add(&fex_timeline.steps[step], ns);
++    spinlock_release(&fex_timeline.lock);
++}
++
++void vkd3d_fex_timeline_present(uint32_t sync_interval, uint32_t queued)
++{
++    if (!vkd3d_fex_timeline_on)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    fex_timeline.presents++;
++    fex_timeline.last_sync_interval = sync_interval;
++    if (queued > fex_timeline.max_queued)
++        fex_timeline.max_queued = queued;
++    spinlock_release(&fex_timeline.lock);
++}
++
++void vkd3d_fex_timeline_release(uint64_t now_ns)
++{
++    vkd3d_atomic_uint64_store_explicit(&fex_timeline_last_release_ns, now_ns, vkd3d_memory_order_relaxed);
++}
++
++uint64_t vkd3d_fex_timeline_last_release(void)
++{
++    return vkd3d_atomic_uint64_load_explicit(&fex_timeline_last_release_ns, vkd3d_memory_order_relaxed);
++}
++
++void vkd3d_fex_timeline_config(const char *text)
++{
++    if (!vkd3d_fex_timeline_on)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    snprintf(fex_timeline.config, sizeof(fex_timeline.config), "%s", text);
++    spinlock_release(&fex_timeline.lock);
++}
++
++static size_t fex_timeline_format_stat(char *buf, size_t size, size_t len, const char *name,
++        const struct fex_timeline_stat *stat)
++{
++    if (!stat->count)
++        return vkd3d_fex_report_append(buf, size, len, " | %s -", name);
++    return vkd3d_fex_report_append(buf, size, len, " | %s %.1f/%.1f", name,
++            stat->sum_ns / 1e6 / stat->count, stat->max_ns / 1e6);
++}
++
++static const char *fex_timeline_queue_name(D3D12_COMMAND_LIST_TYPE type)
++{
++    switch (type)
++    {
++        case D3D12_COMMAND_LIST_TYPE_DIRECT: return "direct";
++        case D3D12_COMMAND_LIST_TYPE_COMPUTE: return "compute";
++        case D3D12_COMMAND_LIST_TYPE_COPY: return "copy";
++        default: return "other";
++    }
++}
++
++static void fex_timeline_publish(double seconds)
++{
++    static char text[VKD3D_FEX_REPORT_SIZE];
++    struct fex_timeline_stat steps[VKD3D_FEX_STEP_COUNT];
++    struct fex_timeline_queue queues[FEX_TIMELINE_MAX_QUEUES];
++    char config[FEX_TIMELINE_CONFIG_SIZE];
++    uint32_t presents, sync_interval, max_queued;
++    size_t len = 0;
++    uint32_t i, j;
++
++    spinlock_acquire(&fex_timeline.lock);
++    memcpy(steps, fex_timeline.steps, sizeof(steps));
++    memcpy(queues, fex_timeline.queues, sizeof(queues));
++    memcpy(config, fex_timeline.config, sizeof(config));
++    presents = fex_timeline.presents;
++    sync_interval = fex_timeline.last_sync_interval;
++    max_queued = fex_timeline.max_queued;
++    memset(fex_timeline.steps, 0, sizeof(fex_timeline.steps));
++    for (i = 0; i < FEX_TIMELINE_MAX_QUEUES; i++)
++    {
++        memset(fex_timeline.queues[i].ops, 0, sizeof(fex_timeline.queues[i].ops));
++        memset(&fex_timeline.queues[i].lag, 0, sizeof(fex_timeline.queues[i].lag));
++        fex_timeline.queues[i].max_depth = 0;
++    }
++    fex_timeline.presents = 0;
++    fex_timeline.max_queued = 0;
++    spinlock_release(&fex_timeline.lock);
++
++    if (config[0])
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "# present: %s\n", config);
++
++    len = vkd3d_fex_report_append(text, sizeof(text), len, "  present n=%u sync=%u waits queued<=%u (ms avg/max)",
++            presents, sync_interval, max_queued);
++    for (i = 0; i < VKD3D_FEX_STEP_COUNT; i++)
++        len = fex_timeline_format_stat(text, sizeof(text), len, fex_step_names[i], &steps[i]);
++    len = vkd3d_fex_report_append(text, sizeof(text), len, " over %.2fs\n", seconds);
++
++    for (i = 0; i < FEX_TIMELINE_MAX_QUEUES; i++)
++    {
++        const struct fex_timeline_queue *q = &queues[i];
++
++        if (!q->used)
++            continue;
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "  queue %u %s (ms/s n):", i,
++                fex_timeline_queue_name(q->type));
++        for (j = 0; j < VKD3D_FEX_QOP_COUNT; j++)
++        {
++            if (q->ops[j].count)
++                len = vkd3d_fex_report_append(text, sizeof(text), len, " %s %.0f x%u max %.1f;", fex_op_names[j],
++                        q->ops[j].sum_ns / 1e6 / seconds, q->ops[j].count, q->ops[j].max_ns / 1e6);
++        }
++        if (q->lag.count)
++            len = vkd3d_fex_report_append(text, sizeof(text), len,
++                    " | lists waited in queue avg %.1f max %.1f ms, depth<=%u", q->lag.sum_ns / 1e6 / q->lag.count,
++                    q->lag.max_ns / 1e6, q->max_depth);
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "\n");
++    }
++
++    vkd3d_fex_report_publish(&vkd3d_fex_present_report, text, len);
++}
++
++void vkd3d_fex_timeline_tick(uint64_t now_ns)
++{
++    uint64_t last;
++
++    if (!vkd3d_fex_timeline_on)
++        return;
++
++    last = vkd3d_atomic_uint64_load_explicit(&fex_timeline_last_publish_ns, vkd3d_memory_order_relaxed);
++    if (now_ns - last < 1000000000ull)
++        return;
++    /* One thread publishes; the others see the new time and skip. */
++    if (vkd3d_atomic_uint64_compare_exchange(&fex_timeline_last_publish_ns, last, now_ns,
++            vkd3d_memory_order_acq_rel, vkd3d_memory_order_relaxed) != last)
++        return;
++    fex_timeline_publish((now_ns - last) / 1e9);
++}
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index 30cb7af..e73112e 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -118,6 +118,8 @@ if enable_profiling
+   vkd3d_src += ['timestamp_profiler.c']
+ endif
+ 
++vkd3d_src += ['fex_pass_meter.c', 'fex_timeline.c']
++
+ vkd3d_lib = static_library('vkd3d-proton', vkd3d_src, glsl_generator.process(vkd3d_shaders), vkd3d_build, vkd3d_version,
+   dependencies        : [ vkd3d_common_dep, vkd3d_shader_dep ] + vkd3d_extra_libs,
+   include_directories : vkd3d_private_includes)
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 4e1fa04..91e697c 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -80,6 +80,7 @@ struct dxgi_vk_swap_chain_present_request
+     };
+     bool low_latency_update_requested;
+     bool modifies_hdr_metadata;
++    uint64_t fex_call_ns; /* FEX timeline: when the game called Present() */
+ };
+ 
+ struct present_wait_entry
+@@ -87,6 +88,7 @@ struct present_wait_entry
+     uint64_t id;
+     uint64_t present_count;
+     uint64_t begin_frame_time_ns;
++    uint64_t fex_call_ns;
+ };
+ 
+ #if defined(_WIN32)
+@@ -403,7 +405,7 @@ static void dxgi_vk_swap_chain_drain_queue(struct dxgi_vk_swap_chain *chain)
+ }
+ 
+ static void dxgi_vk_swap_chain_push_present_id(struct dxgi_vk_swap_chain *chain,
+-        uint64_t present_count, uint64_t present_id, uint64_t begin_frame_time_ns)
++        uint64_t present_count, uint64_t present_id, uint64_t begin_frame_time_ns, uint64_t fex_call_ns)
+ {
+     struct present_wait_entry *entry;
+     pthread_mutex_lock(&chain->wait_thread.lock);
+@@ -413,6 +415,7 @@ static void dxgi_vk_swap_chain_push_present_id(struct dxgi_vk_swap_chain *chain,
+     entry->id = present_id;
+     entry->present_count = present_count;
+     entry->begin_frame_time_ns = begin_frame_time_ns;
++    entry->fex_call_ns = fex_call_ns;
+     pthread_cond_signal(&chain->wait_thread.cond);
+     pthread_mutex_unlock(&chain->wait_thread.lock);
+ }
+@@ -435,7 +438,7 @@ static void dxgi_vk_swap_chain_cleanup_low_latency(struct dxgi_vk_swap_chain *ch
+ 
+ static void dxgi_vk_swap_chain_cleanup_waiter_thread(struct dxgi_vk_swap_chain *chain)
+ {
+-    dxgi_vk_swap_chain_push_present_id(chain, 0, 0, 0);
++    dxgi_vk_swap_chain_push_present_id(chain, 0, 0, 0, 0);
+     pthread_join(chain->wait_thread.thread, NULL);
+     pthread_mutex_destroy(&chain->wait_thread.lock);
+     pthread_cond_destroy(&chain->wait_thread.cond);
+@@ -1021,6 +1024,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     struct dxgi_vk_swap_chain_present_request *request;
+     struct vkd3d_queue_timeline_trace_cookie cookie;
++    uint64_t fex_call_ns = 0, fex_release_ns;
+     bool low_latency_enable;
+ 
+     TRACE("iface %p, SyncInterval %u, PresentFlags #%x, pPresentParameters %p.\n",
+@@ -1032,6 +1036,15 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     if (PresentFlags & DXGI_PRESENT_TEST)
+         return S_OK;
+ 
++    if (vkd3d_fex_timeline_on)
++    {
++        /* Time the game spent on this frame since the last frame latency release. */
++        fex_call_ns = vkd3d_get_current_time_ns();
++        fex_release_ns = vkd3d_fex_timeline_last_release();
++        if (fex_release_ns && fex_call_ns > fex_release_ns && fex_call_ns - fex_release_ns < 1000000000ull)
++            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_GAME, fex_call_ns - fex_release_ns);
++    }
++
+     /* If we missed the event signal last frame, we have to wait for it now.
+      * Otherwise, we end up in a floating state where our waits and thread signals might not stay in sync anymore. */
+     if (chain->outstanding_present_request)
+@@ -1059,6 +1072,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     request->begin_frame_time_ns = chain->user.begin_frame_time_ns;
+     request->low_latency_frame_id = vkd3d_atomic_uint64_load_explicit(
+             &chain->queue->device->frame_markers.present, vkd3d_memory_order_acquire);
++    request->fex_call_ns = fex_call_ns;
+ 
+     if (chain->debug_latency && request->low_latency_frame_id)
+         INFO("Presenting with low latency frame ID: %"PRIu64".\n", request->low_latency_frame_id);
+@@ -1134,6 +1148,13 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     vkd3d_queue_timeline_trace_complete_present_block(
+             &chain->queue->device->queue_timeline_trace, cookie);
+ 
++    if (fex_call_ns)
++    {
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_PRESENT_CALL, vkd3d_get_current_time_ns() - fex_call_ns);
++        vkd3d_fex_timeline_present(SyncInterval, (uint32_t)(chain->user.present_count -
++                vkd3d_atomic_uint64_load_explicit(&chain->present.present_count, vkd3d_memory_order_acquire)));
++    }
++
+     return S_OK;
+ }
+ 
+@@ -1792,6 +1813,41 @@ static void dxgi_vk_swap_chain_anti_lag_state_update(struct dxgi_vk_swap_chain *
+     }
+ }
+ 
++static const char *fex_present_mode_name(VkPresentModeKHR mode)
++{
++    switch (mode)
++    {
++        case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE";
++        case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
++        case VK_PRESENT_MODE_FIFO_KHR: return "FIFO";
++        case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
++        default: return "other";
++    }
++}
++
++static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const VkSwapchainCreateInfoKHR *info)
++{
++    uint64_t target_interval_ns = chain->frame_rate_limit.target_interval_ns;
++    char text[384];
++
++    if (!vkd3d_fex_timeline_on)
++        return;
++
++    snprintf(text, sizeof(text), "swapchain %ux%u, %u images (asked %u, game BufferCount %u), mode %s%s%s,"
++            " SyncInterval %u, present wait %s, game latency handle %s (max latency %u), internal latency %u,"
++            " vkd3d limiter %.1f fps",
++            info->imageExtent.width, info->imageExtent.height, chain->present.backbuffer_count, info->minImageCount,
++            chain->desc.BufferCount, fex_present_mode_name(info->presentMode),
++            chain->present.compatible_unlocked_present_mode ? " switchable to " : "",
++            chain->present.compatible_unlocked_present_mode ?
++                    fex_present_mode_name(chain->present.unlocked_present_mode) : "",
++            chain->request.swap_interval, chain->wait_thread.supports_present_wait ? "yes" : "no",
++            (chain->desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) ? "yes" : "no",
++            chain->frame_latency, chain->frame_latency_internal,
++            target_interval_ns ? 1e9 / (double)target_interval_ns : 0.0);
++    vkd3d_fex_timeline_config(text);
++}
++
+ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk_swap_chain *chain)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+@@ -1960,6 +2016,7 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
+     VK_CALL(vkGetSwapchainImagesKHR(vk_device, chain->present.vk_swapchain, &chain->present.backbuffer_count, chain->present.vk_backbuffer_images));
+ 
+     INFO("Got %u swapchain images.\n", chain->present.backbuffer_count);
++    fex_timeline_note_swapchain(chain, &swapchain_create_info);
+ 
+     memset(&view_info, 0, sizeof(view_info));
+     view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+@@ -2413,6 +2470,8 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+     bool swapchain_is_fifo;
+     bool use_present_id;
+     VkResult vk_result;
++    uint64_t fex_t0 = 0;
++    bool fex_acquires;
+     VkQueue vk_queue;
+     VkResult vr;
+ 
+@@ -2422,7 +2481,12 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+     if (!chain->present.vk_swapchain)
+         return;
+ 
++    fex_acquires = vkd3d_fex_timeline_on && chain->present.current_backbuffer_index == UINT32_MAX;
++    if (fex_acquires)
++        fex_t0 = vkd3d_get_current_time_ns();
+     vr = dxgi_vk_swap_chain_try_acquire_next_image(chain);
++    if (fex_acquires)
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_ACQUIRE, vkd3d_get_current_time_ns() - fex_t0);
+     VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(chain->queue->device, vr == VK_ERROR_DEVICE_LOST);
+ 
+     /* Handle any errors and retry as needed. If we cannot make meaningful forward progress, just give up and retry later. */
+@@ -2448,8 +2512,12 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+     swapchain_index = chain->present.current_backbuffer_index;
+     assert(swapchain_index != UINT32_MAX);
+ 
++    if (vkd3d_fex_timeline_on)
++        fex_t0 = vkd3d_get_current_time_ns();
+     if (!dxgi_vk_swap_chain_submit_blit(chain, swapchain_index))
+         return;
++    if (vkd3d_fex_timeline_on)
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_BLIT, vkd3d_get_current_time_ns() - fex_t0);
+ 
+     /* Only mark anti-lag update after we have submitted blit
+      * so we don't get wrong associations. */
+@@ -2539,7 +2607,11 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+ 
+     vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
+     VKD3D_REGION_BEGIN(queue_present);
++    if (vkd3d_fex_timeline_on)
++        fex_t0 = vkd3d_get_current_time_ns();
+     vr = VK_CALL(vkQueuePresentKHR(vk_queue, &present_info));
++    if (vkd3d_fex_timeline_on)
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_QUEUE_PRESENT, vkd3d_get_current_time_ns() - fex_t0);
+     VKD3D_REGION_END(queue_present);
+     vkd3d_queue_release(chain->queue->vkd3d_queue);
+     VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(chain->queue->device, vr == VK_ERROR_DEVICE_LOST);
+@@ -2579,7 +2651,8 @@ static void dxgi_vk_swap_chain_signal_waitable_handle(struct dxgi_vk_swap_chain
+ {
+     uint64_t present_id = chain->present.present_id_valid ? chain->present.present_id : 0;
+ 
+-    dxgi_vk_swap_chain_push_present_id(chain, present_count, present_id, chain->request.begin_frame_time_ns);
++    dxgi_vk_swap_chain_push_present_id(chain, present_count, present_id, chain->request.begin_frame_time_ns,
++            chain->request.fex_call_ns);
+ }
+ 
+ static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain, uint64_t current_time_ns);
+@@ -2589,9 +2662,12 @@ static void dxgi_vk_swap_chain_present_callback(void *chain_)
+     const struct dxgi_vk_swap_chain_present_request *next_request;
+     struct dxgi_vk_swap_chain *chain = chain_;
+     uint64_t next_present_count;
++    uint64_t fex_t0;
+ 
+     next_present_count = chain->present.present_count + 1;
+     next_request = &chain->request_ring[next_present_count % ARRAY_SIZE(chain->request_ring)];
++    if (vkd3d_fex_timeline_on && next_request->fex_call_ns)
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_QUEUE_DELAY, vkd3d_get_current_time_ns() - next_request->fex_call_ns);
+     if (dxgi_vk_swap_chain_request_needs_swapchain_recreation(chain, next_request, &chain->request))
+         chain->present.force_swapchain_recreation = true;
+ 
+@@ -2634,7 +2710,10 @@ static void dxgi_vk_swap_chain_present_callback(void *chain_)
+      * since we're in a queue callback. */
+     if (!chain->wait_thread.supports_present_wait)
+     {
++        fex_t0 = vkd3d_get_current_time_ns();
+         dxgi_vk_swap_chain_try_acquire_next_image(chain);
++        if (vkd3d_fex_timeline_on)
++            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_ACQUIRE_AHEAD, vkd3d_get_current_time_ns() - fex_t0);
+         dxgi_vk_swap_chain_delay_next_frame(chain, vkd3d_get_current_time_ns());
+ 
+         /* The old implementation used acquire semaphores, and did not block, so to maintain same behavior,
+@@ -2712,6 +2791,7 @@ static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain
+     static const uint32_t max_window_size = 128u;
+     static const uint32_t min_window_size = 8u;
+     uint64_t next_deadline_ns = 0;
++    uint64_t fex_sleep_start_ns;
+ 
+     pthread_mutex_lock(&chain->frame_rate_limit.lock);
+ 
+@@ -2784,6 +2864,8 @@ static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain
+     if (current_time_ns >= next_deadline_ns)
+         return;
+ 
++    fex_sleep_start_ns = current_time_ns;
++
+     /* Busy-wait for the last couple of milliseconds for accuracy, only use the
+      * platform's sleep function for durations longer than the threshold, which
+      * is an estimated error based on the timer interval and sleep duration. */
+@@ -2803,6 +2885,8 @@ static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain
+         vkd3d_pause();
+         current_time_ns = vkd3d_get_current_time_ns();
+     }
++
++    vkd3d_fex_timeline_step(VKD3D_FEX_STEP_LIMITER, current_time_ns - fex_sleep_start_ns);
+ }
+ 
+ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
+@@ -2848,6 +2932,8 @@ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
+         }
+ 
+         end_frame_time_ns = vkd3d_get_current_time_ns();
++        if (vkd3d_fex_timeline_on && entry.fex_call_ns && end_frame_time_ns > entry.fex_call_ns)
++            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_GPU_DONE, end_frame_time_ns - entry.fex_call_ns);
+ 
+         if (chain->wait_thread.supports_present_wait)
+             dxgi_vk_swap_chain_delay_next_frame(chain, end_frame_time_ns);
+@@ -2876,6 +2962,14 @@ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
+         if (vkd3d_native_sync_handle_is_valid(chain->frame_latency_event_internal))
+             vkd3d_native_sync_handle_release(chain->frame_latency_event_internal, 1);
+ 
++        if (vkd3d_fex_timeline_on)
++        {
++            uint64_t fex_now = vkd3d_get_current_time_ns();
++
++            vkd3d_fex_timeline_release(fex_now);
++            vkd3d_fex_timeline_tick(fex_now);
++        }
++
+         if (entry.id && entry.begin_frame_time_ns)
+             INFO("vkWaitForPresentKHR frame latency: %.3f ms.\n", 1e-6 * (end_frame_time_ns - entry.begin_frame_time_ns));
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index d64211b..4d8459b 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3031,6 +3031,92 @@ struct d3d12_command_list_sequence
+ 
+ struct vkd3d_timestamp_profiler_submitted_work;
+ 
++/* Reports FEX's stats log reads from d3d12core.dll (found by export name). seq is odd while text is being written.
++ * Lines starting with '#' are notes; FEX prints each distinct note once, so a note may repeat in every report. */
++#define VKD3D_FEX_REPORT_SIZE 4096u
++#define VKD3D_FEX_REPORT_FLAG_ON 0x1u          /* the report's feature is switched on */
++#define VKD3D_FEX_REPORT_FLAG_FOLD_CLEARS 0x2u /* pass report: clear folding is on */
++#define VKD3D_FEX_REPORT_FLAG_DEVICE 0x80000000u /* a D3D12 device was created */
++struct vkd3d_fex_report
++{
++    uint32_t magic;
++    uint32_t version;
++    volatile uint32_t seq;
++    volatile uint32_t flags;
++    char text[VKD3D_FEX_REPORT_SIZE];
++};
++extern struct vkd3d_fex_report vkd3d_fex_pass_report;    /* magic 'FEXP' */
++extern struct vkd3d_fex_report vkd3d_fex_present_report; /* magic 'FEXT' */
++void vkd3d_fex_report_publish(struct vkd3d_fex_report *report, const char *text, size_t len);
++size_t vkd3d_fex_report_append(char *buf, size_t size, size_t len, const char *fmt, ...);
++
++/* FEX timeline (fex_timeline.c, VKD3D_FEX_TIMELINE=1): where each frame's time goes between the game's Present() and
++ * the image going to the window system, and what every queue thread spends its time on. */
++enum vkd3d_fex_present_step
++{
++    VKD3D_FEX_STEP_PRESENT_CALL,  /* game thread inside Present() */
++    VKD3D_FEX_STEP_QUEUE_DELAY,   /* Present() until the queue thread starts the present */
++    VKD3D_FEX_STEP_ACQUIRE,       /* vkAcquireNextImageKHR in the present */
++    VKD3D_FEX_STEP_BLIT,          /* recording and submitting the copy into the swapchain image */
++    VKD3D_FEX_STEP_QUEUE_PRESENT, /* vkQueuePresentKHR */
++    VKD3D_FEX_STEP_ACQUIRE_AHEAD, /* acquiring the next image right after the present (no present wait) */
++    VKD3D_FEX_STEP_LIMITER,       /* vkd3d's own frame limiter sleeping */
++    VKD3D_FEX_STEP_GPU_DONE,      /* Present() until the copy finished on the GPU (or present wait returned) */
++    VKD3D_FEX_STEP_GAME,          /* frame latency release until the game's next Present() */
++    VKD3D_FEX_STEP_COUNT
++};
++enum vkd3d_fex_queue_op
++{
++    VKD3D_FEX_QOP_EXECUTE,
++    VKD3D_FEX_QOP_WAIT,
++    VKD3D_FEX_QOP_SIGNAL,
++    VKD3D_FEX_QOP_PRESENT,
++    VKD3D_FEX_QOP_OTHER,
++    VKD3D_FEX_QOP_IDLE,
++    VKD3D_FEX_QOP_COUNT
++};
++#define VKD3D_FEX_NO_SLOT 0xffffffffu
++extern bool vkd3d_fex_timeline_on;
++void vkd3d_fex_timeline_init(void);
++uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type);
++void vkd3d_fex_timeline_queue_free_slot(uint32_t slot);
++void vkd3d_fex_timeline_queue_op(uint32_t slot, enum vkd3d_fex_queue_op op, uint64_t ns);
++void vkd3d_fex_timeline_queue_lag(uint32_t slot, uint64_t ns, uint32_t depth);
++void vkd3d_fex_timeline_step(enum vkd3d_fex_present_step step, uint64_t ns);
++void vkd3d_fex_timeline_present(uint32_t sync_interval, uint32_t queued);
++void vkd3d_fex_timeline_release(uint64_t now_ns);
++uint64_t vkd3d_fex_timeline_last_release(void);
++void vkd3d_fex_timeline_config(const char *text);
++void vkd3d_fex_timeline_tick(uint64_t now_ns);
++
++/* FEX pass meter (fex_pass_meter.c): GPU time per render pass and command list, reported to FEX's stats log. */
++#define VKD3D_FEX_PASS_KIND_DRAW 0
++#define VKD3D_FEX_PASS_KIND_CLEAR 1
++#define VKD3D_FEX_PASS_KIND_RESUMED 2
++#define VKD3D_FEX_PASS_KIND_LIST 3
++struct vkd3d_fex_pass_record
++{
++    uint32_t pair;     /* timestamp query pair: begin = 2 * pair, end = 2 * pair + 1 */
++    uint16_t sig;      /* pass signature index, 0xffff = none */
++    uint16_t end_line; /* source line that ended the pass */
++    uint32_t draws;
++    uint32_t kind;
++};
++struct vkd3d_fex_pass_meter;
++
++/* FEX clear folding (command.c, VKD3D_FEX_FOLD_CLEARS=1): a full Clear*View made while no render pass runs waits here
++ * and becomes the load op of the next render pass that uses the same view, instead of a render pass of its own that
++ * writes the whole image to memory just for the next pass to read it back (costly on tiled GPUs). */
++#define VKD3D_FEX_MAX_PENDING_CLEARS (D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT + 1)
++struct vkd3d_fex_pending_clear
++{
++    struct d3d12_resource *resource;
++    struct vkd3d_view *view;
++    VkImageAspectFlags aspects;
++    VkImageLayout layout;
++    VkClearValue value;
++};
++
+ struct d3d12_command_list
+ {
+     d3d12_command_list_iface ID3D12GraphicsCommandList_iface;
+@@ -3187,13 +3273,50 @@ struct d3d12_command_list
+         uint32_t dispatch_count;
+     } timestamp_profiler;
+ #endif
++
++    struct
++    {
++        struct vkd3d_fex_pass_record *records;
++        size_t records_count;
++        size_t records_size;
++        struct vkd3d_fex_pass_record current;
++        uint32_t list_pair;
++        uint32_t block_next, block_end;
++        bool pass_active;
++        bool list_active;
++    } fex_pass;
++
++    struct
++    {
++        struct vkd3d_fex_pending_clear entries[VKD3D_FEX_MAX_PENDING_CLEARS];
++        uint32_t count;
++        bool keep; /* set while ending a render pass that must not emit pending clears */
++    } fex_clears;
+ };
+ 
+ HRESULT d3d12_command_list_create(struct d3d12_device *device,
+         UINT node_mask, D3D12_COMMAND_LIST_TYPE type, struct d3d12_command_list **list);
+ bool d3d12_command_list_reset_query(struct d3d12_command_list *list,
+         VkQueryPool vk_pool, uint32_t index);
+-void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list, bool suspend);
++void d3d12_command_list_end_current_render_pass_line(struct d3d12_command_list *list, bool suspend, unsigned int line);
++/* The line tells the FEX pass meter what ended a render pass. */
++#define d3d12_command_list_end_current_render_pass(list, suspend) \
++        d3d12_command_list_end_current_render_pass_line(list, suspend, __LINE__)
++
++struct vkd3d_format;
++struct vkd3d_fex_pass_meter *vkd3d_fex_pass_meter_init(struct d3d12_device *device);
++void vkd3d_fex_pass_meter_deinit(struct vkd3d_fex_pass_meter *meter);
++void vkd3d_fex_pass_meter_begin_list(struct d3d12_command_list *list);
++void vkd3d_fex_pass_meter_close_list(struct d3d12_command_list *list);
++void vkd3d_fex_pass_meter_begin_pass(struct d3d12_command_list *list, const VkRenderingInfo *info,
++        const struct vkd3d_format *const *color_formats, VkSampleCountFlagBits samples,
++        const struct vkd3d_format *ds_format, uint32_t kind);
++void vkd3d_fex_pass_meter_draw(struct d3d12_command_list *list);
++void vkd3d_fex_pass_meter_end_pass(struct d3d12_command_list *list, unsigned int line);
++void vkd3d_fex_pass_meter_submit_list(struct d3d12_command_list *list);
++void vkd3d_fex_pass_meter_free_list(struct d3d12_command_list *list);
++void vkd3d_fex_pass_meter_count_clears(struct d3d12_device *device, uint32_t folded, uint32_t own_pass);
++bool vkd3d_fex_fold_clears_enabled(void);
+ void d3d12_command_list_invalidate_all_state(struct d3d12_command_list *list);
+ 
+ void d3d12_command_list_debug_mark_label(struct d3d12_command_list *list, const char *tag,
+@@ -3422,6 +3545,7 @@ struct d3d12_command_queue_submission_callback
+ struct d3d12_command_queue_submission
+ {
+     enum vkd3d_submission_type type;
++    uint64_t fex_enqueue_ns; /* FEX timeline: when it was queued */
+     union
+     {
+         struct d3d12_command_queue_submission_wait wait;
+@@ -3514,6 +3638,7 @@ struct d3d12_command_queue
+     struct d3d_destruction_notifier destruction_notifier;
+     struct dxgi_vk_swap_chain_factory vk_swap_chain_factory;
+     unsigned int submission_thread_tid;
++    uint32_t fex_timeline_slot;
+ 
+     struct vkd3d_fence_virtual_wait *wait_fences;
+     size_t wait_fences_size;
+@@ -5374,6 +5499,8 @@ struct d3d12_device
+ #ifdef VKD3D_ENABLE_PROFILING
+     struct vkd3d_timestamp_profiler *timestamp_profiler;
+ #endif
++    struct vkd3d_fex_pass_meter *fex_pass_meter;
++    bool fex_fold_clears;
+     uint64_t shader_interface_key;
+     uint32_t device_has_dgc_templates;
+ 

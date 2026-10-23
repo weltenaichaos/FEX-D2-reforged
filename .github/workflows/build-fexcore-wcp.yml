@@ -13,7 +13,7 @@ name: Build FEXCore WCP
 on:
   push:
     branches: [ d2r/clean ]
-    paths-ignore: [ .github/workflows/build-vkd3d-arm64ec-wcp.yml ]
+    paths-ignore: [ .github/workflows/build-vkd3d-arm64ec-wcp.yml, vkd3d-patches/** ]
   workflow_dispatch:
 
 env:

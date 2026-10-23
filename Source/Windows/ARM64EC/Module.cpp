@@ -56,6 +56,7 @@ $end_info$
 #include "FrameLatency.h"
 #include "Rumble.h"
 #include "NativeRedirect.h"
+#include "Vkd3dReport.h"
 
 #include <atomic>
 #include <cstdint>
@@ -948,6 +949,7 @@ NTSTATUS ProcessInit() {
   FrameLatency::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
   Rumble::Init(StatsLog);
   if (StatsLog) {
+    Vkd3dReport::Init();
     if (!HotPageFaults) {
       FEX::Windows::StatsLogNote("smc: every write to translated code faults and invalidates its page (upstream; FEX_SMC_HOTPAGE=16 "
                                  "stops that for pages that keep faulting)");

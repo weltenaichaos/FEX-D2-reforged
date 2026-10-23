@@ -93,10 +93,47 @@ namespace {
                                     "between batches (FEX_VKD3D_NOSTAGGER=0 leaves VKD3D_CONFIG alone)",
                                     Before, Narrow(Value, Len), static_cast<uint32_t>(SetStatus)));
   }
+
+  // See EnvironmentVariablesHandling.h: turns on a feature of FEX's vkd3d-proton build by setting Var=1, unless the
+  // variable is already set.
+  template<size_t N>
+  void SetupVkd3dFexSwitch(const char* SwitchName, const wchar_t (&VarText)[N], const char* What) {
+    const char* Value = Switch(SwitchName);
+    const bool On = Value && !(Value[0] == '0' && !Value[1]);
+    const auto Var = Narrow(VarText, N - 1);
+    UNICODE_STRING Name {sizeof(VarText) - sizeof(wchar_t), sizeof(VarText), const_cast<wchar_t*>(VarText)};
+
+    wchar_t Old[32];
+    UNICODE_STRING OldValue {0, sizeof(Old) - sizeof(wchar_t), Old};
+    const NTSTATUS QueryStatus = RtlQueryEnvironmentVariable_U(nullptr, &Name, &OldValue);
+    if (QueryStatus != StatusVariableNotFound) {
+      StatsLogNote(fextl::fmt::format("vkd3d: {}={} was already set, left alone ({})", Var,
+                                      QueryStatus == 0 ? Narrow(Old, OldValue.Length / sizeof(wchar_t)) : fextl::string("?"), What));
+      return;
+    }
+    if (!On) {
+      StatsLogNote(fextl::fmt::format("vkd3d: {} not set ({} off): {} stays off", Var, SwitchName, What));
+      return;
+    }
+
+    static constexpr wchar_t OneText[] = L"1";
+    UNICODE_STRING One {sizeof(wchar_t), sizeof(OneText), const_cast<wchar_t*>(OneText)};
+    const NTSTATUS SetStatus = RtlSetEnvironmentVariable(nullptr, &Name, &One);
+    StatsLogNote(fextl::fmt::format("vkd3d: {}=1 (status {:#x}): {} (only FEX's VKD3D build reads it; {}=0 turns it off)", Var,
+                                    static_cast<uint32_t>(SetStatus), What, SwitchName));
+  }
 } // namespace
 
 void SetupEnvironmentVariableValues(HMODULE NtDll) {
   SetupVkd3dConfig();
+  SetupVkd3dFexSwitch("FEX_VKD3D_FOLD_CLEARS", L"VKD3D_FEX_FOLD_CLEARS",
+                      "a full screen clear made between render passes becomes the start of the next pass that draws to "
+                      "that image, instead of a pass of its own that writes the whole image to memory for the next pass "
+                      "to read back");
+  SetupVkd3dFexSwitch("FEX_VKD3D_PASSES", L"VKD3D_FEX_PASSES", "GPU time per render pass on the 'gpu' lines");
+  SetupVkd3dFexSwitch("FEX_VKD3D_TIMELINE", L"VKD3D_FEX_TIMELINE",
+                      "each frame's way from the game's Present() to the window system, and what vkd3d's queue threads do, on "
+                      "the 'present' and 'queue' lines");
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
 

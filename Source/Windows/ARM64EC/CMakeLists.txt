@@ -7,6 +7,7 @@ add_library(arm64ecfex SHARED
   NativeUnpackCache.cpp
   NativeZlib.c
   Rumble.cpp
+  Vkd3dReport.cpp
   libarm64ecfex.def
   $<TARGET_OBJECTS:FEXCore_object>)
 
