@@ -138,8 +138,8 @@ wait_watch_check:
   ldr x4, [x16, #8] // FEXWaitWatch[1]: the watched thread's TEB
   cmp x4, x18
   b.ne wait_watch_done
-  ldr lr, [x16] // FEXWaitWatch[0]: calls recorded so far, then from [4] a ring of 256 (handle, timeout, function, caller)
-  and x23, lr, #0xff
+  ldr lr, [x16] // FEXWaitWatch[0]: calls recorded so far, then from [4] a ring of 1024 (handle, timeout, function, caller)
+  and x23, lr, #0x3ff
   add x23, x16, x23, lsl #5
   mov x4, sp // sp may be only 8-byte aligned here, see frame_mark_check
   ldr x4, [x4] // the x64 return address

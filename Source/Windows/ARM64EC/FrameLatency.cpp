@@ -32,9 +32,9 @@ NTSTATUS WINAPI NtReadVirtualMemory(HANDLE Process, const void* Address, void* B
 
 // Module.S ExitFunctionEC: a call into one of these two native functions (x9 there) from the thread whose TEB is
 // FEXWaitWatch[1] is recorded in FEXWaitWatch: [0] = calls recorded so far, [2] and [3] unused, then from [4] a ring of
-// 256 entries of (handle, timeout, function, x64 return address).
+// 1024 entries of (handle, timeout, function, x64 return address).
 uint64_t FEXWaitWatchTargets[2];
-alignas(64) uint64_t FEXWaitWatch[4 + 4 * 256];
+alignas(64) uint64_t FEXWaitWatch[4 + 4 * 1024];
 
 // NativeRedirect.cpp: [0] = frame starts counted so far (0 until the frame clock is found).
 extern uint64_t FEXFrameMarks[];
@@ -42,7 +42,7 @@ extern uint64_t FEXFrameMarks[];
 
 namespace FrameLatency {
 namespace {
-  constexpr size_t Ring = 256;
+  constexpr size_t Ring = 1024; // must match the mask in Module.S; the log thread reads it once a second
   constexpr uint32_t SyncOnly = SYNCHRONIZE;
   constexpr uint32_t SemaphoreQueryState = 0x0001;
   // vkd3d-proton's frame latency semaphore: CreateSemaphoreA(NULL, latency, DXGI_MAX_SWAP_CHAIN_BUFFERS, NULL).

@@ -16,6 +16,8 @@ int64_t Pread(int Fd, void* Buffer, size_t Size, uint64_t Offset);
 // Reads a small file into Buffer, NUL-terminated. Returns its length, or a negative errno.
 int64_t ReadSmallFile(const char* Path, char* Buffer, size_t Size);
 int GetPid();
+// The calling thread's Linux tid.
+int GetTid();
 
 // Nice value of a Linux thread (tid; a pid names its first thread), or a value below -100 on failure.
 int GetNice(int Tid);

@@ -17,8 +17,14 @@
 // the game calling IDXGISwapChain2::SetMaximumFrameLatency(N): the main thread can then prepare the next frame while the
 // GPU draws the last one.
 //
-//   FEX_FRAMELATENCY=2    one frame more in flight (the D2R default); 3 or 4 for more
-//   FEX_FRAMELATENCY=off  leave the handle alone (also 0 or 1); the waits are still logged with the stats log on
+//   FEX_FRAMELATENCY=2    one frame more in flight; 3 or 4 for more
+//   FEX_FRAMELATENCY=off  leave the handle alone (also 0 or 1; the D2R default since build 51); the waits are still logged
+//                         with the stats log on
+//
+// Build 50 result (D2R on the Thor): the handle was found and released, the main thread then ran a frame further ahead,
+// and the ~20 ms wait moved from the handle into vkd3d-proton's Present (its own limit of the same depth, released by the
+// same present completions). Heavy scenes stayed at 37-42 ms a frame: the stage after the CPU (GPU or present path) is
+// the limit there, not the hand-off. One more frame in flight then only adds input lag, hence off by default.
 //
 // With the stats log on, every second gets a "waits main" line: the handles the main thread waited on, how often, where
 // from, and how long it was sampled waiting in each. "# latency" lines say what was found and done.

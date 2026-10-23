@@ -26,8 +26,12 @@ namespace {
     // Build 49: the main thread alone on the fastest core, FEX's helpers on the slowest, the wineserver above the game
     // (see PriorityGuard.h).
     {"FEX_MAINCORE", "fast"},      {"FEX_HELPER_CORES", "little"}, {"FEX_SERVER_NICE", "-10"},
-    // Build 50: one more frame in flight on the swapchain's frame latency handle (see ARM64EC/FrameLatency.h).
-    {"FEX_FRAMELATENCY", "2"},
+    // Build 51: the main thread may leave its core while it waits 40 ms a second or more for it (see PriorityGuard.h).
+    {"FEX_MAINCORE_WAIT", "40"},
+    // Build 50 tried one more frame in flight on the swapchain's frame latency handle (FEX_FRAMELATENCY=2). Heavy scenes
+    // were no faster: the wait moved into vkd3d-proton's Present, the GPU or present path being the limit there. It only
+    // added input lag, so build 51 leaves the handle as the game set it (see ARM64EC/FrameLatency.h).
+    {"FEX_FRAMELATENCY", "off"},
   };
 
   // In the order the stats log lists them.
@@ -57,9 +61,11 @@ namespace {
     "FEX_HELPER_PRIO",
     "FEX_STALLPROBE",
     "FEX_MAINCORE",
+    "FEX_MAINCORE_WAIT",
     "FEX_HELPER_CORES",
     "FEX_SERVER_NICE",
     "FEX_SCHEDLOG",
+    "FEX_GPULOG",
     "FEX_FRAMELATENCY",
   };
 

@@ -16,6 +16,7 @@ namespace {
   constexpr int64_t NR_setpriority = 140;
   constexpr int64_t NR_getpriority = 141;
   constexpr int64_t NR_getpid = 172;
+  constexpr int64_t NR_gettid = 178;
 
   constexpr int64_t AT_FDCWD = -100;
   constexpr int64_t O_RDONLY = 0;
@@ -135,6 +136,10 @@ int64_t ReadSmallFile(const char* Path, char* Buffer, size_t Size) {
 
 int GetPid() {
   return static_cast<int>(Syscall(NR_getpid));
+}
+
+int GetTid() {
+  return static_cast<int>(Syscall(NR_gettid));
 }
 
 int GetNice(int Tid) {

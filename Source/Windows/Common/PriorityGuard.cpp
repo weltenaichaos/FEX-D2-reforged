@@ -95,6 +95,8 @@ namespace {
     uint64_t FastMask;   // the CPU(s) with the highest maximum clock, 0 when all are alike or unknown
     uint64_t LittleMask; // the CPU(s) with the lowest maximum clock, 0 when all are alike or unknown
     uint32_t MainTID;    // the thread that started the process (FEX's process init runs on it)
+    int MainLinuxTid;    // its Linux tid
+    uint32_t EaseWaitMs; // FEX_MAINCORE_WAIT, 0 = never let the main thread off its core
   };
 
   struct Tracked {
@@ -318,6 +320,103 @@ namespace {
     return Pid;
   }
 
+  // Keeps the main thread on its core at the Linux level. Wine only knows the affinity it set itself: in the build 50 log
+  // the main thread's Linux cores changed to all 8 at 34 s (and to 0-6 for a second now and then) while Wine still
+  // reported the X3, so the 2-second round above never noticed, and the main thread ran 60-80% of the time on the slower
+  // cores. Only the main thread changed. It is the process's first Linux thread, the one a `taskset -p <pid>` or a
+  // per-process cpuset move reaches (Android, or the launcher's power control). Checked every 250 ms with
+  // sched_getaffinity, which costs no wineserver round trip.
+  //
+  // At login and while loading, the main thread alone on the X3 waited up to 650 ms a second for it (build 50; 150-270 ms
+  // in build 49): something outside the game runs there then. When it waits FEX_MAINCORE_WAIT ms (default 40) or more in
+  // a second, it may also use the game's other big cores until it has waited under 10 ms a second for a while (5 s, longer
+  // when it had to leave again soon after coming back).
+  struct MainKeeper {
+    int Tid;
+    uint32_t EaseMs;
+    uint32_t Tick; // 250 ms ticks
+    bool Widened;
+    uint32_t CalmSeconds;
+    uint32_t CalmNeeded = 5;
+    uint32_t RepinnedAt; // tick of the last return to the fast core, 0 = none yet
+    bool HaveWait;
+    uint64_t LastWaitNs;
+    uint64_t Applied;  // the mask this keeper or the round last put the thread on
+    uint64_t LastSeen; // the last mask found that neither of them set
+    uint32_t Resets;
+    uint32_t Widens;
+  };
+
+  void KeepMainCore(MainKeeper& K, uint64_t FastMask, uint64_t WideMask) {
+    ++K.Tick;
+    if (!K.Tid || !FastMask) {
+      K.HaveWait = false;
+      return;
+    }
+
+    // Once a second: how long the main thread was ready to run but had no CPU.
+    if (K.Tick % 4 == 0 && K.EaseMs && (WideMask & ~FastMask)) {
+      Linux::SchedStat S {};
+      if (Linux::ReadSchedStat(fextl::fmt::format("/proc/self/task/{}/schedstat", K.Tid).c_str(), S)) {
+        if (K.HaveWait) {
+          const double WaitMs = static_cast<double>(S.WaitNs - K.LastWaitNs) / 1e6;
+          if (!K.Widened && WaitMs >= K.EaseMs) {
+            K.Widened = true;
+            K.CalmSeconds = 0;
+            ++K.Widens;
+            if (K.RepinnedAt && K.Tick - K.RepinnedAt <= 40) {
+              K.CalmNeeded = std::min<uint32_t>(K.CalmNeeded * 2, 60);
+            }
+            if (K.Widens <= 5 || K.Widens % 20 == 0) {
+              StatsLogNote(fextl::fmt::format("cores: main thread waited {:.0f} ms in the last second for its core (something outside the game "
+                                              "runs there, as at login and while loading); it may use {:#x} until it waits under 10 ms a "
+                                              "second for {} s, #{} (FEX_MAINCORE_WAIT=off keeps it on its core)",
+                                              WaitMs, WideMask, K.CalmNeeded, K.Widens));
+            }
+          } else if (K.Widened) {
+            K.CalmSeconds = WaitMs < 10.0 ? K.CalmSeconds + 1 : 0;
+            if (K.CalmSeconds >= K.CalmNeeded) {
+              K.Widened = false;
+              K.RepinnedAt = K.Tick;
+              if (K.Widens <= 5 || K.Widens % 20 == 0) {
+                StatsLogNote(fextl::fmt::format("cores: main thread back alone on {:#x} after {} s waiting under 10 ms a second", FastMask,
+                                                K.CalmSeconds));
+              }
+            }
+          } else if (K.RepinnedAt && K.Tick - K.RepinnedAt > 240) {
+            K.CalmNeeded = 5;
+          }
+        }
+        K.LastWaitNs = S.WaitNs;
+        K.HaveWait = true;
+      }
+    }
+
+    const uint64_t Want = K.Widened ? WideMask : FastMask;
+    const uint64_t Now = Linux::GetAffinity(K.Tid);
+    if (!Now) {
+      return;
+    }
+    if (Now == Want) {
+      K.Applied = Want;
+      return;
+    }
+    // Neither this keeper nor the round set what it has now: Android or the launcher changed it outside Wine.
+    const bool Outside = Now != K.Applied && Now != K.LastSeen;
+    if (Now != K.Applied) {
+      K.LastSeen = Now;
+    }
+    const int Result = Linux::SetAffinity(K.Tid, Want);
+    if (Result == 0) {
+      K.Applied = Want;
+    }
+    if (Outside && (++K.Resets <= 3 || K.Resets % 50 == 0)) {
+      StatsLogNote(fextl::fmt::format("cores: main thread's Linux cores were changed to {:#x} outside Wine (Android or the launcher); set back "
+                                      "to {:#x}, result {}, change #{}",
+                                      Now, Want, Result, K.Resets));
+    }
+  }
+
   void* GuardThread(void* Arg) {
     const auto* C = static_cast<Config*>(Arg);
     const uint32_t SelfTID = GetCurrentThreadId();
@@ -340,6 +439,8 @@ namespace {
     uint64_t ReportedGameMask {};
     int ServerPid {};
     uint32_t ServerCoreReports {};
+    MainKeeper Keeper {.Tid = C->Cores == CoreMode::Fast ? C->MainLinuxTid : 0, .EaseMs = C->EaseWaitMs};
+    uint64_t KeepFast {}, KeepWide {};
 
     for (;;) {
       const LONG Base = C->Prio != PrioMode::Keep ? CheckClass(Round == 0) : 8;
@@ -415,6 +516,10 @@ namespace {
       if (ServerPid && C->Cores == CoreMode::Fast && FastUsable) {
         KeepServerOff(ServerPid, GameMask & ~C->FastMask, ServerCoreReports);
       }
+      // What the main thread's Linux cores should be until the next round: the fast core, or with it the game's big cores
+      // (never the slowest ones) while it waits too long for the fast one.
+      KeepFast = C->Cores == CoreMode::Fast && FastUsable ? C->FastMask : 0;
+      KeepWide = KeepFast ? ((GameMask | C->FastMask) & ~C->LittleMask) | C->FastMask : 0;
       if (GameMask && GameMask != ReportedGameMask && C->Cores != CoreMode::Off) {
         ReportedGameMask = GameMask;
         StatsLogNote(fextl::fmt::format(
@@ -504,8 +609,12 @@ namespace {
         It = It->second.SeenAt == Round ? std::next(It) : Threads.erase(It);
       }
 
-      LARGE_INTEGER Interval {.QuadPart = -20'000'000}; // 2s
-      NtDelayExecution(FALSE, &Interval);
+      // 2 s to the next round, checking the main thread's Linux cores every 250 ms meanwhile.
+      for (int i = 0; i < 8; ++i) {
+        LARGE_INTEGER Interval {.QuadPart = -2'500'000}; // 250ms
+        NtDelayExecution(FALSE, &Interval);
+        KeepMainCore(Keeper, KeepFast, KeepWide);
+      }
     }
     return nullptr;
   }
@@ -514,12 +623,16 @@ namespace {
 void StartPriorityGuard(std::string_view AppName) {
   auto* C = new Config {};
   C->MainTID = GetCurrentThreadId();
+  C->MainLinuxTid = Linux::GetTid();
 
   const char* Prio = Switch("FEX_PRIO");
   C->Prio = !Prio || Prio[0] == 'k' || Prio[0] == '0' ? PrioMode::Keep : Prio[0] == 'n' ? PrioMode::Normal : PrioMode::Clamp;
 
   const char* Cores = Switch("FEX_MAINCORE");
   C->Cores = !Cores || Cores[0] == 'o' || Cores[0] == '0' ? CoreMode::Off : Cores[0] == 'b' ? CoreMode::Big : CoreMode::Fast;
+
+  const char* Wait = Switch("FEX_MAINCORE_WAIT");
+  C->EaseWaitMs = !Wait ? 40 : (Wait[0] >= '0' && Wait[0] <= '9') ? static_cast<uint32_t>(std::clamp(atoi(Wait), 0, 1000)) : 0;
 
   const char* Helpers = Switch("FEX_HELPER_CORES");
   C->HelpersLittle = Helpers && Helpers[0] == 'l';
@@ -536,12 +649,19 @@ void StartPriorityGuard(std::string_view AppName) {
                                                               C->Prio == PrioMode::Normal ? "every thread at NORMAL" :
                                                                                             "base priorities kept to BELOW_NORMAL..ABOVE_NORMAL",
                                                               AppName));
-  StatsLogNote(fextl::fmt::format("cores: main thread (tid {}) {}; FEX helpers {} (FEX_MAINCORE=off, FEX_HELPER_CORES=off turn them off)",
-                                  C->MainTID,
+  StatsLogNote(fextl::fmt::format("cores: main thread (tid {}, Linux {}) {}; FEX helpers {} (FEX_MAINCORE=off, FEX_HELPER_CORES=off turn them "
+                                  "off)",
+                                  C->MainTID, C->MainLinuxTid,
                                   C->Cores == CoreMode::Fast ? "alone on the fastest core" :
                                   C->Cores == CoreMode::Big  ? "on the game's cores" :
                                                                "left alone",
                                   C->HelpersLittle ? "on the slowest cores" : "left alone"));
+  if (C->Cores == CoreMode::Fast) {
+    StatsLogNote(C->EaseWaitMs ? fextl::fmt::format("cores: main thread's Linux cores checked every 250 ms; it may use the other big cores while it "
+                                                    "waits {} ms or more a second for its own (FEX_MAINCORE_WAIT=off keeps it there)",
+                                                    C->EaseWaitMs) :
+                                 fextl::string("cores: main thread's Linux cores checked every 250 ms; it stays on its core however long it waits"));
+  }
   StatsLogNote(C->ServerNiceOn ? fextl::fmt::format("server: wineserver to nice {} (FEX_SERVER_NICE=off leaves it alone)", C->ServerNice) :
                                  fextl::string("server: wineserver nice left alone"));
 

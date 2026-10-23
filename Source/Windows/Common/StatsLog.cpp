@@ -309,6 +309,20 @@ namespace {
     uint32_t Tick;
     uint64_t Second;
     SchedPrev Main, Server;
+    // vkd3d-proton's busiest queue thread: it hands the game's GPU work and each frame's present to the driver, so what it
+    // waits in tells the GPU apart from the present path. Its /proc syscall file is read every 10ms: "running", or the
+    // Linux call it is blocked in with that call's arguments.
+    int QueueTid;
+    int QueueFd = -1;
+    bool QueueUnreadable;
+    bool QueueEverRead;
+    uint32_t QueueSamples;
+    struct CallCount {
+      uint64_t Key; // syscall number << 32, plus the ioctl request or futex operation; RunningKey, OutsideKey
+      uint32_t N;
+    };
+    CallCount QueueCalls[10];
+    uint32_t QueueOther;
     fextl::unordered_map<int, SchedPrev> Tasks;
     fextl::unordered_map<int, SchedPrev> Procs;
     fextl::unordered_map<int, fextl::string> ProcNames;
@@ -359,13 +373,123 @@ namespace {
     }
   }
 
-  // From the 2ms sampler: every 10ms, the CPU the main thread and the wineserver are on.
+  constexpr uint64_t RunningKey = ~0ull;
+  constexpr uint64_t OutsideKey = ~1ull; // blocked, but not in a system call
+
+  // One sample of what the queue thread is doing, from /proc/self/task/<tid>/syscall.
+  void SchedSampleQueue() {
+    if (Sched.QueueFd < 0) {
+      return;
+    }
+    char Buffer[256];
+    const int64_t Len = Linux::Pread(Sched.QueueFd, Buffer, sizeof(Buffer) - 1, 0);
+    if (Len <= 0) {
+      // Never readable: say so once and stop. Readable before: the thread is gone, find the next busiest one.
+      if (!Sched.QueueEverRead) {
+        Sched.QueueUnreadable = true;
+        StatsLogNote(fextl::fmt::format("sched: can't read what vkd3d's queue thread {} is doing (/proc syscall file, error {})", Sched.QueueTid, Len));
+      }
+      Linux::Close(Sched.QueueFd);
+      Sched.QueueFd = -1;
+      Sched.QueueTid = 0;
+      return;
+    }
+    Sched.QueueEverRead = true;
+    Buffer[Len] = 0;
+    uint64_t Key;
+    if (Buffer[0] == 'r') {
+      Key = RunningKey;
+    } else if (Buffer[0] == '-') {
+      Key = OutsideKey;
+    } else {
+      char* P = Buffer;
+      const uint64_t Nr = strtoull(P, &P, 10);
+      uint64_t Args[2] {};
+      for (auto& A : Args) {
+        A = strtoull(P, &P, 16);
+      }
+      Key = Nr << 32;
+      if (Nr == 29) { // ioctl: the request says which driver call
+        Key |= Args[1] & 0xffffffff;
+      } else if (Nr == 98) { // futex: the operation, without the private flag
+        Key |= Args[1] & 0x7f;
+      }
+    }
+    ++Sched.QueueSamples;
+    for (auto& C : Sched.QueueCalls) {
+      if (C.N && C.Key == Key) {
+        ++C.N;
+        return;
+      }
+    }
+    for (auto& C : Sched.QueueCalls) {
+      if (!C.N) {
+        C = {Key, 1};
+        return;
+      }
+    }
+    ++Sched.QueueOther;
+  }
+
+  const char* SyscallName(uint64_t Nr) {
+    switch (Nr) {
+    case 22: return "epoll_pwait";
+    case 29: return "ioctl";
+    case 63: return "read";
+    case 64: return "write";
+    case 67: return "pread";
+    case 73: return "ppoll";
+    case 98: return "futex";
+    case 101: return "nanosleep";
+    case 115: return "clock_nanosleep";
+    case 124: return "sched_yield";
+    case 206: return "sendto";
+    case 207: return "recvfrom";
+    case 211: return "sendmsg";
+    case 212: return "recvmsg";
+    case 215: return "munmap";
+    case 222: return "mmap";
+    case 226: return "mprotect";
+    case 441: return "epoll_pwait2";
+    case 449: return "futex_waitv";
+    default: return nullptr;
+    }
+  }
+
+  fextl::string QueueCallName(uint64_t Key) {
+    if (Key == RunningKey) {
+      return "running";
+    }
+    if (Key == OutsideKey) {
+      return "blocked";
+    }
+    const uint64_t Nr = Key >> 32;
+    const uint32_t Arg = static_cast<uint32_t>(Key);
+    const char* Name = SyscallName(Nr);
+    fextl::string Out = Name ? fextl::string(Name) : fextl::fmt::format("nr{}", Nr);
+    if (Nr == 29) {
+      Out += fextl::fmt::format("({:#x})", Arg);
+    } else if (Nr == 98 && Arg == 0) {
+      Out += "(wait)";
+    } else if (Nr == 98 && Arg == 1) {
+      Out += "(wake)";
+    } else if (Nr == 98 && Arg == 9) {
+      Out += "(wait_bitset)";
+    } else if (Nr == 98) {
+      Out += fextl::fmt::format("({})", Arg);
+    }
+    return Out;
+  }
+
+  // From the 2ms sampler: every 10ms, the CPU the main thread and the wineserver are on, and what vkd3d's queue thread is
+  // doing.
   void SchedSampleTick() {
     if (!Sched.On || ++Sched.Tick % 5) {
       return;
     }
     SchedSampleOne(Sched.MainFd, Sched.MainSamples, Sched.MainRunnable, Sched.MainCores);
     SchedSampleOne(Sched.ServerFd, Sched.ServerSamples, Sched.ServerRunnable, Sched.ServerCores);
+    SchedSampleQueue();
   }
 
   fextl::string SchedCores(uint32_t Runnable, const uint32_t (&Cores)[Linux::MaxCPUs]) {
@@ -391,6 +515,118 @@ namespace {
     Prev.WaitNs = S.WaitNs;
     Prev.Seen = Second;
     return !Fresh;
+  }
+
+  // GPU view (on with the stats log; FEX_GPULOG=0 turns it off), from the Adreno driver's sysfs files, read with direct
+  // Linux calls: the GPU clock every 50ms (average, lowest and highest each second), the share of the last driver window
+  // the GPU was busy, the highest clock currently allowed and the power levels behind it (a launcher's power control or
+  // the thermal limit lowers them), and the GPU temperature. Build 50 showed heavy scenes limited after the CPU at 37-42
+  // ms a frame; busy near 100% means the GPU itself, lower means the frames wait in the present path.
+  struct GpuState {
+    bool On;
+    bool Unreadable;
+    int ClkFd = -1;
+    uint32_t Tick;
+    uint64_t SumMHz;
+    uint32_t N, MinMHz, MaxMHz;
+    int Levels = -1;
+  };
+  GpuState Gpu;
+  constexpr const char* KgslDir = "/sys/class/kgsl/kgsl-3d0/";
+
+  // A number from a small sysfs file (its first field), or -1.
+  int64_t ReadKgslNumber(const char* Name, int64_t* Second = nullptr) {
+    char Buffer[64];
+    if (Linux::ReadSmallFile(fextl::fmt::format("{}{}", KgslDir, Name).c_str(), Buffer, sizeof(Buffer)) <= 0) {
+      return -1;
+    }
+    char* P = Buffer;
+    while (*P == ' ') {
+      ++P;
+    }
+    if (*P < '0' || *P > '9') {
+      return -1;
+    }
+    const int64_t First = static_cast<int64_t>(strtoull(P, &P, 10));
+    if (Second) {
+      while (*P == ' ' || *P == '\t') {
+        ++P;
+      }
+      *Second = *P >= '0' && *P <= '9' ? static_cast<int64_t>(strtoull(P, nullptr, 10)) : -1;
+    }
+    return First;
+  }
+
+  void GpuInit() {
+    const char* Value = Switch("FEX_GPULOG");
+    Gpu.On = !(Value && Value[0] == '0');
+    if (!Gpu.On) {
+      return;
+    }
+    Gpu.ClkFd = Linux::Open(fextl::fmt::format("{}gpuclk", KgslDir).c_str());
+    if (Gpu.ClkFd < 0) {
+      Gpu.ClkFd = Linux::Open(fextl::fmt::format("{}devfreq/cur_freq", KgslDir).c_str());
+    }
+    if (Gpu.ClkFd < 0) {
+      Gpu.Unreadable = true;
+      StatsLogNote(fextl::fmt::format("gpu: {} can't be read (error {}), no gpu lines", KgslDir, Gpu.ClkFd));
+      return;
+    }
+    Gpu.Levels = static_cast<int>(ReadKgslNumber("num_pwrlevels"));
+    StatsLogNote(fextl::fmt::format("gpu: clock read every 50ms, {} power levels (0 = fastest), max {} MHz (FEX_GPULOG=0 turns it off)", Gpu.Levels,
+                                    ReadKgslNumber("max_gpuclk") / 1000000));
+  }
+
+  // From the 2ms sampler.
+  void GpuSampleTick() {
+    if (Gpu.ClkFd < 0 || ++Gpu.Tick % 25) {
+      return;
+    }
+    char Buffer[32];
+    const int64_t Len = Linux::Pread(Gpu.ClkFd, Buffer, sizeof(Buffer) - 1, 0);
+    if (Len <= 0) {
+      return;
+    }
+    Buffer[Len] = 0;
+    const uint64_t Hz = strtoull(Buffer, nullptr, 10);
+    const uint32_t MHz = static_cast<uint32_t>(Hz > 100000 ? Hz / 1000000 : Hz); // Hz, or already MHz
+    Gpu.SumMHz += MHz;
+    Gpu.MinMHz = Gpu.N ? std::min(Gpu.MinMHz, MHz) : MHz;
+    Gpu.MaxMHz = Gpu.N ? std::max(Gpu.MaxMHz, MHz) : MHz;
+    ++Gpu.N;
+  }
+
+  fextl::string GpuLine() {
+    if (Gpu.ClkFd < 0) {
+      return {};
+    }
+    fextl::string Out = "  gpu";
+    if (Gpu.N) {
+      Out += fextl::fmt::format(" MHz={} (min {} max {})", Gpu.SumMHz / Gpu.N, Gpu.MinMHz, Gpu.MaxMHz);
+    }
+    Gpu.SumMHz = Gpu.N = 0;
+    int64_t Total {};
+    const int64_t Busy = ReadKgslNumber("gpubusy", &Total);
+    if (Busy >= 0 && Total > 0) {
+      Out += fextl::fmt::format(" busy={}%", std::min<int64_t>(Busy * 100 / Total, 100));
+    } else if (const int64_t Percent = ReadKgslNumber("gpu_busy_percentage"); Percent >= 0) {
+      Out += fextl::fmt::format(" busy={}%", Percent);
+    }
+    if (const int64_t Cap = ReadKgslNumber("max_gpuclk"); Cap > 0) {
+      Out += fextl::fmt::format(" cap={}MHz", Cap / 1000000);
+    }
+    const int64_t MaxLevel = ReadKgslNumber("max_pwrlevel");
+    const int64_t MinLevel = ReadKgslNumber("min_pwrlevel");
+    if (MaxLevel >= 0 && MinLevel >= 0) {
+      Out += fextl::fmt::format(" levels={}..{}", MaxLevel, MinLevel);
+    }
+    if (const int64_t Thermal = ReadKgslNumber("thermal_pwrlevel"); Thermal >= 0) {
+      Out += fextl::fmt::format(" thermal={}", Thermal);
+    }
+    if (const int64_t Temp = ReadKgslNumber("temp"); Temp > 0) {
+      Out += fextl::fmt::format(" temp={}C", Temp > 1000 ? Temp / 1000 : Temp);
+    }
+    return Out + "\n";
   }
 
   fextl::string SchedLines(uint64_t Seconds) {
@@ -497,6 +733,38 @@ namespace {
       }
       if (!Rows.empty()) {
         Out += fextl::fmt::format("  sched threads run={:.0f}ms wait={:.0f}ms (name/tid run+wait ms @last cpu):{}\n", TotalRun, TotalWait, Text);
+      }
+
+      // What vkd3d's queue thread did this second, then follow the busiest one (a game can have several queues).
+      if (Sched.QueueFd >= 0 && Sched.QueueSamples) {
+        SchedState::CallCount Calls[std::size(Sched.QueueCalls)];
+        memcpy(Calls, Sched.QueueCalls, sizeof(Calls));
+        std::sort(std::begin(Calls), std::end(Calls), [](const auto& a, const auto& b) { return a.N > b.N; });
+        fextl::string Text;
+        for (const auto& C : Calls) {
+          if (C.N) {
+            Text += fextl::fmt::format(" {} {}%", QueueCallName(C.Key), (C.N * 100 + Sched.QueueSamples / 2) / Sched.QueueSamples);
+          }
+        }
+        if (Sched.QueueOther) {
+          Text += fextl::fmt::format(" other {}%", (Sched.QueueOther * 100 + Sched.QueueSamples / 2) / Sched.QueueSamples);
+        }
+        Out += fextl::fmt::format("  sched queue vkd3d_queue/{} ({} samples):{}\n", Sched.QueueTid, Sched.QueueSamples, Text);
+      }
+      memset(Sched.QueueCalls, 0, sizeof(Sched.QueueCalls));
+      Sched.QueueSamples = Sched.QueueOther = 0;
+      int Busiest {};
+      double BusiestRun = -1.0;
+      for (const auto& R : Rows) {
+        if (strcmp(R.Comm, "vkd3d_queue") == 0 && R.RunMs > BusiestRun) {
+          Busiest = R.Tid;
+          BusiestRun = R.RunMs;
+        }
+      }
+      if (Busiest && Busiest != Sched.QueueTid && !Sched.QueueUnreadable) {
+        Linux::Close(Sched.QueueFd);
+        Sched.QueueTid = Busiest;
+        Sched.QueueFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/syscall", Busiest).c_str());
       }
     }
 
@@ -1674,6 +1942,7 @@ namespace {
         ProfileTick(State);
       }
       SchedSampleTick();
+      GpuSampleTick();
     } while (GetCounter() < End);
   }
 
@@ -1871,6 +2140,7 @@ namespace {
     fextl::vector<const FEXCore::SHMStats::ThreadStats*> Slots;
     Slots.reserve(MaxTracked);
     SchedInit();
+    GpuInit();
 
     for (;;) {
       SampleFor1s(State);
@@ -2110,6 +2380,7 @@ namespace {
       }
 
       Line += SchedLines(Seconds);
+      Line += GpuLine();
       Line += ProbeLine(State, MsPerTick);
       Line += FrameLines(State, Seconds);
       if (State->Profile) {
@@ -2340,7 +2611,12 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                                    "CPUs, and which CPU it was on while runnable (sampled every 10ms); sched threads = the busiest threads "
                                    "(Linux name/tid run+wait ms @last CPU); sched procs 5s = other processes of this user by CPU use; waits main = handles the "
                                    "main thread waited on this second (kind, /latency = a swapchain frame latency handle, +N = released N more "
-                                   "times, calls, ms sampled waiting @caller, timeout ms); '# latency' = what FEX_FRAMELATENCY found and did\n",
+                                   "times, calls, ms sampled waiting @caller, timeout ms); '# latency' = what FEX_FRAMELATENCY found and did; sched queue = what "
+                                   "vkd3d's queue thread (it hands the game's GPU work and each present to the driver) was doing, sampled every "
+                                   "10ms: running, or the Linux call it waited in (ioctl(request) = a GPU driver call, ppoll/futex = waiting "
+                                   "for another thread, a fence or the display server); gpu = GPU clock (average, lowest and highest of 50ms "
+                                   "samples), busy = the GPU's busy share in the driver's last window, cap = highest clock allowed now, levels = "
+                                   "the power levels allowed (0 = fastest; a launcher's power control or heat raises the first), temperature\n",
                                    AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
