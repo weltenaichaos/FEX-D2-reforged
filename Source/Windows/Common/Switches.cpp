@@ -20,7 +20,7 @@ namespace {
     {"FEX_STATSLOG", "D:\\"}, // where the tests' logs have gone so far
     {"FEX_STATSLOG_PROFILE", "1"},
 #endif
-    {"FEX_NATIVE_ZLIB", "1"},      {"FEX_NATIVE_MD5", "1"}, {"FEX_UNPACK_CACHE", "1"}, {"FEX_CODELOCK_POLITE", "500"},
+    {"FEX_NATIVE_ZLIB", "1"},      {"FEX_NATIVE_MD5", "1"}, {"FEX_UNPACK_CACHE", "1"},
   };
 
   // In the order the stats log lists them.
