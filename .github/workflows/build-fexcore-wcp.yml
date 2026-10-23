@@ -50,6 +50,9 @@ jobs:
             statslog: "No stats log in this build."
     env:
       FEX_WCP_VERSION: ${{ matrix.version }}
+      # Shown in the stats log's file name and header (Source/Windows/Common/CMakeLists.txt).
+      FEX_BUILD_NUMBER: ${{ github.run_number }}
+      FEX_BUILD_INFO: ${{ matrix.variant }}-${{ github.run_number }}-${{ github.sha }}
     # Needed for the release step: a fork's default GITHUB_TOKEN is read-only,
     # which makes softprops/action-gh-release fail with HTTP 403.
     permissions:

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/SHMStats.h"
+#include "Windows/Common/Switches.h"
 
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
@@ -1493,16 +1494,30 @@ namespace {
   }
 } // namespace
 
+namespace {
+// Set by CI (FEX_BUILD_NUMBER / FEX_BUILD_INFO in Source/Windows/Common/CMakeLists.txt).
+#ifdef FEX_BUILD_NUMBER
+  constexpr const char* BuildNumberSuffix = "-b" FEX_BUILD_NUMBER;
+#else
+  constexpr const char* BuildNumberSuffix = "";
+#endif
+#ifdef FEX_BUILD_INFO
+  constexpr const char* BuildInfo = FEX_BUILD_INFO;
+#else
+  constexpr const char* BuildInfo = "local";
+#endif
+} // namespace
+
 bool StatsLogRequested(std::string_view AppName) {
 #ifdef FEX_DISABLE_STATSLOG
   return false;
 #endif
-  const char* Dir = getenv("FEX_STATSLOG");
-  if (!Dir || !Dir[0] || (Dir[0] == '0' && !Dir[1])) {
+  const char* Dir = Switch("FEX_STATSLOG");
+  if (!Dir || (Dir[0] == '0' && !Dir[1])) {
     return false;
   }
-  const char* App = getenv("FEX_STATSLOG_APP");
-  return !App || !App[0] || EqualsIgnoreCase(App, AppName);
+  const char* App = Switch("FEX_STATSLOG_APP");
+  return !App || EqualsIgnoreCase(App, AppName);
 }
 
 void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
@@ -1510,24 +1525,34 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
     return;
   }
 
-  fextl::string Dir = getenv("FEX_STATSLOG");
+  const char* Temp = getenv("TEMP");
+  const fextl::string TempDir = Temp ? Temp : "C:\\";
+  fextl::string Dir = Switch("FEX_STATSLOG");
   // FEX_STATSLOG=1 means "pick a default": the per-user temp directory.
   if (Dir == "1") {
-    const char* Temp = getenv("TEMP");
-    Dir = Temp ? Temp : "C:\\";
-  }
-  while (!Dir.empty() && (Dir.back() == '\\' || Dir.back() == '/')) {
-    Dir.pop_back();
+    Dir = TempDir;
   }
 
   // Wine reuses small PIDs, so add the local time: on Android shared storage an existing log often can't be replaced.
+  // The build number tells which build a log came from.
   LARGE_INTEGER SystemTime {}, LocalTime {};
   NtQuerySystemTime(&SystemTime);
   RtlSystemTimeToLocalTime(&SystemTime, &LocalTime);
   const uint64_t SecondOfDay = (static_cast<uint64_t>(LocalTime.QuadPart) / 10'000'000ULL) % 86400;
-  const auto Path = fextl::fmt::format("{}\\fexstats-{}-{:02}{:02}{:02}-{}.txt", Dir, AppName, SecondOfDay / 3600, (SecondOfDay / 60) % 60,
-                                       SecondOfDay % 60, GetCurrentProcessId());
+  auto PathIn = [&](fextl::string Folder) {
+    while (!Folder.empty() && (Folder.back() == '\\' || Folder.back() == '/')) {
+      Folder.pop_back();
+    }
+    return fextl::fmt::format("{}\\fexstats-{}{}-{:02}{:02}{:02}-{}.txt", Folder, AppName, BuildNumberSuffix, SecondOfDay / 3600,
+                              (SecondOfDay / 60) % 60, SecondOfDay % 60, GetCurrentProcessId());
+  };
+  auto Path = PathIn(Dir);
   FILE* File = fopen(Path.c_str(), "w");
+  if (!File && Dir != TempDir) {
+    LogMan::Msg::EFmt("FEX_STATSLOG: can't open {}, trying {}", Path, TempDir);
+    Path = PathIn(TempDir);
+    File = fopen(Path.c_str(), "w");
+  }
   if (!File) {
     LogMan::Msg::EFmt("FEX_STATSLOG: can't open {}", Path);
     return;
@@ -1546,6 +1571,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
   fwrite(Header.data(), 1, Header.size(), File);
+  const auto Build = fextl::fmt::format("# build: {}, log file {}\n", BuildInfo, Path);
+  fwrite(Build.data(), 1, Build.size(), File);
   if (!PendingNotes.empty()) {
     fwrite(PendingNotes.data(), 1, PendingNotes.size(), File);
     PendingNotes.clear();
@@ -1554,21 +1581,11 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
 
   // Lives for the rest of the process.
   auto* State = new LogState {.Stats = Stats, .File = File, .CounterFreq = GetCounterFrequency()};
-  const char* Profile = getenv("FEX_STATSLOG_PROFILE");
+  const char* Profile = Switch("FEX_STATSLOG_PROFILE");
   State->Profile = Profile && Profile[0] == '1';
-  const char* Timeline = getenv("FEX_STATSLOG_TIMELINE");
+  const char* Timeline = Switch("FEX_STATSLOG_TIMELINE");
   State->Timeline = !(Timeline && Timeline[0] == '0');
-  const auto Env = [](const char* Name) {
-    const char* Value = getenv(Name);
-    return Value ? Value : "-";
-  };
-  const auto Switches = fextl::fmt::format(
-    "# switches: FEX_STATSLOG_PROFILE={} FEX_STATSLOG_TIMELINE={} FEX_THREADPIN={} FEX_NATIVE_ZLIB={} FEX_NATIVE_MD5={} FEX_UNPACK_CACHE={} "
-    "FEX_UNPACK_CACHE_MAX_GB={} FEX_UNPACK_CACHE_RESET={} FEX_UNPACK_CACHE_READAHEAD_MB={} FEX_UNPACK_CACHE_SKIP_ADLER={} "
-    "FEX_NATIVE_ADLER_NEON={} FEX_NATIVE_MD5_CACHE={} FEX_JOBWAIT={} FEX_JOBWAIT_BACKOFF={} FEX_DISKCACHE_PREFETCH={} FEX_DISKCACHE_PREFETCH_MB={}\n",
-    State->Profile ? 1 : 0, State->Timeline ? 1 : 0, Env("FEX_THREADPIN"), Env("FEX_NATIVE_ZLIB"), Env("FEX_NATIVE_MD5"), Env("FEX_UNPACK_CACHE"),
-    Env("FEX_UNPACK_CACHE_MAX_GB"), Env("FEX_UNPACK_CACHE_RESET"), Env("FEX_UNPACK_CACHE_READAHEAD_MB"), Env("FEX_UNPACK_CACHE_SKIP_ADLER"),
-    Env("FEX_NATIVE_ADLER_NEON"), Env("FEX_NATIVE_MD5_CACHE"), Env("FEX_JOBWAIT"), Env("FEX_JOBWAIT_BACKOFF"), Env("FEX_DISKCACHE_PREFETCH"), Env("FEX_DISKCACHE_PREFETCH_MB"));
+  const auto Switches = fextl::fmt::format("# switches:{}\n", SwitchSummary());
   fwrite(Switches.data(), 1, Switches.size(), File);
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
@@ -1618,8 +1635,8 @@ void StatsLogNote(std::string_view Line) {
 #ifdef FEX_DISABLE_STATSLOG
   return;
 #endif
-  const char* Dir = getenv("FEX_STATSLOG");
-  if (!Dir || !Dir[0] || (Dir[0] == '0' && !Dir[1])) {
+  const char* Dir = Switch("FEX_STATSLOG");
+  if (!Dir || (Dir[0] == '0' && !Dir[1])) {
     return;
   }
   auto Text = fextl::fmt::format("# {}\n", Line);

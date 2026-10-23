@@ -24,6 +24,7 @@ $end_info$
 
 #include "NativeUnpackCache.h"
 #include "Windows/Common/StatsLog.h"
+#include "Windows/Common/Switches.h"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
@@ -777,14 +778,14 @@ void StartWriter() {
 }
 
 bool Init(bool MD5Cache) {
-  const char* ResetEnv = getenv("FEX_UNPACK_CACHE_RESET");
+  const char* ResetEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_RESET");
   const bool Reset = ResetEnv && ResetEnv[0] == '1';
-  const char* MaxEnv = getenv("FEX_UNPACK_CACHE_MAX_GB");
+  const char* MaxEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_MAX_GB");
   uint64_t MaxGB = MaxEnv ? strtoull(MaxEnv, nullptr, 10) : 0;
   if (!MaxGB) {
     MaxGB = 16;
   }
-  const char* AheadEnv = getenv("FEX_UNPACK_CACHE_READAHEAD_MB");
+  const char* AheadEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_READAHEAD_MB");
   const uint64_t AheadMB = std::min<uint64_t>(AheadEnv && AheadEnv[0] ? strtoull(AheadEnv, nullptr, 10) : DefaultReadAheadMB, 1024);
 
   uint64_t Frequency {};

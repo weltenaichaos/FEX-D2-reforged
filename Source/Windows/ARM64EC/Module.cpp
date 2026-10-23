@@ -51,6 +51,7 @@ $end_info$
 #include "Windows/Common/SHMStats.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/ThreadPlacer.h"
+#include "Windows/Common/Switches.h"
 #include "NativeRedirect.h"
 
 #include <atomic>
@@ -767,6 +768,10 @@ public:
   uintptr_t RedirectBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) override {
     return NativeRedirect::Lookup(GuestRIP);
   }
+
+  uintptr_t RedirectBlockByCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) override {
+    return NativeRedirect::LookupByCode(GuestRIP, Thread->CompileFaultPage);
+  }
 };
 } // namespace Exception
 
@@ -797,6 +802,7 @@ NTSTATUS ProcessInit() {
   FEX::Windows::SetupThreadHandlers();
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
+  FEX::Windows::InitSwitches(AppConfigName);
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();

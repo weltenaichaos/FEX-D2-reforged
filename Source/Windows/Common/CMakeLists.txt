@@ -13,6 +13,7 @@ add_library(CommonWindows STATIC
   FEXUnixLib.cpp
   SHMStats.cpp
   StatsLog.cpp
+  Switches.cpp
   ThreadPlacer.cpp
   InvalidationTracker.cpp
   ImageTracker.cpp
@@ -27,3 +28,12 @@ if (NOT ENABLE_STATSLOG)
   target_compile_definitions(CommonWindows PRIVATE FEX_DISABLE_STATSLOG)
 endif()
 target_include_directories(CommonWindows PRIVATE "${CMAKE_SOURCE_DIR}/Source/Windows/include/")
+
+# CI's build number and description go into the stats log's file name and header. Only StatsLog.cpp sees them, so a new
+# number recompiles that one file.
+if (DEFINED ENV{FEX_BUILD_NUMBER})
+  set_property(SOURCE StatsLog.cpp APPEND PROPERTY COMPILE_DEFINITIONS "FEX_BUILD_NUMBER=\"$ENV{FEX_BUILD_NUMBER}\"")
+endif()
+if (DEFINED ENV{FEX_BUILD_INFO})
+  set_property(SOURCE StatsLog.cpp APPEND PROPERTY COMPILE_DEFINITIONS "FEX_BUILD_INFO=\"$ENV{FEX_BUILD_INFO}\"")
+endif()

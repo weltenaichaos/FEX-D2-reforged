@@ -51,6 +51,7 @@ $end_info$
 #include "BTInterface.h"
 #include "Windows/Common/SHMStats.h"
 #include "Windows/Common/ThreadPlacer.h"
+#include "Windows/Common/Switches.h"
 
 #include <cstdint>
 #include <type_traits>
@@ -501,6 +502,7 @@ void BTCpuProcessInit() {
   FEX::Windows::SetupThreadHandlers();
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   const auto ExecutableName = FEX::Windows::BaseName(ExecutablePath);
+  FEX::Windows::InitSwitches(ExecutableName);
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();

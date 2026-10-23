@@ -911,6 +911,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     Thread->FrontendDecoder->ResetExecutableRangeCache();
   }
 
+  if (MaxInst == 0) {
+    if (const auto Redirect = SyscallHandler->RedirectBlockByCode(Thread, GuestRIP)) {
+      return Redirect;
+    }
+  }
+
   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
 
   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);

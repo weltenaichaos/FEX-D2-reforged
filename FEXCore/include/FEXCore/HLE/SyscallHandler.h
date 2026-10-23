@@ -52,6 +52,13 @@ public:
     return 0;
   }
 
+  // Like RedirectBlock, but for a block about to be compiled (not found in this thread's lookup cache), before the disk
+  // cache is consulted, inside the compiler's guest read fault recovery: the frontend may read the guest code at GuestRIP
+  // directly. A read that faults restarts the compile with Thread->CompileFaultPage set to that page.
+  virtual uintptr_t RedirectBlockByCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
+    return 0;
+  }
+
   virtual SourcecodeResolver* GetSourcecodeResolver() {
     return nullptr;
   }

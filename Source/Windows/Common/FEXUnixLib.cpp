@@ -17,6 +17,7 @@
 #include "FEXUnixLib.h"
 #include "Priv.h"
 #include "StatsLog.h"
+#include "Switches.h"
 
 #define PR_SET_VMA 0x53564d41
 #define PR_SET_VMA_ANON_NAME 0
@@ -213,13 +214,13 @@ namespace {
   }
 
   void StartPrefetch(const void* Base, uint64_t Size) {
-    const char* Switch = getenv("FEX_DISKCACHE_PREFETCH");
-    if (!Base || !Size || (Switch && Switch[0] == '0')) {
+    const char* Enabled = FEX::Windows::Switch("FEX_DISKCACHE_PREFETCH");
+    if (!Base || !Size || (Enabled && Enabled[0] == '0')) {
       FEX::Windows::StatsLogNote("diskcache prefetch: off");
       return;
     }
     // FEX_DISKCACHE_PREFETCH_MB caps how much of the file is kept in memory (default 2048, from the start of the file).
-    const char* Cap = getenv("FEX_DISKCACHE_PREFETCH_MB");
+    const char* Cap = FEX::Windows::Switch("FEX_DISKCACHE_PREFETCH_MB");
     const uint64_t CapMB = Cap && Cap[0] ? strtoull(Cap, nullptr, 10) : 2048;
     Size = std::min<uint64_t>(Size, CapMB << 20);
     if (!Size) {

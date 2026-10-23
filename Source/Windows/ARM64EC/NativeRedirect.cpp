@@ -19,13 +19,18 @@ $end_info$
 //   FEX_JOBWAIT_BACKOFF=N  microseconds the frame wait loop pauses when it has nothing to help with (default 0 = no pause;
 //                          build 42 tests: 2 us left 0.3-0.4 s frame waits, 0 had none)
 //
-// A function is found by its offset in the main executable and the first bytes of its code, which are compared when the
-// JIT first asks for that address (and, for MD5, the game's round tables). Anything that doesn't match stays emulated.
+// A function is found by its code, not by its address: game updates move code and data around (the 2026-10 update moved
+// these functions by 0x390-0x700 bytes and the data by 0x2000), so until everything is found the first bytes of every
+// block the JIT compiles in the main executable are compared with each function's first bytes. Fields that hold a
+// RIP-relative displacement or a call's target are skipped in that comparison; the data those fields point at is found
+// from the matched code (job system) or searched for near where the last known version had it (MD5 round tables).
+// Anything that isn't found stays emulated.
 
 #include "NativeRedirect.h"
 #include "NativeStats.h"
 #include "NativeUnpackCache.h"
 #include "Windows/Common/StatsLog.h"
+#include "Windows/Common/Switches.h"
 
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/fextl/fmt.h>
@@ -104,13 +109,51 @@ namespace {
     0xca, 0x44, 0x8b, 0xc0, 0x48, 0x8b, 0xd5, 0x8b, 0xf8, 0xe8, 0x94, 0x0c, 0x9a, 0x00, 0x01, 0x7b, 0x18, 0x48,
   };
 
-  constexpr size_t MaxSignatureSize = 128;
-  static_assert(sizeof(InflateFastSignature) <= MaxSignatureSize && sizeof(Adler32ZSignature) <= MaxSignatureSize &&
-                sizeof(MD5TransformSignature) <= MaxSignatureSize && sizeof(MD5UpdateSignature) <= MaxSignatureSize);
+  // Offsets of the 4-byte fields skipped when comparing: RIP-relative displacements and call targets.
+  constexpr uint8_t MD5TransformRel32[] = {0x1f, 0x30}; // security cookie; lea r12, [image base]
+  constexpr uint8_t MD5UpdateRel32[] = {0x44, 0x78};    // call md5block; call memcpy
+
+  struct Pattern {
+    const uint8_t* Bytes;
+    size_t Size;
+    const uint8_t* Rel32;
+    size_t Rel32Count;
+  };
+
+  // Compares the first Size bytes of Code with the pattern (Size <= P.Size).
+  bool Matches(const Pattern& P, const uint8_t* Code, size_t Size) {
+    for (size_t i = 0; i < Size; ++i) {
+      bool Skip = false;
+      for (size_t f = 0; f < P.Rel32Count; ++f) {
+        Skip |= i >= P.Rel32[f] && i < P.Rel32[f] + 4u;
+      }
+      if (!Skip && Code[i] != P.Bytes[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  int32_t Rel32At(const uint8_t* Code, size_t Offset) {
+    int32_t Value;
+    memcpy(&Value, Code + Offset, sizeof(Value));
+    return Value;
+  }
+
+  // Bytes always read for a compiled block, even when its page ends sooner.
+  constexpr size_t PrefixSize = 16;
+  constexpr size_t MaxPatternSize = 192;
+
+  // Where the last known version of the game had things (D2R.exe base 0x140000000, before the 2026-10 update). Only used
+  // as the starting point of searches and in notes.
+  constexpr uint32_t KnownMD5TablesRVA = 0x16976A0;
+  // How far from the last known place the MD5 tables and the frame wait loop's call are searched for.
+  constexpr uint64_t SearchRadius = 4 * 1024 * 1024;
+  // Compiled blocks looked at before giving up on functions that weren't found.
+  constexpr uint32_t MaxSearchedBlocks = 300000;
 
   // The game's MD5 transform reads its round constants from three tables (shift amounts, message word order, sines);
   // NativeMD5.c hard-codes the standard ones, so they must match.
-  constexpr uint32_t MD5TablesRVA = 0x16976A0;
   constexpr uint8_t MD5Shifts[64] = {
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20,
     4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
@@ -127,10 +170,6 @@ namespace {
     0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d,
     0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
   };
-
-  // A target whose bytes keep differing this many times is given up on. Unreadable code (not yet decrypted by the game's
-  // protector) is not counted: the JIT can't run it either, so it will be asked for again once it is readable.
-  constexpr uint32_t MaxMismatches = 16;
 
   enum class Group {
     Zlib,
@@ -152,28 +191,40 @@ namespace {
   struct Target {
     const char* Name;
     Group Group;
-    uint32_t RVA;
-    const uint8_t* Signature;
-    size_t SignatureSize;
+    uint32_t KnownRVA;
+    Pattern Code;
     void* Stub;
     FEXNativeCallStats* Stats;
     void* Entry;
 
-    uint64_t GuestRIP;
+    std::atomic<uint64_t> GuestRIP; // where its code was found, 0 until then
     std::atomic<TargetState> State;
-    std::atomic<uint32_t> Mismatches;
     FEXNativeCallStats Prev; // Log thread only
   };
 
   Target Targets[] = {
-    {"inflate_fast", Group::Zlib, 0xBD2090, InflateFastSignature, sizeof(InflateFastSignature), &NativeInflateFastRedirect,
-     &FEXNativeInflateFastStats, &NativeInflateFastTarget},
-    {"adler32_z", Group::Zlib, 0xBD17F0, Adler32ZSignature, sizeof(Adler32ZSignature), &NativeAdler32ZRedirect, &FEXNativeAdler32ZStats,
-     &NativeAdler32ZTarget},
-    {"md5", Group::MD5, 0xBC10F0, MD5UpdateSignature, sizeof(MD5UpdateSignature), &NativeMD5UpdateRedirect, &FEXNativeMD5UpdateStats,
+    {"inflate_fast",
+     Group::Zlib,
+     0xBD2090,
+     {InflateFastSignature, sizeof(InflateFastSignature), nullptr, 0},
+     &NativeInflateFastRedirect,
+     &FEXNativeInflateFastStats,
+     &NativeInflateFastTarget},
+    {"adler32_z", Group::Zlib, 0xBD17F0, {Adler32ZSignature, sizeof(Adler32ZSignature), nullptr, 0}, &NativeAdler32ZRedirect, &FEXNativeAdler32ZStats, &NativeAdler32ZTarget},
+    {"md5",
+     Group::MD5,
+     0xBC10F0,
+     {MD5UpdateSignature, sizeof(MD5UpdateSignature), MD5UpdateRel32, sizeof(MD5UpdateRel32)},
+     &NativeMD5UpdateRedirect,
+     &FEXNativeMD5UpdateStats,
      &NativeMD5UpdateTarget},
-    {"md5block", Group::MD5, 0xBC0E80, MD5TransformSignature, sizeof(MD5TransformSignature), &NativeMD5TransformRedirect,
-     &FEXNativeMD5TransformStats, &NativeMD5TransformTarget},
+    {"md5block",
+     Group::MD5,
+     0xBC0E80,
+     {MD5TransformSignature, sizeof(MD5TransformSignature), MD5TransformRel32, sizeof(MD5TransformRel32)},
+     &NativeMD5TransformRedirect,
+     &FEXNativeMD5TransformStats,
+     &NativeMD5TransformTarget},
   };
 
   bool ZlibEnabled {};
@@ -182,6 +233,9 @@ namespace {
   std::mutex UnpackCacheLock;
   std::atomic<bool> UnpackCacheOpened {};
   uint64_t ImageBase {};
+  uint64_t ImageEnd {};
+  // True until every switched-on function is found (or LookupByCode gives up).
+  std::atomic<bool> Searching {};
   uint64_t TickFrequency {1};
 
   bool Enabled(Group G) {
@@ -205,30 +259,105 @@ namespace {
     return NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), Buffer, Size, &Read) == STATUS_SUCCESS && Read == Size;
   }
 
-  // Checks the parts of a target beyond its first bytes. Notes what differs.
+  enum class ScanResult {
+    Found,
+    NotFound,
+    Unreadable, // not found, and part of the range couldn't be read
+  };
+
+  // Reads [Begin, End), limited to SearchRadius around Center, in 64 KiB chunks: the chunk holding Center first, then
+  // outwards, so something a game update moved a little is found after one or two reads. Hands each chunk to Visit until
+  // it returns true. Chunks overlap by Overlap bytes so a pattern across a boundary is seen whole; pages that can't be
+  // read are left zero. Uses NtReadVirtualMemory, which goes through the Wine server: fine for a few searches, too slow
+  // for every compiled block.
+  template<typename VisitFn>
+  ScanResult ScanNear(uint64_t Center, uint64_t Begin, uint64_t End, size_t Overlap, VisitFn&& Visit) {
+    constexpr uint64_t ChunkSize = 64 * 1024;
+    constexpr uint64_t PageSize = 4096;
+    Begin = std::max(Begin, Center > SearchRadius ? Center - SearchRadius : 0);
+    End = std::min(End, Center + SearchRadius);
+    if (Begin >= End) {
+      return ScanResult::NotFound;
+    }
+    Center = std::clamp(Center, Begin, End - 1);
+    fextl::vector<uint8_t> Buffer(ChunkSize + Overlap);
+    bool Unreadable = false;
+    auto VisitChunk = [&](uint64_t Chunk) {
+      const uint64_t From = std::max(Chunk, Begin);
+      const uint64_t To = std::min(Chunk + ChunkSize + Overlap, End);
+      const size_t Size = To - From;
+      if (!Read(From, Buffer.data(), Size)) {
+        memset(Buffer.data(), 0, Size);
+        for (uint64_t Page = From & ~(PageSize - 1); Page < To; Page += PageSize) {
+          const uint64_t PageFrom = std::max(Page, From);
+          const uint64_t PageTo = std::min(Page + PageSize, To);
+          if (!Read(PageFrom, Buffer.data() + (PageFrom - From), PageTo - PageFrom)) {
+            Unreadable = true;
+          }
+        }
+      }
+      return Visit(From, Buffer.data(), Size);
+    };
+    const uint64_t First = Center & ~(ChunkSize - 1);
+    const uint64_t Below = (First - (Begin & ~(ChunkSize - 1))) / ChunkSize;
+    const uint64_t Above = (((End - 1) & ~(ChunkSize - 1)) - First) / ChunkSize;
+    for (uint64_t Step = 0; Step <= std::max(Below, Above); ++Step) {
+      if (Step <= Above && VisitChunk(First + Step * ChunkSize)) {
+        return ScanResult::Found;
+      }
+      if (Step && Step <= Below && VisitChunk(First - Step * ChunkSize)) {
+        return ScanResult::Found;
+      }
+    }
+    return Unreadable ? ScanResult::Unreadable : ScanResult::NotFound;
+  }
+
+  // The MD5 round tables: shifts, message word order and sines, back to back.
+  struct MD5Tables {
+    uint8_t Shifts[64];
+    uint8_t Order[64];
+    uint32_t Sines[64];
+  };
+  static_assert(sizeof(MD5Tables) == 384);
+
+  std::mutex MD5TablesLock;
+  bool MD5TablesSearched {};
+  uint64_t MD5TablesAddress {};
+
+  // Finds the game's MD5 round tables near where the last known version had them. Searched once.
+  uint64_t FindMD5Tables() {
+    std::scoped_lock Guard {MD5TablesLock};
+    if (MD5TablesSearched) {
+      return MD5TablesAddress;
+    }
+    MD5TablesSearched = true;
+    const auto Result =
+      ScanNear(ImageBase + KnownMD5TablesRVA, ImageBase, ImageEnd, sizeof(MD5Tables), [](uint64_t At, const uint8_t* Data, size_t Size) {
+        for (size_t i = 0; i + sizeof(MD5Tables) <= Size; ++i) {
+          if (Data[i] == MD5Shifts[0] && memcmp(Data + i + offsetof(MD5Tables, Shifts), MD5Shifts, sizeof(MD5Shifts)) == 0 &&
+              memcmp(Data + i + offsetof(MD5Tables, Order), MD5Order, sizeof(MD5Order)) == 0 &&
+              memcmp(Data + i + offsetof(MD5Tables, Sines), MD5Sines, sizeof(MD5Sines)) == 0) {
+            MD5TablesAddress = At + i;
+            return true;
+          }
+        }
+        return false;
+      });
+    FEX::Windows::StatsLogNote(
+      Result == ScanResult::Found ?
+        fextl::fmt::format("native md5: standard MD5 round tables at {:X} (last known at {:X})", MD5TablesAddress, ImageBase + KnownMD5TablesRVA) :
+        fextl::fmt::format("native md5: no standard MD5 round tables within {} MB of {:X}{}, MD5 stays emulated", SearchRadius >> 20,
+                           ImageBase + KnownMD5TablesRVA, Result == ScanResult::Unreadable ? " (some pages unreadable)" : ""));
+    return MD5TablesAddress;
+  }
+
+  // Checks the parts of a target beyond its code: NativeMD5.c hard-codes the standard round tables, so the game's must
+  // be the standard ones.
   CheckResult CheckExtra(Target& T) {
     if (T.Group != Group::MD5) {
       return CheckResult::Match;
     }
-    struct {
-      uint8_t Shifts[64];
-      uint8_t Order[64];
-      uint32_t Sines[64];
-    } Tables;
-    static_assert(sizeof(Tables) == 384);
-    if (!Read(ImageBase + MD5TablesRVA, &Tables, sizeof(Tables))) {
-      return CheckResult::Unreadable;
-    }
-    const bool Shifts = memcmp(Tables.Shifts, MD5Shifts, sizeof(MD5Shifts)) == 0;
-    const bool Order = memcmp(Tables.Order, MD5Order, sizeof(MD5Order)) == 0;
-    const bool Sines = memcmp(Tables.Sines, MD5Sines, sizeof(MD5Sines)) == 0;
-    if (Shifts && Order && Sines) {
-      return CheckResult::Match;
-    }
-    FEX::Windows::StatsLogNote(fextl::fmt::format("native md5: {} round tables at {:X} are not standard MD5 (shifts {}, order {}, sines {})",
-                                                  T.Name, ImageBase + MD5TablesRVA, Shifts ? "ok" : "differ", Order ? "ok" : "differ",
-                                                  Sines ? "ok" : "differ"));
-    return CheckResult::Mismatch;
+    return FindMD5Tables() ? CheckResult::Match : CheckResult::Mismatch;
   }
 
   // Opens the unpack cache once the game's inflate_fast is found, so other processes started with the same settings
@@ -239,37 +368,17 @@ namespace {
     }
     std::scoped_lock Guard {UnpackCacheLock};
     if (!UnpackCacheOpened.load(std::memory_order_relaxed)) {
-      const char* MD5Cache = getenv("FEX_NATIVE_MD5_CACHE");
+      const char* MD5Cache = FEX::Windows::Switch("FEX_NATIVE_MD5_CACHE");
       NativeUnpackCache::Init(MD5Enabled && !(MD5Cache && MD5Cache[0] == '0'));
       UnpackCacheOpened.store(true, std::memory_order_release);
     }
   }
 
+  // Arms a target whose code was found.
   uintptr_t Check(Target& T) {
-    uint8_t Code[MaxSignatureSize];
-    if (!Read(T.GuestRIP, Code, T.SignatureSize)) {
-      return 0;
-    }
-
-    CheckResult Result = memcmp(Code, T.Signature, T.SignatureSize) == 0 ? CheckResult::Match : CheckResult::Mismatch;
-    if (Result == CheckResult::Mismatch) {
-      const uint32_t Count = T.Mismatches.load(std::memory_order_relaxed) + 1;
-      if (Count == 1 || Count == MaxMismatches) {
-        FEX::Windows::StatsLogNote(fextl::fmt::format("{}: {} at {:X} has different code ({}/{}){}: {}", GroupName(T.Group), T.Name,
-                                                      T.GuestRIP, Count, MaxMismatches, Count == MaxMismatches ? ", stays emulated" : "",
-                                                      Hex(Code, T.SignatureSize)));
-      }
-    } else {
-      Result = CheckExtra(T);
-      if (Result == CheckResult::Unreadable) {
-        return 0;
-      }
-    }
-
-    if (Result == CheckResult::Mismatch) {
-      if (T.Mismatches.fetch_add(1, std::memory_order_relaxed) + 1 >= MaxMismatches) {
-        T.State.store(TargetState::Rejected, std::memory_order_release);
-      }
+    const auto Result = CheckExtra(T);
+    if (Result != CheckResult::Match) {
+      T.State.store(TargetState::Rejected, std::memory_order_release);
       return 0;
     }
 
@@ -279,10 +388,10 @@ namespace {
 
     auto Expected = TargetState::Unchecked;
     if (T.State.compare_exchange_strong(Expected, TargetState::Armed, std::memory_order_acq_rel)) {
-      FEX::Windows::StatsLogNote(
-        fextl::fmt::format("{}: {} at {:X} matched, runs natively from now on", GroupName(T.Group), T.Name, T.GuestRIP));
+      FEX::Windows::StatsLogNote(fextl::fmt::format("{}: {} at {:X} matched, runs natively from now on", GroupName(T.Group), T.Name,
+                                                    T.GuestRIP.load(std::memory_order_relaxed)));
     }
-    return reinterpret_cast<uintptr_t>(T.Stub);
+    return T.State.load(std::memory_order_acquire) == TargetState::Armed ? reinterpret_cast<uintptr_t>(T.Stub) : 0;
   }
 
   // The executable sections of the main image, to tell return addresses on the stack apart from other values. Falls back
@@ -295,8 +404,10 @@ namespace {
         Nt.Signature != IMAGE_NT_SIGNATURE) {
       FEXNativeTextBegin = Base;
       FEXNativeTextEnd = Base + 0x2000000;
+      ImageEnd = FEXNativeTextEnd;
       return;
     }
+    ImageEnd = Base + Nt.OptionalHeader.SizeOfImage;
     uint64_t Begin = ~0ULL, End = 0;
     const uint64_t SectionsAt = Base + Dos.e_lfanew + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + Nt.FileHeader.SizeOfOptionalHeader;
     for (uint32_t i = 0; i < Nt.FileHeader.NumberOfSections; ++i) {
@@ -446,7 +557,8 @@ namespace {
     return (Line.empty() ? Line : fextl::fmt::format("  native{}\n", Line)) + NativeUnpackCache::StatsLine() + JobWaitStatsLine() + Window;
   }
 
-  // D2R's main thread waits for a frame's parallel tasks in a loop that never sleeps (D2R.exe 0x1408764A8):
+  // D2R's main thread waits for a frame's parallel tasks in a loop that never sleeps (addresses below are from the last
+  // known version; the code is found wherever an update puts it):
   //
   //   do { JobSystem()->Queue->TryRunJob(priority 2) } while (finished task bits != all tasks)
   //
@@ -458,12 +570,10 @@ namespace {
   // before each TryRunJob. Running that getter natively lets the wait loop's call pause for a moment when the priority 2
   // list is empty, so the lock stays free for the workers; every other caller just gets the object back.
   namespace JobWait {
-    constexpr uint32_t GetterRVA = 0x7B75B0;
-    constexpr uint32_t ObjectRVA = 0x2056B00;  // what the getter returns
-    constexpr uint32_t GuardRVA = 0x2056CD8;   // its init guard: 0 = not constructed, -1 = being constructed, else epoch
-    constexpr uint32_t CallSiteRVA = 0x8764A8; // the wait loop's call of the getter
-    constexpr uint32_t ReturnRVA = CallSiteRVA + 5;
-    constexpr uint32_t TryRunRVA = 0x7B7700;
+    // Where the last known version had the getter and the wait loop's call of it: the call is searched for starting
+    // there (moved by as much as the getter moved).
+    constexpr uint32_t KnownGetterRVA = 0x7B75B0;
+    constexpr uint32_t KnownCallSiteRVA = 0x8764A8;
     constexpr uint64_t QueueOffset = 0x1A0; // job system -> queue the wait loop helps with
     constexpr uint64_t ListOffset = 0x38;   // queue -> list head of priority 2 jobs (empty when it points to itself)
 
@@ -480,11 +590,19 @@ namespace {
       0xf6, 0x89, 0x01, 0x48, 0x89, 0x15, 0x83, 0xf6, 0x89, 0x01, 0xe8, 0xfa, 0x73, 0xda, 0x00, 0x48, 0x8d, 0x0d, 0x7f, 0xf6, 0x89,
       0x01, 0xe8, 0x2e, 0x75, 0xda, 0x00, 0x48, 0x8d, 0x05, 0x9b, 0xf4, 0x89, 0x01, 0x48, 0x83, 0xc4, 0x28, 0xc3,
     };
+    // The getter's RIP-relative displacements and call targets: its init guard (read at 0x1a, 0x27, 0x32 and 0xa5), the
+    // object it returns (0xb1) and the object's fields, the CRT's init and atexit helpers.
+    constexpr uint8_t GetterRel32[] = {0x1a, 0x27, 0x2c, 0x32, 0x3d, 0x45, 0x4c, 0x53, 0x5a, 0x6b,
+                                       0x72, 0x7c, 0x84, 0x8b, 0x92, 0x99, 0x9e, 0xa5, 0xaa, 0xb1};
+    // Each guard reference: the displacement's offset and the end of its instruction.
+    constexpr std::pair<uint8_t, uint8_t> GuardRefs[] = {{0x1a, 0x1e}, {0x27, 0x2b}, {0x32, 0x37}, {0xa5, 0xa9}};
+    constexpr std::pair<uint8_t, uint8_t> ObjectRef {0xb1, 0xb5};
     constexpr uint8_t CallSiteCode[] = {
       0xe8, 0x03, 0x11, 0xf4, 0xff, 0x41, 0xb1, 0xff, 0x45, 0x8b, 0xc4, 0x48, 0x8b, 0x90, 0xa0, 0x01, 0x00, 0x00, 0xe8, 0x41, 0x12,
       0xf4, 0xff, 0x8b, 0x97, 0xe8, 0x60, 0x00, 0x00, 0x48, 0x8b, 0x8f, 0xc0, 0x5e, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x48,
       0xd3, 0xe0, 0xff, 0xc8, 0x3b, 0xd0, 0x75, 0xce,
     };
+    constexpr uint8_t CallSiteRel32[] = {0x01, 0x13}; // call getter; call TryRunJob (which ends at 0x17)
     constexpr uint8_t TryRunCode[] = {
       0x48, 0x83, 0xec, 0x28, 0x48, 0x8d, 0x42, 0x10, 0x4c, 0x8b, 0xda, 0x48, 0x87, 0x42, 0x10, 0x48, 0x85, 0xc0, 0x74, 0x18, 0xf3,
       0x90, 0x48, 0x8b, 0x42, 0x10, 0x48, 0x85, 0xc0, 0x75, 0xf5, 0x48, 0x8d, 0x42, 0x10, 0x48, 0x87, 0x42, 0x10, 0x48, 0x85, 0xc0,
@@ -492,8 +610,19 @@ namespace {
       0x49, 0x8d, 0x4b, 0x38,
     };
 
+    constexpr Pattern Getter {GetterCode, sizeof(GetterCode), GetterRel32, sizeof(GetterRel32)};
+    constexpr Pattern CallSite {CallSiteCode, sizeof(CallSiteCode), CallSiteRel32, sizeof(CallSiteRel32)};
+    // Searches for the wait loop when its page couldn't be read, at most every 2 seconds.
+    constexpr uint32_t MaxCallSiteScans = 10;
+
     bool Enabled {};
     uint64_t BackoffMicroseconds {};
+    std::atomic<uint64_t> GetterAddress {}; // where the getter's code was found, 0 until then
+    uint64_t GuardAddress {};               // its init guard: 0 = not constructed, -1 = being constructed, else epoch
+    std::mutex CheckLock;
+    bool CallSiteDone {};
+    uint32_t CallSiteScans {};
+    uint64_t LastCallSiteScan {};
     std::atomic<TargetState> State {TargetState::Unchecked};
     std::atomic<bool> Pending {};      // waiting for the object to be constructed or the code to be readable
     std::atomic<uint64_t> NextRetry {}; // tick of the next PreCompile check while Pending
@@ -501,32 +630,73 @@ namespace {
     void (*Invalidate)(uint64_t Address, uint64_t Size) {};
   } // namespace JobWait
 
-  CheckResult CheckJobWait() {
-    uint8_t Getter[sizeof(JobWait::GetterCode)];
-    uint8_t CallSite[sizeof(JobWait::CallSiteCode)];
-    uint8_t TryRun[sizeof(JobWait::TryRunCode)];
-    int32_t Guard {};
-    if (!Read(ImageBase + JobWait::GetterRVA, Getter, sizeof(Getter)) || !Read(ImageBase + JobWait::CallSiteRVA, CallSite, sizeof(CallSite)) ||
-        !Read(ImageBase + JobWait::TryRunRVA, TryRun, sizeof(TryRun)) || !Read(ImageBase + JobWait::GuardRVA, &Guard, sizeof(Guard))) {
-      return CheckResult::Unreadable;
-    }
-    const bool GetterOk = memcmp(Getter, JobWait::GetterCode, sizeof(Getter)) == 0;
-    const bool CallSiteOk = memcmp(CallSite, JobWait::CallSiteCode, sizeof(CallSite)) == 0;
-    const bool TryRunOk = memcmp(TryRun, JobWait::TryRunCode, sizeof(TryRun)) == 0;
-    if (!GetterOk || !CallSiteOk || !TryRunOk) {
-      FEX::Windows::StatsLogNote(fextl::fmt::format("native jobwait: different code (getter {}, wait loop {}, TryRunJob {}), stays emulated",
-                                                    GetterOk ? "ok" : "differs", CallSiteOk ? "ok" : "differs", TryRunOk ? "ok" : "differs"));
-      return CheckResult::Mismatch;
-    }
-    // Not constructed yet: the getter would have to run the constructor, which only the guest code can do. Once it is,
-    // MSVC stores the global init epoch there, which counts up from INT_MIN.
-    return Guard != 0 && Guard != -1 ? CheckResult::Match : CheckResult::Unreadable;
-  }
+  uint64_t JobWaitObject {}; // what the getter returns, from its code
+  uint64_t JobWaitReturn {}; // the wait loop's return address from its call of the getter; 0 if not found
 
   uint64_t NowTicks() {
     uint64_t Ticks;
     __asm volatile("mrs %[Res], CNTVCT_EL0" : [Res] "=r"(Ticks));
     return Ticks;
+  }
+
+  // Finds the wait loop's call of the getter: the call, then the constant part of the loop, then a call of code that is
+  // TryRunJob. Its return address tells the wait loop's calls apart from everyone else's.
+  ScanResult FindWaitLoop(uint64_t Getter) {
+    const uint64_t Expected = ImageBase + JobWait::KnownCallSiteRVA + (Getter - (ImageBase + JobWait::KnownGetterRVA));
+    constexpr size_t TailOffset = 5, TailSize = 14; // 41 b1 ff ... e8: everything between the two calls
+    return ScanNear(
+      Expected, FEXNativeTextBegin, FEXNativeTextEnd, sizeof(JobWait::CallSiteCode), [&](uint64_t At, const uint8_t* Data, size_t Size) {
+        for (size_t i = 0; i + sizeof(JobWait::CallSiteCode) <= Size; ++i) {
+          if (Data[i] != 0xe8 || memcmp(Data + i + TailOffset, JobWait::CallSiteCode + TailOffset, TailSize) != 0) {
+            continue;
+          }
+          const uint64_t Call = At + i;
+          if (Call + 5 + Rel32At(Data, i + 1) != Getter || !Matches(JobWait::CallSite, Data + i, sizeof(JobWait::CallSiteCode))) {
+            continue;
+          }
+          const uint64_t TryRun = Call + 0x17 + Rel32At(Data, i + 0x13);
+          uint8_t Code[sizeof(JobWait::TryRunCode)];
+          if (!Read(TryRun, Code, sizeof(Code)) || memcmp(Code, JobWait::TryRunCode, sizeof(Code)) != 0) {
+            continue;
+          }
+          JobWaitReturn = Call + 5;
+          FEX::Windows::StatsLogNote(fextl::fmt::format("native jobwait: frame wait loop calls the getter at {:X} (last known at {:X}), "
+                                                        "TryRunJob at {:X}",
+                                                        Call, ImageBase + JobWait::KnownCallSiteRVA, TryRun));
+          return true;
+        }
+        return false;
+      });
+  }
+
+  CheckResult CheckJobWait() {
+    std::scoped_lock Lock {JobWait::CheckLock};
+    // Not constructed yet: the getter would have to run the constructor, which only the guest code can do. Once it is,
+    // MSVC stores the global init epoch there, which counts up from INT_MIN.
+    int32_t Guard {};
+    if (!Read(JobWait::GuardAddress, &Guard, sizeof(Guard)) || Guard == 0 || Guard == -1) {
+      return CheckResult::Unreadable;
+    }
+    if (!JobWait::CallSiteDone) {
+      const uint64_t Now = NowTicks();
+      if (JobWait::CallSiteScans && Now - JobWait::LastCallSiteScan < 2 * TickFrequency) {
+        return CheckResult::Unreadable;
+      }
+      JobWait::LastCallSiteScan = Now;
+      const auto Result = FindWaitLoop(JobWait::GetterAddress.load(std::memory_order_acquire));
+      if (Result == ScanResult::Unreadable && ++JobWait::CallSiteScans < JobWait::MaxCallSiteScans) {
+        return CheckResult::Unreadable;
+      }
+      JobWait::CallSiteDone = true;
+      if (Result != ScanResult::Found) {
+        // The getter still runs natively for everyone, as it did for the other callers in build 42; only the wait
+        // loop's pause and its jobwait line need the loop.
+        FEX::Windows::StatsLogNote(fextl::fmt::format("native jobwait: frame wait loop not found within {} MB{}, the getter runs natively "
+                                                      "for every caller, no jobwait line",
+                                                      SearchRadius >> 20, Result == ScanResult::Unreadable ? " (some pages unreadable)" : ""));
+      }
+    }
+    return CheckResult::Match;
   }
 
   uintptr_t LookupJobWait() {
@@ -540,7 +710,7 @@ namespace {
       auto Expected = TargetState::Unchecked;
       if (JobWait::State.compare_exchange_strong(Expected, TargetState::Armed, std::memory_order_acq_rel)) {
         FEX::Windows::StatsLogNote(fextl::fmt::format("native jobwait: getter at {:X} matched, frame wait loop pauses {} us when idle",
-                                                      ImageBase + JobWait::GetterRVA, JobWait::BackoffMicroseconds));
+                                                      JobWait::GetterAddress.load(std::memory_order_relaxed), JobWait::BackoffMicroseconds));
       }
       return reinterpret_cast<uintptr_t>(&NativeJobSystemGetRedirect);
     }
@@ -564,8 +734,6 @@ namespace {
     std::atomic<uint64_t> EpisodeStart;
     std::atomic<uint64_t> LastWait;
   } JobWaitStats;
-  uint64_t JobWaitObject {};
-  uint64_t JobWaitReturn {};
   uint64_t JobWaitBackoff {};    // ticks
   uint64_t JobWaitEpisodeGap {}; // ticks: idle waits further apart than this start a new stretch
 
@@ -587,13 +755,12 @@ namespace {
 } // namespace
 
 void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Address, uint64_t Size)) {
-  const char* Zlib = getenv("FEX_NATIVE_ZLIB");
-  const char* MD5 = getenv("FEX_NATIVE_MD5");
+  const char* Zlib = FEX::Windows::Switch("FEX_NATIVE_ZLIB");
+  const char* MD5 = FEX::Windows::Switch("FEX_NATIVE_MD5");
   ZlibEnabled = Zlib && Zlib[0] == '1';
   MD5Enabled = MD5 && MD5[0] == '1';
   ImageBase = MainImageBase;
   for (auto& T : Targets) {
-    T.GuestRIP = MainImageBase + T.RVA;
     if (StatsLog) {
       FEX::Windows::StatsLogNameNative(reinterpret_cast<uint64_t>(T.Entry), fextl::fmt::format("fex:{}", T.Name));
     }
@@ -603,13 +770,11 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
   TickFrequency = Frequency ? Frequency : 1;
 
   {
-    const char* JobWaitSwitch = getenv("FEX_JOBWAIT");
-    const char* Backoff = getenv("FEX_JOBWAIT_BACKOFF");
+    const char* JobWaitSwitch = FEX::Windows::Switch("FEX_JOBWAIT");
+    const char* Backoff = FEX::Windows::Switch("FEX_JOBWAIT_BACKOFF");
     JobWait::Enabled = !(JobWaitSwitch && JobWaitSwitch[0] == '0') && Invalidate;
     JobWait::BackoffMicroseconds = Backoff && Backoff[0] ? std::min<uint64_t>(strtoull(Backoff, nullptr, 10), 1000) : 0;
     JobWait::Invalidate = Invalidate;
-    JobWaitObject = MainImageBase + JobWait::ObjectRVA;
-    JobWaitReturn = MainImageBase + JobWait::ReturnRVA;
     JobWaitBackoff = JobWait::BackoffMicroseconds ? std::max<uint64_t>(JobWait::BackoffMicroseconds * TickFrequency / 1000000, 1) : 0;
     JobWaitEpisodeGap = std::max<uint64_t>(TickFrequency / 5000, 1); // 200 us
     if (StatsLog) {
@@ -617,14 +782,15 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
     }
   }
 
+  FindText(MainImageBase);
   if (StatsLog && ZlibEnabled) {
-    FindText(MainImageBase);
     FEXNativeZlibTrackStreams = 1;
   }
+  Searching.store(ZlibEnabled || MD5Enabled || JobWait::Enabled, std::memory_order_relaxed);
 
   // On unless set to 0.
   auto DefaultOn = [](const char* Name) {
-    const char* Value = getenv(Name);
+    const char* Value = FEX::Windows::Switch(Name);
     return !(Value && Value[0] == '0');
   };
   FEXNativeSkipHitAdler = DefaultOn("FEX_UNPACK_CACHE_SKIP_ADLER");
@@ -644,7 +810,7 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
   if (FEXNativeZlibTrackStreams) {
     FEX::Windows::StatsLogNote(fextl::fmt::format("native zlib: tracking streams, code range {:X}-{:X}", FEXNativeTextBegin, FEXNativeTextEnd));
   }
-  if (const char* Cache = getenv("FEX_UNPACK_CACHE"); Cache && Cache[0] == '1') {
+  if (const char* Cache = FEX::Windows::Switch("FEX_UNPACK_CACHE"); Cache && Cache[0] == '1') {
     UnpackCacheRequested = ZlibEnabled;
     FEX::Windows::StatsLogNote(ZlibEnabled ? "unpack cache: requested, opens when the game's inflate_fast is found" :
                                              "unpack cache: off, it needs FEX_NATIVE_ZLIB=1");
@@ -686,18 +852,15 @@ void PreCompile() {
   }
   // Drop the compiled guest getter, so the next call asks Lookup again and gets the native one.
   JobWait::Pending.store(false, std::memory_order_relaxed);
-  JobWait::Invalidate(ImageBase + JobWait::GetterRVA, 1);
+  JobWait::Invalidate(JobWait::GetterAddress.load(std::memory_order_relaxed), 1);
 }
 
 uintptr_t Lookup(uint64_t GuestRIP) {
-  if (JobWait::Enabled && GuestRIP == ImageBase + JobWait::GetterRVA) {
+  if (JobWait::Enabled && GuestRIP == JobWait::GetterAddress.load(std::memory_order_acquire)) {
     return LookupJobWait();
   }
-  if (!ZlibEnabled && !MD5Enabled) {
-    return 0;
-  }
   for (auto& T : Targets) {
-    if (T.GuestRIP != GuestRIP) {
+    if (T.GuestRIP.load(std::memory_order_acquire) != GuestRIP) {
       continue;
     }
     if (!Enabled(T.Group)) {
@@ -711,9 +874,120 @@ uintptr_t Lookup(uint64_t GuestRIP) {
   }
   return 0;
 }
+
+namespace {
+  std::atomic<uint32_t> SearchedBlocks {};
+
+  fextl::string NotFound() {
+    fextl::string Names;
+    for (auto& T : Targets) {
+      if (Enabled(T.Group) && !T.GuestRIP.load(std::memory_order_relaxed)) {
+        Names += fextl::fmt::format("{}{}", Names.empty() ? "" : ", ", T.Name);
+      }
+    }
+    if (JobWait::Enabled && !JobWait::GetterAddress.load(std::memory_order_relaxed)) {
+      Names += fextl::fmt::format("{}job system getter", Names.empty() ? "" : ", ");
+    }
+    return Names;
+  }
+
+  void FoundOne(const char* Group, const char* Name, uint64_t Address, uint64_t KnownAddress) {
+    FEX::Windows::StatsLogNote(fextl::fmt::format("{}: {} found at {:X} (last known at {:X})", Group, Name, Address, KnownAddress));
+    if (NotFound().empty() && Searching.exchange(false, std::memory_order_relaxed)) {
+      FEX::Windows::StatsLogNote(
+        fextl::fmt::format("native: found everything after {} compiled blocks", SearchedBlocks.load(std::memory_order_relaxed)));
+    }
+  }
+
+  // Copies guest code inside the compiler's fault recovery: a read of a page the protector keeps inaccessible restarts
+  // the compile with that page recorded as FaultPage, and the next try leaves it alone.
+  bool CopyCode(uint64_t Address, void* Buffer, size_t Size, uint64_t FaultPage) {
+    if (FaultPage && FaultPage >= (Address & ~uint64_t {4095}) && FaultPage < Address + Size) {
+      return false;
+    }
+    memcpy(Buffer, reinterpret_cast<const void*>(Address), Size);
+    return true;
+  }
+
+  uintptr_t FoundGetter(uint64_t GuestRIP, const uint8_t* Code) {
+    // Every reference to the init guard must point at the same place.
+    uint64_t Guard {};
+    for (const auto& [Field, End] : JobWait::GuardRefs) {
+      const uint64_t Ref = GuestRIP + End + Rel32At(Code, Field);
+      if (Guard && Ref != Guard) {
+        return 0;
+      }
+      Guard = Ref;
+    }
+    {
+      std::scoped_lock Lock {JobWait::CheckLock};
+      const uint64_t Known = JobWait::GetterAddress.load(std::memory_order_relaxed);
+      if (Known) {
+        if (Known != GuestRIP) {
+          return 0;
+        }
+      } else {
+        JobWait::GuardAddress = Guard;
+        JobWaitObject = GuestRIP + JobWait::ObjectRef.second + Rel32At(Code, JobWait::ObjectRef.first);
+        JobWait::GetterAddress.store(GuestRIP, std::memory_order_release);
+        FEX::Windows::StatsLogNote(fextl::fmt::format("native jobwait: guard at {:X}, job system at {:X}", Guard, JobWaitObject));
+        FoundOne("native jobwait", "getter", GuestRIP, ImageBase + JobWait::KnownGetterRVA);
+      }
+    }
+    return LookupJobWait();
+  }
+} // namespace
+
+uintptr_t LookupByCode(uint64_t GuestRIP, uint64_t FaultPage) {
+  if (!Searching.load(std::memory_order_relaxed) || GuestRIP < FEXNativeTextBegin || GuestRIP + MaxPatternSize > FEXNativeTextEnd) {
+    return 0;
+  }
+  if (SearchedBlocks.fetch_add(1, std::memory_order_relaxed) + 1 == MaxSearchedBlocks) {
+    Searching.store(false, std::memory_order_relaxed);
+    FEX::Windows::StatsLogNote(
+      fextl::fmt::format("native: stopped looking after {} compiled blocks, not found: {}", MaxSearchedBlocks, NotFound()));
+    return 0;
+  }
+
+  // Read what the page holds first: common prologues match the first bytes of a pattern, and reading on into the next
+  // page for those could fault where the decoder would never have read.
+  uint8_t Code[MaxPatternSize];
+  size_t Have = std::max(PrefixSize, std::min<size_t>(MaxPatternSize, 4096 - (GuestRIP & 4095)));
+  if (!CopyCode(GuestRIP, Code, Have, FaultPage)) {
+    return 0;
+  }
+  auto Found = [&](const Pattern& P) {
+    if (!Matches(P, Code, std::min(P.Size, Have))) {
+      return false;
+    }
+    if (P.Size > Have) {
+      if (!CopyCode(GuestRIP, Code, P.Size, FaultPage)) {
+        return false;
+      }
+      Have = P.Size;
+    }
+    return Matches(P, Code, P.Size);
+  };
+  for (auto& T : Targets) {
+    if (!Enabled(T.Group) || T.GuestRIP.load(std::memory_order_acquire) || !Found(T.Code)) {
+      continue;
+    }
+    uint64_t Expected = 0;
+    if (!T.GuestRIP.compare_exchange_strong(Expected, GuestRIP, std::memory_order_acq_rel)) {
+      // Another thread found it first; a second copy of the same code stays emulated.
+      return Expected == GuestRIP ? Lookup(GuestRIP) : 0;
+    }
+    FoundOne(GroupName(T.Group), T.Name, GuestRIP, ImageBase + T.KnownRVA);
+    return Check(T);
+  }
+  if (JobWait::Enabled && !JobWait::GetterAddress.load(std::memory_order_acquire) && Found(JobWait::Getter)) {
+    return FoundGetter(GuestRIP, Code);
+  }
+  return 0;
+}
 } // namespace NativeRedirect
 
-// The job system getter, run in place of D2R.exe 0x1407B75B0 once its object exists (see JobWait). Every caller gets the
+// The job system getter, run in place of the game's once its object exists (see JobWait). Every caller gets the
 // object; the frame wait loop's call first pauses when the priority 2 list is empty.
 extern "C" uint64_t FEXNativeJobSystemGet(uint64_t ReturnAddress) {
   using namespace NativeRedirect;
