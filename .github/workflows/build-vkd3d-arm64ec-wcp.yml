@@ -22,8 +22,8 @@ on:
 env:
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
   VKD3D_TAG: v3.0b
-  WCP_VERSION: 3.0b-arm64ec-fex6
-  WCP_VERSION_CODE: 7
+  WCP_VERSION: 3.0b-arm64ec-fex7
+  WCP_VERSION_CODE: 8
 
 jobs:
   build:
@@ -124,7 +124,7 @@ jobs:
             "type": "VKD3D",
             "versionName": "${WCP_VERSION}",
             "versionCode": ${WCP_VERSION_CODE},
-            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline, cap pre-sleep, gradual frame start pacing whose margin only grows for frames the hold-back made late, read-only depth-stencil planes not written back after a render pass, frame start pacing that counts a busy GPU as spare time, pass shape measurements). Build from ${GITHUB_SHA}.",
+            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline, cap pre-sleep, gradual frame start pacing whose margin only grows for frames the hold-back made late, read-only depth-stencil planes not written back after a render pass, frame start pacing that counts a busy GPU as spare time, pass shape measurements, frame done signalled from the CPU after the swapchain copy's fence instead of an empty queue submit). Build from ${GITHUB_SHA}.",
             "files": [
               {"source": "system32/d3d12.dll",     "target": "\${system32}/d3d12.dll"},
               {"source": "system32/d3d12core.dll", "target": "\${system32}/d3d12core.dll"},
@@ -160,7 +160,11 @@ jobs:
             are no longer written back to memory after each render pass (on unless
             VKD3D_FEX_DS_STORE_NONE=0). From fex6 on, frame start pacing also counts the time a
             frame waits for a busy GPU as spare time (lower input lag in GPU-bound scenes), and the
-            pass meter measures the shape of the costliest passes. Install in GameNative as a VKD3D
+            pass meter measures the shape of the costliest passes. From fex7 on, each frame's done
+            signal comes from the CPU after the swapchain copy's fence instead of an empty queue
+            submit that held the shared VkQueue until the GPU caught up (on unless
+            VKD3D_FEX_HOST_FRAME_DONE=0), and frame start pacing sees the GPU finish of every frame.
+            Install in GameNative as a VKD3D
             content profile; it appears as `${{ env.WCP_VERSION }}`.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
