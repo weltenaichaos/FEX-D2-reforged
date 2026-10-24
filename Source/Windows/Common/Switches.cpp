@@ -23,6 +23,9 @@ namespace {
     {"FEX_NATIVE_ZLIB", "1"},
     {"FEX_NATIVE_MD5", "1"},
     {"FEX_UNPACK_CACHE", "1"},
+    // Build 58: the unpack cache's data file stays out of Android's file cache (see ARM64EC/NativeUnpackCache.cpp). Its
+    // 3-4 GB of reads per area load came right before the device's other cores went busy in the build 56 and 57 logs.
+    {"FEX_UNPACK_CACHE_DIRECT", "1"},
     // Build 48: no thread at extreme Linux nice values (see PriorityGuard.h, Threads.cpp).
     {"FEX_PRIO", "normal"},
     {"FEX_HELPER_PRIO", "normal"},
@@ -75,6 +78,7 @@ namespace {
     "FEX_UNPACK_CACHE_MAX_GB",
     "FEX_UNPACK_CACHE_RESET",
     "FEX_UNPACK_CACHE_READAHEAD_MB",
+    "FEX_UNPACK_CACHE_DIRECT",
     "FEX_UNPACK_CACHE_SKIP_ADLER",
     "FEX_NATIVE_ADLER_NEON",
     "FEX_NATIVE_MD5_CACHE",

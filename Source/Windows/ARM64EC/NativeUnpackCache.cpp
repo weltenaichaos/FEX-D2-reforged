@@ -21,8 +21,17 @@ $end_info$
 // Reading ahead: data.bin holds the streams in the order they were first unpacked, and a later session asks for them in
 // much the same order. Once hits come from the same or neighbouring 1 MB pieces of data.bin, a reader thread reads the
 // next pieces into memory in large reads, and hits are copied from there instead of each reading from disk.
+//
+// Keeping data.bin out of the kernel's file cache (FEX_UNPACK_CACHE_DIRECT, from build 58): an area load reads 3-4 GB of
+// it in a few seconds, a third of that read ahead and never used, and Android's whole-device load went up to 5-6 of 8
+// cores right after such loads in the build 56 and 57 logs. Read through the file cache, all of it displaces other
+// apps' cached files (which they then read back from storage), and pages read again after being displaced count as
+// "thrashing" to the kernel and to Android's memory killer. The data is copied into our own memory anyway, so data.bin is
+// read through a Linux file of its own: read-ahead with direct reads (storage to our memory, no file cache), other reads
+// and writes are dropped from the file cache right after.
 
 #include "NativeUnpackCache.h"
+#include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/Switches.h"
 
@@ -69,6 +78,7 @@ constexpr size_t MaxAheadRequests = 64;   // chunks waiting for the reader
 constexpr size_t RecentDiskChunks = 16;   // chunks of recent hits read from disk, to see when they come in sequence
 constexpr uint64_t NoChunk = ~0ull;
 constexpr uint64_t DefaultReadAheadMB = 64;
+constexpr uint64_t PageSize = 4096; // direct reads need buffer, offset and size in multiples of the storage block size
 
 struct FileHeader {
   char Magic[8];
@@ -117,6 +127,9 @@ struct Job {
 struct Cache {
   FEXCore::File::File Data;
   FEXCore::File::File Index;
+  // data.bin as Linux files of our own, see above: -1 when not used.
+  int LinuxRead {-1};
+  std::atomic<int> LinuxDirect {-1}; // used by the read-ahead thread only
   std::mutex Lock;
   fextl::unordered_map<std::pair<uint64_t, uint64_t>, Entry, KeyHash> Entries;
   uint64_t DataEnd {};  // next free data offset
@@ -249,6 +262,131 @@ bool Start(FEXCore::File::File& F, const char (&Magic)[8]) {
 
 uint64_t AlignUp(uint64_t Value, uint64_t Alignment) {
   return (Value + Alignment - 1) & ~(Alignment - 1);
+}
+
+// Reads up to Size bytes with a Linux file, fewer at the end of the file. Returns how many, or a negative errno when
+// the first read failed.
+int64_t LinuxReadUpTo(int Fd, uint8_t* Buffer, uint64_t Size, uint64_t Offset) {
+  uint64_t Total {};
+  while (Total < Size) {
+    const int64_t Result = FEX::Windows::Linux::Pread(Fd, Buffer + Total, Size - Total, Offset + Total);
+    if (Result <= 0) {
+      return Total ? static_cast<int64_t>(Total) : Result;
+    }
+    Total += Result;
+  }
+  return static_cast<int64_t>(Total);
+}
+
+// Drops a range of data.bin from the kernel's file cache, see above.
+void DropRange(const Cache* C, uint64_t Offset, uint64_t Size) {
+  if (C->LinuxRead < 0 || !Size) {
+    return;
+  }
+  const uint64_t Start = Offset & ~(PageSize - 1);
+  FEX::Windows::Linux::DropFromFileCache(C->LinuxRead, Start, AlignUp(Offset + Size, PageSize) - Start);
+  __atomic_fetch_add(&FEXUnpackCacheStats.CacheDrops, 1, __ATOMIC_RELAXED);
+}
+
+// A stored stream's data, read from disk.
+bool ReadEntry(Cache* C, uint8_t* Out, uint64_t Offset, uint32_t Size) {
+  if (C->LinuxRead >= 0) {
+    const int64_t Result = LinuxReadUpTo(C->LinuxRead, Out, Size, Offset);
+    DropRange(C, Offset, Size);
+    if (Result == Size) {
+      return true;
+    }
+    // Linux refuses to write into memory the process has protected (EFAULT), which Wine's reads handle.
+  }
+  return ReadExact(C->Data, Out, Size, Offset);
+}
+
+// A read-ahead chunk: a direct read where it works, else a read whose pages are dropped from the file cache afterwards.
+uint64_t ReadChunk(Cache* C, uint8_t* Buffer, uint64_t Offset) {
+  if (const int Direct = C->LinuxDirect.load(std::memory_order_relaxed); Direct >= 0) {
+    const int64_t Result = FEX::Windows::Linux::Pread(Direct, Buffer, ChunkSize, Offset);
+    if (Result >= 0) {
+      __atomic_fetch_add(&FEXUnpackCacheStats.AheadDirect, 1, __ATOMIC_RELAXED);
+      // Some files can't be read past the cache (f2fs reads compressed files and those without inline encryption through
+      // it anyway, without an error): drop it from there too.
+      DropRange(C, Offset, ChunkSize);
+      return static_cast<uint64_t>(Result);
+    }
+    C->LinuxDirect.store(-1, std::memory_order_relaxed);
+    FEX::Windows::Linux::Close(Direct);
+    FEX::Windows::StatsLogNote(fextl::fmt::format(
+      "unpack cache: a direct read failed (error {}), reading ahead through the file cache and dropping it from there", -Result));
+  }
+  if (C->LinuxRead >= 0) {
+    const int64_t Result = LinuxReadUpTo(C->LinuxRead, Buffer, ChunkSize, Offset);
+    DropRange(C, Offset, ChunkSize);
+    return Result > 0 ? static_cast<uint64_t>(Result) : 0;
+  }
+  return ReadUpTo(C->Data, Buffer, ChunkSize, Offset);
+}
+
+// Wine keeps the Linux file it opened for data.bin, so data.bin's Linux path is the target of one of this process's
+// /proc/self/fd links.
+struct FindDataArgs {
+  char Path[1024];
+  bool Found;
+};
+
+void FindDataFile(const char* Name, void* Arg) {
+  auto* A = static_cast<FindDataArgs*>(Arg);
+  if (A->Found) {
+    return;
+  }
+  const fextl::string Link = fextl::fmt::format("/proc/self/fd/{}", Name);
+  const int64_t Len = FEX::Windows::Linux::ReadLink(Link.c_str(), A->Path, sizeof(A->Path));
+  constexpr char Suffix[] = "/unpackcache/data.bin";
+  constexpr int64_t SuffixLen = sizeof(Suffix) - 1;
+  if (Len <= SuffixLen) {
+    return;
+  }
+  for (int64_t i = 0; i < SuffixLen; ++i) {
+    char Ch = A->Path[Len - SuffixLen + i];
+    if (Ch >= 'A' && Ch <= 'Z') {
+      Ch = static_cast<char>(Ch - 'A' + 'a');
+    }
+    if (Ch != Suffix[i]) {
+      return;
+    }
+  }
+  A->Found = true;
+}
+
+// Opens data.bin's Linux files (Probe: page-aligned memory for a test read). Returns a note for the log.
+fextl::string OpenLinuxFiles(Cache* C, uint8_t* Probe) {
+  const char* Env = FEX::Windows::Switch("FEX_UNPACK_CACHE_DIRECT");
+  if (!Env || Env[0] != '1') {
+    return "unpack cache: data.bin is read through the file cache (FEX_UNPACK_CACHE_DIRECT=1 keeps it out)";
+  }
+  FindDataArgs Args {};
+  if (!FEX::Windows::Linux::ForEachEntry("/proc/self/fd", FindDataFile, &Args) || !Args.Found) {
+    return "unpack cache: can't find data.bin's Linux file, it is read through the file cache";
+  }
+  C->LinuxRead = FEX::Windows::Linux::OpenRead(Args.Path, false);
+  if (C->LinuxRead < 0) {
+    const int Error = -C->LinuxRead;
+    C->LinuxRead = -1;
+    return fextl::fmt::format("unpack cache: can't open {} (error {}), it is read through the file cache", Args.Path, Error);
+  }
+  int Direct = FEX::Windows::Linux::OpenRead(Args.Path, true);
+  int64_t Tried = Direct;
+  if (Direct >= 0) {
+    Tried = FEX::Windows::Linux::Pread(Direct, Probe, PageSize, 0);
+    if (Tried < 0) {
+      FEX::Windows::Linux::Close(Direct);
+      Direct = -1;
+    }
+  }
+  C->LinuxDirect.store(Direct, std::memory_order_relaxed);
+  DropRange(C, 0, PageSize);
+  return fextl::fmt::format(
+    "unpack cache: data.bin is kept out of the file cache ({}): read ahead with {}, other reads and writes "
+    "dropped from the cache afterwards (FEX_UNPACK_CACHE_DIRECT=0 turns it off)",
+    Args.Path, Direct >= 0 ? fextl::string("direct reads") : fextl::fmt::format("normal reads (direct reads failed: error {})", -Tried));
 }
 
 // Log thread state.
@@ -406,7 +544,7 @@ void* ReaderThread(void*) {
       C->ChunkSlots[Chunk] = Index;
     }
     const uint64_t Start = ReadTicks();
-    const uint64_t Bytes = ReadUpTo(C->Data, C->AheadMemory + Index * ChunkSize, ChunkSize, Chunk * ChunkSize);
+    const uint64_t Bytes = ReadChunk(C, C->AheadMemory + Index * ChunkSize, Chunk * ChunkSize);
     __atomic_fetch_add(&FEXUnpackCacheStats.AheadChunks, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&FEXUnpackCacheStats.AheadBytes, Bytes, __ATOMIC_RELAXED);
     __atomic_fetch_add(&FEXUnpackCacheStats.AheadTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
@@ -468,7 +606,7 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
     if (Ahead) {
       NoteDiskHit(C, E);
     }
-    const bool Read = ReadExact(C->Data, Out, E.Produced, E.Offset);
+    const bool Read = ReadEntry(C, Out, E.Offset, E.Produced);
     const uint64_t ReadDone = ReadTicks();
     __atomic_fetch_add(&FEXUnpackCacheStats.DiskTicks, ReadDone - Now, __ATOMIC_RELAXED);
     Good = Read && XXH3_64bits(Out, E.Produced) == E.OutputHash;
@@ -545,6 +683,7 @@ void Write(Cache* C, Job& J, const uint8_t* Data) {
   J.R.Check = RecordCheck(J.R);
   const bool Written = WriteExact(C->Data, Data, J.R.Produced, J.R.Offset) && WriteExact(C->Index, &J.R, sizeof(J.R), J.RecordOffset);
   ForgetChunks(C, J.R.Offset, J.R.Produced);
+  DropRange(C, J.R.Offset, J.R.Produced);
   {
     std::scoped_lock Guard {C->Lock};
     if (Written) {
@@ -858,6 +997,8 @@ bool Init(bool MD5Cache) {
     delete C;
     return false;
   }
+  // Before the writer gets the ring: its first page is free for the test read.
+  const fextl::string LinuxNote = OpenLinuxFiles(C, C->Ring);
   C->ReadAheadSlots = static_cast<uint32_t>(AheadMB * (1ull << 20) / ChunkSize);
   if (C->ReadAheadSlots && C->ReadAheadSlots < AheadChunks + MaxHitChunks) {
     C->ReadAheadSlots = AheadChunks + MaxHitChunks;
@@ -875,6 +1016,7 @@ bool Init(bool MD5Cache) {
     ReaderCache = C;
   }
   ReaderWake.notify_all();
+  FEX::Windows::StatsLogNote(LinuxNote);
   if (MD5Cache) {
     FEX::Windows::StatsLogNote(OpenMD5Cache(Dir, Reset));
   } else {
@@ -918,15 +1060,17 @@ fextl::string StatsLine() {
     Waiting = TheCache->RingHead - TheCache->RingTail;
   }
   // hit: total time per hit, then ram = hits copied from read-ahead memory, disk = time reading the others, verify =
-  // hashing all of them. ahead = chunks the read-ahead thread read (and how many it dropped unused). adler = checks of a
-  // hit's output answered without computing them.
+  // hashing all of them. ahead = chunks the read-ahead thread read (direct = of those, read past the file cache; wasted =
+  // dropped unused). uncached = reads and writes dropped from the file cache. adler = checks of a hit's output answered
+  // without computing them.
   return fextl::fmt::format("  ucache lookups={} key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms ram={}/{:.1f}ms disk={:.1f}ms verify={:.1f}ms "
-                            "ahead={}/{:.1f}MB/{:.1f}ms wasted={} adler={}/{:.1f}MB stored={}/{:.1f}MB/{:.1f}ms written={}/{:.1f}ms "
+                            "ahead={}/{:.1f}MB/{:.1f}ms direct={} wasted={} uncached={} adler={}/{:.1f}MB stored={}/{:.1f}MB/{:.1f}ms "
+                            "written={}/{:.1f}ms "
                             "waiting={:.1f}MB dropped={} failed={} size={}MB writer={}{} md5cache={}/{}/{:.1f}MB/{:.1f}ms stored={}\n",
                             D.Lookups, Ms(D.KeyTicks), D.Hits, MB(D.HitBytes), Ms(D.HitTicks), D.RamHits, Ms(D.RamTicks), Ms(D.DiskTicks),
-                            Ms(D.VerifyTicks), D.AheadChunks, MB(D.AheadBytes), Ms(D.AheadTicks), D.AheadWasted, D.AdlerSkips,
-                            MB(D.AdlerSkipBytes), D.Stores, MB(D.StoreBytes), Ms(D.StoreTicks), D.Written, Ms(D.WriteTicks), MB(Waiting),
-                            D.Dropped, D.Failures, Size >> 20, WriterState.load(std::memory_order_relaxed), TheCache->Full ? " full" : "",
-                            D.MD5Hits, D.MD5Lookups, MB(D.MD5HitBytes), Ms(D.MD5Ticks), D.MD5Stores);
+                            Ms(D.VerifyTicks), D.AheadChunks, MB(D.AheadBytes), Ms(D.AheadTicks), D.AheadDirect, D.AheadWasted,
+                            D.CacheDrops, D.AdlerSkips, MB(D.AdlerSkipBytes), D.Stores, MB(D.StoreBytes), Ms(D.StoreTicks), D.Written,
+                            Ms(D.WriteTicks), MB(Waiting), D.Dropped, D.Failures, Size >> 20, WriterState.load(std::memory_order_relaxed),
+                            TheCache->Full ? " full" : "", D.MD5Hits, D.MD5Lookups, MB(D.MD5HitBytes), Ms(D.MD5Ticks), D.MD5Stores);
 }
 } // namespace NativeUnpackCache

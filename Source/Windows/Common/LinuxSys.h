@@ -13,6 +13,14 @@ int64_t Syscall(int64_t Nr, int64_t A0 = 0, int64_t A1 = 0, int64_t A2 = 0, int6
 int Open(const char* Path, bool Directory = false);
 void Close(int Fd);
 int64_t Pread(int Fd, void* Buffer, size_t Size, uint64_t Offset);
+// Opens a file for reading. Direct asks for direct reads (O_DIRECT): data goes from storage to the caller's buffer without
+// passing through the kernel's file cache; buffer, offset and size must then be multiples of the storage block size.
+int OpenRead(const char* Path, bool Direct);
+// Drops a range of a file from the kernel's file cache (posix_fadvise DONTNEED; pages not yet written are only queued
+// for writing). 0 or a negative errno.
+int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size);
+// The target of a symbolic link, NUL-terminated. Its length, or a negative errno.
+int64_t ReadLink(const char* Path, char* Buffer, size_t Size);
 // Reads a small file into Buffer, NUL-terminated. Returns its length, or a negative errno.
 int64_t ReadSmallFile(const char* Path, char* Buffer, size_t Size);
 int GetPid();

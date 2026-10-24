@@ -717,6 +717,239 @@ namespace {
     return Us;
   }
 
+  // Every second, the CPU use of each Android user (cgroup v2: Android puts every app and every system service in
+  // /sys/fs/cgroup/uid_<its user>/pid_<its process>), the busy time in no user's group (kernel threads and interrupts),
+  // and the processes each user started and ended. Build 57 saw 5-6 of 8 cores busy outside this app's user for 60-80 s
+  // after area loads; Android hides other users' processes in /proc, but not their groups.
+  struct UserCpu {
+    uint32_t Uid;
+    uint64_t UsageUs, SystemUs;
+    fextl::vector<uint32_t> Pids; // sorted
+  };
+  struct UsersState {
+    bool On;
+    bool Listable; // /sys/fs/cgroup can be listed; else Probed holds the users found once at the start
+    bool Have;
+    uint32_t OwnUid;
+    fextl::vector<UserCpu> Prev; // sorted by Uid
+    fextl::vector<uint32_t> Probed;
+  };
+  UsersState Users;
+
+  struct NumberedNames {
+    const char* Prefix;
+    size_t PrefixLen;
+    fextl::vector<uint32_t>* Out;
+  };
+
+  // Collects N from directory entries named <Prefix>N.
+  void CollectNumbered(const char* Name, void* Arg) {
+    auto* A = static_cast<NumberedNames*>(Arg);
+    if (strncmp(Name, A->Prefix, A->PrefixLen) != 0) {
+      return;
+    }
+    const char* P = Name + A->PrefixLen;
+    if (*P < '0' || *P > '9') {
+      return;
+    }
+    char* End {};
+    const unsigned long long Value = strtoull(P, &End, 10);
+    if (*End == 0) {
+      A->Out->push_back(static_cast<uint32_t>(Value));
+    }
+  }
+
+  bool ListNumbered(const char* Path, const char* Prefix, fextl::vector<uint32_t>& Out) {
+    Out.clear();
+    NumberedNames Args {Prefix, strlen(Prefix), &Out};
+    if (!Linux::ForEachEntry(Path, CollectNumbered, &Args)) {
+      return false;
+    }
+    std::sort(Out.begin(), Out.end());
+    return true;
+  }
+
+  fextl::string UserName(uint32_t Uid) {
+    const uint32_t AppId = Uid % 100000;
+    const char* Known {};
+    switch (AppId) {
+    case 0: Known = "root"; break;
+    case 1000: Known = "system"; break;
+    case 1001: Known = "phone"; break;
+    case 1002: Known = "bluetooth"; break;
+    case 1010: Known = "wifi"; break;
+    case 1013: Known = "media"; break;
+    case 1019: Known = "drm"; break;
+    case 1021: Known = "gps"; break;
+    case 1027: Known = "nfc"; break;
+    case 1036: Known = "logd"; break;
+    case 1041: Known = "audioserver"; break;
+    case 1046: Known = "mediacodec"; break;
+    case 1047: Known = "cameraserver"; break;
+    case 1066: Known = "statsd"; break;
+    case 1069: Known = "lmkd"; break;
+    case 1073: Known = "network stack"; break;
+    case 2000: Known = "shell"; break;
+    case 9999: Known = "nobody"; break;
+    default: break;
+    }
+    if (Known) {
+      return Uid >= 100000 ? fextl::fmt::format("{} (user {})", Known, Uid / 100000) : fextl::string(Known);
+    }
+    if (AppId >= 10000 && AppId < 20000) {
+      return fextl::fmt::format("app {}", Uid);
+    }
+    if (AppId >= 90000 && AppId < 99000) {
+      return fextl::fmt::format("app zygote child {}", Uid);
+    }
+    if (AppId >= 99000) {
+      return fextl::fmt::format("isolated {}", Uid);
+    }
+    return fextl::fmt::format("uid {}", Uid);
+  }
+
+  bool ReadUserCpu(uint32_t Uid, UserCpu& Out) {
+    char Path[64];
+    snprintf(Path, sizeof(Path), "/sys/fs/cgroup/uid_%u/cpu.stat", Uid);
+    if (Linux::ReadSmallFile(Path, SystemBuffer, sizeof(SystemBuffer)) <= 0 || !SystemField(SystemBuffer, "usage_usec", Out.UsageUs)) {
+      return false;
+    }
+    SystemField(SystemBuffer, "system_usec", Out.SystemUs);
+    Out.Uid = Uid;
+    return true;
+  }
+
+  void UsersInit(uint32_t OwnUid) {
+    Users.OwnUid = OwnUid;
+    fextl::vector<uint32_t> Uids;
+    Users.Listable = ListNumbered("/sys/fs/cgroup", "uid_", Uids) && !Uids.empty();
+    if (!Users.Listable) {
+      // Can't list: look for the usual users once (system services, the first apps).
+      const auto Probe = [&](uint32_t First, uint32_t Last) {
+        UserCpu U {};
+        for (uint32_t Uid = First; Uid <= Last; ++Uid) {
+          if (ReadUserCpu(Uid, U)) {
+            Users.Probed.push_back(Uid);
+          }
+        }
+      };
+      Probe(0, 0);
+      Probe(1000, 1099);
+      Probe(2000, 2000);
+      Probe(10000, 10999);
+      Uids = Users.Probed;
+    }
+    fextl::vector<uint32_t> Pids;
+    char Path[64];
+    snprintf(Path, sizeof(Path), "/sys/fs/cgroup/uid_%u", OwnUid);
+    const bool PidsOk = ListNumbered(Path, "pid_", Pids) && !Pids.empty();
+    Users.On = !Uids.empty();
+    StatsLogNote(fextl::fmt::format("users: CPU use of {} Android users {}, {}", Uids.size(),
+                                    Users.Listable ? "(all, listed every second)" : "(not listable: the usual ones, found once)",
+                                    PidsOk ? "their process starts and ends counted" : "process starts and ends not readable"));
+  }
+
+  // The 'users busy' line. BusyCores: the whole device's busy CPU time this second, in cores (< 0 when unknown).
+  fextl::string UsersLine(bool Show, double Wall, double BusyCores) {
+    if (!Users.On) {
+      return {};
+    }
+    fextl::vector<uint32_t> Uids;
+    if (Users.Listable) {
+      ListNumbered("/sys/fs/cgroup", "uid_", Uids);
+    } else {
+      Uids = Users.Probed;
+    }
+    fextl::vector<UserCpu> Now;
+    Now.reserve(Uids.size());
+    char Path[64];
+    for (const uint32_t Uid : Uids) {
+      UserCpu U {};
+      if (!ReadUserCpu(Uid, U)) {
+        continue;
+      }
+      snprintf(Path, sizeof(Path), "/sys/fs/cgroup/uid_%u", Uid);
+      ListNumbered(Path, "pid_", U.Pids);
+      Now.push_back(std::move(U));
+    }
+    fextl::string Out;
+    if (Show && Users.Have) {
+      struct Row {
+        uint32_t Uid;
+        double Cores, Kernel;
+        uint32_t Started, Ended;
+        size_t Procs;
+      };
+      fextl::vector<Row> Rows;
+      uint64_t SumUs {};
+      uint32_t Started {}, Ended {};
+      const auto Count = [](const fextl::vector<uint32_t>& A, const fextl::vector<uint32_t>& B) {
+        // Entries of A not in B (both sorted).
+        uint32_t N {};
+        size_t j {};
+        for (const uint32_t V : A) {
+          while (j < B.size() && B[j] < V) {
+            ++j;
+          }
+          N += j == B.size() || B[j] != V;
+        }
+        return N;
+      };
+      static const fextl::vector<uint32_t> NoPids;
+      size_t i {}, j {};
+      while (i < Users.Prev.size() || j < Now.size()) {
+        const UserCpu* P = i < Users.Prev.size() ? &Users.Prev[i] : nullptr;
+        const UserCpu* N = j < Now.size() ? &Now[j] : nullptr;
+        if (P && N && P->Uid == N->Uid) {
+          ++i, ++j;
+        } else if (N && (!P || N->Uid < P->Uid)) {
+          P = nullptr; // a new user: all of its use and processes are new
+          ++j;
+        } else {
+          N = nullptr; // a user whose group is gone
+          ++i;
+        }
+        const uint64_t Usage = N ? N->UsageUs - std::min(N->UsageUs, P ? P->UsageUs : 0) : 0;
+        const uint64_t Kernel = N ? N->SystemUs - std::min(N->SystemUs, P ? P->SystemUs : 0) : 0;
+        const uint32_t Start = Count(N ? N->Pids : NoPids, P ? P->Pids : NoPids);
+        const uint32_t End = Count(P ? P->Pids : NoPids, N ? N->Pids : NoPids);
+        SumUs += Usage;
+        const uint32_t Uid = N ? N->Uid : P->Uid;
+        if (Uid == Users.OwnUid) {
+          continue;
+        }
+        Started += Start;
+        Ended += End;
+        Rows.push_back(
+          {Uid, static_cast<double>(Usage) / 1e6 / Wall, static_cast<double>(Kernel) / 1e6 / Wall, Start, End, N ? N->Pids.size() : 0});
+      }
+      std::sort(Rows.begin(), Rows.end(), [](const Row& a, const Row& b) { return a.Cores > b.Cores; });
+      Out = "  users busy:";
+      if (BusyCores >= 0) {
+        Out += fextl::fmt::format(" kernel threads+irq {:.1f}", std::max(0.0, BusyCores - static_cast<double>(SumUs) / 1e6 / Wall));
+      }
+      size_t Listed {};
+      for (const auto& R : Rows) {
+        if (Listed == 6 || R.Cores < 0.05) {
+          break;
+        }
+        Out += fextl::fmt::format(" | {} {:.1f} (kernel {:.1f}, {} procs", UserName(R.Uid), R.Cores, R.Kernel, R.Procs);
+        if (R.Started) {
+          Out += fextl::fmt::format(", +{}", R.Started);
+        }
+        if (R.Ended) {
+          Out += fextl::fmt::format(", -{}", R.Ended);
+        }
+        Out += ")";
+        ++Listed;
+      }
+      Out += fextl::fmt::format(" | outside this app: {} processes started, {} ended\n", Started, Ended);
+    }
+    Users.Prev = std::move(Now);
+    Users.Have = true;
+    return Out;
+  }
+
   void SystemInit() {
     System.On = true;
     // "0::/uid_10121/pid_22319": this process's cgroup v2 group (the app's process tree) and its parent (the app's user).
@@ -765,6 +998,11 @@ namespace {
                                     "GPU memory per process from kgsl (checked once the game uses the GPU)",
                                     Mem ? fextl::fmt::format("{}", TotalKB / 1024) : fextl::string("?"), SwapKB / 1024, AppNote,
                                     Vm ? "readable" : "not readable", Psi ? "readable" : "not readable"));
+    uint32_t OwnUid = ~0u;
+    if (const size_t At = Group.find("/uid_"); At != fextl::string::npos) {
+      OwnUid = static_cast<uint32_t>(strtoull(Group.c_str() + At + 5, nullptr, 10));
+    }
+    UsersInit(OwnUid);
   }
 
   fextl::string SystemLine(double ServerRunMs) {
@@ -792,12 +1030,14 @@ namespace {
     }
     Linux::TaskStat Self {};
     const bool HaveSelf = Linux::ReadTaskStat("/proc/self/stat", Self);
+    double BusyCores = -1.0;
     if (Show && Cpu[0]) {
       uint64_t D[8];
       for (int i = 0; i < 8; ++i) {
         D[i] = Cpu[i] - System.PrevCpu[i];
       }
       const uint64_t Busy = D[0] + D[1] + D[2] + D[5] + D[6] + D[7];
+      BusyCores = Cores(Busy);
       Out += fextl::fmt::format("  system busy {:.1f} cores = user {:.1f} + low prio {:.1f} + kernel {:.1f} + irq {:.1f}, io wait {:.1f}",
                                 Cores(Busy), Cores(D[0]), Cores(D[1]), Cores(D[2]), Cores(D[5] + D[6] + D[7]), Cores(D[4]));
       if (HaveSelf) {
@@ -833,6 +1073,7 @@ namespace {
     if (!Out.empty()) {
       Out += "\n";
     }
+    Out += UsersLine(Show, Wall, BusyCores);
 
     // Memory.
     fextl::string Mem;
@@ -840,7 +1081,10 @@ namespace {
     if (Linux::ReadSmallFile("/proc/meminfo", SystemBuffer, sizeof(SystemBuffer)) > 0 && SystemField(SystemBuffer, "MemAvailable", AvailKB)) {
       SystemField(SystemBuffer, "SwapTotal", SwapTotalKB);
       SystemField(SystemBuffer, "SwapFree", SwapFreeKB);
-      Mem += fextl::fmt::format("  memory free {} MB, swap used {} MB", AvailKB / 1024, (SwapTotalKB - std::min(SwapFreeKB, SwapTotalKB)) / 1024);
+      uint64_t CachedKB {};
+      SystemField(SystemBuffer, "\nCached", CachedKB);
+      Mem += fextl::fmt::format("  memory free {} MB, file cache {} MB, swap used {} MB", AvailKB / 1024, CachedKB / 1024,
+                                (SwapTotalKB - std::min(SwapFreeKB, SwapTotalKB)) / 1024);
     }
     uint64_t Vm[7] {};
     bool HaveVm = Linux::ReadSmallFile("/proc/vmstat", SystemBuffer, sizeof(SystemBuffer)) > 0;
@@ -892,10 +1136,17 @@ namespace {
 
     // This process: resident memory, swapped out, GPU memory.
     if (Linux::ReadSmallFile("/proc/self/status", SystemBuffer, sizeof(SystemBuffer)) > 0) {
-      uint64_t RssKB {}, SwapKB {};
+      uint64_t RssKB {}, SwapKB {}, AnonKB {}, FileKB {}, ShmemKB {};
       if (SystemField(SystemBuffer, "\nVmRSS", RssKB)) {
         SystemField(SystemBuffer, "\nVmSwap", SwapKB);
-        Mem += fextl::fmt::format(" | this process {} MB (swapped {} MB)", RssKB / 1024, SwapKB / 1024);
+        if (SystemField(SystemBuffer, "\nRssAnon", AnonKB)) {
+          SystemField(SystemBuffer, "\nRssFile", FileKB);
+          SystemField(SystemBuffer, "\nRssShmem", ShmemKB);
+          Mem += fextl::fmt::format(" | this process {} MB (own {}, files {}, shared {}; swapped {} MB)", RssKB / 1024, AnonKB / 1024,
+                                    FileKB / 1024, ShmemKB / 1024, SwapKB / 1024);
+        } else {
+          Mem += fextl::fmt::format(" | this process {} MB (swapped {} MB)", RssKB / 1024, SwapKB / 1024);
+        }
       }
     }
     if (!System.GpuMemMapped.empty()) {
@@ -3220,10 +3471,14 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "pressure = share of the second some task waited for a CPU; system busy = the whole device's busy CPU "
                        "time in cores by kind (user, low prio = user at lowered priority, kernel, irq), this process, the "
                        "wineserver, app group = this app's Android group (the launcher's own process and Wine's processes), "
-                       "app user = all processes of the app's user; memory = free memory, swap, the kernel's reclaim (swap "
+                       "app user = all processes of the app's user; users busy = the busy time of the kernel's own threads and "
+                       "interrupts (in no Android user's group), then the busiest Android users (system services and apps; app "
+                       "N = an app's user id) with their kernel share, processes, and processes started (+) and ended (-) "
+                       "since the last second; memory = free memory, file cache, swap, the kernel's reclaim (swap "
                        "out/in, pages scanned to free memory by kswapd or by allocating tasks, stalls = allocations that had to "
                        "reclaim, refaults = evicted file pages read again), pressure = share of the second tasks waited for "
-                       "memory or storage, this process's resident, swapped and GPU memory; '# cgroup' = the Android groups the main "
+                       "memory or storage, this process's resident memory (own = its private memory, files = mapped files, shared "
+                       "= shared memory), swapped and GPU memory; '# cgroup' = the Android groups the main "
                        "thread and the wineserver are in; rumble = the game's XInputSetState calls (FEX_RUMBLE): calls, changes "
                        "of strength, changes sent to the controller and how long Wine took for each\n",
                        AppName, GetCurrentProcessId());

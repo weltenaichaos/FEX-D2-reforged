@@ -11,18 +11,22 @@ namespace {
   constexpr int64_t NR_close = 57;
   constexpr int64_t NR_getdents64 = 61;
   constexpr int64_t NR_pread64 = 67;
+  constexpr int64_t NR_readlinkat = 78;
   constexpr int64_t NR_sched_setaffinity = 122;
   constexpr int64_t NR_sched_getaffinity = 123;
   constexpr int64_t NR_setpriority = 140;
   constexpr int64_t NR_getpriority = 141;
   constexpr int64_t NR_getpid = 172;
   constexpr int64_t NR_gettid = 178;
+  constexpr int64_t NR_fadvise64 = 223;
 
   constexpr int64_t AT_FDCWD = -100;
   constexpr int64_t O_RDONLY = 0;
   constexpr int64_t O_DIRECTORY = 0x4000;
+  constexpr int64_t O_DIRECT = 0x10000; // arm64's value
   constexpr int64_t O_CLOEXEC = 0x80000;
   constexpr int64_t PRIO_PROCESS = 0;
+  constexpr int64_t POSIX_FADV_DONTNEED = 4;
 
   struct Dirent64 {
     uint64_t Ino;
@@ -117,6 +121,24 @@ void Close(int Fd) {
 
 int64_t Pread(int Fd, void* Buffer, size_t Size, uint64_t Offset) {
   return Syscall(NR_pread64, Fd, reinterpret_cast<intptr_t>(Buffer), static_cast<int64_t>(Size), static_cast<int64_t>(Offset));
+}
+
+int OpenRead(const char* Path, bool Direct) {
+  return static_cast<int>(Syscall(NR_openat, AT_FDCWD, reinterpret_cast<intptr_t>(Path), O_RDONLY | O_CLOEXEC | (Direct ? O_DIRECT : 0), 0));
+}
+
+int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size) {
+  return static_cast<int>(Syscall(NR_fadvise64, Fd, static_cast<int64_t>(Offset), static_cast<int64_t>(Size), POSIX_FADV_DONTNEED));
+}
+
+int64_t ReadLink(const char* Path, char* Buffer, size_t Size) {
+  if (Size < 2) {
+    return -22;
+  }
+  const int64_t Len =
+    Syscall(NR_readlinkat, AT_FDCWD, reinterpret_cast<intptr_t>(Path), reinterpret_cast<intptr_t>(Buffer), static_cast<int64_t>(Size - 1));
+  Buffer[Len > 0 ? Len : 0] = 0;
+  return Len;
 }
 
 int64_t ReadSmallFile(const char* Path, char* Buffer, size_t Size) {

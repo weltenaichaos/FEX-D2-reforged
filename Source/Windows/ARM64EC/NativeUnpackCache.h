@@ -41,6 +41,8 @@ struct FEXUnpackCacheCounters {
   uint64_t MD5HitBytes;
   uint64_t MD5Ticks;    // hashing and looking them up (and applying hits)
   uint64_t MD5Stores;
+  uint64_t AheadDirect; // read-ahead chunks read with direct reads, past the kernel's file cache
+  uint64_t CacheDrops;  // reads and writes of data.bin dropped from the kernel's file cache afterwards
 };
 extern struct FEXUnpackCacheCounters FEXUnpackCacheStats;
 
@@ -69,8 +71,10 @@ namespace NativeUnpackCache {
 // Call at process start when the cache is requested.
 void StartWriter();
 
-// Reads FEX_UNPACK_CACHE_MAX_GB (default 16), FEX_UNPACK_CACHE_RESET (1 = start empty) and
-// FEX_UNPACK_CACHE_READAHEAD_MB (memory for reading stored data ahead, default 64, 0 = off), and opens the cache, plus
+// Reads FEX_UNPACK_CACHE_MAX_GB (default 16), FEX_UNPACK_CACHE_RESET (1 = start empty),
+// FEX_UNPACK_CACHE_READAHEAD_MB (memory for reading stored data ahead, default 64, 0 = off) and
+// FEX_UNPACK_CACHE_DIRECT (1 = data.bin is read past the kernel's file cache, see NativeUnpackCache.cpp; D2R default 1),
+// and opens the cache, plus
 // the MD5 cache if MD5Cache. Call once (NativeRedirect does, when FEX_UNPACK_CACHE=1 and it finds the game's
 // inflate_fast) before handing out the stubs that use it. Returns whether the cache is on.
 bool Init(bool MD5Cache);
