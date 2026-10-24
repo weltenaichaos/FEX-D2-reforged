@@ -2871,21 +2871,12 @@ namespace {
     return Out + "\n";
   }
 
-  // Process page faults that had to read from storage, and bytes read from storage, from procfs (through Wine's Z: drive).
+  // Process page faults that had to read from storage, and bytes read from storage, from procfs. Read with Linux calls:
+  // Wine opens files in the wineserver, so /proc/self through Wine's Z: drive is the wineserver (builds before 60 showed
+  // its numbers here).
   bool IOUnreadable {};
   bool IOHavePrev {};
   uint64_t IOPrevMajorFaults {}, IOPrevReadBytes {}, IOPrevReadChars {};
-
-  bool ReadSmallFile(const char* Path, char* Buf, size_t Size) {
-    FILE* F = fopen(Path, "r");
-    if (!F) {
-      return false;
-    }
-    const size_t Len = fread(Buf, 1, Size - 1, F);
-    fclose(F);
-    Buf[Len] = 0;
-    return Len != 0;
-  }
 
   fextl::string IOLine() {
     if (IOUnreadable) {
@@ -2894,7 +2885,7 @@ namespace {
     uint64_t MajorFaults {}, ReadBytes {}, ReadChars {};
     bool HaveFaults {}, HaveRead {};
     char Buf[1024];
-    if (ReadSmallFile("Z:\\proc\\self\\stat", Buf, sizeof(Buf))) {
+    if (Linux::ReadSmallFile("/proc/self/stat", Buf, sizeof(Buf)) > 0) {
       // Fields after the command name, which is in parentheses and may contain spaces: state is field 3, majflt field 12.
       if (const char* P = strrchr(Buf, ')')) {
         int Field = 2;
@@ -2909,12 +2900,13 @@ namespace {
         }
       }
     }
-    if (ReadSmallFile("Z:\\proc\\self\\io", Buf, sizeof(Buf))) {
+    if (Linux::ReadSmallFile("/proc/self/io", Buf, sizeof(Buf)) > 0) {
       if (const char* P = strstr(Buf, "\nread_bytes:")) {
         ReadBytes = strtoull(P + 12, nullptr, 10);
         HaveRead = true;
       }
-      // All bytes read by read calls (files, pipes, sockets), from the file cache or not.
+      // All bytes read by read calls (files, pipes, sockets), from the file cache or not; FEX's own reads too (the unpack
+      // cache's, see its ucache line).
       if (!strncmp(Buf, "rchar:", 6)) {
         ReadChars = strtoull(Buf + 6, nullptr, 10);
       }
@@ -3456,7 +3448,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "handling; miss = lookup cache misses; lock = lookup cache lock time; x87fb = x87 fallbacks; dc = disk "
                        "cache hits; emu = share of the second spent in emulated x86 code (the rest of cpu is native: "
                        "Wine, VKD3D, driver); dco = why compiles missed the disk cache and what happened to the code "
-                       "compiled instead; io = page faults that read storage, and storage reads; with FEX_STATSLOG_PROFILE=1, "
+                       "compiled instead; io = this process's page faults that read storage, storage reads and bytes of all read calls "
+                       "(FEX's own included); with FEX_STATSLOG_PROFILE=1, "
                        "'# hitch' / '# stall' = Main ran emulated code / no emulated code for 100ms or more, with the other "
                        "threads that were busy in emulated code meanwhile; jobwait = the game's frame wait loop: tries that "
                        "found "
