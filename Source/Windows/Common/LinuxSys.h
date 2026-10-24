@@ -19,6 +19,15 @@ int OpenRead(const char* Path, bool Direct);
 // Drops a range of a file from the kernel's file cache (posix_fadvise DONTNEED; pages not yet written are only queued
 // for writing). 0 or a negative errno.
 int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size);
+// What a path names (following symbolic links), from fstatat. False when it can't be looked at.
+struct FileInfo {
+  uint64_t Size;
+  bool Regular;
+  bool Directory;
+};
+bool Stat(const char* Path, FileInfo& Out);
+// The kind of file system a path is on (statfs f_type, such as 0xF2F52010 for f2fs), 0 when it can't be looked at.
+uint64_t FileSystemType(const char* Path);
 // The target of a symbolic link, NUL-terminated. Its length, or a negative errno.
 int64_t ReadLink(const char* Path, char* Buffer, size_t Size);
 // Reads a small file into Buffer, NUL-terminated. Returns its length, or a negative errno.

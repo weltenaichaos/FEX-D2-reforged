@@ -3502,8 +3502,9 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "memory or storage, this process's resident memory (own = its private memory, files = mapped files, shared "
                        "= shared memory), swapped and GPU memory; '# cgroup' = the Android groups the main "
                        "thread and the wineserver are in; rumble = the game's XInputSetState calls (FEX_RUMBLE): calls, changes "
-                       "of strength, changes sent to the controller and how long Wine took for each; game files = the game's data "
-                       "files open and how much the file cache shrank when FEXFileCache dropped them (FEX_GAME_FILES_UNCACHED)\n",
+                       "of strength, changes sent to the controller and how long Wine took for each; game files = the game's big "
+                       "files (in its folder, or open) that FEXFileCache drops from the file cache, and how much the file cache "
+                       "shrank at the drops (FEX_GAME_FILES_UNCACHED)\n",
                        AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.

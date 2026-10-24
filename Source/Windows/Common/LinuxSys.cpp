@@ -9,9 +9,11 @@ namespace {
   // arm64 Linux system call numbers (asm-generic/unistd.h).
   constexpr int64_t NR_openat = 56;
   constexpr int64_t NR_close = 57;
+  constexpr int64_t NR_statfs = 43;
   constexpr int64_t NR_getdents64 = 61;
   constexpr int64_t NR_pread64 = 67;
   constexpr int64_t NR_readlinkat = 78;
+  constexpr int64_t NR_newfstatat = 79;
   constexpr int64_t NR_sched_setaffinity = 122;
   constexpr int64_t NR_sched_getaffinity = 123;
   constexpr int64_t NR_setpriority = 140;
@@ -129,6 +131,33 @@ int OpenRead(const char* Path, bool Direct) {
 
 int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size) {
   return static_cast<int>(Syscall(NR_fadvise64, Fd, static_cast<int64_t>(Offset), static_cast<int64_t>(Size), POSIX_FADV_DONTNEED));
+}
+
+bool Stat(const char* Path, FileInfo& Out) {
+  // struct stat of arm64 Linux (asm-generic): st_mode at byte 16, st_size at byte 48, 128 bytes in all.
+  alignas(8) uint8_t Buffer[128];
+  if (Syscall(NR_newfstatat, AT_FDCWD, reinterpret_cast<intptr_t>(Path), reinterpret_cast<intptr_t>(Buffer), 0) != 0) {
+    return false;
+  }
+  uint32_t Mode {};
+  int64_t Size {};
+  memcpy(&Mode, Buffer + 16, sizeof(Mode));
+  memcpy(&Size, Buffer + 48, sizeof(Size));
+  Out.Size = Size > 0 ? static_cast<uint64_t>(Size) : 0;
+  Out.Regular = (Mode & 0170000) == 0100000;
+  Out.Directory = (Mode & 0170000) == 0040000;
+  return true;
+}
+
+uint64_t FileSystemType(const char* Path) {
+  // struct statfs of arm64 Linux: f_type first, 120 bytes in all.
+  alignas(8) uint8_t Buffer[120];
+  if (Syscall(NR_statfs, reinterpret_cast<intptr_t>(Path), reinterpret_cast<intptr_t>(Buffer)) != 0) {
+    return 0;
+  }
+  uint64_t Type {};
+  memcpy(&Type, Buffer, sizeof(Type));
+  return Type;
 }
 
 int64_t ReadLink(const char* Path, char* Buffer, size_t Size) {

@@ -2,7 +2,7 @@
 /*
 $info$
 tags: Bin|ARM64EC
-desc: Drops the game's data files from Android's file cache, so its reads don't push other apps out of memory
+desc: Drops the game's big files from Android's file cache, so its reads don't push other apps out of memory
 $end_info$
 */
 
@@ -26,8 +26,11 @@ $end_info$
 namespace GameFiles {
 namespace {
   constexpr size_t MaxFiles = 256;
-  constexpr size_t MaxOtherDirs = 6;
-  constexpr int64_t NotFoundNoteMs = 120'000;
+  constexpr uint64_t MinBytes = 32ull << 20; // smaller files don't matter for the file cache
+  constexpr int MaxDepth = 4;                // <game>/Data/data/data.000 is depth 3
+  constexpr size_t MaxWalkEntries = 20'000;
+  constexpr size_t PathSize = 1024;
+  constexpr uint32_t FileOpen = 1; // FILE_OPEN
 
   struct Counters {
     std::atomic<uint64_t> Passes;
@@ -35,12 +38,27 @@ namespace {
     std::atomic<uint64_t> Failed;    // fadvise calls that failed
     std::atomic<uint64_t> ShrankKB;  // how much the file cache shrank across the drops
     std::atomic<uint64_t> LongestNs; // longest pass
-    std::atomic<uint32_t> Open;      // data files open at the last pass
+    std::atomic<uint32_t> Files;     // files dropped at the last pass
+  };
+
+  struct File {
+    int Fd;
+    uint64_t Hash;
   };
 
   Counters Stats {};
   uint64_t IntervalMs {500};
   uint64_t CounterFreq {1};
+
+  // FEXFileCache thread only.
+  File Files[MaxFiles];
+  size_t FileCount {};
+  uint64_t FileBytes {};
+  fextl::string FirstNames; // a few of the files, for the log
+  size_t Named {};
+  size_t WalkEntries {};
+  char WalkPath[PathSize];
+  char LinkTarget[PathSize];
 
   uint64_t GetCounter() {
     uint64_t Result {};
@@ -59,55 +77,6 @@ namespace {
     NtDelayExecution(FALSE, &Interval);
   }
 
-  char Lower(char Ch) {
-    return Ch >= 'A' && Ch <= 'Z' ? static_cast<char>(Ch - 'A' + 'a') : Ch;
-  }
-
-  // The last '/' in Text[0..Len), or nullptr.
-  const char* LastSlash(const char* Text, size_t Len) {
-    while (Len) {
-      if (Text[--Len] == '/') {
-        return Text + Len;
-      }
-    }
-    return nullptr;
-  }
-
-  bool EqualsLower(const char* Text, size_t Len, const char* Lowercase) {
-    if (strlen(Lowercase) != Len) {
-      return false;
-    }
-    for (size_t i = 0; i < Len; ++i) {
-      if (Lower(Text[i]) != Lowercase[i]) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  // A CASC data archive: ".../data/data.<digits>" (any case).
-  bool IsDataFile(const char* Path, size_t Len) {
-    const char* Slash = LastSlash(Path, Len);
-    if (!Slash || Slash == Path) {
-      return false;
-    }
-    const char* Name = Slash + 1;
-    const size_t NameLen = Len - static_cast<size_t>(Name - Path);
-    if (NameLen < 6 || !EqualsLower(Name, 5, "data.")) {
-      return false;
-    }
-    for (size_t i = 5; i < NameLen; ++i) {
-      if (Name[i] < '0' || Name[i] > '9') {
-        return false;
-      }
-    }
-    const char* DirSlash = LastSlash(Path, static_cast<size_t>(Slash - Path));
-    if (!DirSlash) {
-      return false;
-    }
-    return EqualsLower(DirSlash + 1, static_cast<size_t>(Slash - DirSlash - 1), "data");
-  }
-
   uint64_t Hash(const char* Text, size_t Len) {
     uint64_t H = 1469598103934665603ull;
     for (size_t i = 0; i < Len; ++i) {
@@ -116,80 +85,195 @@ namespace {
     return H;
   }
 
-  struct PassState {
-    int Fds[MaxFiles];
-    uint64_t Hashes[MaxFiles];
-    size_t Count;
-    bool Full;
-    char Path[512];
-    char FirstPath[512];
-    // For the note when no data file shows up: folders of the other open files.
-    bool CollectOthers;
-    size_t OtherCount;
-    uint64_t OtherHashes[MaxOtherDirs];
-    char OtherDirs[MaxOtherDirs][96];
-  };
-
-  void NoteOther(PassState* S, const char* Path, size_t Len) {
-    if (S->OtherCount >= MaxOtherDirs || Path[0] != '/') {
-      return;
-    }
-    if (!strncmp(Path, "/dev/", 5) || !strncmp(Path, "/proc/", 6) || !strncmp(Path, "/sys/", 5) || !strncmp(Path, "/memfd:", 7) ||
-        strstr(Path, "(deleted)")) {
-      return;
-    }
-    const char* Slash = LastSlash(Path, Len);
-    const size_t DirLen = Slash ? static_cast<size_t>(Slash - Path) : Len;
-    const uint64_t H = Hash(Path, DirLen);
-    for (size_t i = 0; i < S->OtherCount; ++i) {
-      if (S->OtherHashes[i] == H) {
-        return;
-      }
-    }
-    // The end of the folder's path says the most.
-    char* Out = S->OtherDirs[S->OtherCount];
-    constexpr size_t Room = sizeof(S->OtherDirs[0]) - 1;
-    if (DirLen <= Room) {
-      memcpy(Out, Path, DirLen);
-      Out[DirLen] = 0;
-    } else {
-      memcpy(Out, "...", 3);
-      memcpy(Out + 3, Path + DirLen - (Room - 3), Room - 3);
-      Out[Room] = 0;
-    }
-    S->OtherHashes[S->OtherCount++] = H;
+  // Files left alone: FEX's own caches (the disk cache is mapped, the unpack cache drops itself), the driver's shader
+  // caches (small reads that are wanted again), and what isn't a file on storage.
+  bool Excluded(const char* Path) {
+    return Path[0] != '/' || !strncmp(Path, "/proc/", 6) || !strncmp(Path, "/dev/", 5) || !strncmp(Path, "/sys/", 5) ||
+           strstr(Path, "/fex-emu/") || strstr(Path, "shader_cache") || strstr(Path, "(deleted)");
   }
 
-  void Visit(const char* Name, void* Arg) {
-    auto* S = static_cast<PassState*>(Arg);
-    if (S->Count >= MaxFiles) {
-      S->Full = true;
+  bool Known(uint64_t H) {
+    for (size_t i = 0; i < FileCount; ++i) {
+      if (Files[i].Hash == H) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Opens Path (a regular file of Size bytes) for dropping. False when it was known, excluded or can't be opened.
+  bool Add(const char* Path, uint64_t Size) {
+    const size_t Len = strlen(Path);
+    const uint64_t H = Hash(Path, Len);
+    if (FileCount >= MaxFiles || Excluded(Path) || Known(H)) {
+      return false;
+    }
+    const int Fd = FEX::Windows::Linux::OpenRead(Path, false);
+    if (Fd < 0) {
+      return false;
+    }
+    // Known by the path the kernel names it with (symbolic links resolved), which is what the scan of the game's open
+    // files sees.
+    uint64_t Canonical = H;
+    char Link[48];
+    snprintf(Link, sizeof(Link), "/proc/self/fd/%d", Fd);
+    char Resolved[PathSize];
+    const int64_t ResolvedLen = FEX::Windows::Linux::ReadLink(Link, Resolved, sizeof(Resolved));
+    if (ResolvedLen > 0) {
+      Canonical = Hash(Resolved, static_cast<size_t>(ResolvedLen));
+      if (Canonical != H && Known(Canonical)) {
+        FEX::Windows::Linux::Close(Fd);
+        return false;
+      }
+    }
+    Files[FileCount++] = {Fd, Canonical};
+    FileBytes += Size;
+    if (Named < 6) {
+      const char* Slash = strrchr(Path, '/');
+      FirstNames += fextl::fmt::format("{}{} {} MB", Named ? ", " : "", Slash ? Slash + 1 : Path, Size >> 20);
+      ++Named;
+    }
+    return true;
+  }
+
+  void WalkDir(size_t PathLen, int Depth);
+
+  struct WalkArgs {
+    size_t PathLen;
+    int Depth;
+  };
+
+  void WalkEntry(const char* Name, void* Arg) {
+    const auto* A = static_cast<WalkArgs*>(Arg);
+    if (++WalkEntries > MaxWalkEntries || FileCount >= MaxFiles) {
+      return;
+    }
+    const size_t NameLen = strlen(Name);
+    if (A->PathLen + 1 + NameLen + 1 > PathSize) {
+      return;
+    }
+    WalkPath[A->PathLen] = '/';
+    memcpy(WalkPath + A->PathLen + 1, Name, NameLen + 1);
+    FEX::Windows::Linux::FileInfo Info {};
+    if (FEX::Windows::Linux::Stat(WalkPath, Info)) {
+      if (Info.Directory && A->Depth + 1 < MaxDepth) {
+        WalkDir(A->PathLen + 1 + NameLen, A->Depth + 1);
+      } else if (Info.Regular && Info.Size >= MinBytes) {
+        Add(WalkPath, Info.Size);
+      }
+    }
+    WalkPath[A->PathLen] = 0;
+  }
+
+  // Walks WalkPath[0..PathLen) (NUL-terminated there).
+  void WalkDir(size_t PathLen, int Depth) {
+    WalkArgs Args {PathLen, Depth};
+    WalkPath[PathLen] = 0;
+    FEX::Windows::Linux::ForEachEntry(WalkPath, WalkEntry, &Args);
+    WalkPath[PathLen] = 0;
+  }
+
+  // The Linux path of the folder D2R.exe is in, through Wine's wine_nt_to_unix_file_name. Empty with the reason in Why.
+  fextl::string GameFolder(fextl::string& Why) {
+    const auto* Params = reinterpret_cast<const RTL_USER_PROCESS_PARAMETERS64*>(NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters);
+    if (!Params || !Params->ImagePathName.Buffer || !Params->ImagePathName.Length) {
+      Why = "no image path";
+      return {};
+    }
+    wchar_t DosPath[PathSize];
+    const size_t Chars = std::min<size_t>(Params->ImagePathName.Length / sizeof(wchar_t), PathSize - 1);
+    memcpy(DosPath, reinterpret_cast<const wchar_t*>(Params->ImagePathName.Buffer), Chars * sizeof(wchar_t));
+    DosPath[Chars] = 0;
+    // The folder: up to the last backslash.
+    size_t Cut = Chars;
+    while (Cut && DosPath[Cut - 1] != L'\\' && DosPath[Cut - 1] != L'/') {
+      --Cut;
+    }
+    if (Cut <= 1) {
+      Why = "image path has no folder";
+      return {};
+    }
+    DosPath[Cut - 1] = 0;
+
+    UNICODE_STRING NtName {};
+    if (!RtlDosPathNameToNtPathName_U(DosPath, &NtName, nullptr, nullptr)) {
+      Why = "RtlDosPathNameToNtPathName_U failed";
+      return {};
+    }
+    UNICODE_STRING NtDll {};
+    RtlInitUnicodeString(&NtDll, L"ntdll.dll");
+    HMODULE Module {};
+    void* Proc {};
+    ANSI_STRING ProcName {};
+    RtlInitAnsiString(&ProcName, "wine_nt_to_unix_file_name");
+    using ToUnixFn = NTSTATUS(WINAPI*)(const OBJECT_ATTRIBUTES*, char*, ULONG*, UINT);
+    fextl::string Result;
+    if (LdrGetDllHandle(nullptr, 0, &NtDll, &Module) != STATUS_SUCCESS ||
+        LdrGetProcedureAddress(Module, &ProcName, 0, &Proc) != STATUS_SUCCESS || !Proc) {
+      Why = "ntdll has no wine_nt_to_unix_file_name";
+    } else {
+      OBJECT_ATTRIBUTES Attr {};
+      InitializeObjectAttributes(&Attr, &NtName, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+      char Unix[PathSize];
+      ULONG Size = sizeof(Unix);
+      const NTSTATUS Status = reinterpret_cast<ToUnixFn>(Proc)(&Attr, Unix, &Size, FileOpen);
+      if (Status != STATUS_SUCCESS) {
+        Why = fextl::fmt::format("wine_nt_to_unix_file_name failed ({:X})", static_cast<uint32_t>(Status));
+      } else {
+        Unix[sizeof(Unix) - 1] = 0;
+        Result = Unix;
+        while (Result.size() > 1 && Result.back() == '/') {
+          Result.pop_back();
+        }
+      }
+    }
+    RtlFreeUnicodeString(&NtName);
+    return Result;
+  }
+
+  // Big files the game has open that the walk didn't find (it may keep data elsewhere): opened too, from then on.
+  struct ScanArgs {
+    size_t Added;
+  };
+
+  void ScanEntry(const char* Name, void* Arg) {
+    auto* A = static_cast<ScanArgs*>(Arg);
+    if (FileCount >= MaxFiles) {
       return;
     }
     char Link[48];
     snprintf(Link, sizeof(Link), "/proc/self/fd/%s", Name);
-    const int64_t Len = FEX::Windows::Linux::ReadLink(Link, S->Path, sizeof(S->Path));
-    if (Len <= 0) {
+    const int64_t Len = FEX::Windows::Linux::ReadLink(Link, LinkTarget, sizeof(LinkTarget));
+    if (Len <= 0 || Excluded(LinkTarget) || Known(Hash(LinkTarget, static_cast<size_t>(Len)))) {
       return;
     }
-    if (!IsDataFile(S->Path, static_cast<size_t>(Len))) {
-      if (S->CollectOthers) {
-        NoteOther(S, S->Path, static_cast<size_t>(Len));
-      }
+    FEX::Windows::Linux::FileInfo Info {};
+    if (!FEX::Windows::Linux::Stat(Link, Info) || !Info.Regular || Info.Size < MinBytes) {
       return;
     }
-    // Wine may hold several fds for one file (the wineserver's and each handle's); dropping it once is enough.
-    const uint64_t H = Hash(S->Path, static_cast<size_t>(Len));
-    for (size_t i = 0; i < S->Count; ++i) {
-      if (S->Hashes[i] == H) {
-        return;
-      }
+    if (Add(LinkTarget, Info.Size)) {
+      ++A->Added;
+      FEX::Windows::StatsLogNote(fextl::fmt::format("game files: also dropping {} ({} MB), which the game has open", LinkTarget, Info.Size >> 20));
     }
-    if (!S->Count) {
-      memcpy(S->FirstPath, S->Path, static_cast<size_t>(Len) + 1);
+  }
+
+  // The kind of storage the game's folder is on, for the log. Through FUSE (an SD card, or Android's shared storage)
+  // reads are passed on to the files under it, whose cache a drop through FUSE may not reach.
+  fextl::string Storage(const char* Path) {
+    const uint64_t Type = FEX::Windows::Linux::FileSystemType(Path);
+    switch (Type) {
+    case 0xF2F52010: return "f2fs";
+    case 0xEF53: return "ext4";
+    case 0xE0F5E1E2: return "erofs";
+    case 0x794C7630: return "overlayfs";
+    case 0x01021994: return "tmpfs";
+    case 0x2011BAB0: return "exFAT";
+    case 0x4D44: return "FAT";
+    case 0x65735546: return "FUSE, the drops may not reach the cache of the files under it";
+    case 0x5DCA2DF5: return "sdcardfs, the drops may not reach the cache of the files under it";
+    case 0: return "unknown storage";
+    default: return fextl::fmt::format("file system {:X}", Type);
     }
-    S->Fds[S->Count] = static_cast<int>(strtoull(Name, nullptr, 10));
-    S->Hashes[S->Count++] = H;
   }
 
   // The kernel's file cache ("Cached" in /proc/meminfo) in KB, 0 when unreadable.
@@ -203,26 +287,34 @@ namespace {
   }
 
   void* FileCacheThread(void*) {
-    // About 11 KB: off the stack of a thread that also lists directories.
-    static PassState S;
-    bool Found = false;
-    bool NotFoundNoted = false;
-    const uint64_t Start = GetCounter();
-    for (;;) {
-      const uint64_t Begin = GetCounter();
-      const int64_t SinceStartMs = static_cast<int64_t>((Begin - Start) * 1000 / CounterFreq);
-      S.Count = 0;
-      S.Full = false;
-      S.OtherCount = 0;
-      S.CollectOthers = !Found && !NotFoundNoted && SinceStartMs >= NotFoundNoteMs;
-      const bool Listed = FEX::Windows::Linux::ForEachEntry("/proc/self/fd", Visit, &S);
+    fextl::string Why;
+    const fextl::string Folder = GameFolder(Why);
+    if (!Folder.empty() && Folder.size() < PathSize) {
+      memcpy(WalkPath, Folder.c_str(), Folder.size() + 1);
+      WalkDir(Folder.size(), 0);
+      FEX::Windows::StatsLogNote(fextl::fmt::format(
+        "game files: {} files of {} MB or more in {} ({:.1f} GB on {}{}), dropped from the file cache "
+        "every {} ms{}{}",
+        FileCount, MinBytes >> 20, Folder, static_cast<double>(FileBytes) / (1024.0 * 1024.0 * 1024.0), Storage(Folder.c_str()),
+        WalkEntries > MaxWalkEntries ? ", folder too big to look at all of it" : "", IntervalMs, FirstNames.empty() ? "" : ": ", FirstNames));
+    } else {
+      FEX::Windows::StatsLogNote(fextl::fmt::format("game files: can't find the game's folder ({}); only big files the game has open are "
+                                                    "dropped",
+                                                    Folder.empty() ? Why : fextl::string("path too long")));
+    }
 
-      uint64_t Before = 0;
+    for (uint64_t Pass = 0;; ++Pass) {
+      const uint64_t Begin = GetCounter();
+      // Every 2 s, look for big files the game has open that aren't in the list.
+      if (Pass % 4 == 0) {
+        ScanArgs Args {};
+        FEX::Windows::Linux::ForEachEntry("/proc/self/fd", ScanEntry, &Args);
+      }
       uint64_t Failed = 0;
-      if (S.Count) {
-        Before = FileCacheKB();
-        for (size_t i = 0; i < S.Count; ++i) {
-          if (FEX::Windows::Linux::DropFromFileCache(S.Fds[i], 0, 0) < 0) {
+      if (FileCount) {
+        const uint64_t Before = FileCacheKB();
+        for (size_t i = 0; i < FileCount; ++i) {
+          if (FEX::Windows::Linux::DropFromFileCache(Files[i].Fd, 0, 0) < 0) {
             ++Failed;
           }
         }
@@ -231,31 +323,13 @@ namespace {
           Stats.ShrankKB.fetch_add(Before - After, std::memory_order_relaxed);
         }
       }
-      Stats.Open.store(static_cast<uint32_t>(S.Count), std::memory_order_relaxed);
-      Stats.Drops.fetch_add(S.Count - Failed, std::memory_order_relaxed);
+      Stats.Files.store(static_cast<uint32_t>(FileCount), std::memory_order_relaxed);
+      Stats.Drops.fetch_add(FileCount - Failed, std::memory_order_relaxed);
       Stats.Failed.fetch_add(Failed, std::memory_order_relaxed);
       Stats.Passes.fetch_add(1, std::memory_order_relaxed);
       const uint64_t Ns = (GetCounter() - Begin) * 1'000'000'000 / CounterFreq;
       uint64_t Longest = Stats.LongestNs.load(std::memory_order_relaxed);
       while (Ns > Longest && !Stats.LongestNs.compare_exchange_weak(Longest, Ns, std::memory_order_relaxed)) {}
-
-      if (!Found && S.Count) {
-        Found = true;
-        FEX::Windows::StatsLogNote(
-          fextl::fmt::format("game files: {} data file{} open (first {}){}; dropped from the file cache every {} ms", S.Count,
-                             S.Count == 1 ? "" : "s", S.FirstPath, S.Full ? ", more open files than are looked at" : "", IntervalMs));
-      } else if (S.CollectOthers) {
-        NotFoundNoted = true;
-        fextl::string Dirs;
-        for (size_t i = 0; i < S.OtherCount; ++i) {
-          Dirs += fextl::fmt::format("{}{}", i ? ", " : " ", S.OtherDirs[i]);
-        }
-        FEX::Windows::StatsLogNote(Listed ? fextl::fmt::format("game files: no data.NNN file open after 2 minutes, nothing dropped; "
-                                                               "folders of "
-                                                               "other open files:{}",
-                                                               Dirs.empty() ? fextl::string(" none") : Dirs) :
-                                            fextl::string("game files: /proc/self/fd can't be listed, nothing dropped"));
-      }
       SleepMs(IntervalMs);
     }
     return nullptr;
@@ -267,13 +341,13 @@ namespace {
     const uint64_t Failed = Stats.Failed.exchange(0, std::memory_order_relaxed);
     const uint64_t ShrankKB = Stats.ShrankKB.exchange(0, std::memory_order_relaxed);
     const uint64_t LongestNs = Stats.LongestNs.exchange(0, std::memory_order_relaxed);
-    const uint32_t Open = Stats.Open.load(std::memory_order_relaxed);
+    const uint32_t Count = Stats.Files.load(std::memory_order_relaxed);
     if (!Passes) {
       return {};
     }
-    return fextl::fmt::format("  game files: {} data files open, file cache {:.0f} MB smaller after the drops ({} drops in {} passes, "
-                              "longest {:.1f} ms{})\n",
-                              Open, static_cast<double>(ShrankKB) / 1024.0, Drops, Passes, static_cast<double>(LongestNs) / 1e6,
+    return fextl::fmt::format("  game files: {} files, file cache {:.0f} MB smaller after the drops ({} drops in {} passes, longest {:.1f} "
+                              "ms{})\n",
+                              Count, static_cast<double>(ShrankKB) / 1024.0, Drops, Passes, static_cast<double>(LongestNs) / 1e6,
                               Failed ? fextl::fmt::format(", {} failed", Failed) : fextl::string());
   }
 } // namespace
@@ -286,10 +360,10 @@ void Init(bool StatsLog) {
   const char* Ms = FEX::Windows::Switch("FEX_GAME_FILES_MS");
   IntervalMs = std::clamp<uint64_t>(Ms && Ms[0] >= '0' && Ms[0] <= '9' ? strtoull(Ms, nullptr, 10) : 500, 100, 10'000);
   CounterFreq = GetCounterFrequency();
-  FEX::Windows::StatsLogNote(fextl::fmt::format("game files: the game's data files (.../data/data.NNN) are dropped from the file cache "
-                                                "every {} ms by FEXFileCache (FEX_GAME_FILES_UNCACHED=0 turns it off, FEX_GAME_FILES_MS "
-                                                "sets the time)",
-                                                IntervalMs));
+  FEX::Windows::StatsLogNote(fextl::fmt::format("game files: the game's files of {} MB or more are dropped from the file cache every {} ms "
+                                                "by "
+                                                "FEXFileCache (FEX_GAME_FILES_UNCACHED=0 turns it off, FEX_GAME_FILES_MS sets the time)",
+                                                MinBytes >> 20, IntervalMs));
   if (StatsLog) {
     FEX::Windows::StatsLogSetLineProvider(StatsLine);
   }

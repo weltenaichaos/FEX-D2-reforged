@@ -28,7 +28,8 @@ namespace {
     {"FEX_UNPACK_CACHE_DIRECT", "1"},
     // Build 59: the game's own data files (CASC archives) are dropped from Android's file cache every 500 ms (see
     // ARM64EC/GameFiles.h). In the build 58 log the second area load still filled memory and Android's memory killer
-    // closed 20 apps, which then restarted for ~35 s on 5-6 cores.
+    // closed 20 apps, which then restarted for ~35 s on 5-6 cores. Build 60 finds them in the game's folder (build 59
+    // looked for them among the game's open files and found none).
     {"FEX_GAME_FILES_UNCACHED", "1"},
     // Build 48: no thread at extreme Linux nice values (see PriorityGuard.h, Threads.cpp).
     {"FEX_PRIO", "normal"},
