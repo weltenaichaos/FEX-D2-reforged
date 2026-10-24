@@ -1077,14 +1077,21 @@ namespace {
 
     // Memory.
     fextl::string Mem;
-    uint64_t AvailKB {}, SwapTotalKB {}, SwapFreeKB {};
+    uint64_t AvailKB {}, SwapTotalKB {}, SwapFreeKB {}, FileListsKB {};
     if (Linux::ReadSmallFile("/proc/meminfo", SystemBuffer, sizeof(SystemBuffer)) > 0 && SystemField(SystemBuffer, "MemAvailable", AvailKB)) {
       SystemField(SystemBuffer, "SwapTotal", SwapTotalKB);
       SystemField(SystemBuffer, "SwapFree", SwapFreeKB);
-      uint64_t CachedKB {};
+      uint64_t CachedKB {}, FreeKB {}, ActiveFileKB {}, InactiveFileKB {};
       SystemField(SystemBuffer, "\nCached", CachedKB);
-      Mem += fextl::fmt::format("  memory free {} MB, file cache {} MB, swap used {} MB", AvailKB / 1024, CachedKB / 1024,
-                                (SwapTotalKB - std::min(SwapFreeKB, SwapTotalKB)) / 1024);
+      SystemField(SystemBuffer, "MemFree", FreeKB);
+      SystemField(SystemBuffer, "\nActive(file)", ActiveFileKB);
+      SystemField(SystemBuffer, "\nInactive(file)", InactiveFileKB);
+      FileListsKB = ActiveFileKB + InactiveFileKB;
+      // "free" is what the kernel could hand out (MemAvailable, file cache included); "unused" is memory nothing holds
+      // (MemFree), which the kernel keeps above its watermarks by reclaiming. The file lists are the file cache pages
+      // the kernel can reclaim; Android's memory killer measures thrashing against them.
+      Mem += fextl::fmt::format("  memory free {} MB (unused {} MB), file cache {} MB (file lists {} MB), swap used {} MB", AvailKB / 1024,
+                                FreeKB / 1024, CachedKB / 1024, FileListsKB / 1024, (SwapTotalKB - std::min(SwapFreeKB, SwapTotalKB)) / 1024);
     }
     uint64_t Vm[7] {};
     bool HaveVm = Linux::ReadSmallFile("/proc/vmstat", SystemBuffer, sizeof(SystemBuffer)) > 0;
@@ -1108,9 +1115,15 @@ namespace {
         for (int i = 0; i < 7; ++i) {
           D[i] = Vm[i] - System.PrevVm[i];
         }
+        // Refaults as a share of the file lists: lmkd's thrashing figure (it kills when that passes its limit while the
+        // kernel reclaims memory on allocating threads), here per second.
+        const fextl::string Thrash = FileListsKB ?
+                                       fextl::fmt::format(" ({:.0f}% of the file lists)",
+                                                          static_cast<double>(D[4]) * 4.0 * 100.0 / static_cast<double>(FileListsKB) / Wall) :
+                                       fextl::string();
         Mem += fextl::fmt::format("{}swap out {:.1f} in {:.1f} MB/s, reclaim scan kswapd {:.0f} direct {:.0f} MB/s, stalls {}, "
-                                  "refaults {:.1f} MB/s, major faults {}",
-                                  Mem.empty() ? "  memory " : ", ", MBs(D[1]), MBs(D[0]), MBs(D[2]), MBs(D[3]), D[5], MBs(D[4]), D[6]);
+                                  "refaults {:.1f} MB/s{}, major faults {}",
+                                  Mem.empty() ? "  memory " : ", ", MBs(D[1]), MBs(D[0]), MBs(D[2]), MBs(D[3]), D[5], MBs(D[4]), Thrash, D[6]);
       }
       memcpy(System.PrevVm, Vm, sizeof(Vm));
     }
@@ -1756,8 +1769,8 @@ namespace {
     fextl::vector<ProbeEvent> ProbeEvents;
   };
 
-  // Up to six, see StatsLogSetLineProvider.
-  constexpr size_t MaxLineProviders = 6;
+  // Up to eight, see StatsLogSetLineProvider.
+  constexpr size_t MaxLineProviders = 8;
   std::atomic<fextl::string (*)()> LineProviders[MaxLineProviders] {};
   // Called with every sample of the main thread, see StatsLogSetMainSampleHook.
   std::atomic<void (*)(uint64_t)> MainSampleHook {};
@@ -2861,7 +2874,7 @@ namespace {
   // Process page faults that had to read from storage, and bytes read from storage, from procfs (through Wine's Z: drive).
   bool IOUnreadable {};
   bool IOHavePrev {};
-  uint64_t IOPrevMajorFaults {}, IOPrevReadBytes {};
+  uint64_t IOPrevMajorFaults {}, IOPrevReadBytes {}, IOPrevReadChars {};
 
   bool ReadSmallFile(const char* Path, char* Buf, size_t Size) {
     FILE* F = fopen(Path, "r");
@@ -2878,7 +2891,7 @@ namespace {
     if (IOUnreadable) {
       return {};
     }
-    uint64_t MajorFaults {}, ReadBytes {};
+    uint64_t MajorFaults {}, ReadBytes {}, ReadChars {};
     bool HaveFaults {}, HaveRead {};
     char Buf[1024];
     if (ReadSmallFile("Z:\\proc\\self\\stat", Buf, sizeof(Buf))) {
@@ -2901,6 +2914,10 @@ namespace {
         ReadBytes = strtoull(P + 12, nullptr, 10);
         HaveRead = true;
       }
+      // All bytes read by read calls (files, pipes, sockets), from the file cache or not.
+      if (!strncmp(Buf, "rchar:", 6)) {
+        ReadChars = strtoull(Buf + 6, nullptr, 10);
+      }
     }
     if (!HaveFaults && !HaveRead) {
       IOUnreadable = true;
@@ -2908,11 +2925,14 @@ namespace {
     }
     fextl::string Out;
     if (IOHavePrev) {
-      Out = fextl::fmt::format("  io majflt={} read={:.1f}MB\n", HaveFaults ? MajorFaults - std::min(MajorFaults, IOPrevMajorFaults) : 0,
-                               HaveRead ? static_cast<double>(ReadBytes - std::min(ReadBytes, IOPrevReadBytes)) / (1024.0 * 1024.0) : 0.0);
+      Out = fextl::fmt::format("  io majflt={} read={:.1f}MB read calls={:.1f}MB\n",
+                               HaveFaults ? MajorFaults - std::min(MajorFaults, IOPrevMajorFaults) : 0,
+                               HaveRead ? static_cast<double>(ReadBytes - std::min(ReadBytes, IOPrevReadBytes)) / (1024.0 * 1024.0) : 0.0,
+                               static_cast<double>(ReadChars - std::min(ReadChars, IOPrevReadChars)) / (1024.0 * 1024.0));
     }
     IOPrevMajorFaults = MajorFaults;
     IOPrevReadBytes = ReadBytes;
+    IOPrevReadChars = ReadChars;
     IOHavePrev = true;
     return Out;
   }
@@ -3474,13 +3494,16 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "app user = all processes of the app's user; users busy = the busy time of the kernel's own threads and "
                        "interrupts (in no Android user's group), then the busiest Android users (system services and apps; app "
                        "N = an app's user id) with their kernel share, processes, and processes started (+) and ended (-) "
-                       "since the last second; memory = free memory, file cache, swap, the kernel's reclaim (swap "
+                       "since the last second; memory = free memory (unused = held by nothing), file cache (file lists = its "
+                       "reclaimable pages), swap, the kernel's reclaim (swap "
                        "out/in, pages scanned to free memory by kswapd or by allocating tasks, stalls = allocations that had to "
-                       "reclaim, refaults = evicted file pages read again), pressure = share of the second tasks waited for "
+                       "reclaim, refaults = evicted file pages read again, as a share of the file lists = Android's thrashing "
+                       "figure), pressure = share of the second tasks waited for "
                        "memory or storage, this process's resident memory (own = its private memory, files = mapped files, shared "
                        "= shared memory), swapped and GPU memory; '# cgroup' = the Android groups the main "
                        "thread and the wineserver are in; rumble = the game's XInputSetState calls (FEX_RUMBLE): calls, changes "
-                       "of strength, changes sent to the controller and how long Wine took for each\n",
+                       "of strength, changes sent to the controller and how long Wine took for each; game files = the game's data "
+                       "files open and how much the file cache shrank when FEXFileCache dropped them (FEX_GAME_FILES_UNCACHED)\n",
                        AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.

@@ -1,0 +1,176 @@
+From 210e307551cdf5e3ea4126797b29622c99c4a783 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 11:52:47 +0000
+Subject: [PATCH] FEX: only frames the hold-back made late grow the frame start
+ margin
+
+A frame that would have come late without the hold-back too (a loading hitch, the device busy with other work) no longer
+makes the margin 3 ms bigger, and the margin shrinks by 1 ms per 150 frames (5 s) instead of 600 (20 s). In the build 57
+and 58 logs loading hitches pushed the margin to 30 ms; it then stayed above the spare time for the rest of the run, so
+nothing was held back and every frame reached the screen ~17 ms later (start to shown 66.7 ms instead of ~50).
+
+The present report's 'frame start' line counts the late frames the hold-back caused, and flag 0x20 says this build does.
+---
+ libs/vkd3d/fex_timeline.c  | 18 ++++++++++++------
+ libs/vkd3d/swapchain.c     | 22 ++++++++++++++++------
+ libs/vkd3d/vkd3d_private.h |  3 ++-
+ 3 files changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index 93012ec..6221e7f 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -50,7 +50,7 @@ static struct
+     uint32_t presents, last_sync_interval, max_queued;
+     char config[FEX_TIMELINE_CONFIG_SIZE];
+     /* frame start pacing */
+-    uint32_t pacing_frames, pacing_late;
++    uint32_t pacing_frames, pacing_late, pacing_caused;
+     uint64_t pacing_delay_ns, pacing_margin_ns;
+     int64_t pacing_spare_min_ns;
+     /* cap pre-sleep */
+@@ -112,7 +112,8 @@ void vkd3d_fex_timeline_init(void)
+             !strcmp(env, "1");
+     vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_present_report.flags, VKD3D_FEX_REPORT_FLAG_DEVICE |
+             (vkd3d_fex_timeline_on ? VKD3D_FEX_REPORT_FLAG_ON : 0) |
+-            (vkd3d_fex_frame_start_on ? VKD3D_FEX_REPORT_FLAG_FRAME_START | VKD3D_FEX_REPORT_FLAG_GRADUAL_START : 0) |
++            (vkd3d_fex_frame_start_on ? VKD3D_FEX_REPORT_FLAG_FRAME_START | VKD3D_FEX_REPORT_FLAG_GRADUAL_START |
++                    VKD3D_FEX_REPORT_FLAG_MARGIN_CAUSED : 0) |
+             (vkd3d_fex_present_presleep_on ? VKD3D_FEX_REPORT_FLAG_PRESLEEP : 0), vkd3d_memory_order_release);
+     vkd3d_atomic_uint64_store_explicit(&fex_timeline_last_publish_ns, vkd3d_get_current_time_ns(),
+             vkd3d_memory_order_relaxed);
+@@ -218,7 +219,7 @@ void vkd3d_fex_timeline_cap(bool presleep, bool held_long, bool not_held, bool a
+     spinlock_release(&fex_timeline.lock);
+ }
+ 
+-void vkd3d_fex_timeline_pacing(uint64_t delay_ns, uint64_t margin_ns, int64_t spare_ns, bool late)
++void vkd3d_fex_timeline_pacing(uint64_t delay_ns, uint64_t margin_ns, int64_t spare_ns, bool late, bool caused)
+ {
+     if (!vkd3d_fex_timeline_on)
+         return;
+@@ -230,6 +231,8 @@ void vkd3d_fex_timeline_pacing(uint64_t delay_ns, uint64_t margin_ns, int64_t sp
+     fex_timeline.pacing_margin_ns = margin_ns;
+     if (late)
+         fex_timeline.pacing_late++;
++    if (caused)
++        fex_timeline.pacing_caused++;
+     spinlock_release(&fex_timeline.lock);
+ }
+ 
+@@ -279,7 +282,7 @@ static void fex_timeline_publish(double seconds)
+     struct fex_timeline_queue queues[FEX_TIMELINE_MAX_QUEUES];
+     char config[FEX_TIMELINE_CONFIG_SIZE];
+     uint32_t presents, sync_interval, max_queued;
+-    uint32_t pacing_frames, pacing_late;
++    uint32_t pacing_frames, pacing_late, pacing_caused;
+     uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored;
+     uint64_t pacing_delay_ns, pacing_margin_ns, cap_step_ns, cap_guard_ns;
+     int64_t pacing_spare_min_ns;
+@@ -305,11 +308,13 @@ static void fex_timeline_publish(double seconds)
+     fex_timeline.max_queued = 0;
+     pacing_frames = fex_timeline.pacing_frames;
+     pacing_late = fex_timeline.pacing_late;
++    pacing_caused = fex_timeline.pacing_caused;
+     pacing_delay_ns = fex_timeline.pacing_delay_ns;
+     pacing_margin_ns = fex_timeline.pacing_margin_ns;
+     pacing_spare_min_ns = fex_timeline.pacing_spare_min_ns;
+     fex_timeline.pacing_frames = 0;
+     fex_timeline.pacing_late = 0;
++    fex_timeline.pacing_caused = 0;
+     cap_presents = fex_timeline.cap_presents;
+     cap_presleeps = fex_timeline.cap_presleeps;
+     cap_held_long = fex_timeline.cap_held_long;
+@@ -336,8 +341,9 @@ static void fex_timeline_publish(double seconds)
+ 
+     if (pacing_frames)
+         len = vkd3d_fex_report_append(text, sizeof(text), len,
+-                "  frame start n=%u | held back now %.1f ms (margin %.0f ms) | spare min %.1f ms | late %u\n",
+-                pacing_frames, pacing_delay_ns / 1e6, pacing_margin_ns / 1e6, pacing_spare_min_ns / 1e6, pacing_late);
++                "  frame start n=%u | held back now %.1f ms (margin %.0f ms) | spare min %.1f ms | late %u (%u from the hold-back)\n",
++                pacing_frames, pacing_delay_ns / 1e6, pacing_margin_ns / 1e6, pacing_spare_min_ns / 1e6, pacing_late,
++                pacing_caused);
+     if (cap_presents)
+         len = vkd3d_fex_report_append(text, sizeof(text), len,
+                 "  cap n=%u | pre-slept %u | held 3ms+ in vkQueuePresentKHR %u (grid measured %u) | not held %u | pre-sleep %s,"
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index e7a2d14..2e614c3 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -3303,8 +3303,11 @@ static void *dxgi_vk_swap_chain_fex_gpu_worker(void *chain_)
+ #define FEX_START_MARGIN_MIN_NS 3000000ll
+ #define FEX_START_MARGIN_FIRST_NS 6000000ll
+ #define FEX_START_MARGIN_MAX_NS 30000000ll
+-#define FEX_START_MARGIN_UP_NS 3000000ll   /* margin added for each frame that came late while held back */
+-#define FEX_START_MARGIN_DOWN_FRAMES 600u  /* frames without a late one before the margin shrinks by 1 ms */
++#define FEX_START_MARGIN_UP_NS 3000000ll   /* margin added for each frame the hold-back made late */
++/* Frames without one before the margin shrinks by 1 ms. Build 58 shrank it by 1 ms per 600 frames (20 s): after loading
++ * hitches had pushed it to 30 ms it stayed above the spare time for the rest of the run, so nothing was held back and
++ * every frame reached the screen ~17 ms later than with the hold-back. */
++#define FEX_START_MARGIN_DOWN_FRAMES 150u
+ #define FEX_START_NEAR_NS 1000000ll        /* less spare than this while held back: the frame nearly came late */
+ #define FEX_START_LATE_NS 2000000ll        /* this much past its time while held back: the frame came late */
+ #define FEX_START_MAX_NS 20000000ll
+@@ -3324,7 +3327,7 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+ {
+     int64_t queue_wait, held, gpu_ahead, spare = 0, natural, lowest, target, delay, step, margin;
+     uint64_t gpu_done_ns = 0, release_ns, now_ns, base_ns, hold_start_ns;
+-    bool late = false, measured = false, held_back;
++    bool late = false, caused = false, measured = false, held_back;
+     uint32_t slot, i;
+ 
+     if (fex->blit_value)
+@@ -3361,12 +3364,19 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+         if (chain->fex_start.spare_count < ARRAY_SIZE(chain->fex_start.spare_ns))
+             chain->fex_start.spare_count++;
+ 
+-        /* The game's own slow frames decide the margin: each frame that came late because it was held back makes it
+-         * 3 ms bigger, 20 s without one make it 1 ms smaller. */
++        /* The margin covers how much the game's frame times vary beyond what the last frames showed: each frame the
++         * hold-back made late makes it 3 ms bigger, 150 frames (5 s) without one make it 1 ms smaller. A frame that would
++         * have come late even without the hold-back (a loading hitch, the device busy with other work) was not made
++         * late by it and leaves the margin alone; its spare time still keeps the hold-back down while it is among the
++         * last frames. */
+         held_back = fex->delay_ns >= (uint64_t)FEX_START_NEAR_NS;
+         if (held_back && spare < -FEX_START_LATE_NS)
+         {
+             late = true;
++            caused = natural >= -FEX_START_LATE_NS;
++        }
++        if (caused)
++        {
+             margin = min(margin + FEX_START_MARGIN_UP_NS, FEX_START_MARGIN_MAX_NS);
+             chain->fex_start.quiet_frames = 0;
+         }
+@@ -3420,7 +3430,7 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+     if (measured)
+     {
+         vkd3d_fex_timeline_step(VKD3D_FEX_STEP_SPARE, spare > 0 ? (uint64_t)spare : 0);
+-        vkd3d_fex_timeline_pacing(chain->fex_start.delay_ns, chain->fex_start.margin_ns, spare, late);
++        vkd3d_fex_timeline_pacing(chain->fex_start.delay_ns, chain->fex_start.margin_ns, spare, late, caused);
+     }
+ 
+     /* Without pacing, the release would happen now. */
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 04556f6..c7f5394 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3039,6 +3039,7 @@ struct vkd3d_timestamp_profiler_submitted_work;
+ #define VKD3D_FEX_REPORT_FLAG_FRAME_START 0x4u /* present report: frame start pacing is on */
+ #define VKD3D_FEX_REPORT_FLAG_PRESLEEP 0x8u    /* present report: cap pre-sleep is on */
+ #define VKD3D_FEX_REPORT_FLAG_GRADUAL_START 0x10u /* present report: frame start pacing changes gradually */
++#define VKD3D_FEX_REPORT_FLAG_MARGIN_CAUSED 0x20u /* present report: only frames the hold-back made late grow the margin */
+ #define VKD3D_FEX_REPORT_FLAG_DEVICE 0x80000000u /* a D3D12 device was created */
+ struct vkd3d_fex_report
+ {
+@@ -3098,7 +3099,7 @@ void vkd3d_fex_timeline_queue_lag(uint32_t slot, uint64_t ns, uint32_t depth);
+ void vkd3d_fex_timeline_step(enum vkd3d_fex_present_step step, uint64_t ns);
+ void vkd3d_fex_timeline_present(uint32_t sync_interval, uint32_t queued);
+ void vkd3d_fex_timeline_release(uint64_t now_ns);
+-void vkd3d_fex_timeline_pacing(uint64_t delay_ns, uint64_t margin_ns, int64_t spare_ns, bool late);
++void vkd3d_fex_timeline_pacing(uint64_t delay_ns, uint64_t margin_ns, int64_t spare_ns, bool late, bool caused);
+ void vkd3d_fex_timeline_cap(bool presleep, bool held_long, bool not_held, bool anchored, bool active, uint64_t step_ns,
+         uint64_t guard_ns);
+ uint64_t vkd3d_fex_timeline_last_release(void);
+-- 
+2.43.0
+

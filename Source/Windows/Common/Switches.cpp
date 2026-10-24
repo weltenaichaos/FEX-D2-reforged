@@ -26,6 +26,10 @@ namespace {
     // Build 58: the unpack cache's data file stays out of Android's file cache (see ARM64EC/NativeUnpackCache.cpp). Its
     // 3-4 GB of reads per area load came right before the device's other cores went busy in the build 56 and 57 logs.
     {"FEX_UNPACK_CACHE_DIRECT", "1"},
+    // Build 59: the game's own data files (CASC archives) are dropped from Android's file cache every 500 ms (see
+    // ARM64EC/GameFiles.h). In the build 58 log the second area load still filled memory and Android's memory killer
+    // closed 20 apps, which then restarted for ~35 s on 5-6 cores.
+    {"FEX_GAME_FILES_UNCACHED", "1"},
     // Build 48: no thread at extreme Linux nice values (see PriorityGuard.h, Threads.cpp).
     {"FEX_PRIO", "normal"},
     {"FEX_HELPER_PRIO", "normal"},
@@ -79,6 +83,8 @@ namespace {
     "FEX_UNPACK_CACHE_RESET",
     "FEX_UNPACK_CACHE_READAHEAD_MB",
     "FEX_UNPACK_CACHE_DIRECT",
+    "FEX_GAME_FILES_UNCACHED",
+    "FEX_GAME_FILES_MS",
     "FEX_UNPACK_CACHE_SKIP_ADLER",
     "FEX_NATIVE_ADLER_NEON",
     "FEX_NATIVE_MD5_CACHE",

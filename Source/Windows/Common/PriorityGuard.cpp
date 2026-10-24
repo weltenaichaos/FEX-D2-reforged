@@ -512,11 +512,11 @@ namespace {
           T.Name = QueryName(Next);
           T.Named = true;
           T.FEX = T.Name.size() >= 3 && T.Name.compare(0, 3, "FEX") == 0;
-          // Only the stats log (its 2ms sampler and per-second work), this guard and the rumble sender move: the stall
+          // Only the stats log (its 2ms sampler and per-second work), this guard, the rumble sender and the file cache dropper move: the stall
           // probe measures what game threads see, and the disk cache writer, prefetcher and unpack cache threads hold locks
           // or feed loads the game waits on.
           T.KeepCores = !(T.Name == "FEXStatsLog" || T.Name == "FEXPrioGuard" || T.Name == "FEXThreadPin" || T.Name == "FEXFrameLatency" ||
-                          T.Name == "FEXRumble");
+                          T.Name == "FEXRumble" || T.Name == "FEXFileCache");
         }
         Entries.push_back({Next, TID, Basic, &T, TID == C->MainTID || T.Name == "Main"});
       }

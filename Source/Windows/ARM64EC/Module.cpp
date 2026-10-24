@@ -55,6 +55,7 @@ $end_info$
 #include "Windows/Common/Switches.h"
 #include "FrameLatency.h"
 #include "Rumble.h"
+#include "GameFiles.h"
 #include "NativeRedirect.h"
 #include "Vkd3dReport.h"
 
@@ -948,6 +949,7 @@ NTSTATUS ProcessInit() {
   FEX::Windows::StartPriorityGuard(AppConfigName);
   FrameLatency::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
   Rumble::Init(StatsLog);
+  GameFiles::Init(StatsLog);
   if (StatsLog) {
     Vkd3dReport::Init();
     if (!HotPageFaults) {

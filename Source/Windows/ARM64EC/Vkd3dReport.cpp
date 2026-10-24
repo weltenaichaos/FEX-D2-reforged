@@ -41,6 +41,7 @@ namespace {
   constexpr uint32_t FlagFrameStart = 0x4;
   constexpr uint32_t FlagCapPresleep = 0x8;
   constexpr uint32_t FlagGradualStart = 0x10; // VKD3D fex3 and later: the frame start hold-back changes by small steps
+  constexpr uint32_t FlagMarginCaused = 0x20; // VKD3D fex4 and later: only frames the hold-back made late grow its margin
   constexpr uint32_t FlagDevice = 0x80000000u;
 
   struct Source {
@@ -266,8 +267,10 @@ namespace {
                                        ModuleAddress, PassFlags & FlagFoldClears ? "on" : "off", PassFlags & FlagOn ? "on" : "off",
                                        PresentState, PresentFlags & FlagCapPresleep ? "on" : "off",
                                        !(PresentFlags & FlagFrameStart) ? "off" :
-                                       PresentFlags & FlagGradualStart  ? "on (gradual, VKD3D fex3 or later)" :
-                                                                          "on (build 56 style: an older VKD3D component is selected)"));
+                                       PresentFlags & FlagMarginCaused ? "on (gradual, margin only from frames it made late: VKD3D fex4 or "
+                                                                         "later)" :
+                                       PresentFlags & FlagGradualStart ? "on (gradual, VKD3D fex3: an older VKD3D component is selected)" :
+                                                                         "on (build 56 style: an older VKD3D component is selected)"));
       Out += CapLayerNote();
     }
     return Out;
