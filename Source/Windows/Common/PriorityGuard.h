@@ -53,11 +53,23 @@ namespace FEX::Windows {
 // second against 0.08), fights 7 times as many (4.0 against 0.6), and the main thread waited twice as long for a CPU. It
 // ran on the same big cores as the game's workers and the wineserver.
 //
-//   FEX_LOADER_CORES=little  every thread that runs at 25% of a core or more for 2 seconds with at least 6 of 8 samples
-//                      of its code (4 a second) outside any loaded module goes to the slowest cores (0-2 on the Thor)
-//                      for good, at the Linux level: GameNative's container lets Wine use cores 3-7 only, but Linux lets
-//                      the process use all 8. Its Linux cores are checked 4 times a second and set back when something
-//                      changed them (the D2R default).
+// Build 62 counted every sample outside an image view as loader code. D2R's protection remaps D2R.exe into a view that is
+// no longer an image, so it moved three of the game's worker threads (their code is in D2R.exe) to the slow cores, and the
+// game got slower everywhere (calm play 5 times as many frames of 40 ms or more, the main thread at 62-78% of its core
+// instead of 40-49%, spinning in the job wait). Since build 63 each code sample (4 a second, the guest code of the JIT
+// block the thread last entered) counts as:
+//   game code        in the main exe's range as loaded (read at process start, before the remap), or in an x64 DLL
+//   protection code  in committed memory that is neither: D2R_loader.dll's remapped code and what it decrypts
+//   neither          in an ARM64EC DLL (Wine's, VKD3D, DXVK): a thread in a Wine call (a wait, CreateEventW) was last in
+//                    that function's x64 entry stub, which says nothing about its own code; or unreadable
+//
+//   FEX_LOADER_CORES=little  every thread that runs at 25% of a core or more (over 2 second rounds), with at least 6
+//                      protection code samples and 3 times as many as game code samples over its busy rounds (up to 4,
+//                      then it isn't looked at for a minute), goes to the slowest cores (0-2 on the Thor) for good, at the
+//                      Linux level: GameNative's container lets Wine use cores 3-7 only, but Linux lets the process use
+//                      all 8. Its Linux cores are checked 4 times a second and set back when something changed them (the
+//                      D2R default).
+//   FEX_LOADER_CORES=find    find and log them, leave them where they are
 //   FEX_LOADER_CORES=off     leave them where Wine puts them
 //
 // Each loader thread found gets a "# loader: ..." line, and every second a "loader" line with how long it ran and how

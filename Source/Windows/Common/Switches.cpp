@@ -70,6 +70,8 @@ namespace {
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
+    // Build 63 tells the game's code from the protection's by the exe's range as loaded (build 62 moved three of the game's
+    // worker threads, whose code is in the remapped D2R.exe).
     {"FEX_LOADER_CORES", "little"},
     {"FEX_LOADER_WATCH", "1"},
     // Build 62: during play, unpack cache hits not in read-ahead memory are left to the game to unpack (1.9 ms average

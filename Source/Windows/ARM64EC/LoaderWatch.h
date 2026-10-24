@@ -8,11 +8,14 @@
 // events would save most of that, but only if the loop's events are its own and short-lived, which a log can't tell yet.
 //
 // Once the priority guard finds a loader thread, Module.S ExitFunctionEC runs FEX's wrappers in place of kernelbase's
-// CreateEventW, CloseHandle and WaitForMultipleObjects for that thread's calls (other threads' calls are untouched). The
-// wrappers call Wine's functions unchanged and count what the calls were. Every second a "loader calls" line says, per
-// function: calls, time in them, the arguments (event type, handle counts, timeouts), the results, whether the waits and
-// closes were on events the thread had just created (and how long those lived), and where in the game's code the calls
-// came from.
+// CreateEventW, CloseHandle, WaitForMultipleObjects and WaitForSingleObject for that thread's calls (other threads' calls
+// are untouched). The wrappers call Wine's functions unchanged and count what the calls were. Every second a "loader
+// calls" line says, per function: calls, time in them, the arguments (event type, handle counts, timeouts), the results,
+// whether the waits and closes were on events the thread had just created (and how long those lived), which other handles
+// WaitForSingleObject waited on (and their object type), and where in the game's code the calls came from.
+//
+// The functions' entries are looked up when the first loader thread is found: kernelbase isn't loaded yet when FEX's
+// process init runs, which is why the build 62 log found none.
 //
 //   FEX_LOADER_WATCH=1  watch the loader threads' calls (the D2R default, with the stats log)
 //   FEX_LOADER_WATCH=0  don't

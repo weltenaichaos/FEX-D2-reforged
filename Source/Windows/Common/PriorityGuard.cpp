@@ -102,16 +102,19 @@ namespace {
     int MainLinuxTid;    // its Linux tid
     uint32_t EaseWaitMs; // FEX_MAINCORE_WAIT, 0 = never let the main thread off its core
     LoaderMode Loader;   // FEX_LOADER_CORES
+    uint64_t ExeBase;    // the main exe's image range as loaded, before any protection remaps it
+    uint64_t ExeEnd;
   };
 
   // Loader threads, see FEX_LOADER_CORES in PriorityGuard.h.
   constexpr uint32_t LoaderSamples = 8;              // per 2 s round, one every 250 ms
-  constexpr uint32_t LoaderMinSamples = 6;           // samples that resolved to guest code, and at least 3 in 4 of them outside modules
+  constexpr uint32_t LoaderMinProtection = 6;        // samples in protection code, over a thread's busy rounds; and 3 times its game samples
+  constexpr uint32_t LoaderMaxRounds = 4;            // busy rounds counted before a thread that didn't qualify isn't sampled for a while
   constexpr uint64_t LoaderBusyNs = 500'000'000;     // run time in a 2 s round: 25% of a core
-  constexpr uint32_t LoaderGameRounds = 3;           // busy rounds in module code before a thread isn't sampled for a while
   constexpr uint32_t LoaderSkipRounds = 30;          // 1 minute
+  constexpr size_t MaxModuleKinds = 64;              // cached image kinds, see ModuleKinds
   constexpr size_t MaxLoaderThreads = 4;
-  constexpr uint32_t MaxCheckNotes = 24;             // "# loader: checked ..." lines, the first check of each busy thread
+  constexpr uint32_t MaxCheckNotes = 24;             // "# loader: checked ..." lines, for busy threads found not to be loader threads
 
   // The emulated threads, see GuardThreadStarted.
   struct Registered {
@@ -161,23 +164,65 @@ namespace {
     size_t GuestSize;
   };
 
-  // Where a sampled JIT block's guest code is: Valid when it could be read, Outside when that is not in any loaded
-  // module (private or mapped memory rather than an image).
+  // Where a sampled JIT block's guest code is (build 63; build 62 counted everything that wasn't an image view as outside
+  // the game, and D2R's protection remaps D2R.exe into a non-image view, so it moved three of the game's worker threads):
+  //  - Game: in the main exe's range as loaded, or in an image of x64 code (another DLL of the game's).
+  //  - Native: in an ARM64EC image (Wine's DLLs, VKD3D, DXVK). A thread that sits in a Wine call (a wait, CreateEventW)
+  //    was last in the x64 entry stub of that DLL's function, so these samples say nothing about the thread's own code.
+  //  - Protection: in committed memory that is neither: D2R_loader.dll's remapped code and the code it decrypts.
+  //  - Unread: no block yet, or the block or its memory is gone.
+  enum class CodeKind : uint8_t { Unread, Native, Game, Protection };
   struct CodeClass {
     uint64_t Header;
-    bool Valid;
-    bool Outside;
+    CodeKind Kind;
     uint64_t RIP;
-    uint64_t Base;
+    uint64_t Base; // allocation base
   };
 
-  CodeClass ClassifyBlock(uint64_t Header) {
-    CodeClass R {.Header = Header};
+  // Image kinds by allocation base, so each image's header is read once.
+  struct ModuleKinds {
+    uint64_t Base[MaxModuleKinds];
+    bool Native[MaxModuleKinds];
+    size_t Count;
+  };
+
+  // Whether the image at Base is ARM64EC (its load config has CHPE metadata), read through /proc/self/mem.
+  bool IsArm64ECImage(uint64_t Base) {
+    IMAGE_DOS_HEADER Dos {};
+    if (!Linux::ReadOwnMemory(Base, &Dos, sizeof(Dos)) || Dos.e_magic != IMAGE_DOS_SIGNATURE || Dos.e_lfanew <= 0 || Dos.e_lfanew > 0x10000) {
+      return false;
+    }
+    IMAGE_NT_HEADERS64 Nt {};
+    if (!Linux::ReadOwnMemory(Base + Dos.e_lfanew, &Nt, sizeof(Nt)) || Nt.Signature != IMAGE_NT_SIGNATURE ||
+        Nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+      return false;
+    }
+    const auto& Dir = Nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    constexpr size_t CHPEFieldEnd =
+      offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, CHPEMetadataPointer) + sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64::CHPEMetadataPointer);
+    if (!Dir.VirtualAddress || Dir.Size < CHPEFieldEnd) {
+      return false;
+    }
+    IMAGE_LOAD_CONFIG_DIRECTORY64 LoadConfig {};
+    if (!Linux::ReadOwnMemory(Base + Dir.VirtualAddress, &LoadConfig, CHPEFieldEnd)) {
+      return false;
+    }
+    return LoadConfig.Size >= CHPEFieldEnd && LoadConfig.CHPEMetadataPointer;
+  }
+
+  CodeClass ClassifyBlock(const Config& C, ModuleKinds& Kinds, uint64_t Header) {
+    CodeClass R {.Header = Header, .Kind = CodeKind::Unread};
     uint32_t OffsetToTail {};
     JITCodeTailMirror Tail {};
     // The block may have been freed since it was sampled: read through /proc/self/mem, which fails safely.
     if (!Header || !Linux::ReadOwnMemory(Header, &OffsetToTail, sizeof(OffsetToTail)) || !OffsetToTail ||
         !Linux::ReadOwnMemory(Header + OffsetToTail, &Tail, sizeof(Tail)) || !Tail.RIP) {
+      return R;
+    }
+    R.RIP = Tail.RIP;
+    if (Tail.RIP >= C.ExeBase && Tail.RIP < C.ExeEnd) {
+      R.Kind = CodeKind::Game;
+      R.Base = C.ExeBase;
       return R;
     }
     MEMORY_BASIC_INFORMATION Info {};
@@ -186,10 +231,29 @@ namespace {
         Info.State != MEM_COMMIT) {
       return R;
     }
-    R.Valid = true;
-    R.RIP = Tail.RIP;
     R.Base = reinterpret_cast<uintptr_t>(Info.AllocationBase);
-    R.Outside = Info.Type != MEM_IMAGE;
+    if (R.Base == C.ExeBase) {
+      // The exe's remapped view, should its size be unknown.
+      R.Kind = CodeKind::Game;
+      return R;
+    }
+    if (Info.Type != MEM_IMAGE) {
+      R.Kind = CodeKind::Protection;
+      return R;
+    }
+    for (size_t i = 0; i < Kinds.Count; ++i) {
+      if (Kinds.Base[i] == R.Base) {
+        R.Kind = Kinds.Native[i] ? CodeKind::Native : CodeKind::Game;
+        return R;
+      }
+    }
+    const bool Native = IsArm64ECImage(R.Base);
+    if (Kinds.Count == MaxModuleKinds) {
+      Kinds.Count = 0;
+    }
+    Kinds.Base[Kinds.Count] = R.Base;
+    Kinds.Native[Kinds.Count++] = Native;
+    R.Kind = Native ? CodeKind::Native : CodeKind::Game;
     return R;
   }
 
@@ -213,7 +277,9 @@ namespace {
     uint64_t Samples[LoaderSamples]; // JIT block headers sampled this round
     uint32_t SampleCount;
     uint64_t LastRunNs; // its Linux run time at the last round, 0 = not read yet
-    uint32_t GameRounds;
+    // Code samples of its busy rounds so far, by CodeKind, and an example of protection and of game code.
+    uint32_t InProtection, InGame, InNative, Unread, BusyRounds;
+    CodeClass ProtectionExample, GameExample;
     uint32_t SkipUntil;
     uint32_t Checks;
     bool Loader;
@@ -574,6 +640,7 @@ namespace {
 
   struct LoaderFinder {
     const Config* C;
+    ModuleKinds Kinds;
     fextl::vector<LoaderThread> Threads;
     uint32_t Tick;
     uint32_t CheckNotes;
@@ -597,7 +664,8 @@ namespace {
         if (T.LinuxTid != R.LinuxTid) {
           // New, or a new thread with an old one's TID.
           T.LinuxTid = R.LinuxTid;
-          T.SampleCount = T.GameRounds = T.SkipUntil = T.Checks = 0;
+          T.SampleCount = T.SkipUntil = T.Checks = 0;
+          T.InProtection = T.InGame = T.InNative = T.Unread = T.BusyRounds = 0;
           T.LastRunNs = 0;
           T.Loader = false;
         }
@@ -672,57 +740,74 @@ namespace {
       }
       const uint64_t RunNs = T.LastRunNs ? S.RunNs - T.LastRunNs : 0;
       T.LastRunNs = std::max<uint64_t>(S.RunNs, 1);
-      if (Round < T.SkipUntil || RunNs < LoaderBusyNs || N < LoaderMinSamples) {
+      if (Round < T.SkipUntil || RunNs < LoaderBusyNs || !N) {
         continue;
       }
 
-      // Each distinct block resolved once.
+      // Each distinct block resolved once; the counts add up over the thread's busy rounds, since a thread that spends
+      // much of its time in Wine calls gives only a few samples of its own code per round.
       CodeClass Seen[LoaderSamples];
       size_t SeenCount {};
-      uint32_t Valid {}, Outside {};
-      const CodeClass* Example {};
       for (uint32_t i = 0; i < N; ++i) {
         const CodeClass* K {};
         for (size_t j = 0; j < SeenCount && !K; ++j) {
           K = Seen[j].Header == T.Samples[i] ? &Seen[j] : nullptr;
         }
         if (!K) {
-          Seen[SeenCount] = ClassifyBlock(T.Samples[i]);
+          Seen[SeenCount] = ClassifyBlock(*F.C, F.Kinds, T.Samples[i]);
           K = &Seen[SeenCount++];
         }
-        if (K->Valid) {
-          ++Valid;
-          Outside += K->Outside ? 1 : 0;
-          if (!Example || (K->Outside && !Example->Outside)) {
-            Example = K;
+        switch (K->Kind) {
+        case CodeKind::Protection:
+          if (++T.InProtection == 1) {
+            T.ProtectionExample = *K;
           }
+          break;
+        case CodeKind::Game:
+          if (++T.InGame == 1) {
+            T.GameExample = *K;
+          }
+          break;
+        case CodeKind::Native: ++T.InNative; break;
+        case CodeKind::Unread: ++T.Unread; break;
         }
       }
+      ++T.BusyRounds;
       ++T.Checks;
       const double Busy = static_cast<double>(RunNs) / 2e7; // % of a core over the 2 s round
-      const bool IsLoader = Valid >= LoaderMinSamples && Outside * 4 >= Valid * 3;
-      const fextl::string Where = Example ? fextl::fmt::format(" (e.g. guest code {:X} in the {} at {:X})", Example->RIP,
-                                                               Example->Outside ? "allocation" : "module", Example->Base) :
-                                            fextl::string {};
+      const bool IsLoader = T.InProtection >= LoaderMinProtection && T.InProtection >= 3 * T.InGame;
+      if (!IsLoader && T.BusyRounds < LoaderMaxRounds) {
+        continue;
+      }
+      fextl::string Where;
+      if (T.InProtection) {
+        Where += fextl::fmt::format(", e.g. {:X} in the allocation at {:X}", T.ProtectionExample.RIP, T.ProtectionExample.Base);
+      }
+      if (T.InGame) {
+        Where += fextl::fmt::format("{} game code e.g. {:X} in the {} at {:X}", T.InProtection ? ";" : ",", T.GameExample.RIP,
+                                    T.GameExample.Base == F.C->ExeBase ? "main exe" : "module", T.GameExample.Base);
+      }
+      const fextl::string Counts =
+        fextl::fmt::format("over {} busy rounds, of {} code samples {} in protection code (outside the exe and the game's DLLs), {} in the game's "
+                           "code, {} in Wine's or other native DLLs (waiting or in a Wine call), {} unreadable{}",
+                           T.BusyRounds, T.InProtection + T.InGame + T.InNative + T.Unread, T.InProtection, T.InGame, T.InNative, T.Unread, Where);
       if (!IsLoader) {
-        if (T.Checks == 1 && F.CheckNotes < MaxCheckNotes) {
+        if (F.CheckNotes < MaxCheckNotes) {
           ++F.CheckNotes;
-          StatsLogNote(fextl::fmt::format("loader: checked tid={} {} (Linux {}) at {:.0f}% of a core: {} of {} code samples outside modules{}; "
-                                          "not a loader thread",
-                                          TID, T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Outside, Valid, Where));
+          StatsLogNote(fextl::fmt::format("loader: checked tid={} {} (Linux {}) at {:.0f}% of a core {}; not a loader thread, checked again in a "
+                                          "minute",
+                                          TID, T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Counts));
         }
-        if (++T.GameRounds >= LoaderGameRounds) {
-          T.GameRounds = 0;
-          T.SkipUntil = Round + LoaderSkipRounds;
-        }
+        T.InProtection = T.InGame = T.InNative = T.Unread = T.BusyRounds = 0;
+        T.SkipUntil = Round + LoaderSkipRounds;
         continue;
       }
 
       T.Loader = true;
       if (F.Threads.size() >= MaxLoaderThreads) {
-        StatsLogNote(fextl::fmt::format("loader: tid={} (Linux {}) at {:.0f}% of a core ran {} of {} code samples outside modules{}, but {} "
-                                        "loader threads are kept already; left where it is",
-                                        TID, T.LinuxTid, Busy, Outside, Valid, Where, F.Threads.size()));
+        StatsLogNote(fextl::fmt::format("loader: tid={} (Linux {}) at {:.0f}% of a core {}: a loader thread, but {} loader threads are kept "
+                                        "already; left where it is",
+                                        TID, T.LinuxTid, Busy, Counts, F.Threads.size()));
         continue;
       }
       LoaderThread L {.TID = TID, .LinuxTid = T.LinuxTid};
@@ -736,8 +821,7 @@ namespace {
         L.RetryAt = F.Tick + 40;
       }
       StatsLogNote(fextl::fmt::format(
-        "loader: tid={} {} (Linux {}) at {:.0f}% of a core ran {} of {} code samples outside any loaded module{}: a loader thread; {}", TID,
-        T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Outside, Valid, Where,
+        "loader: tid={} {} (Linux {}) at {:.0f}% of a core {}: a loader thread; {}", TID, T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Counts,
         Want                                     ? fextl::fmt::format("Linux cores {:#x} -> {:#x} (the slowest), result {} (FEX_LOADER_CORES=off leaves it)",
                                                                       Before, Want, Result) :
         F.C->Loader == LoaderMode::Little ? fextl::string("left where it is: the slowest cores aren't known") :
@@ -997,6 +1081,11 @@ void StartPriorityGuard(std::string_view AppName) {
 
   const char* Loader = Switch("FEX_LOADER_CORES");
   C->Loader = !Loader || Loader[0] == 'o' || Loader[0] == '0' ? LoaderMode::Off : Loader[0] == 'f' ? LoaderMode::Find : LoaderMode::Little;
+  // Read now, in process init: D2R's protection later remaps the exe into a view that is no longer an image.
+  C->ExeBase = reinterpret_cast<uint64_t>(reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress);
+  if (const auto* Nt = C->ExeBase ? RtlImageNtHeader(reinterpret_cast<HMODULE>(C->ExeBase)) : nullptr) {
+    C->ExeEnd = C->ExeBase + Nt->OptionalHeader.SizeOfImage;
+  }
 
   const char* ServerNice = Switch("FEX_SERVER_NICE");
   if (ServerNice && ServerNice[0] != 'o' && (ServerNice[0] == '-' || (ServerNice[0] >= '0' && ServerNice[0] <= '9'))) {
@@ -1026,14 +1115,18 @@ void StartPriorityGuard(std::string_view AppName) {
   StatsLogNote(C->ServerNiceOn ? fextl::fmt::format("server: wineserver to nice {} (FEX_SERVER_NICE=off leaves it alone)", C->ServerNice) :
                                  fextl::string("server: wineserver nice left alone"));
 
+  const fextl::string Exe = fextl::fmt::format("main exe {:X}-{:X}", C->ExeBase, C->ExeEnd);
   StatsLogNote(C->Loader == LoaderMode::Little ?
-                 fextl::string("loader: threads running at 25% of a core or more mostly outside any loaded module (the game's protection/loader "
-                               "code) go to the slowest cores at the Linux level, checked every 250 ms (FEX_LOADER_CORES=off leaves them, =find "
-                               "only finds them)") :
+                 fextl::fmt::format("loader: threads running at 25% of a core or more whose own code is mostly protection code (not in the {} "
+                                    "or another x64 DLL; Wine's DLLs don't count either way) go to the slowest cores at the Linux level, checked "
+                                    "every 250 ms (FEX_LOADER_CORES=off leaves them, =find only finds them)",
+                                    Exe) :
                C->Loader == LoaderMode::Find ?
-                 fextl::string("loader: threads running mostly outside any loaded module are found and logged, left where they are "
-                               "(FEX_LOADER_CORES=little moves them to the slowest cores)") :
-                 fextl::string("loader: off (FEX_LOADER_CORES=little moves threads running mostly outside any loaded module to the slowest cores)"));
+                 fextl::fmt::format("loader: threads running mostly protection code (not in the {} or another x64 DLL) are found and logged, "
+                                    "left where they are (FEX_LOADER_CORES=little moves them to the slowest cores)",
+                                    Exe) :
+                 fextl::string("loader: off (FEX_LOADER_CORES=little moves threads running mostly the game's protection code to the slowest "
+                               "cores)"));
 
   if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && C->Loader == LoaderMode::Off) {
     delete C;

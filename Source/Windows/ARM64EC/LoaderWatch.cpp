@@ -27,13 +27,14 @@ $end_info$
 
 extern "C" {
 // Module.S ExitFunctionEC: while [0] is non-zero, a call from x64 code on a thread whose TEB is one of [1..4] into one of
-// the entries [5..8] (CreateEventW), [9..12] (CloseHandle) or [13..16] (WaitForMultipleObjects) runs FEX's wrapper instead
-// (NativeLoaderCreateEventTarget and so on), after storing the entry it called in [17], [18] or [19]. Entries not found
-// stay 0, which never matches.
-alignas(64) uint64_t FEXLoaderWatch[20];
+// the entries [5..8] (CreateEventW), [9..12] (CloseHandle), [13..16] (WaitForMultipleObjects) or [17..20]
+// (WaitForSingleObject) runs FEX's wrapper instead (NativeLoaderCreateEventTarget and so on), after storing the entry it
+// called in [21], [22], [23] or [24]. Entries not found stay 0, which never matches.
+alignas(64) uint64_t FEXLoaderWatch[25];
 HANDLE FEXNativeLoaderCreateEventW(void* Attributes, BOOL ManualReset, BOOL InitialState, const wchar_t* Name, uint64_t Lr, uint64_t Sp);
 BOOL FEXNativeLoaderCloseHandle(HANDLE Handle, uint64_t Lr, uint64_t Sp);
 DWORD FEXNativeLoaderWaitForMultiple(DWORD Count, const HANDLE* Handles, BOOL WaitAll, DWORD Milliseconds, uint64_t Lr, uint64_t Sp);
+DWORD FEXNativeLoaderWaitForSingle(HANDLE Handle, DWORD Milliseconds, uint64_t Lr, uint64_t Sp);
 extern void* X64ReturnInstr; // Module.cpp
 }
 
@@ -41,13 +42,15 @@ namespace LoaderWatch {
 namespace {
   constexpr size_t TebSlots = 4;
   constexpr size_t EntriesPerFunction = 4;
-  constexpr size_t CreateEntries = 5, CloseEntries = 9, WaitEntries = 13, CalledEntries = 17;
-  enum Function { Create, Close, Wait, FunctionCount };
-  constexpr const char* FunctionNames[FunctionCount] = {"CreateEventW", "CloseHandle", "WaitForMultipleObjects"};
+  constexpr size_t CreateEntries = 5, CloseEntries = 9, WaitEntries = 13, WaitOneEntries = 17, CalledEntries = 21;
+  enum Function { Create, Close, Wait, WaitOne, FunctionCount };
+  constexpr const char* FunctionNames[FunctionCount] = {"CreateEventW", "CloseHandle", "WaitForMultipleObjects", "WaitForSingleObject"};
+  constexpr size_t FirstEntry[FunctionCount] = {CreateEntries, CloseEntries, WaitEntries, WaitOneEntries};
 
   using CreateEventFn = HANDLE (*)(void*, BOOL, BOOL, const wchar_t*);
   using CloseHandleFn = BOOL (*)(HANDLE);
   using WaitMultipleFn = DWORD (*)(DWORD, const HANDLE*, BOOL, DWORD);
+  using WaitSingleFn = DWORD (*)(HANDLE, DWORD);
 
   constexpr DWORD Infinite = 0xffffffff;
   constexpr DWORD WaitObject0 = 0, WaitAbandoned0 = 0x80, WaitTimeout = 0x102, WaitFailed = 0xffffffff;
@@ -55,6 +58,11 @@ namespace {
   constexpr size_t MaxCallers = 8;    // per function
   constexpr size_t HandleBins = 5;    // 1, 2, 3, 4, 5 or more
   constexpr size_t TimeoutBins = 6;   // 0, 1-15, 16-100, 101-1000, more, INFINITE
+  constexpr size_t WaitedHandles = 4; // WaitForSingleObject's handles named on the line
+
+  size_t TimeoutBin(DWORD Milliseconds) {
+    return Milliseconds == Infinite ? 5 : Milliseconds == 0 ? 0 : Milliseconds <= 15 ? 1 : Milliseconds <= 100 ? 2 : Milliseconds <= 1000 ? 3 : 4;
+  }
 
   uint64_t Freq {1};
 
@@ -82,6 +90,13 @@ namespace {
     uint32_t Calls;
   };
 
+  struct WaitedHandle {
+    uint64_t Handle;
+    uint32_t Calls;
+    uint32_t TimedOut;
+    uint64_t Ticks;
+  };
+
   // One second's counts, under Lock; the log thread takes them every second.
   struct Counts {
     uint64_t Calls[FunctionCount];
@@ -99,12 +114,52 @@ namespace {
     uint64_t Long; // 5 ms or longer
     // CloseHandle
     uint64_t CloseOwn, CloseOwnLifeTicks, CloseOwnWaits, CloseOwnUnwaited;
+    // WaitForSingleObject
+    uint64_t OneTimeouts[TimeoutBins];
+    uint64_t OneSignaled, OneAbandoned, OneTimedOut, OneLong, OneOwn, OneOwnSignaled;
+    WaitedHandle OneHandles[WaitedHandles];
+    uint64_t OneOtherHandles;
     Caller Callers[FunctionCount][MaxCallers];
     uint64_t OtherCallers[FunctionCount];
   };
   std::mutex Lock;
   Counts Current {};
-  bool Logging {};
+
+  // The entries are looked up when the priority guard finds the first loader thread, on its thread: kernelbase isn't loaded
+  // yet when FEX's process init runs (the build 62 log found no entries for that reason).
+  enum class EntryState { NotLooked, Found, Missing };
+  EntryState Lookup {EntryState::NotLooked}; // the guard thread's
+
+  // Each function's entries in kernelbase, and kernel32's own ones if it has any (Wine's kernel32 forwards these to
+  // kernelbase, and a forwarded export has no entry of its own). On success they are in FEXLoaderWatch, else it stays 0.
+  bool FindEntries(fextl::string& Found) {
+    const wchar_t* Modules[] = {L"kernelbase.dll", L"kernel32.dll"};
+    uint64_t Bases[std::size(Modules)] {};
+    for (size_t i = 0; i < std::size(Modules); ++i) {
+      Bases[i] = FrameLatency::FindModule(Modules[i]);
+    }
+    Found = fextl::fmt::format(" (kernelbase at {:X}, kernel32 at {:X}):", Bases[0], Bases[1]);
+    bool Complete = true;
+    for (size_t Fn = 0; Fn < FunctionCount; ++Fn) {
+      size_t Count {};
+      for (size_t m = 0; m < std::size(Modules); ++m) {
+        uint64_t Entries[3] {};
+        const size_t N = Bases[m] ? FrameLatency::FindExportEntries(Bases[m], FunctionNames[Fn], Entries) : 0;
+        for (size_t i = 0; i < N && Count < EntriesPerFunction; ++i) {
+          uint64_t* First = FEXLoaderWatch + FirstEntry[Fn];
+          if (std::find(First, First + Count, Entries[i]) == First + Count) {
+            First[Count++] = Entries[i];
+          }
+        }
+      }
+      Complete &= Count != 0;
+      Found += fextl::fmt::format(" {} {}", FunctionNames[Fn], Count);
+    }
+    if (!Complete) {
+      std::fill(std::begin(FEXLoaderWatch), std::end(FEXLoaderWatch), 0);
+    }
+    return Complete;
+  }
 
   int SlotOf(uint64_t Teb) {
     for (size_t i = 0; i < TebSlots; ++i) {
@@ -148,9 +203,18 @@ namespace {
     return nullptr;
   }
 
-  // Called by the priority guard for each loader thread it finds (Teb != 0) or that ended (Teb == 0).
+  // Called by the priority guard, on its thread, for each loader thread it finds (Teb != 0) or that ended (Teb == 0).
   void Watch(uint32_t TID, uint64_t Teb) {
     if (Teb) {
+      if (Lookup == EntryState::NotLooked) {
+        fextl::string Found;
+        Lookup = FindEntries(Found) ? EntryState::Found : EntryState::Missing;
+        FEX::Windows::StatsLogNote(
+          fextl::fmt::format("loader calls: entries {}{}", Lookup == EntryState::Found ? "found" : "not all found, not watched", Found));
+      }
+      if (Lookup != EntryState::Found) {
+        return;
+      }
       bool Watching = false;
       {
         std::scoped_lock Guard {Lock};
@@ -165,8 +229,8 @@ namespace {
       }
       // Not under Lock: the log thread holds its own lock while it asks for the line.
       if (Watching) {
-        FEX::Windows::StatsLogNote(fextl::fmt::format("loader calls: watching tid={}'s CreateEventW, CloseHandle and WaitForMultipleObjects "
-                                                      "(FEX_LOADER_WATCH=0 turns it off)",
+        FEX::Windows::StatsLogNote(fextl::fmt::format("loader calls: watching tid={}'s CreateEventW, CloseHandle, WaitForMultipleObjects and "
+                                                      "WaitForSingleObject (FEX_LOADER_WATCH=0 turns it off)",
                                                       TID));
       }
       return;
@@ -192,6 +256,23 @@ namespace {
     return fextl::fmt::format("{:X}", Address);
   }
 
+  // The object type of a handle the loader thread waited on (Event, Timer, Thread, ...), read on the log thread when it
+  // writes the line. "-" when the handle is gone by then.
+  fextl::string HandleType(uint64_t Handle) {
+    alignas(8) uint8_t Buffer[sizeof(UNICODE_STRING) + 64 * sizeof(WCHAR) + 128] {};
+    ULONG Length {};
+    if (NtQueryObject(reinterpret_cast<HANDLE>(Handle), ObjectTypeInformation, Buffer, sizeof(Buffer), &Length) != STATUS_SUCCESS) {
+      return "-";
+    }
+    const auto* Name = reinterpret_cast<const UNICODE_STRING*>(Buffer);
+    fextl::string Result;
+    for (USHORT i = 0; Name->Buffer && i < Name->Length / sizeof(WCHAR) && i < 32; ++i) {
+      const WCHAR Ch = Name->Buffer[i];
+      Result += Ch < 0x80 ? static_cast<char>(Ch) : '?';
+    }
+    return Result.empty() ? fextl::string("?") : Result;
+  }
+
   fextl::string StatsLine() {
     Counts C;
     fextl::string Threads;
@@ -205,7 +286,7 @@ namespace {
         }
       }
     }
-    if (!C.Calls[Create] && !C.Calls[Close] && !C.Calls[Wait]) {
+    if (!C.Calls[Create] && !C.Calls[Close] && !C.Calls[Wait] && !C.Calls[WaitOne]) {
       return {};
     }
     const auto Ms = [](uint64_t Ticks) {
@@ -225,6 +306,24 @@ namespace {
                               C.Handles[0], C.Handles[1], C.Handles[2], C.Handles[3], C.Handles[4], C.AllOf, C.Timeouts[0], C.Timeouts[1],
                               C.Timeouts[2], C.Timeouts[3], C.Timeouts[4], C.Timeouts[5], C.SignaledFirst, C.SignaledOther, C.Abandoned,
                               C.TimedOut, C.Long, C.OwnEvent, C.OwnFirst, C.OwnSignaled);
+    Out += " | " + Head(WaitOne) +
+           fextl::fmt::format(" timeout 0/1-15/16-100/101-1000/more/infinite {}/{}/{}/{}/{}/{} | result signaled {} abandoned {} timeout {} | 5 ms+ {} "
+                              "| on a new event of its own {} (signaled {}) | handles",
+                              C.OneTimeouts[0], C.OneTimeouts[1], C.OneTimeouts[2], C.OneTimeouts[3], C.OneTimeouts[4], C.OneTimeouts[5],
+                              C.OneSignaled, C.OneAbandoned, C.OneTimedOut, C.OneLong, C.OneOwn, C.OneOwnSignaled);
+    {
+      WaitedHandle Sorted[WaitedHandles];
+      std::copy(std::begin(C.OneHandles), std::end(C.OneHandles), Sorted);
+      std::sort(std::begin(Sorted), std::end(Sorted), [](const WaitedHandle& A, const WaitedHandle& B) { return A.Ticks > B.Ticks; });
+      for (const auto& H : Sorted) {
+        if (H.Handle) {
+          Out += fextl::fmt::format(" {:#x} {} x{} {:.1f} ms (timed out {})", H.Handle, HandleType(H.Handle), H.Calls, Ms(H.Ticks), H.TimedOut);
+        }
+      }
+      if (C.OneOtherHandles) {
+        Out += fextl::fmt::format(" others x{}", C.OneOtherHandles);
+      }
+    }
     Out += " | " + Head(Close) +
            fextl::fmt::format(" its own new events {} (lived {:.2f} ms avg, waited on {:.1f} times avg, never {})", C.CloseOwn,
                               C.CloseOwn ? Ms(C.CloseOwnLifeTicks) / static_cast<double>(C.CloseOwn) : 0.0,
@@ -265,39 +364,10 @@ void Init(bool StatsLog) {
   __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(F));
   Freq = F ? F : 1;
 
-  // Each function's entries in kernelbase, and kernel32's own ones if it has any (Wine's kernel32 forwards these to
-  // kernelbase, and a forwarded export has no entry of its own).
-  const wchar_t* Modules[] = {L"kernelbase.dll", L"kernel32.dll"};
-  const char* Names[FunctionCount] = {"CreateEventW", "CloseHandle", "WaitForMultipleObjects"};
-  const size_t First[FunctionCount] = {CreateEntries, CloseEntries, WaitEntries};
-  fextl::string Found;
-  bool Complete = true;
-  for (size_t Fn = 0; Fn < FunctionCount; ++Fn) {
-    size_t Count {};
-    for (const wchar_t* Module : Modules) {
-      const uint64_t Base = FrameLatency::FindModule(Module);
-      uint64_t Entries[3] {};
-      const size_t N = Base ? FrameLatency::FindExportEntries(Base, Names[Fn], Entries) : 0;
-      for (size_t i = 0; i < N && Count < EntriesPerFunction; ++i) {
-        if (std::find(FEXLoaderWatch + First[Fn], FEXLoaderWatch + First[Fn] + Count, Entries[i]) == FEXLoaderWatch + First[Fn] + Count) {
-          FEXLoaderWatch[First[Fn] + Count++] = Entries[i];
-        }
-      }
-    }
-    Complete &= Count != 0;
-    Found += fextl::fmt::format(" {} {}", Names[Fn], Count);
-  }
-  if (!Complete) {
-    FEX::Windows::StatsLogNote(fextl::fmt::format("loader calls: not watched, entries not all found (found{})", Found));
-    std::fill(std::begin(FEXLoaderWatch), std::end(FEXLoaderWatch), 0);
-    return;
-  }
-  Logging = true;
   FEX::Windows::SetLoaderThreadHook(Watch);
   FEX::Windows::StatsLogSetLineProvider(StatsLine);
-  FEX::Windows::StatsLogNote(fextl::fmt::format("loader calls: ready to watch loader threads' calls (entries found{}; FEX_LOADER_WATCH=0 turns "
-                                                "it off)",
-                                                Found));
+  FEX::Windows::StatsLogNote("loader calls: a loader thread's CreateEventW, CloseHandle, WaitForMultipleObjects and WaitForSingleObject calls are "
+                             "counted once the priority guard finds one ('loader calls' line; FEX_LOADER_WATCH=0 turns it off)");
 }
 } // namespace LoaderWatch
 
@@ -377,7 +447,7 @@ extern "C" DWORD FEXNativeLoaderWaitForMultiple(DWORD Count, const HANDLE* Handl
   NoteCall(Current, Wait, End - Start, CallerOf(Lr, Sp), Result == WaitFailed);
   ++Current.Handles[std::clamp<DWORD>(Count, 1, HandleBins) - 1];
   Current.AllOf += WaitAll ? 1 : 0;
-  ++Current.Timeouts[Milliseconds == Infinite ? 5 : Milliseconds == 0 ? 0 : Milliseconds <= 15 ? 1 : Milliseconds <= 100 ? 2 : Milliseconds <= 1000 ? 3 : 4];
+  ++Current.Timeouts[TimeoutBin(Milliseconds)];
   if (Result == WaitObject0) {
     ++Current.SignaledFirst;
   } else if (Result > WaitObject0 && Result < WaitObject0 + Count) {
@@ -392,6 +462,50 @@ extern "C" DWORD FEXNativeLoaderWaitForMultiple(DWORD Count, const HANDLE* Handl
     ++Current.OwnEvent;
     Current.OwnFirst += OwnFirst ? 1 : 0;
     Current.OwnSignaled += Result == WaitObject0 + static_cast<DWORD>(OwnIndex) ? 1 : 0;
+  }
+  return Result;
+}
+
+extern "C" DWORD FEXNativeLoaderWaitForSingle(HANDLE Handle, DWORD Milliseconds, uint64_t Lr, uint64_t Sp) {
+  const auto Real = reinterpret_cast<WaitSingleFn>(__atomic_load_n(&FEXLoaderWatch[CalledEntries + WaitOne], __ATOMIC_ACQUIRE));
+  const int Slot = SlotOf(reinterpret_cast<uint64_t>(NtCurrentTeb()));
+  Created* Own = Slot >= 0 ? FindOwn(Slot, reinterpret_cast<uint64_t>(Handle)) : nullptr;
+  if (Own) {
+    ++Own->Waits;
+  }
+  const uint64_t Start = Now();
+  const DWORD Result = Real(Handle, Milliseconds);
+  const uint64_t End = Now();
+  if (Slot < 0) {
+    return Result;
+  }
+  std::scoped_lock Guard {Lock};
+  NoteCall(Current, WaitOne, End - Start, CallerOf(Lr, Sp), Result == WaitFailed);
+  ++Current.OneTimeouts[TimeoutBin(Milliseconds)];
+  Current.OneSignaled += Result == WaitObject0 ? 1 : 0;
+  Current.OneAbandoned += Result == WaitAbandoned0 ? 1 : 0;
+  Current.OneTimedOut += Result == WaitTimeout ? 1 : 0;
+  Current.OneLong += End - Start >= Freq / 200 ? 1 : 0;
+  if (Own) {
+    ++Current.OneOwn;
+    Current.OneOwnSignaled += Result == WaitObject0 ? 1 : 0;
+  } else {
+    // Handles that aren't new events of its own, by time waited on them.
+    WaitedHandle* Entry = nullptr;
+    for (auto& H : Current.OneHandles) {
+      if (H.Handle == reinterpret_cast<uint64_t>(Handle) || !H.Handle) {
+        Entry = &H;
+        break;
+      }
+    }
+    if (Entry) {
+      Entry->Handle = reinterpret_cast<uint64_t>(Handle);
+      ++Entry->Calls;
+      Entry->TimedOut += Result == WaitTimeout ? 1 : 0;
+      Entry->Ticks += End - Start;
+    } else {
+      ++Current.OneOtherHandles;
+    }
   }
   return Result;
 }

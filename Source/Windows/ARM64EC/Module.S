@@ -90,8 +90,8 @@ rumble_hit:
 rumble_done:
 
   // A call from one of the game's loader threads (its TEB in FEXLoaderWatch[1..4], see LoaderWatch.h) into CreateEventW,
-  // CloseHandle or WaitForMultipleObjects runs FEX's counting wrapper instead, which calls the one it was going to. Only
-  // x16 and x17, as above; [0] stays 0 until a loader thread is found.
+  // CloseHandle, WaitForMultipleObjects or WaitForSingleObject runs FEX's counting wrapper instead, which calls the one it
+  // was going to. Only x16 and x17, as above; [0] stays 0 until a loader thread is found.
   adrp x16, FEXLoaderWatch
   add x16, x16, #:lo12:FEXLoaderWatch
   ldr x17, [x16]
@@ -230,21 +230,38 @@ loader_watch_thread:
   ldr x17, [x16, #128]
   cmp x17, x9
   b.eq loader_watch_wait
+  ldr x17, [x16, #136]
+  cmp x17, x9
+  b.eq loader_watch_waitone
+  ldr x17, [x16, #144]
+  cmp x17, x9
+  b.eq loader_watch_waitone
+  ldr x17, [x16, #152]
+  cmp x17, x9
+  b.eq loader_watch_waitone
+  ldr x17, [x16, #160]
+  cmp x17, x9
+  b.eq loader_watch_waitone
   b loader_watch_done
 loader_watch_create:
-  str x9, [x16, #136] // FEXLoaderWatch[17]: the CreateEventW entry called
+  str x9, [x16, #168] // FEXLoaderWatch[21]: the CreateEventW entry called
   adrp x9, NativeLoaderCreateEventTarget
   add x9, x9, #:lo12:NativeLoaderCreateEventTarget
   b loader_watch_done
 loader_watch_close:
-  str x9, [x16, #144] // [18]: the CloseHandle entry
+  str x9, [x16, #176] // [22]: the CloseHandle entry
   adrp x9, NativeLoaderCloseHandleTarget
   add x9, x9, #:lo12:NativeLoaderCloseHandleTarget
   b loader_watch_done
 loader_watch_wait:
-  str x9, [x16, #152] // [19]: the WaitForMultipleObjects entry
+  str x9, [x16, #184] // [23]: the WaitForMultipleObjects entry
   adrp x9, NativeLoaderWaitTarget
   add x9, x9, #:lo12:NativeLoaderWaitTarget
+  b loader_watch_done
+loader_watch_waitone:
+  str x9, [x16, #192] // [24]: the WaitForSingleObject entry
+  adrp x9, NativeLoaderWaitOneTarget
+  add x9, x9, #:lo12:NativeLoaderWaitOneTarget
   b loader_watch_done
 
 .global ExitFunctionSuspendPoint
@@ -382,3 +399,4 @@ NATIVE_REDIRECT NativeRumble, #FEXNativeRumbleSetState
 NATIVE_REDIRECT NativeLoaderCreateEvent, #FEXNativeLoaderCreateEventW, "mov x4, x30; mov x5, sp"
 NATIVE_REDIRECT NativeLoaderCloseHandle, #FEXNativeLoaderCloseHandle, "mov x1, x30; mov x2, sp"
 NATIVE_REDIRECT NativeLoaderWait, #FEXNativeLoaderWaitForMultiple, "mov x4, x30; mov x5, sp"
+NATIVE_REDIRECT NativeLoaderWaitOne, #FEXNativeLoaderWaitForSingle, "mov x2, x30; mov x3, sp"
