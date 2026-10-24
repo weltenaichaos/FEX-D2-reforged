@@ -52,6 +52,13 @@ namespace {
     {"FEX_VKD3D_FOLD_CLEARS", "1"},
     {"FEX_VKD3D_PASSES", "1"},
     {"FEX_VKD3D_TIMELINE", "1"},
+    // Build 56: the build 55 log showed the frame cap sleeping ~32 ms in every vkQueuePresentKHR on vkd3d's queue thread,
+    // with the VkQueue the game's compute and copy queues share held all that time, and each frame waiting ~23 ms for the
+    // queue thread after the game was done with it. FEX's vkd3d-proton build sleeps the cap's wait out before the present
+    // without the VkQueue, and holds back the game's frame start by the waiting it measured, as far as the game's own
+    // slow frames allow (see EnvironmentVariablesHandling.h).
+    {"FEX_VKD3D_CAP_PRESLEEP", "1"},
+    {"FEX_VKD3D_FRAME_START", "1"},
   };
 
   // In the order the stats log lists them.
@@ -94,6 +101,8 @@ namespace {
     "FEX_VKD3D_FOLD_CLEARS",
     "FEX_VKD3D_PASSES",
     "FEX_VKD3D_TIMELINE",
+    "FEX_VKD3D_CAP_PRESLEEP",
+    "FEX_VKD3D_FRAME_START",
   };
 
   bool UseD2RDefaults {};

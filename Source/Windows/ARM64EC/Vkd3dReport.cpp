@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "Vkd3dReport.h"
+#include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/StatsLog.h"
 
 #include <FEXCore/fextl/fmt.h>
@@ -22,6 +23,7 @@ $end_info$
 #include <winnt.h>
 
 extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE Process, const void* Address, void* Buffer, SIZE_T Size, SIZE_T* BytesRead);
+extern "C" NTSTATUS WINAPI RtlQueryEnvironmentVariable_U(PWSTR Environment, PUNICODE_STRING Name, PUNICODE_STRING Value);
 
 namespace Vkd3dReport {
 namespace {
@@ -36,6 +38,8 @@ namespace {
   constexpr size_t TextSize = 4096;
   constexpr uint32_t FlagOn = 0x1;
   constexpr uint32_t FlagFoldClears = 0x2;
+  constexpr uint32_t FlagFrameStart = 0x4;
+  constexpr uint32_t FlagCapPresleep = 0x8;
   constexpr uint32_t FlagDevice = 0x80000000u;
 
   struct Source {
@@ -76,6 +80,71 @@ namespace {
     ANSI_STRING Text {static_cast<USHORT>(strlen(Name)), static_cast<USHORT>(strlen(Name) + 1), const_cast<char*>(Name)};
     void* Address {};
     return LdrGetProcedureAddress(reinterpret_cast<HMODULE>(Module), &Text, 0, &Address) == STATUS_SUCCESS ? reinterpret_cast<uint64_t>(Address) : 0;
+  }
+
+  // GameNative's FPS limit: when its Lossless Scaling Vulkan layer (liblsfg-vk-layer.so) is armed, the layer paces each
+  // vkQueuePresentKHR to fps_limit from its conf.toml (environment variable LSFG_CONFIG). Says whether the layer is mapped
+  // into the process and what its config caps, once.
+  fextl::string CapLayerNote() {
+    namespace Linux = FEX::Windows::Linux;
+    fextl::string Maps;
+    const int Fd = Linux::Open("/proc/self/maps");
+    if (Fd >= 0) {
+      static char Chunk[65536];
+      for (uint64_t Offset = 0; Offset < (64ull << 20);) {
+        const int64_t Len = Linux::Pread(Fd, Chunk, sizeof(Chunk), Offset);
+        if (Len <= 0) {
+          break;
+        }
+        Maps.append(Chunk, Len);
+        Offset += Len;
+      }
+      Linux::Close(Fd);
+    }
+    fextl::string Layer;
+    const size_t At = Maps.find("lsfg");
+    if (At != fextl::string::npos) {
+      const size_t Space = Maps.rfind(' ', At);
+      const size_t Begin = Space == fextl::string::npos ? At : Space + 1;
+      const size_t End = Maps.find('\n', At);
+      Layer = Maps.substr(Begin, End == fextl::string::npos ? fextl::string::npos : End - Begin);
+    }
+
+    static constexpr wchar_t NameText[] = L"LSFG_CONFIG";
+    UNICODE_STRING Name {sizeof(NameText) - sizeof(wchar_t), sizeof(NameText), const_cast<wchar_t*>(NameText)};
+    wchar_t Value[512];
+    UNICODE_STRING ValueText {0, sizeof(Value) - sizeof(wchar_t), Value};
+    fextl::string Config;
+    fextl::string Caps;
+    if (RtlQueryEnvironmentVariable_U(nullptr, &Name, &ValueText) == STATUS_SUCCESS) {
+      for (size_t i = 0; i < ValueText.Length / sizeof(wchar_t); ++i) {
+        Config += Value[i] < 0x80 ? static_cast<char>(Value[i]) : '?';
+      }
+      static char Text[8192];
+      if (Linux::ReadSmallFile(Config.c_str(), Text, sizeof(Text)) > 0) {
+        std::string_view All {Text};
+        while (!All.empty()) {
+          const size_t End = All.find('\n');
+          std::string_view Line = All.substr(0, End);
+          All = End == std::string_view::npos ? std::string_view {} : All.substr(End + 1);
+          while (!Line.empty() && (Line.front() == ' ' || Line.front() == '\t')) {
+            Line.remove_prefix(1);
+          }
+          if (Line.starts_with("fps_limit") || Line.starts_with("multiplier") || Line.starts_with("[")) {
+            Caps += Caps.empty() ? "" : ", ";
+            Caps.append(Line.data(), std::min<size_t>(Line.size(), 80));
+          }
+        }
+      } else {
+        Caps = "can't be read";
+      }
+    }
+
+    if (Layer.empty() && Config.empty()) {
+      return "# cap: GameNative's frame cap layer isn't loaded (no lsfg mapping, no LSFG_CONFIG)\n";
+    }
+    return fextl::fmt::format("# cap: GameNative's frame cap layer {} ({}); LSFG_CONFIG {}: {}\n", Layer.empty() ? "isn't mapped" : "is loaded",
+                              Layer.empty() ? "-" : Layer, Config.empty() ? "-" : Config, Caps.empty() ? "-" : Caps);
   }
 
   enum class ReadResult { Gone, Unchanged, New };
@@ -190,12 +259,12 @@ namespace {
     const uint32_t PresentFlags = Sources[Present].Flags;
     if (!Announced && (PassFlags & FlagDevice) && (!Sources[Present].Address || (PresentFlags & FlagDevice))) {
       Announced = true;
+      const char* PresentState = !Sources[Present].Address ? "missing" : PresentFlags & FlagOn ? "on" : "off";
       Out.insert(0, fextl::fmt::format("# vkd3d: FEX's VKD3D build is loaded (d3d12core.dll at {:X}): clear folding {}, "
-                                       "GPU pass meter {}, present timeline {}\n",
-                                       ModuleAddress, PassFlags & FlagFoldClears ? "on" : "off", PassFlags & FlagOn ? "on" : "off",
-                                       !Sources[Present].Address ? "missing" :
-                                       PresentFlags & FlagOn     ? "on" :
-                                                                   "off"));
+                                       "GPU pass meter {}, present timeline {}, cap pre-sleep {}, frame start pacing {}\n",
+                                       ModuleAddress, PassFlags & FlagFoldClears ? "on" : "off", PassFlags & FlagOn ? "on" : "off", PresentState,
+                                       PresentFlags & FlagCapPresleep ? "on" : "off", PresentFlags & FlagFrameStart ? "on" : "off"));
+      Out += CapLayerNote();
     }
     return Out;
   }

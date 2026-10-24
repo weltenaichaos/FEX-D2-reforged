@@ -22,8 +22,8 @@ on:
 env:
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
   VKD3D_TAG: v3.0b
-  WCP_VERSION: 3.0b-arm64ec-fex1
-  WCP_VERSION_CODE: 2
+  WCP_VERSION: 3.0b-arm64ec-fex2
+  WCP_VERSION_CODE: 3
 
 jobs:
   build:
@@ -124,7 +124,7 @@ jobs:
             "type": "VKD3D",
             "versionName": "${WCP_VERSION}",
             "versionCode": ${WCP_VERSION_CODE},
-            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline). Build from ${GITHUB_SHA}.",
+            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline, cap pre-sleep, frame start pacing). Build from ${GITHUB_SHA}.",
             "files": [
               {"source": "system32/d3d12.dll",     "target": "\${system32}/d3d12.dll"},
               {"source": "system32/d3d12core.dll", "target": "\${system32}/d3d12core.dll"},
@@ -154,7 +154,8 @@ jobs:
           body: |
             vkd3d-proton ${{ env.VKD3D_TAG }} compiled as ARM64EC, so D3D12 translation runs
             natively instead of through FEX, with this repo's vkd3d-patches: full clears folded
-            into the next render pass, a GPU pass meter and a present timeline for FEX's stats log
+            into the next render pass, a GPU pass meter and a present timeline for FEX's stats log,
+            a frame cap's wait slept out without holding the VkQueue, and frame start pacing
             (all off unless FEX's switches set their variables). Install in GameNative as a VKD3D
             content profile; it appears as `${{ env.WCP_VERSION }}`.
         env:

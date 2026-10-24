@@ -6,7 +6,9 @@
 // vkd3d_fex_present_report (each frame's way from the game's Present() to the window system and the queue threads' time,
 // FEX_VKD3D_TIMELINE). With the stats log on, their lines go into every per-second block ('gpu ...', 'present ...',
 // 'queue ...'); their '#' notes (driver, swapchain setup) are printed once each. Once the game has loaded d3d12core.dll,
-// a note says whether it is FEX's build and which of its features are on.
+// a note says whether it is FEX's build and which of its features are on, and a '# cap' note whether GameNative's frame
+// cap layer (liblsfg-vk-layer.so, which sleeps in vkQueuePresentKHR) is loaded and what its config caps. Build 56 adds
+// the 'frame start' (frame start pacing) and 'cap' (cap pre-sleep) lines.
 namespace Vkd3dReport {
 // Call on the process's first thread, in process init, when the stats log is on.
 void Init();

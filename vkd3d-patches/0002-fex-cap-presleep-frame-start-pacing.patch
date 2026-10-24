@@ -1,0 +1,1086 @@
+From 7d4631aab984ddfb1f6e8f30aba8c87c20397c66 Mon Sep 17 00:00:00 2001
+From: FEX-D2-reforged <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 00:01:51 +0000
+Subject: [PATCH] FEX: cap pre-sleep and frame start pacing
+
+Cap pre-sleep (VKD3D_FEX_PRESENT_PRESLEEP=1): a frame cap that sleeps
+inside vkQueuePresentKHR (GameNative's FPS limit in its Vulkan layer)
+sleeps while vkd3d holds the VkQueue that the game's compute and copy
+queues share. Once presents are held at a steady period, sleep until
+4 ms before the cap's next due time without the VkQueue.
+
+Frame start pacing (VKD3D_FEX_FRAME_START=1): hold back the release of
+the game's frame latency handle by the time its frames were measured to
+wait anyway (queue thread wait plus the cap's hold, as far as the GPU
+was done), minus a margin that grows when a frame comes late.
+
+Both report into the FEX present timeline ('frame start', 'cap' lines).
+---
+ libs/vkd3d/fex_timeline.c  |  96 +++++-
+ libs/vkd3d/swapchain.c     | 649 ++++++++++++++++++++++++++++++++++---
+ libs/vkd3d/vkd3d_private.h |  15 +
+ 3 files changed, 710 insertions(+), 50 deletions(-)
+
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index 7a92722..4d724e8 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -24,6 +24,8 @@
+ struct vkd3d_fex_report vkd3d_fex_present_report = { 0x54584546u /* 'FEXT' */, 1u, 0u, 0u, { 0 } };
+ 
+ bool vkd3d_fex_timeline_on;
++bool vkd3d_fex_frame_start_on;
++bool vkd3d_fex_present_presleep_on;
+ 
+ struct fex_timeline_stat
+ {
+@@ -47,6 +49,14 @@ static struct
+     struct fex_timeline_queue queues[FEX_TIMELINE_MAX_QUEUES];
+     uint32_t presents, last_sync_interval, max_queued;
+     char config[FEX_TIMELINE_CONFIG_SIZE];
++    /* frame start pacing */
++    uint32_t pacing_frames, pacing_late;
++    uint64_t pacing_delay_ns, pacing_margin_ns;
++    int64_t pacing_spare_min_ns;
++    /* cap pre-sleep */
++    uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored;
++    bool cap_active;
++    uint64_t cap_step_ns, cap_guard_ns;
+ } fex_timeline;
+ 
+ static UINT64 fex_timeline_last_publish_ns;
+@@ -64,6 +74,10 @@ static const char *const fex_step_names[VKD3D_FEX_STEP_COUNT] =
+     "limiter",
+     "Present->gpu done",
+     "release->next Present",
++    "start delay",
++    "spare",
++    "start->shown",
++    "pre-sleep",
+ };
+ 
+ static const char *const fex_op_names[VKD3D_FEX_QOP_COUNT] =
+@@ -93,12 +107,21 @@ void vkd3d_fex_timeline_init(void)
+ 
+     spinlock_init(&fex_timeline.lock);
+     vkd3d_fex_timeline_on = vkd3d_get_env_var("VKD3D_FEX_TIMELINE", env, sizeof(env)) && !strcmp(env, "1");
++    vkd3d_fex_frame_start_on = vkd3d_get_env_var("VKD3D_FEX_FRAME_START", env, sizeof(env)) && !strcmp(env, "1");
++    vkd3d_fex_present_presleep_on = vkd3d_get_env_var("VKD3D_FEX_PRESENT_PRESLEEP", env, sizeof(env)) &&
++            !strcmp(env, "1");
+     vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_present_report.flags, VKD3D_FEX_REPORT_FLAG_DEVICE |
+-            (vkd3d_fex_timeline_on ? VKD3D_FEX_REPORT_FLAG_ON : 0), vkd3d_memory_order_release);
++            (vkd3d_fex_timeline_on ? VKD3D_FEX_REPORT_FLAG_ON : 0) |
++            (vkd3d_fex_frame_start_on ? VKD3D_FEX_REPORT_FLAG_FRAME_START : 0) |
++            (vkd3d_fex_present_presleep_on ? VKD3D_FEX_REPORT_FLAG_PRESLEEP : 0), vkd3d_memory_order_release);
+     vkd3d_atomic_uint64_store_explicit(&fex_timeline_last_publish_ns, vkd3d_get_current_time_ns(),
+             vkd3d_memory_order_relaxed);
+     if (vkd3d_fex_timeline_on)
+         INFO("FEX timeline on.\n");
++    if (vkd3d_fex_frame_start_on)
++        INFO("FEX frame start pacing on.\n");
++    if (vkd3d_fex_present_presleep_on)
++        INFO("FEX cap pre-sleep on.\n");
+ }
+ 
+ uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type)
+@@ -174,6 +197,42 @@ void vkd3d_fex_timeline_present(uint32_t sync_interval, uint32_t queued)
+     spinlock_release(&fex_timeline.lock);
+ }
+ 
++void vkd3d_fex_timeline_cap(bool presleep, bool held_long, bool not_held, bool anchored, bool active, uint64_t step_ns,
++        uint64_t guard_ns)
++{
++    if (!vkd3d_fex_timeline_on)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    fex_timeline.cap_presents++;
++    if (presleep)
++        fex_timeline.cap_presleeps++;
++    if (held_long)
++        fex_timeline.cap_held_long++;
++    if (not_held)
++        fex_timeline.cap_not_held++;
++    if (anchored)
++        fex_timeline.cap_anchored++;
++    fex_timeline.cap_active = active;
++    fex_timeline.cap_step_ns = step_ns;
++    fex_timeline.cap_guard_ns = guard_ns;
++    spinlock_release(&fex_timeline.lock);
++}
++
++void vkd3d_fex_timeline_pacing(uint64_t delay_ns, uint64_t margin_ns, int64_t spare_ns, bool late)
++{
++    if (!vkd3d_fex_timeline_on)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    if (!fex_timeline.pacing_frames || spare_ns < fex_timeline.pacing_spare_min_ns)
++        fex_timeline.pacing_spare_min_ns = spare_ns;
++    fex_timeline.pacing_frames++;
++    fex_timeline.pacing_delay_ns = delay_ns;
++    fex_timeline.pacing_margin_ns = margin_ns;
++    if (late)
++        fex_timeline.pacing_late++;
++    spinlock_release(&fex_timeline.lock);
++}
++
+ void vkd3d_fex_timeline_release(uint64_t now_ns)
+ {
+     vkd3d_atomic_uint64_store_explicit(&fex_timeline_last_release_ns, now_ns, vkd3d_memory_order_relaxed);
+@@ -220,6 +279,11 @@ static void fex_timeline_publish(double seconds)
+     struct fex_timeline_queue queues[FEX_TIMELINE_MAX_QUEUES];
+     char config[FEX_TIMELINE_CONFIG_SIZE];
+     uint32_t presents, sync_interval, max_queued;
++    uint32_t pacing_frames, pacing_late;
++    uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored;
++    uint64_t pacing_delay_ns, pacing_margin_ns, cap_step_ns, cap_guard_ns;
++    int64_t pacing_spare_min_ns;
++    bool cap_active;
+     size_t len = 0;
+     uint32_t i, j;
+ 
+@@ -239,6 +303,26 @@ static void fex_timeline_publish(double seconds)
+     }
+     fex_timeline.presents = 0;
+     fex_timeline.max_queued = 0;
++    pacing_frames = fex_timeline.pacing_frames;
++    pacing_late = fex_timeline.pacing_late;
++    pacing_delay_ns = fex_timeline.pacing_delay_ns;
++    pacing_margin_ns = fex_timeline.pacing_margin_ns;
++    pacing_spare_min_ns = fex_timeline.pacing_spare_min_ns;
++    fex_timeline.pacing_frames = 0;
++    fex_timeline.pacing_late = 0;
++    cap_presents = fex_timeline.cap_presents;
++    cap_presleeps = fex_timeline.cap_presleeps;
++    cap_held_long = fex_timeline.cap_held_long;
++    cap_not_held = fex_timeline.cap_not_held;
++    cap_anchored = fex_timeline.cap_anchored;
++    cap_active = fex_timeline.cap_active;
++    cap_step_ns = fex_timeline.cap_step_ns;
++    cap_guard_ns = fex_timeline.cap_guard_ns;
++    fex_timeline.cap_presents = 0;
++    fex_timeline.cap_presleeps = 0;
++    fex_timeline.cap_held_long = 0;
++    fex_timeline.cap_not_held = 0;
++    fex_timeline.cap_anchored = 0;
+     spinlock_release(&fex_timeline.lock);
+ 
+     if (config[0])
+@@ -250,6 +334,16 @@ static void fex_timeline_publish(double seconds)
+         len = fex_timeline_format_stat(text, sizeof(text), len, fex_step_names[i], &steps[i]);
+     len = vkd3d_fex_report_append(text, sizeof(text), len, " over %.2fs\n", seconds);
+ 
++    if (pacing_frames)
++        len = vkd3d_fex_report_append(text, sizeof(text), len,
++                "  frame start n=%u | held back now %.1f ms (margin %.0f ms) | spare min %.1f ms | late %u\n",
++                pacing_frames, pacing_delay_ns / 1e6, pacing_margin_ns / 1e6, pacing_spare_min_ns / 1e6, pacing_late);
++    if (cap_presents)
++        len = vkd3d_fex_report_append(text, sizeof(text), len,
++                "  cap n=%u | pre-slept %u | held 3ms+ in vkQueuePresentKHR %u (grid measured %u) | not held %u | pre-sleep %s,"
++                " period %.2f ms, guard %.1f ms\n", cap_presents, cap_presleeps, cap_held_long, cap_anchored, cap_not_held,
++                cap_active ? "on" : "waiting", cap_step_ns / 1e6, cap_guard_ns / 1e6);
++
+     for (i = 0; i < FEX_TIMELINE_MAX_QUEUES; i++)
+     {
+         const struct fex_timeline_queue *q = &queues[i];
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 91e697c..05ec1d4 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -63,6 +63,19 @@ struct anti_lag_state
+     uint32_t max_fps;
+ };
+ 
++/* FEX timeline and frame start pacing: one frame's way from the game's Present() to the screen. */
++struct fex_frame_times
++{
++    uint64_t call_ns;     /* the game called Present() */
++    uint64_t start_ns;    /* the frame latency release before that Present(): when the game started the frame */
++    uint64_t delay_ns;    /* how long frame start pacing held that release back */
++    uint64_t pickup_ns;   /* the queue thread started this present */
++    uint64_t hold_start_ns; /* the queue thread was ready to present (before the cap pre-sleep, if any) */
++    uint64_t qp_start_ns; /* vkQueuePresentKHR was called */
++    uint64_t qp_end_ns;   /* vkQueuePresentKHR returned */
++    uint64_t blit_value;  /* internal blit timeline value signalled by this frame's copy into the swapchain image */
++};
++
+ struct dxgi_vk_swap_chain_present_request
+ {
+     uint64_t begin_frame_time_ns;
+@@ -80,7 +93,7 @@ struct dxgi_vk_swap_chain_present_request
+     };
+     bool low_latency_update_requested;
+     bool modifies_hdr_metadata;
+-    uint64_t fex_call_ns; /* FEX timeline: when the game called Present() */
++    struct fex_frame_times fex; /* call_ns, start_ns and delay_ns are set in Present() */
+ };
+ 
+ struct present_wait_entry
+@@ -88,7 +101,7 @@ struct present_wait_entry
+     uint64_t id;
+     uint64_t present_count;
+     uint64_t begin_frame_time_ns;
+-    uint64_t fex_call_ns;
++    struct fex_frame_times fex;
+ };
+ 
+ #if defined(_WIN32)
+@@ -198,6 +211,30 @@ struct dxgi_vk_swap_chain
+         uint64_t low_latency_sem_value;
+ 
+         struct low_latency_state low_latency_state;
++
++        /* FEX: times of the present the queue thread is working on. */
++        struct fex_frame_times fex;
++
++        /* FEX cap pre-sleep (VKD3D_FEX_PRESENT_PRESLEEP=1), queue thread only. A frame cap that sleeps inside
++         * vkQueuePresentKHR (GameNative's FPS limit in its Vulkan layer does) sleeps while vkd3d holds the VkQueue,
++         * which the game's compute and copy queues share: their submits wait up to a whole frame. Once presents are
++         * seen held at a steady period, vkd3d sleeps until just before the cap's next due time without holding the
++         * VkQueue, so the cap only sleeps the last moment. */
++        struct
++        {
++            bool active;
++            bool last_held_long;
++            uint32_t start_count;   /* long holds in a row, before pre-sleeping starts */
++            uint32_t late_count;    /* presents in a row the cap didn't hold at all, while pre-sleeping */
++            uint32_t since_anchor;  /* presents since the grid was last measured again */
++            uint32_t anchor_left;   /* presents left without pre-sleep to measure the grid again */
++            uint64_t due_ns;        /* when the last present came out, or would have on the cap's grid */
++            uint64_t last_end_ns;
++            uint64_t step_ns;       /* the cap's period: median of the last intervals between held presents */
++            uint64_t intervals_ns[15];
++            uint32_t interval_pos;
++            uint32_t interval_count;
++        } fex_presleep;
+     } present;
+ 
+     struct dxgi_vk_swap_chain_present_request request, request_ring[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+@@ -257,6 +294,53 @@ struct dxgi_vk_swap_chain
+         bool supports_present_wait;
+         bool skip_waits;
+     } wait_thread;
++
++    /* FEX frame start pacing (VKD3D_FEX_FRAME_START=1). When something after vkd3d holds each frame back (a frame
++     * limiter sleeping in vkQueuePresentKHR, a queue thread still busy with the last present), the game's frames wait
++     * for it after the game is done with them, and the game reads input that much earlier than needed. The wait
++     * worker measures per frame how much later the frame could have started without reaching the screen later (time
++     * its present waited for the queue thread, plus the smaller of the time vkQueuePresentKHR held it and the time
++     * the GPU finished the frame before vkQueuePresentKHR returned), and holds back the game's frame latency release
++     * by the smallest of that over the last frames minus a margin. A separate thread does the held-back releases, so
++     * the wait worker keeps timing presents. */
++    struct
++    {
++        bool enable;
++        bool thread_started;
++        pthread_t thread;
++        pthread_mutex_t lock;
++        pthread_cond_t cond;
++        bool locks_initialized;
++        uint64_t release_ns[16];   /* when to release */
++        uint64_t release_base_ns[16]; /* when the release would have happened without pacing */
++        uint32_t head;
++        uint32_t count;
++        bool stop;
++        uint64_t last_scheduled_ns;
++
++        /* GPU watcher thread: notes when each frame's copy into the swapchain image finished on the GPU. The wait
++         * worker only sees a frame after vkQueuePresentKHR returned, too late to tell how much earlier the GPU was done. */
++        bool gpu_thread_started;
++        pthread_t gpu_thread;
++        pthread_mutex_t gpu_lock;
++        pthread_cond_t gpu_cond;
++        uint64_t gpu_target;
++        bool gpu_stop;
++        uint64_t gpu_done_value[16];
++        uint64_t gpu_done_ns[16];
++
++        /* Wait worker only. */
++        uint64_t margin_ns;     /* kept free below the smallest spare time; grows when frames come late */
++        uint32_t quiet_frames;  /* frames since the last late one or the last margin shrink */
++        uint64_t delay_ns;
++        int64_t spare_ns[64];
++        uint32_t spare_pos;
++        uint32_t spare_count;
++        uint32_t calm_frames;
++
++        /* Written by the release thread, read in Present(). */
++        UINT64 last_release_delay_ns;
++    } fex_start;
+ };
+ 
+ static void dxgi_vk_swap_chain_drain_internal_blit_semaphore(struct dxgi_vk_swap_chain *chain, uint64_t value);
+@@ -405,7 +489,7 @@ static void dxgi_vk_swap_chain_drain_queue(struct dxgi_vk_swap_chain *chain)
+ }
+ 
+ static void dxgi_vk_swap_chain_push_present_id(struct dxgi_vk_swap_chain *chain,
+-        uint64_t present_count, uint64_t present_id, uint64_t begin_frame_time_ns, uint64_t fex_call_ns)
++        uint64_t present_count, uint64_t present_id, uint64_t begin_frame_time_ns, const struct fex_frame_times *fex)
+ {
+     struct present_wait_entry *entry;
+     pthread_mutex_lock(&chain->wait_thread.lock);
+@@ -415,7 +499,10 @@ static void dxgi_vk_swap_chain_push_present_id(struct dxgi_vk_swap_chain *chain,
+     entry->id = present_id;
+     entry->present_count = present_count;
+     entry->begin_frame_time_ns = begin_frame_time_ns;
+-    entry->fex_call_ns = fex_call_ns;
++    if (fex)
++        entry->fex = *fex;
++    else
++        memset(&entry->fex, 0, sizeof(entry->fex));
+     pthread_cond_signal(&chain->wait_thread.cond);
+     pthread_mutex_unlock(&chain->wait_thread.lock);
+ }
+@@ -438,11 +525,40 @@ static void dxgi_vk_swap_chain_cleanup_low_latency(struct dxgi_vk_swap_chain *ch
+ 
+ static void dxgi_vk_swap_chain_cleanup_waiter_thread(struct dxgi_vk_swap_chain *chain)
+ {
+-    dxgi_vk_swap_chain_push_present_id(chain, 0, 0, 0, 0);
++    dxgi_vk_swap_chain_push_present_id(chain, 0, 0, 0, NULL);
+     pthread_join(chain->wait_thread.thread, NULL);
+     pthread_mutex_destroy(&chain->wait_thread.lock);
+     pthread_cond_destroy(&chain->wait_thread.cond);
+     vkd3d_free(chain->wait_thread.wait_queue);
++
++    /* Frame start pacing: the release thread hands out what is still held back right away, then exits. */
++    if (chain->fex_start.locks_initialized)
++    {
++        if (chain->fex_start.thread_started)
++        {
++            pthread_mutex_lock(&chain->fex_start.lock);
++            chain->fex_start.stop = true;
++            pthread_cond_signal(&chain->fex_start.cond);
++            pthread_mutex_unlock(&chain->fex_start.lock);
++            pthread_join(chain->fex_start.thread, NULL);
++            chain->fex_start.thread_started = false;
++        }
++        if (chain->fex_start.gpu_thread_started)
++        {
++            pthread_mutex_lock(&chain->fex_start.gpu_lock);
++            chain->fex_start.gpu_stop = true;
++            pthread_cond_signal(&chain->fex_start.gpu_cond);
++            pthread_mutex_unlock(&chain->fex_start.gpu_lock);
++            pthread_join(chain->fex_start.gpu_thread, NULL);
++            chain->fex_start.gpu_thread_started = false;
++        }
++        pthread_mutex_destroy(&chain->fex_start.lock);
++        pthread_cond_destroy(&chain->fex_start.cond);
++        pthread_mutex_destroy(&chain->fex_start.gpu_lock);
++        pthread_cond_destroy(&chain->fex_start.gpu_cond);
++        chain->fex_start.locks_initialized = false;
++        chain->fex_start.enable = false;
++    }
+ }
+ 
+ static void dxgi_vk_swap_chain_cleanup_surface(struct dxgi_vk_swap_chain *chain)
+@@ -1024,7 +1140,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     struct dxgi_vk_swap_chain_present_request *request;
+     struct vkd3d_queue_timeline_trace_cookie cookie;
+-    uint64_t fex_call_ns = 0, fex_release_ns;
++    struct fex_frame_times fex_times;
+     bool low_latency_enable;
+ 
+     TRACE("iface %p, SyncInterval %u, PresentFlags #%x, pPresentParameters %p.\n",
+@@ -1036,13 +1152,19 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     if (PresentFlags & DXGI_PRESENT_TEST)
+         return S_OK;
+ 
+-    if (vkd3d_fex_timeline_on)
++    memset(&fex_times, 0, sizeof(fex_times));
++    if (vkd3d_fex_timeline_on || chain->fex_start.enable)
+     {
+-        /* Time the game spent on this frame since the last frame latency release. */
+-        fex_call_ns = vkd3d_get_current_time_ns();
+-        fex_release_ns = vkd3d_fex_timeline_last_release();
+-        if (fex_release_ns && fex_call_ns > fex_release_ns && fex_call_ns - fex_release_ns < 1000000000ull)
+-            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_GAME, fex_call_ns - fex_release_ns);
++        /* The frame started at the last frame latency release (the game waits on it before a frame). */
++        fex_times.call_ns = vkd3d_get_current_time_ns();
++        fex_times.start_ns = vkd3d_fex_timeline_last_release();
++        if (!fex_times.start_ns || fex_times.call_ns <= fex_times.start_ns ||
++                fex_times.call_ns - fex_times.start_ns >= 1000000000ull)
++            fex_times.start_ns = 0;
++        fex_times.delay_ns = vkd3d_atomic_uint64_load_explicit(&chain->fex_start.last_release_delay_ns,
++                vkd3d_memory_order_relaxed);
++        if (vkd3d_fex_timeline_on && fex_times.start_ns)
++            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_GAME, fex_times.call_ns - fex_times.start_ns);
+     }
+ 
+     /* If we missed the event signal last frame, we have to wait for it now.
+@@ -1072,7 +1194,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     request->begin_frame_time_ns = chain->user.begin_frame_time_ns;
+     request->low_latency_frame_id = vkd3d_atomic_uint64_load_explicit(
+             &chain->queue->device->frame_markers.present, vkd3d_memory_order_acquire);
+-    request->fex_call_ns = fex_call_ns;
++    request->fex = fex_times;
+ 
+     if (chain->debug_latency && request->low_latency_frame_id)
+         INFO("Presenting with low latency frame ID: %"PRIu64".\n", request->low_latency_frame_id);
+@@ -1148,9 +1270,9 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     vkd3d_queue_timeline_trace_complete_present_block(
+             &chain->queue->device->queue_timeline_trace, cookie);
+ 
+-    if (fex_call_ns)
++    if (vkd3d_fex_timeline_on && fex_times.call_ns)
+     {
+-        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_PRESENT_CALL, vkd3d_get_current_time_ns() - fex_call_ns);
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_PRESENT_CALL, vkd3d_get_current_time_ns() - fex_times.call_ns);
+         vkd3d_fex_timeline_present(SyncInterval, (uint32_t)(chain->user.present_count -
+                 vkd3d_atomic_uint64_load_explicit(&chain->present.present_count, vkd3d_memory_order_acquire)));
+     }
+@@ -1828,14 +1950,17 @@ static const char *fex_present_mode_name(VkPresentModeKHR mode)
+ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const VkSwapchainCreateInfoKHR *info)
+ {
+     uint64_t target_interval_ns = chain->frame_rate_limit.target_interval_ns;
+-    char text[384];
++    struct vkd3d_queue_family_info *const *families = chain->queue->device->queue_families;
++    char text[512];
+ 
+     if (!vkd3d_fex_timeline_on)
+         return;
+ 
+     snprintf(text, sizeof(text), "swapchain %ux%u, %u images (asked %u, game BufferCount %u), mode %s%s%s,"
+             " SyncInterval %u, present wait %s, game latency handle %s (max latency %u), internal latency %u,"
+-            " vkd3d limiter %.1f fps",
++            " vkd3d limiter %.1f fps, frame start pacing %s, cap pre-sleep %s, VkQueues: graphics family %u x%u,"
++            " compute family %u x%u,"
++            " copy family %u x%u",
+             info->imageExtent.width, info->imageExtent.height, chain->present.backbuffer_count, info->minImageCount,
+             chain->desc.BufferCount, fex_present_mode_name(info->presentMode),
+             chain->present.compatible_unlocked_present_mode ? " switchable to " : "",
+@@ -1844,7 +1969,12 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+             chain->request.swap_interval, chain->wait_thread.supports_present_wait ? "yes" : "no",
+             (chain->desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) ? "yes" : "no",
+             chain->frame_latency, chain->frame_latency_internal,
+-            target_interval_ns ? 1e9 / (double)target_interval_ns : 0.0);
++            target_interval_ns ? 1e9 / (double)target_interval_ns : 0.0,
++            chain->fex_start.enable ? "on" : vkd3d_fex_frame_start_on ? "off (no game latency handle)" : "off",
++            vkd3d_fex_present_presleep_on ? "on" : "off",
++            families[VKD3D_QUEUE_FAMILY_GRAPHICS]->vk_family_index, families[VKD3D_QUEUE_FAMILY_GRAPHICS]->queue_count,
++            families[VKD3D_QUEUE_FAMILY_COMPUTE]->vk_family_index, families[VKD3D_QUEUE_FAMILY_COMPUTE]->queue_count,
++            families[VKD3D_QUEUE_FAMILY_TRANSFER]->vk_family_index, families[VKD3D_QUEUE_FAMILY_TRANSFER]->queue_count);
+     vkd3d_fex_timeline_config(text);
+ }
+ 
+@@ -2457,6 +2587,142 @@ static VkResult dxgi_vk_swap_chain_try_acquire_next_image(struct dxgi_vk_swap_ch
+     return vr;
+ }
+ 
++static void dxgi_vk_swap_chain_platform_sleep_for_ns(struct platform_sleep_state *sleep_state, uint64_t duration_ns);
++
++#define FEX_PRESLEEP_GUARD_NS 4000000ull     /* wake this long before the cap's next due time */
++#define FEX_PRESLEEP_HELD_NS 300000ull       /* vkQueuePresentKHR took at least this long: the cap held the present */
++#define FEX_PRESLEEP_LONG_NS 3000000ull      /* the cap held the present this long: it came out at the cap's due time */
++#define FEX_PRESLEEP_START_COUNT 8u          /* long holds in a row before pre-sleeping starts */
++#define FEX_PRESLEEP_LATE_COUNT 4u           /* stop after this many presents in a row the cap didn't hold */
++#define FEX_PRESLEEP_ANCHOR_EVERY 150u       /* every this many presents, ... */
++#define FEX_PRESLEEP_ANCHOR_COUNT 2u         /* ... this many go without pre-sleep to measure the cap's grid again */
++
++/* Cap pre-sleep: sleeps, without holding the VkQueue, until shortly before the cap's next due time. Returns whether
++ * it slept. */
++static bool dxgi_vk_swap_chain_fex_presleep(struct dxgi_vk_swap_chain *chain)
++{
++    uint64_t now_ns, wake_ns;
++
++    if (!chain->present.fex_presleep.active || chain->present.fex_presleep.anchor_left)
++        return false;
++
++    wake_ns = chain->present.fex_presleep.due_ns + chain->present.fex_presleep.step_ns - FEX_PRESLEEP_GUARD_NS;
++    now_ns = vkd3d_get_current_time_ns();
++    if (wake_ns <= now_ns || wake_ns - now_ns >= chain->present.fex_presleep.step_ns)
++        return false;
++
++    dxgi_vk_swap_chain_platform_sleep_for_ns(&chain->frame_rate_limit.sleep_state, wake_ns - now_ns);
++    return true;
++}
++
++/* Cap pre-sleep: learns the cap's period and grid from presents it held long (those come out at the cap's due time
++ * plus the real present's own time). While pre-sleeping, the expected time only moves along that grid or earlier,
++ * never later, so waking late can't add up; every few seconds two presents go without pre-sleep to measure the grid
++ * again. */
++static void dxgi_vk_swap_chain_fex_presleep_note(struct dxgi_vk_swap_chain *chain, bool slept,
++        uint64_t start_ns, uint64_t end_ns)
++{
++    uint64_t held_ns = end_ns - start_ns, interval_ns, expected_ns, sorted[15], v;
++    bool held = held_ns >= FEX_PRESLEEP_HELD_NS, held_long = held_ns >= FEX_PRESLEEP_LONG_NS, anchored = false;
++    uint32_t i, j, n;
++
++    /* Two long holds in a row, neither pre-slept: the cap's period. A pre-slept present's end depends on when the
++     * pre-sleep woke, not only on the cap. */
++    if (held_long && !slept && chain->present.fex_presleep.last_held_long && chain->present.fex_presleep.last_end_ns)
++    {
++        interval_ns = end_ns - chain->present.fex_presleep.last_end_ns;
++        if (interval_ns >= 5000000ull && interval_ns <= 250000000ull)
++        {
++            chain->present.fex_presleep.intervals_ns[chain->present.fex_presleep.interval_pos] = interval_ns;
++            chain->present.fex_presleep.interval_pos = (chain->present.fex_presleep.interval_pos + 1) %
++                    ARRAY_SIZE(chain->present.fex_presleep.intervals_ns);
++            if (chain->present.fex_presleep.interval_count < ARRAY_SIZE(chain->present.fex_presleep.intervals_ns))
++                chain->present.fex_presleep.interval_count++;
++
++            n = chain->present.fex_presleep.interval_count;
++            if (n >= 5)
++            {
++                for (i = 0; i < n; i++)
++                {
++                    v = chain->present.fex_presleep.intervals_ns[i];
++                    for (j = i; j > 0 && sorted[j - 1] > v; j--)
++                        sorted[j] = sorted[j - 1];
++                    sorted[j] = v;
++                }
++                chain->present.fex_presleep.step_ns = sorted[n / 2];
++            }
++        }
++    }
++
++    if (!chain->present.fex_presleep.active)
++    {
++        if (held_long)
++        {
++            chain->present.fex_presleep.due_ns = end_ns;
++            anchored = true;
++            if (++chain->present.fex_presleep.start_count >= FEX_PRESLEEP_START_COUNT &&
++                    chain->present.fex_presleep.step_ns)
++            {
++                chain->present.fex_presleep.active = true;
++                chain->present.fex_presleep.late_count = 0;
++                chain->present.fex_presleep.since_anchor = 0;
++                chain->present.fex_presleep.anchor_left = 0;
++            }
++        }
++        else
++            chain->present.fex_presleep.start_count = 0;
++    }
++    else
++    {
++        expected_ns = chain->present.fex_presleep.due_ns + chain->present.fex_presleep.step_ns;
++        if (held_long && !slept)
++        {
++            /* Not pre-slept and held long: out at the cap's due time. */
++            chain->present.fex_presleep.due_ns = end_ns;
++            anchored = true;
++        }
++        else if (held)
++            chain->present.fex_presleep.due_ns = min(end_ns, expected_ns);
++        else
++            chain->present.fex_presleep.due_ns = expected_ns;
++
++        if (held)
++            chain->present.fex_presleep.late_count = 0;
++        else if (++chain->present.fex_presleep.late_count >= FEX_PRESLEEP_LATE_COUNT)
++        {
++            /* Frames slower than the cap, or nothing caps: wait for long holds again. */
++            chain->present.fex_presleep.active = false;
++            chain->present.fex_presleep.start_count = 0;
++        }
++
++        if (chain->present.fex_presleep.anchor_left)
++            chain->present.fex_presleep.anchor_left--;
++        else if (++chain->present.fex_presleep.since_anchor >= FEX_PRESLEEP_ANCHOR_EVERY)
++        {
++            chain->present.fex_presleep.since_anchor = 0;
++            chain->present.fex_presleep.anchor_left = FEX_PRESLEEP_ANCHOR_COUNT;
++        }
++    }
++
++    chain->present.fex_presleep.last_held_long = held_long && !slept;
++    chain->present.fex_presleep.last_end_ns = end_ns;
++
++    vkd3d_fex_timeline_cap(slept, held_long, !held, anchored, chain->present.fex_presleep.active,
++            chain->present.fex_presleep.step_ns, FEX_PRESLEEP_GUARD_NS);
++}
++
++/* Frame start pacing: has the GPU watcher note when this blit finishes on the GPU. */
++static void dxgi_vk_swap_chain_fex_watch_blit(struct dxgi_vk_swap_chain *chain, uint64_t blit_value)
++{
++    pthread_mutex_lock(&chain->fex_start.gpu_lock);
++    if (blit_value > chain->fex_start.gpu_target)
++    {
++        chain->fex_start.gpu_target = blit_value;
++        pthread_cond_signal(&chain->fex_start.gpu_cond);
++    }
++    pthread_mutex_unlock(&chain->fex_start.gpu_lock);
++}
++
+ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chain, uint64_t present_count, unsigned int retry_counter)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+@@ -2470,6 +2736,7 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+     bool swapchain_is_fifo;
+     bool use_present_id;
+     VkResult vk_result;
++    bool fex_presleep_slept;
+     uint64_t fex_t0 = 0;
+     bool fex_acquires;
+     VkQueue vk_queue;
+@@ -2516,6 +2783,9 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+         fex_t0 = vkd3d_get_current_time_ns();
+     if (!dxgi_vk_swap_chain_submit_blit(chain, swapchain_index))
+         return;
++    chain->present.fex.blit_value = chain->present.internal_blit_count;
++    if (chain->fex_start.enable)
++        dxgi_vk_swap_chain_fex_watch_blit(chain, chain->present.fex.blit_value);
+     if (vkd3d_fex_timeline_on)
+         vkd3d_fex_timeline_step(VKD3D_FEX_STEP_BLIT, vkd3d_get_current_time_ns() - fex_t0);
+ 
+@@ -2605,15 +2875,27 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+         }
+     }
+ 
++    chain->present.fex.hold_start_ns = vkd3d_get_current_time_ns();
++    fex_presleep_slept = vkd3d_fex_present_presleep_on && dxgi_vk_swap_chain_fex_presleep(chain);
++
+     vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
+     VKD3D_REGION_BEGIN(queue_present);
+-    if (vkd3d_fex_timeline_on)
+-        fex_t0 = vkd3d_get_current_time_ns();
++    chain->present.fex.qp_start_ns = vkd3d_get_current_time_ns();
+     vr = VK_CALL(vkQueuePresentKHR(vk_queue, &present_info));
++    chain->present.fex.qp_end_ns = vkd3d_get_current_time_ns();
+     if (vkd3d_fex_timeline_on)
+-        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_QUEUE_PRESENT, vkd3d_get_current_time_ns() - fex_t0);
++    {
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_QUEUE_PRESENT,
++                chain->present.fex.qp_end_ns - chain->present.fex.qp_start_ns);
++        if (fex_presleep_slept)
++            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_PRESLEEP,
++                    chain->present.fex.qp_start_ns - chain->present.fex.hold_start_ns);
++    }
+     VKD3D_REGION_END(queue_present);
+     vkd3d_queue_release(chain->queue->vkd3d_queue);
++    if (vkd3d_fex_present_presleep_on)
++        dxgi_vk_swap_chain_fex_presleep_note(chain, fex_presleep_slept,
++                chain->present.fex.qp_start_ns, chain->present.fex.qp_end_ns);
+     VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(chain->queue->device, vr == VK_ERROR_DEVICE_LOST);
+ 
+     if (vr == VK_SUCCESS && vk_result != VK_SUCCESS)
+@@ -2652,7 +2934,7 @@ static void dxgi_vk_swap_chain_signal_waitable_handle(struct dxgi_vk_swap_chain
+     uint64_t present_id = chain->present.present_id_valid ? chain->present.present_id : 0;
+ 
+     dxgi_vk_swap_chain_push_present_id(chain, present_count, present_id, chain->request.begin_frame_time_ns,
+-            chain->request.fex_call_ns);
++            &chain->present.fex);
+ }
+ 
+ static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain, uint64_t current_time_ns);
+@@ -2666,8 +2948,10 @@ static void dxgi_vk_swap_chain_present_callback(void *chain_)
+ 
+     next_present_count = chain->present.present_count + 1;
+     next_request = &chain->request_ring[next_present_count % ARRAY_SIZE(chain->request_ring)];
+-    if (vkd3d_fex_timeline_on && next_request->fex_call_ns)
+-        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_QUEUE_DELAY, vkd3d_get_current_time_ns() - next_request->fex_call_ns);
++    chain->present.fex = next_request->fex;
++    chain->present.fex.pickup_ns = vkd3d_get_current_time_ns();
++    if (vkd3d_fex_timeline_on && next_request->fex.call_ns)
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_QUEUE_DELAY, chain->present.fex.pickup_ns - next_request->fex.call_ns);
+     if (dxgi_vk_swap_chain_request_needs_swapchain_recreation(chain, next_request, &chain->request))
+         chain->present.force_swapchain_recreation = true;
+ 
+@@ -2889,6 +3173,269 @@ static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain
+     vkd3d_fex_timeline_step(VKD3D_FEX_STEP_LIMITER, current_time_ns - fex_sleep_start_ns);
+ }
+ 
++static void dxgi_vk_swap_chain_release_frame_latency_event(struct dxgi_vk_swap_chain *chain)
++{
++    int previous_semaphore;
++
++    if (!vkd3d_native_sync_handle_is_valid(chain->frame_latency_event))
++        return;
++
++    if ((previous_semaphore = vkd3d_native_sync_handle_release(chain->frame_latency_event, 1)) >= 0)
++    {
++        /* Some applications can keep using MaxLatency of 1,
++         * but just avoid acquiring the semaphore a few times to achieve higher latency.
++         * Only warn if the counter becomes unreasonably large, e.g. 4+ frames.
++         * That's a good sign the application is actually not behaving correctly. */
++        if (previous_semaphore >= (int)chain->frame_latency + 4)
++        {
++            TRACE("Incrementing frame latency semaphore beyond max latency. "
++                    "Did application forget to acquire? (new count = %d, max latency = %u)\n",
++                    previous_semaphore + 1, chain->frame_latency);
++        }
++    }
++    else
++        TRACE("Failed to increment swapchain semaphore. Did application forget to acquire?\n");
++}
++
++/* Frame start pacing: hands the game its next frame (the release of the frame latency handle it waits on before each
++ * frame). base_ns is when the release would have happened without pacing. */
++static void dxgi_vk_swap_chain_fex_release(struct dxgi_vk_swap_chain *chain, uint64_t base_ns)
++{
++    uint64_t now_ns, held_ns;
++
++    /* Noted before the release: the game reads them in its next Present(). */
++    now_ns = vkd3d_get_current_time_ns();
++    held_ns = now_ns > base_ns ? now_ns - base_ns : 0;
++    vkd3d_atomic_uint64_store_explicit(&chain->fex_start.last_release_delay_ns, held_ns, vkd3d_memory_order_relaxed);
++    vkd3d_fex_timeline_release(now_ns);
++    dxgi_vk_swap_chain_release_frame_latency_event(chain);
++    vkd3d_fex_timeline_step(VKD3D_FEX_STEP_START_DELAY, held_ns);
++}
++
++/* Frame start pacing: does the held-back releases at their time. */
++static void *dxgi_vk_swap_chain_fex_start_worker(void *chain_)
++{
++    struct dxgi_vk_swap_chain *chain = chain_;
++    uint64_t release_ns, base_ns, now_ns;
++
++    vkd3d_set_thread_name("vkd3d-fex-start");
++
++    pthread_mutex_lock(&chain->fex_start.lock);
++    for (;;)
++    {
++        while (!chain->fex_start.stop && !chain->fex_start.count)
++            pthread_cond_wait(&chain->fex_start.cond, &chain->fex_start.lock);
++        if (!chain->fex_start.count)
++            break;
++
++        release_ns = chain->fex_start.release_ns[chain->fex_start.head];
++        base_ns = chain->fex_start.release_base_ns[chain->fex_start.head];
++        now_ns = vkd3d_get_current_time_ns();
++        if (!chain->fex_start.stop && release_ns > now_ns)
++        {
++            /* Releases are queued in time order, so nothing new can be due before this one. */
++            pthread_mutex_unlock(&chain->fex_start.lock);
++            dxgi_vk_swap_chain_platform_sleep_for_ns(&chain->frame_rate_limit.sleep_state, release_ns - now_ns);
++            pthread_mutex_lock(&chain->fex_start.lock);
++            continue;
++        }
++
++        chain->fex_start.head = (chain->fex_start.head + 1) % ARRAY_SIZE(chain->fex_start.release_ns);
++        chain->fex_start.count--;
++        pthread_mutex_unlock(&chain->fex_start.lock);
++        dxgi_vk_swap_chain_fex_release(chain, base_ns);
++        pthread_mutex_lock(&chain->fex_start.lock);
++    }
++    pthread_mutex_unlock(&chain->fex_start.lock);
++
++    return NULL;
++}
++
++/* Frame start pacing: notes when each watched blit finished on the GPU. */
++static void *dxgi_vk_swap_chain_fex_gpu_worker(void *chain_)
++{
++    struct dxgi_vk_swap_chain *chain = chain_;
++    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
++    uint64_t watched = 0, value = 0, now_ns;
++    VkSemaphoreWaitInfo wait_info;
++    uint32_t slot;
++    VkResult vr;
++
++    vkd3d_set_thread_name("vkd3d-fex-gpu");
++
++    memset(&wait_info, 0, sizeof(wait_info));
++    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
++    wait_info.pSemaphores = &chain->present.vk_internal_blit_semaphore;
++    wait_info.pValues = &value;
++    wait_info.semaphoreCount = 1;
++
++    for (;;)
++    {
++        pthread_mutex_lock(&chain->fex_start.gpu_lock);
++        while (!chain->fex_start.gpu_stop && chain->fex_start.gpu_target <= watched)
++            pthread_cond_wait(&chain->fex_start.gpu_cond, &chain->fex_start.gpu_lock);
++        if (chain->fex_start.gpu_stop)
++        {
++            pthread_mutex_unlock(&chain->fex_start.gpu_lock);
++            break;
++        }
++        value = chain->fex_start.gpu_target;
++        pthread_mutex_unlock(&chain->fex_start.gpu_lock);
++
++        /* Bounded, so a lost device or a teardown can't keep this thread. */
++        vr = VK_CALL(vkWaitSemaphores(chain->queue->device->vk_device, &wait_info, 250000000ull));
++        now_ns = vkd3d_get_current_time_ns();
++
++        pthread_mutex_lock(&chain->fex_start.gpu_lock);
++        if (vr == VK_SUCCESS)
++        {
++            slot = value % ARRAY_SIZE(chain->fex_start.gpu_done_value);
++            chain->fex_start.gpu_done_value[slot] = value;
++            chain->fex_start.gpu_done_ns[slot] = now_ns;
++        }
++        watched = value;
++        pthread_mutex_unlock(&chain->fex_start.gpu_lock);
++    }
++
++    return NULL;
++}
++
++#define FEX_START_MARGIN_MIN_NS 3000000ll
++#define FEX_START_MARGIN_FIRST_NS 6000000ll
++#define FEX_START_MARGIN_MAX_NS 30000000ll
++#define FEX_START_MARGIN_UP_NS 3000000ll   /* margin added for each frame that came late while held back */
++#define FEX_START_MARGIN_DOWN_FRAMES 600u  /* frames without a late one before the margin shrinks by 1 ms */
++#define FEX_START_NEAR_NS 1000000ll        /* less spare than this while held back: start the next frames at once */
++#define FEX_START_LATE_NS 2000000ll        /* this much past its time while held back: the frame came late */
++#define FEX_START_MAX_NS 50000000ll
++#define FEX_START_CALM_FRAMES 60u          /* frames without a near-late one before the hold-back grows again */
++#define FEX_START_STEP_NS 1000000ll        /* the most the hold-back grows per frame */
++
++/* Frame start pacing, run by the wait worker when a frame is done: works out how much later this frame could have
++ * started without reaching the screen later, updates the hold-back and schedules the release of the frame latency
++ * handle (the game's next frame start) after it. */
++static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *chain,
++        const struct fex_frame_times *fex)
++{
++    int64_t queue_wait, held, gpu_ahead, spare = 0, natural, lowest, target, delay, step, margin;
++    uint64_t gpu_done_ns = 0, release_ns, now_ns, base_ns, hold_start_ns;
++    bool late = false, measured = false, held_back;
++    uint32_t slot, i;
++
++    if (fex->blit_value)
++    {
++        slot = fex->blit_value % ARRAY_SIZE(chain->fex_start.gpu_done_value);
++        pthread_mutex_lock(&chain->fex_start.gpu_lock);
++        if (chain->fex_start.gpu_done_value[slot] == fex->blit_value)
++            gpu_done_ns = chain->fex_start.gpu_done_ns[slot];
++        pthread_mutex_unlock(&chain->fex_start.gpu_lock);
++        /* Not noted (yet): the frame is on screen, so the copy is done by now; count it as done just now. */
++        if (!gpu_done_ns)
++            gpu_done_ns = vkd3d_get_current_time_ns();
++    }
++
++    delay = (int64_t)chain->fex_start.delay_ns;
++    margin = (int64_t)chain->fex_start.margin_ns;
++    hold_start_ns = fex->hold_start_ns ? fex->hold_start_ns : fex->qp_start_ns;
++
++    if (fex->call_ns && fex->pickup_ns && hold_start_ns && fex->qp_end_ns >= hold_start_ns && gpu_done_ns)
++    {
++        measured = true;
++        /* The present waited this long for the queue thread (busy with the frame before), */
++        queue_wait = fex->pickup_ns > fex->call_ns ? (int64_t)(fex->pickup_ns - fex->call_ns) : 0;
++        /* and a frame cap held it this long (sleeping in vkQueuePresentKHR, or before it in the cap pre-sleep), which
++         * a later frame would only have saved as far as the GPU had the frame done before vkQueuePresentKHR returned. */
++        held = (int64_t)(fex->qp_end_ns - hold_start_ns);
++        gpu_ahead = (int64_t)fex->qp_end_ns - (int64_t)gpu_done_ns;
++        spare = queue_wait + min(held, gpu_ahead);
++        /* Without the hold-back on its start, the frame would have had this much spare time. */
++        natural = spare + (int64_t)fex->delay_ns;
++
++        chain->fex_start.spare_ns[chain->fex_start.spare_pos] = natural;
++        chain->fex_start.spare_pos = (chain->fex_start.spare_pos + 1) % ARRAY_SIZE(chain->fex_start.spare_ns);
++        if (chain->fex_start.spare_count < ARRAY_SIZE(chain->fex_start.spare_ns))
++            chain->fex_start.spare_count++;
++
++        /* The game's own slow frames decide the margin: each frame that came late because it was held back makes it
++         * 3 ms bigger, 20 s without one make it 1 ms smaller. */
++        held_back = fex->delay_ns >= (uint64_t)FEX_START_NEAR_NS;
++        if (held_back && spare < -FEX_START_LATE_NS)
++        {
++            late = true;
++            margin = min(margin + FEX_START_MARGIN_UP_NS, FEX_START_MARGIN_MAX_NS);
++            chain->fex_start.quiet_frames = 0;
++        }
++        else if (++chain->fex_start.quiet_frames >= FEX_START_MARGIN_DOWN_FRAMES)
++        {
++            margin = max(margin - 1000000ll, FEX_START_MARGIN_MIN_NS);
++            chain->fex_start.quiet_frames = 0;
++        }
++
++        lowest = chain->fex_start.spare_ns[0];
++        for (i = 0; i < chain->fex_start.spare_count; i++)
++            lowest = min(lowest, chain->fex_start.spare_ns[i]);
++        target = lowest - margin;
++        target = max(target, 0);
++        target = min(target, FEX_START_MAX_NS);
++
++        if (held_back && spare < FEX_START_NEAR_NS)
++        {
++            /* Came (nearly) too late while held back: start the next frames at once, grow again later. */
++            delay = 0;
++            chain->fex_start.calm_frames = 0;
++        }
++        else if (target < delay)
++        {
++            delay = target;
++            chain->fex_start.calm_frames++;
++        }
++        else if (++chain->fex_start.calm_frames >= FEX_START_CALM_FRAMES)
++        {
++            step = (target - delay) / 4;
++            if (step < FEX_START_STEP_NS / 10)
++                step = target - delay;
++            delay += min(step, FEX_START_STEP_NS);
++        }
++    }
++    else
++    {
++        /* No times for this frame (the present failed or the swapchain was rebuilt): back off. */
++        delay /= 2;
++        chain->fex_start.calm_frames = 0;
++    }
++
++    chain->fex_start.delay_ns = delay;
++    chain->fex_start.margin_ns = margin;
++    if (measured)
++    {
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_SPARE, spare > 0 ? (uint64_t)spare : 0);
++        vkd3d_fex_timeline_pacing(chain->fex_start.delay_ns, chain->fex_start.margin_ns, spare, late);
++    }
++
++    /* Without pacing, the release would happen now. */
++    base_ns = vkd3d_get_current_time_ns();
++    release_ns = base_ns + chain->fex_start.delay_ns;
++    pthread_mutex_lock(&chain->fex_start.lock);
++    release_ns = max(release_ns, chain->fex_start.last_scheduled_ns);
++    now_ns = vkd3d_get_current_time_ns();
++    if (chain->fex_start.thread_started && (release_ns > now_ns || chain->fex_start.count) &&
++            chain->fex_start.count < ARRAY_SIZE(chain->fex_start.release_ns))
++    {
++        i = (chain->fex_start.head + chain->fex_start.count) % ARRAY_SIZE(chain->fex_start.release_ns);
++        chain->fex_start.release_ns[i] = release_ns;
++        chain->fex_start.release_base_ns[i] = base_ns;
++        chain->fex_start.count++;
++        chain->fex_start.last_scheduled_ns = release_ns;
++        pthread_cond_signal(&chain->fex_start.cond);
++        pthread_mutex_unlock(&chain->fex_start.lock);
++    }
++    else
++    {
++        pthread_mutex_unlock(&chain->fex_start.lock);
++        dxgi_vk_swap_chain_fex_release(chain, base_ns);
++    }
++}
++
+ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
+ {
+     struct dxgi_vk_swap_chain *chain = chain_;
+@@ -2898,7 +3445,6 @@ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
+     struct vkd3d_queue_timeline_trace_cookie cookie;
+     struct present_wait_entry entry;
+     uint64_t end_frame_time_ns = 0;
+-    int previous_semaphore;
+ 
+     vkd3d_set_thread_name("vkd3d-swapchain-sync");
+ 
+@@ -2932,43 +3478,31 @@ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
+         }
+ 
+         end_frame_time_ns = vkd3d_get_current_time_ns();
+-        if (vkd3d_fex_timeline_on && entry.fex_call_ns && end_frame_time_ns > entry.fex_call_ns)
+-            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_GPU_DONE, end_frame_time_ns - entry.fex_call_ns);
++        if (vkd3d_fex_timeline_on && entry.fex.call_ns && end_frame_time_ns > entry.fex.call_ns)
++            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_GPU_DONE, end_frame_time_ns - entry.fex.call_ns);
++        if (vkd3d_fex_timeline_on && entry.fex.start_ns && end_frame_time_ns > entry.fex.start_ns)
++            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_START_SHOWN, end_frame_time_ns - entry.fex.start_ns);
+ 
+         if (chain->wait_thread.supports_present_wait)
+             dxgi_vk_swap_chain_delay_next_frame(chain, end_frame_time_ns);
+ 
+         dxgi_vk_swap_chain_update_frame_statistics(chain, entry.present_count);
+ 
+-        if (vkd3d_native_sync_handle_is_valid(chain->frame_latency_event))
++        /* FEX frame start pacing may hold back the release the game waits on. vkd3d's own (internal) latency
++         * handle is still released right away. */
++        if (chain->fex_start.enable)
++            dxgi_vk_swap_chain_fex_start_frame_done(chain, &entry.fex);
++        else
+         {
+-            if ((previous_semaphore = vkd3d_native_sync_handle_release(chain->frame_latency_event, 1)) >= 0)
+-            {
+-                /* Some applications can keep using MaxLatency of 1,
+-                 * but just avoid acquiring the semaphore a few times to achieve higher latency.
+-                 * Only warn if the counter becomes unreasonably large, e.g. 4+ frames.
+-                 * That's a good sign the application is actually not behaving correctly. */
+-                if (previous_semaphore >= (int)chain->frame_latency + 4)
+-                {
+-                    TRACE("Incrementing frame latency semaphore beyond max latency. "
+-                            "Did application forget to acquire? (new count = %d, max latency = %u)\n",
+-                            previous_semaphore + 1, chain->frame_latency);
+-                }
+-            }
+-            else
+-                TRACE("Failed to increment swapchain semaphore. Did application forget to acquire?\n");
++            dxgi_vk_swap_chain_release_frame_latency_event(chain);
++            vkd3d_fex_timeline_release(vkd3d_get_current_time_ns());
+         }
+ 
+         if (vkd3d_native_sync_handle_is_valid(chain->frame_latency_event_internal))
+             vkd3d_native_sync_handle_release(chain->frame_latency_event_internal, 1);
+ 
+         if (vkd3d_fex_timeline_on)
+-        {
+-            uint64_t fex_now = vkd3d_get_current_time_ns();
+-
+-            vkd3d_fex_timeline_release(fex_now);
+-            vkd3d_fex_timeline_tick(fex_now);
+-        }
++            vkd3d_fex_timeline_tick(vkd3d_get_current_time_ns());
+ 
+         if (entry.id && entry.begin_frame_time_ns)
+             INFO("vkWaitForPresentKHR frame latency: %.3f ms.\n", 1e-6 * (end_frame_time_ns - entry.begin_frame_time_ns));
+@@ -3007,6 +3541,23 @@ static HRESULT dxgi_vk_swap_chain_init_waiter_thread(struct dxgi_vk_swap_chain *
+         return E_OUTOFMEMORY;
+     }
+ 
++    /* FEX frame start pacing: only when the game waits on the frame latency handle before its frames. */
++    if (vkd3d_fex_frame_start_on && vkd3d_native_sync_handle_is_valid(chain->frame_latency_event))
++    {
++        pthread_mutex_init(&chain->fex_start.lock, NULL);
++        pthread_cond_init(&chain->fex_start.cond, NULL);
++        pthread_mutex_init(&chain->fex_start.gpu_lock, NULL);
++        pthread_cond_init(&chain->fex_start.gpu_cond, NULL);
++        chain->fex_start.locks_initialized = true;
++        chain->fex_start.margin_ns = FEX_START_MARGIN_FIRST_NS;
++        chain->fex_start.thread_started =
++                !pthread_create(&chain->fex_start.thread, NULL, dxgi_vk_swap_chain_fex_start_worker, chain);
++        chain->fex_start.gpu_thread_started =
++                !pthread_create(&chain->fex_start.gpu_thread, NULL, dxgi_vk_swap_chain_fex_gpu_worker, chain);
++        chain->fex_start.enable = chain->fex_start.thread_started && chain->fex_start.gpu_thread_started;
++        INFO("FEX frame start pacing %s.\n", chain->fex_start.enable ? "on" : "off (thread creation failed)");
++    }
++
+     if ((chain->wait_thread.supports_present_wait = chain->queue->device->device_info.present_wait_features.presentWait))
+     {
+         if (vkd3d_get_env_var("VKD3D_SWAPCHAIN_DEBUG_LATENCY", env, sizeof(env)) && strcmp(env, "1") == 0)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 4d8459b..e30510d 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3036,6 +3036,8 @@ struct vkd3d_timestamp_profiler_submitted_work;
+ #define VKD3D_FEX_REPORT_SIZE 4096u
+ #define VKD3D_FEX_REPORT_FLAG_ON 0x1u          /* the report's feature is switched on */
+ #define VKD3D_FEX_REPORT_FLAG_FOLD_CLEARS 0x2u /* pass report: clear folding is on */
++#define VKD3D_FEX_REPORT_FLAG_FRAME_START 0x4u /* present report: frame start pacing is on */
++#define VKD3D_FEX_REPORT_FLAG_PRESLEEP 0x8u    /* present report: cap pre-sleep is on */
+ #define VKD3D_FEX_REPORT_FLAG_DEVICE 0x80000000u /* a D3D12 device was created */
+ struct vkd3d_fex_report
+ {
+@@ -3063,6 +3065,10 @@ enum vkd3d_fex_present_step
+     VKD3D_FEX_STEP_LIMITER,       /* vkd3d's own frame limiter sleeping */
+     VKD3D_FEX_STEP_GPU_DONE,      /* Present() until the copy finished on the GPU (or present wait returned) */
+     VKD3D_FEX_STEP_GAME,          /* frame latency release until the game's next Present() */
++    VKD3D_FEX_STEP_START_DELAY,   /* frame start pacing: how long a frame latency release was held back */
++    VKD3D_FEX_STEP_SPARE,         /* frame start pacing: how much later the frame could have started (spare time) */
++    VKD3D_FEX_STEP_START_SHOWN,   /* frame latency release (frame start) until the frame was handed to the screen */
++    VKD3D_FEX_STEP_PRESLEEP,      /* cap pre-sleep: vkd3d sleeping before vkQueuePresentKHR without the VkQueue */
+     VKD3D_FEX_STEP_COUNT
+ };
+ enum vkd3d_fex_queue_op
+@@ -3077,6 +3083,12 @@ enum vkd3d_fex_queue_op
+ };
+ #define VKD3D_FEX_NO_SLOT 0xffffffffu
+ extern bool vkd3d_fex_timeline_on;
++/* Frame start pacing (VKD3D_FEX_FRAME_START=1, swapchain.c): hold back the game's frame latency release by the time its
++ * frames were measured to wait anyway, so the game starts each frame (and reads input) as late as still works. */
++extern bool vkd3d_fex_frame_start_on;
++/* Cap pre-sleep (VKD3D_FEX_PRESENT_PRESLEEP=1, swapchain.c): sleep out a frame cap's wait before vkQueuePresentKHR,
++ * without holding the VkQueue the game's other queues share. */
++extern bool vkd3d_fex_present_presleep_on;
+ void vkd3d_fex_timeline_init(void);
+ uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type);
+ void vkd3d_fex_timeline_queue_free_slot(uint32_t slot);
+@@ -3085,6 +3097,9 @@ void vkd3d_fex_timeline_queue_lag(uint32_t slot, uint64_t ns, uint32_t depth);
+ void vkd3d_fex_timeline_step(enum vkd3d_fex_present_step step, uint64_t ns);
+ void vkd3d_fex_timeline_present(uint32_t sync_interval, uint32_t queued);
+ void vkd3d_fex_timeline_release(uint64_t now_ns);
++void vkd3d_fex_timeline_pacing(uint64_t delay_ns, uint64_t margin_ns, int64_t spare_ns, bool late);
++void vkd3d_fex_timeline_cap(bool presleep, bool held_long, bool not_held, bool anchored, bool active, uint64_t step_ns,
++        uint64_t guard_ns);
+ uint64_t vkd3d_fex_timeline_last_release(void);
+ void vkd3d_fex_timeline_config(const char *text);
+ void vkd3d_fex_timeline_tick(uint64_t now_ns);
+-- 
+2.43.0
+

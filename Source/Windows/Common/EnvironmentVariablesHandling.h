@@ -17,7 +17,7 @@ namespace FEX::Windows {
 //   FEX_VKD3D_NOSTAGGER=1  add no_staggered_submit to VKD3D_CONFIG in the process environment (the D2R default)
 //   FEX_VKD3D_NOSTAGGER=0  leave VKD3D_CONFIG alone
 //
-// FEX's own vkd3d-proton build (build 55, vkd3d-patches/ in this repo, a GameNative VKD3D component) has three features
+// FEX's own vkd3d-proton build (build 55, vkd3d-patches/ in this repo, a GameNative VKD3D component) has features
 // these switch on through its environment variables. A variable that is already set is left alone, and another
 // vkd3d-proton ignores them. The stats log says which build the game loaded (see ARM64EC/Vkd3dReport.h).
 //
@@ -30,5 +30,15 @@ namespace FEX::Windows {
 //   FEX_VKD3D_PASSES=1       VKD3D_FEX_PASSES=1 (the D2R default): GPU time per render pass and command list.
 //   FEX_VKD3D_TIMELINE=1     VKD3D_FEX_TIMELINE=1 (the D2R default): each frame's steps from the game's Present() to the
 //                            window system, and the queue threads' time.
+//   FEX_VKD3D_CAP_PRESLEEP=1 VKD3D_FEX_PRESENT_PRESLEEP=1 (the D2R default, build 56). GameNative's FPS limit sleeps in
+//                            its Vulkan layer's vkQueuePresentKHR, ~32 ms of each frame at 30 FPS, while vkd3d holds the
+//                            VkQueue; on Adreno the game's compute and copy queues share it and waited (build 55: compute
+//                            queue signals up to 34 ms, ~600 ms a second). Once presents are held at a steady period, vkd3d
+//                            sleeps until 4 ms before the cap's next due time without the VkQueue.
+//   FEX_VKD3D_FRAME_START=1  VKD3D_FEX_FRAME_START=1 (the D2R default, build 56). D2R keeps 2 frames in flight; at the
+//                            cap each finished frame waited ~23 ms for the queue thread, so the game read input ~2 frames
+//                            before the screen showed it. vkd3d holds back the frame latency release the game waits on
+//                            before each frame by the smallest spare time of the last 64 frames minus a margin; a frame
+//                            that came late because of it grows the margin by 3 ms, 20 s without one shrink it by 1 ms.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }
