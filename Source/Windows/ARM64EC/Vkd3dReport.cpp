@@ -42,6 +42,7 @@ namespace {
   constexpr uint32_t FlagCapPresleep = 0x8;
   constexpr uint32_t FlagGradualStart = 0x10; // VKD3D fex3 and later: the frame start hold-back changes by small steps
   constexpr uint32_t FlagMarginCaused = 0x20; // VKD3D fex4 and later: only frames the hold-back made late grow its margin
+  constexpr uint32_t FlagSkipFreshClears = 0x400; // gpu report (VKD3D fex11): zero fills of never-used block pages skipped
   constexpr uint32_t FlagDevice = 0x80000000u;
 
   struct Source {
@@ -52,10 +53,12 @@ namespace {
     uint32_t Flags;
   };
 
-  enum { Pass, Present, SourceCount };
+  enum { Pass, Present, Gpu, SourceCount };
   Source Sources[SourceCount] = {
     {"vkd3d_fex_pass_report", 0x50584546u /* 'FEXP' */, 0, 0, 0},
     {"vkd3d_fex_present_report", 0x54584546u /* 'FEXT' */, 0, 0, 0},
+    // VKD3D fex11: new memory's zero fills, vkd3d's own transfer submissions, GPU time between render passes.
+    {"vkd3d_fex_gpu_report", 0x47584546u /* 'FEXG' */, 0, 0, 0},
   };
 
   uint64_t ModuleAddress;
@@ -259,13 +262,17 @@ namespace {
 
     const uint32_t PassFlags = Sources[Pass].Flags;
     const uint32_t PresentFlags = Sources[Present].Flags;
+    const uint32_t GpuFlags = Sources[Gpu].Flags;
     if (!Announced && (PassFlags & FlagDevice) && (!Sources[Present].Address || (PresentFlags & FlagDevice))) {
       Announced = true;
       const char* PresentState = !Sources[Present].Address ? "missing" : PresentFlags & FlagOn ? "on" : "off";
+      const char* FreshState = !Sources[Gpu].Address ? "missing (VKD3D older than fex11)" :
+                               GpuFlags & FlagSkipFreshClears ? "on" : "off";
       Out.insert(0, fextl::fmt::format("# vkd3d: FEX's VKD3D build is loaded (d3d12core.dll at {:X}): clear folding {}, "
-                                       "GPU pass meter {}, present timeline {}, cap pre-sleep {}, frame start pacing {}\n",
+                                       "GPU pass meter {}, present timeline {}, cap pre-sleep {}, zero fills of never-used memory "
+                                       "skipped {}, frame start pacing {}\n",
                                        ModuleAddress, PassFlags & FlagFoldClears ? "on" : "off", PassFlags & FlagOn ? "on" : "off",
-                                       PresentState, PresentFlags & FlagCapPresleep ? "on" : "off",
+                                       PresentState, PresentFlags & FlagCapPresleep ? "on" : "off", FreshState,
                                        !(PresentFlags & FlagFrameStart) ? "off" :
                                        PresentFlags & FlagMarginCaused ? "on (gradual, margin only from frames it made late: VKD3D fex4 or "
                                                                          "later)" :

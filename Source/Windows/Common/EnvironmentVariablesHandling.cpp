@@ -141,6 +141,9 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "the game's next frame starts as late as the measured waiting allows (up to 20 ms, changing by at most "
                       "0.2 ms per frame up and 1 ms down, from VKD3D fex3 on), so it reads input closer to when the frame is "
                       "shown ('frame start' line)");
+  SetupVkd3dFexSwitch("FEX_VKD3D_SKIP_FRESH_CLEARS", L"VKD3D_FEX_SKIP_FRESH_CLEARS",
+                      "new GPU memory that vkd3d places in block pages never used since the driver zeroed them skips its "
+                      "zero fill (VKD3D fex11 and later; 'gpu memory' line)");
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
 

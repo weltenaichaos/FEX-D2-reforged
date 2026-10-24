@@ -78,6 +78,11 @@ namespace {
     // disk reads during play in the fex10 run, around the 100-140 ms streaming hitches), and read-ahead is shorter
     // (see ARM64EC/NativeUnpackCache.cpp).
     {"FEX_UNPACK_CACHE_PLAY", "1"},
+    // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
+    // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
+    // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
+    // fill where the block's pages were never used since the driver zeroed them (see EnvironmentVariablesHandling.h).
+    {"FEX_VKD3D_SKIP_FRESH_CLEARS", "1"},
   };
 
   // In the order the stats log lists them.
@@ -128,6 +133,7 @@ namespace {
     "FEX_VKD3D_TIMELINE",
     "FEX_VKD3D_CAP_PRESLEEP",
     "FEX_VKD3D_FRAME_START",
+    "FEX_VKD3D_SKIP_FRESH_CLEARS",
   };
 
   bool UseD2RDefaults {};

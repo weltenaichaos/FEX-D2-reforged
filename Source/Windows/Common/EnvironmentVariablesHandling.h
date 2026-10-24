@@ -40,5 +40,11 @@ namespace FEX::Windows {
 //                            before the screen showed it. vkd3d holds back the frame latency release the game waits on
 //                            before each frame by the smallest spare time of the last 64 frames minus a margin; a frame
 //                            that came late because of it grows the margin by 3 ms, 20 s without one shrink it by 1 ms.
+//   FEX_VKD3D_SKIP_FRESH_CLEARS=1 VKD3D_FEX_SKIP_FRESH_CLEARS=1 (the D2R default, build 64, VKD3D fex11). New D3D12
+//                            memory has to read as zero. vkd3d places small buffers (<2 MB) and textures/heaps (<8 MB) in
+//                            16/32 MB blocks of its own and zero-fills each such placement on the GPU (a chain of 64 KB
+//                            fills on Turnip, and all of the game's queues wait for it). Block pages nothing was placed in
+//                            since the driver zeroed the block are skipped. Suspected cause of the ~1 s of 50-55 ms frames
+//                            after each area load (build 63 log); the 'gpu memory' and 'gpu transfers' lines count it.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

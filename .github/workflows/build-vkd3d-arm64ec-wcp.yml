@@ -22,8 +22,8 @@ on:
 env:
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
   VKD3D_TAG: v3.0b
-  WCP_VERSION: 3.0b-arm64ec-fex10
-  WCP_VERSION_CODE: 11
+  WCP_VERSION: 3.0b-arm64ec-fex11
+  WCP_VERSION_CODE: 12
 
 jobs:
   build:
@@ -124,7 +124,7 @@ jobs:
             "type": "VKD3D",
             "versionName": "${WCP_VERSION}",
             "versionCode": ${WCP_VERSION_CODE},
-            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline, cap pre-sleep, gradual frame start pacing whose margin only grows for frames the hold-back made late, read-only depth-stencil planes not written back after a render pass, frame start pacing that counts a busy GPU as spare time, pass shape measurements, frame done signalled from the CPU after the swapchain copy's fence instead of an empty queue submit, that fence watched from the copy's submit so pacing sees the real GPU finish, a 30 ms hold-back ceiling, the cap's grid measured from every held present, a frame start margin that recovers 1 ms per 60 frames, per-draw GPU timing with the driver's shader statistics, GPU-bound frame start pacing, GPU timers in 1 frame in 8). Build from ${GITHUB_SHA}.",
+            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline, cap pre-sleep, gradual frame start pacing whose margin only grows for frames the hold-back made late, read-only depth-stencil planes not written back after a render pass, frame start pacing that counts a busy GPU as spare time, pass shape measurements, frame done signalled from the CPU after the swapchain copy's fence instead of an empty queue submit, that fence watched from the copy's submit so pacing sees the real GPU finish, a 30 ms hold-back ceiling, the cap's grid measured from every held present, a frame start margin that recovers 1 ms per 60 frames, per-draw GPU timing with the driver's shader statistics, GPU-bound frame start pacing, GPU timers in 1 frame in 8, zero fills of never-used memory skipped, a gpu report of new memory, vkd3d's transfers and the GPU time between render passes). Build from ${GITHUB_SHA}.",
             "files": [
               {"source": "system32/d3d12.dll",     "target": "\${system32}/d3d12.dll"},
               {"source": "system32/d3d12core.dll", "target": "\${system32}/d3d12core.dll"},
@@ -176,6 +176,12 @@ jobs:
             smallest, and a late frame takes off what it came late by instead of halving it. The
             pass meter's GPU timers go into 1 frame in 8 (VKD3D_FEX_PASSES=2: every frame), and the
             per-draw timing is off unless VKD3D_FEX_DRAWS=1.
+            From fex11 on, new memory placed in pages of vkd3d's memory blocks that were never used
+            since the driver zeroed the block skips its zero fill on the GPU (on with
+            VKD3D_FEX_SKIP_FRESH_CLEARS=1, Turnip only), and a new gpu report counts new memory's
+            zero fills, times vkd3d's own transfer submissions and the GPU time between render
+            passes by what the game recorded there. Pass timer results are reset once read, so a
+            reused timer can't show an earlier frame's values.
             Install in GameNative as a VKD3D
             content profile; it appears as `${{ env.WCP_VERSION }}`.
         env:
