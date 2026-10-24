@@ -22,8 +22,8 @@ on:
 env:
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
   VKD3D_TAG: v3.0b
-  WCP_VERSION: 3.0b-arm64ec-fex7
-  WCP_VERSION_CODE: 8
+  WCP_VERSION: 3.0b-arm64ec-fex8
+  WCP_VERSION_CODE: 9
 
 jobs:
   build:
@@ -124,7 +124,7 @@ jobs:
             "type": "VKD3D",
             "versionName": "${WCP_VERSION}",
             "versionCode": ${WCP_VERSION_CODE},
-            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline, cap pre-sleep, gradual frame start pacing whose margin only grows for frames the hold-back made late, read-only depth-stencil planes not written back after a render pass, frame start pacing that counts a busy GPU as spare time, pass shape measurements, frame done signalled from the CPU after the swapchain copy's fence instead of an empty queue submit). Build from ${GITHUB_SHA}.",
+            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline, cap pre-sleep, gradual frame start pacing whose margin only grows for frames the hold-back made late, read-only depth-stencil planes not written back after a render pass, frame start pacing that counts a busy GPU as spare time, pass shape measurements, frame done signalled from the CPU after the swapchain copy's fence instead of an empty queue submit, that fence watched from the copy's submit so pacing sees the real GPU finish, a 30 ms hold-back ceiling, the cap's grid measured from every held present). Build from ${GITHUB_SHA}.",
             "files": [
               {"source": "system32/d3d12.dll",     "target": "\${system32}/d3d12.dll"},
               {"source": "system32/d3d12core.dll", "target": "\${system32}/d3d12core.dll"},
@@ -164,6 +164,10 @@ jobs:
             signal comes from the CPU after the swapchain copy's fence instead of an empty queue
             submit that held the shared VkQueue until the GPU caught up (on unless
             VKD3D_FEX_HOST_FRAME_DONE=0), and frame start pacing sees the GPU finish of every frame.
+            From fex8 on, that fence is watched from the copy's submit, so a GPU finish before the
+            frame cap's release is seen when it happens; the hold-back may reach 30 ms (was 20);
+            and the cap pre-sleep measures the cap's grid from every held present instead of
+            letting two presents a few seconds hold the VkQueue for a whole frame.
             Install in GameNative as a VKD3D
             content profile; it appears as `${{ env.WCP_VERSION }}`.
         env:
