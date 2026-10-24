@@ -40,6 +40,7 @@ namespace {
   constexpr uint32_t FlagFoldClears = 0x2;
   constexpr uint32_t FlagFrameStart = 0x4;
   constexpr uint32_t FlagCapPresleep = 0x8;
+  constexpr uint32_t FlagGradualStart = 0x10; // VKD3D fex3 and later: the frame start hold-back changes by small steps
   constexpr uint32_t FlagDevice = 0x80000000u;
 
   struct Source {
@@ -262,8 +263,11 @@ namespace {
       const char* PresentState = !Sources[Present].Address ? "missing" : PresentFlags & FlagOn ? "on" : "off";
       Out.insert(0, fextl::fmt::format("# vkd3d: FEX's VKD3D build is loaded (d3d12core.dll at {:X}): clear folding {}, "
                                        "GPU pass meter {}, present timeline {}, cap pre-sleep {}, frame start pacing {}\n",
-                                       ModuleAddress, PassFlags & FlagFoldClears ? "on" : "off", PassFlags & FlagOn ? "on" : "off", PresentState,
-                                       PresentFlags & FlagCapPresleep ? "on" : "off", PresentFlags & FlagFrameStart ? "on" : "off"));
+                                       ModuleAddress, PassFlags & FlagFoldClears ? "on" : "off", PassFlags & FlagOn ? "on" : "off",
+                                       PresentState, PresentFlags & FlagCapPresleep ? "on" : "off",
+                                       !(PresentFlags & FlagFrameStart) ? "off" :
+                                       PresentFlags & FlagGradualStart  ? "on (gradual, VKD3D fex3 or later)" :
+                                                                          "on (build 56 style: an older VKD3D component is selected)"));
       Out += CapLayerNote();
     }
     return Out;

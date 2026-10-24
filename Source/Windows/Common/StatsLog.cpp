@@ -675,6 +675,253 @@ namespace {
     }
   }
 
+  // Every second, the whole device: what kind of CPU time the busy CPUs spent (user, low priority user, kernel,
+  // interrupts), how much of it this app's Android group and its user had (cgroup v2 cpu.stat, which also counts the
+  // launcher's own process and Wine's other processes, hidden from /proc or not), and how short memory is (free memory,
+  // swap, the kernel's reclaim and pressure), with this process's resident and GPU memory. For load from outside the
+  // game: build 56 saw 5 of 8 cores busy outside it for 90 s after a load, with no visible process using them.
+  struct SystemLoadState {
+    bool On;
+    bool Have;
+    uint64_t PrevCounter;
+    uint64_t PrevCpu[8];           // /proc/stat "cpu" line: user nice system idle iowait irq softirq steal (ticks)
+    uint64_t PrevUser, PrevSystem; // this process (ticks)
+    fextl::string AppCpuStat, UidCpuStat;
+    uint64_t PrevAppUs, PrevUidUs;
+    bool HaveApp, HaveUid;
+    uint64_t PrevVm[7];  // pswpin pswpout pgscan_kswapd pgscan_direct workingset refaults allocstall pgmajfault (pages/count)
+    uint64_t PrevPsi[3]; // memory some, memory full, io some (us)
+    fextl::string GpuMemMapped, GpuMemUnmapped;
+  };
+  SystemLoadState System;
+
+  char SystemBuffer[16384];
+
+  // The number after Key ("Key value" or "Key=value" form) in Text, at a line start (Key begins with '\n') or anywhere.
+  bool SystemField(const char* Text, const char* Key, uint64_t& Out) {
+    const char* P = strstr(Text, Key);
+    if (!P) {
+      return false;
+    }
+    P += strlen(Key);
+    while (*P == ' ' || *P == ':' || *P == '=') {
+      ++P;
+    }
+    Out = strtoull(P, nullptr, 10);
+    return true;
+  }
+
+  uint64_t SystemCgroupUs(const fextl::string& Path, bool& Ok) {
+    uint64_t Us {};
+    Ok = Linux::ReadSmallFile(Path.c_str(), SystemBuffer, sizeof(SystemBuffer)) > 0 && SystemField(SystemBuffer, "usage_usec", Us);
+    return Us;
+  }
+
+  void SystemInit() {
+    System.On = true;
+    // "0::/uid_10121/pid_22319": this process's cgroup v2 group (the app's process tree) and its parent (the app's user).
+    char Buffer[1024];
+    fextl::string Group;
+    if (Linux::ReadSmallFile("/proc/self/cgroup", Buffer, sizeof(Buffer)) > 0) {
+      if (const char* P = strstr(Buffer, "0::")) {
+        const char* End = strchr(P, '\n');
+        Group.assign(P + 3, End ? End : P + strlen(P));
+      }
+    }
+    fextl::string AppNote = "no cgroup v2 group";
+    if (!Group.empty() && Group != "/") {
+      System.AppCpuStat = fextl::fmt::format("/sys/fs/cgroup{}/cpu.stat", Group);
+      const size_t Slash = Group.rfind('/');
+      if (Slash != fextl::string::npos && Slash > 0) {
+        System.UidCpuStat = fextl::fmt::format("/sys/fs/cgroup{}/cpu.stat", Group.substr(0, Slash));
+      }
+      bool AppOk {}, UidOk {};
+      SystemCgroupUs(System.AppCpuStat, AppOk);
+      if (!System.UidCpuStat.empty()) {
+        SystemCgroupUs(System.UidCpuStat, UidOk);
+      }
+      AppNote = fextl::fmt::format("group {} {}, its parent {}", Group, AppOk ? "readable" : "not readable",
+                                   System.UidCpuStat.empty() ? "-" :
+                                   UidOk                     ? "readable" :
+                                                               "not readable");
+      if (!AppOk) {
+        System.AppCpuStat.clear();
+      }
+      if (!UidOk) {
+        System.UidCpuStat.clear();
+      }
+    }
+    uint64_t TotalKB {}, SwapKB {};
+    const bool Mem =
+      Linux::ReadSmallFile("/proc/meminfo", SystemBuffer, sizeof(SystemBuffer)) > 0 && SystemField(SystemBuffer, "MemTotal", TotalKB);
+    SystemField(SystemBuffer, "SwapTotal", SwapKB);
+    const bool Vm = Linux::ReadSmallFile("/proc/vmstat", SystemBuffer, sizeof(SystemBuffer)) > 0;
+    const bool Psi = Linux::ReadSmallFile("/proc/pressure/memory", SystemBuffer, sizeof(SystemBuffer)) > 0;
+    // Adreno's per-process GPU memory (kgsl), when readable.
+    const int Pid = Linux::GetPid();
+    System.GpuMemMapped = fextl::fmt::format("/sys/class/kgsl/kgsl/proc/{}/gpumem_mapped", Pid);
+    System.GpuMemUnmapped = fextl::fmt::format("/sys/class/kgsl/kgsl/proc/{}/gpumem_unmapped", Pid);
+    StatsLogNote(fextl::fmt::format("system: memory {} MB, swap {} MB; cgroup cpu use: {}; /proc/vmstat {}; memory pressure {}; "
+                                    "GPU memory per process from kgsl (checked once the game uses the GPU)",
+                                    Mem ? fextl::fmt::format("{}", TotalKB / 1024) : fextl::string("?"), SwapKB / 1024, AppNote,
+                                    Vm ? "readable" : "not readable", Psi ? "readable" : "not readable"));
+  }
+
+  fextl::string SystemLine(double ServerRunMs) {
+    if (!System.On) {
+      return {};
+    }
+    const uint64_t Counter = GetCounter();
+    const double Wall = System.Have ? static_cast<double>(Counter - System.PrevCounter) / static_cast<double>(GetCounterFrequency()) : 0.0;
+    const bool Show = System.Have && Wall > 0.2;
+    auto Cores = [&](uint64_t Ticks) {
+      return static_cast<double>(Ticks) / 100.0 / Wall;
+    };
+    auto MBs = [&](uint64_t Pages) {
+      return static_cast<double>(Pages) * 4096.0 / 1048576.0 / Wall;
+    };
+    fextl::string Out;
+
+    // CPU time of the whole device by kind.
+    uint64_t Cpu[8] {};
+    if (Linux::ReadSmallFile("/proc/stat", SystemBuffer, sizeof(SystemBuffer)) > 0 && !strncmp(SystemBuffer, "cpu ", 4)) {
+      char* P = SystemBuffer + 4;
+      for (auto& F : Cpu) {
+        F = strtoull(P, &P, 10);
+      }
+    }
+    Linux::TaskStat Self {};
+    const bool HaveSelf = Linux::ReadTaskStat("/proc/self/stat", Self);
+    if (Show && Cpu[0]) {
+      uint64_t D[8];
+      for (int i = 0; i < 8; ++i) {
+        D[i] = Cpu[i] - System.PrevCpu[i];
+      }
+      const uint64_t Busy = D[0] + D[1] + D[2] + D[5] + D[6] + D[7];
+      Out += fextl::fmt::format("  system busy {:.1f} cores = user {:.1f} + low prio {:.1f} + kernel {:.1f} + irq {:.1f}, io wait {:.1f}",
+                                Cores(Busy), Cores(D[0]), Cores(D[1]), Cores(D[2]), Cores(D[5] + D[6] + D[7]), Cores(D[4]));
+      if (HaveSelf) {
+        Out += fextl::fmt::format(" | this process {:.1f} (kernel {:.1f}), wineserver {:.1f}",
+                                  Cores(Self.UserTicks + Self.SystemTicks - System.PrevUser - System.PrevSystem),
+                                  Cores(Self.SystemTicks - System.PrevSystem), ServerRunMs / 1000.0 / Wall);
+      }
+    }
+    memcpy(System.PrevCpu, Cpu, sizeof(Cpu));
+    if (HaveSelf) {
+      System.PrevUser = Self.UserTicks;
+      System.PrevSystem = Self.SystemTicks;
+    }
+
+    // This app's group and its user.
+    if (!System.AppCpuStat.empty() || !System.UidCpuStat.empty()) {
+      bool AppOk {}, UidOk {};
+      const uint64_t AppUs = System.AppCpuStat.empty() ? 0 : SystemCgroupUs(System.AppCpuStat, AppOk);
+      const uint64_t UidUs = System.UidCpuStat.empty() ? 0 : SystemCgroupUs(System.UidCpuStat, UidOk);
+      if (Show && !Out.empty()) {
+        Out += " | app group ";
+        Out += AppOk && System.HaveApp ? fextl::fmt::format("{:.1f}", static_cast<double>(AppUs - System.PrevAppUs) / 1e6 / Wall) :
+                                         fextl::string("?");
+        Out += ", app user ";
+        Out += UidOk && System.HaveUid ? fextl::fmt::format("{:.1f}", static_cast<double>(UidUs - System.PrevUidUs) / 1e6 / Wall) :
+                                         fextl::string("?");
+      }
+      System.PrevAppUs = AppUs;
+      System.PrevUidUs = UidUs;
+      System.HaveApp = AppOk;
+      System.HaveUid = UidOk;
+    }
+    if (!Out.empty()) {
+      Out += "\n";
+    }
+
+    // Memory.
+    fextl::string Mem;
+    uint64_t AvailKB {}, SwapTotalKB {}, SwapFreeKB {};
+    if (Linux::ReadSmallFile("/proc/meminfo", SystemBuffer, sizeof(SystemBuffer)) > 0 && SystemField(SystemBuffer, "MemAvailable", AvailKB)) {
+      SystemField(SystemBuffer, "SwapTotal", SwapTotalKB);
+      SystemField(SystemBuffer, "SwapFree", SwapFreeKB);
+      Mem += fextl::fmt::format("  memory free {} MB, swap used {} MB", AvailKB / 1024, (SwapTotalKB - std::min(SwapFreeKB, SwapTotalKB)) / 1024);
+    }
+    uint64_t Vm[7] {};
+    bool HaveVm = Linux::ReadSmallFile("/proc/vmstat", SystemBuffer, sizeof(SystemBuffer)) > 0;
+    if (HaveVm) {
+      SystemField(SystemBuffer, "\npswpin ", Vm[0]);
+      SystemField(SystemBuffer, "\npswpout ", Vm[1]);
+      SystemField(SystemBuffer, "\npgscan_kswapd ", Vm[2]);
+      SystemField(SystemBuffer, "\npgscan_direct ", Vm[3]);
+      if (!SystemField(SystemBuffer, "\nworkingset_refault_file ", Vm[4])) {
+        SystemField(SystemBuffer, "\nworkingset_refault ", Vm[4]);
+      }
+      for (const char* P = SystemBuffer; (P = strstr(P, "\nallocstall")) != nullptr; ++P) {
+        const char* Space = strchr(P + 1, ' ');
+        if (Space) {
+          Vm[5] += strtoull(Space + 1, nullptr, 10);
+        }
+      }
+      SystemField(SystemBuffer, "\npgmajfault ", Vm[6]);
+      if (Show) {
+        uint64_t D[7];
+        for (int i = 0; i < 7; ++i) {
+          D[i] = Vm[i] - System.PrevVm[i];
+        }
+        Mem += fextl::fmt::format("{}swap out {:.1f} in {:.1f} MB/s, reclaim scan kswapd {:.0f} direct {:.0f} MB/s, stalls {}, "
+                                  "refaults {:.1f} MB/s, major faults {}",
+                                  Mem.empty() ? "  memory " : ", ", MBs(D[1]), MBs(D[0]), MBs(D[2]), MBs(D[3]), D[5], MBs(D[4]), D[6]);
+      }
+      memcpy(System.PrevVm, Vm, sizeof(Vm));
+    }
+    uint64_t Psi[3] {};
+    bool HavePsi = false;
+    if (Linux::ReadSmallFile("/proc/pressure/memory", SystemBuffer, sizeof(SystemBuffer)) > 0) {
+      // "some avg10=... total=N\nfull avg10=... total=N"
+      const char* Full = strstr(SystemBuffer, "full");
+      HavePsi = SystemField(SystemBuffer, "total", Psi[0]);
+      if (Full) {
+        SystemField(Full, "total", Psi[1]);
+      }
+    }
+    if (Linux::ReadSmallFile("/proc/pressure/io", SystemBuffer, sizeof(SystemBuffer)) > 0) {
+      SystemField(SystemBuffer, "total", Psi[2]);
+    }
+    if (Show && HavePsi) {
+      Mem += fextl::fmt::format(
+        " | pressure memory {:.0f}% (all stuck {:.0f}%), io {:.0f}%", static_cast<double>(Psi[0] - System.PrevPsi[0]) / (Wall * 1e4),
+        static_cast<double>(Psi[1] - System.PrevPsi[1]) / (Wall * 1e4), static_cast<double>(Psi[2] - System.PrevPsi[2]) / (Wall * 1e4));
+    }
+    memcpy(System.PrevPsi, Psi, sizeof(Psi));
+
+    // This process: resident memory, swapped out, GPU memory.
+    if (Linux::ReadSmallFile("/proc/self/status", SystemBuffer, sizeof(SystemBuffer)) > 0) {
+      uint64_t RssKB {}, SwapKB {};
+      if (SystemField(SystemBuffer, "\nVmRSS", RssKB)) {
+        SystemField(SystemBuffer, "\nVmSwap", SwapKB);
+        Mem += fextl::fmt::format(" | this process {} MB (swapped {} MB)", RssKB / 1024, SwapKB / 1024);
+      }
+    }
+    if (!System.GpuMemMapped.empty()) {
+      char Buffer[64];
+      uint64_t Gpu {};
+      bool Ok = false;
+      for (const auto* Path : {&System.GpuMemMapped, &System.GpuMemUnmapped}) {
+        if (Linux::ReadSmallFile(Path->c_str(), Buffer, sizeof(Buffer)) > 0) {
+          Gpu += strtoull(Buffer, nullptr, 10);
+          Ok = true;
+        }
+      }
+      if (Ok) {
+        Mem += fextl::fmt::format(", GPU {} MB", Gpu >> 20);
+      }
+    }
+    if (Show && !Mem.empty()) {
+      Out += Mem;
+      Out += "\n";
+    }
+
+    System.PrevCounter = Counter;
+    System.Have = true;
+    return Out;
+  }
+
   void SchedInit() {
     const char* Value = Switch("FEX_SCHEDLOG");
     Sched.On = !(Value && Value[0] == '0');
@@ -685,6 +932,7 @@ namespace {
     Sched.MainFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/stat", Sched.Pid).c_str());
     SchedOpenServer();
     CoreLoadInit();
+    SystemInit();
   }
 
   void SchedSampleOne(int Fd, uint32_t& Samples, uint32_t& Runnable, uint32_t (&Cores)[Linux::MaxCPUs]) {
@@ -1167,6 +1415,7 @@ namespace {
     }
 
     Out += CoreLine(GameRunMs, ServerRunMs);
+    Out += SystemLine(ServerRunMs);
     CgroupCheck();
 
     Sched.MainSamples = Sched.MainRunnable = Sched.ServerSamples = Sched.ServerRunnable = 0;
@@ -2930,45 +3179,54 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
     return;
   }
 
-  auto Header = fextl::fmt::format("# FEX stats for {} (pid {}), one block per second. cpu = thread CPU time; jit = time/blocks compiled; "
-                                   "smc = writes to translated code; sigbus = unaligned atomic fixups; sig = time in exception "
-                                   "handling; miss = lookup cache misses; lock = lookup cache lock time; x87fb = x87 fallbacks; dc = disk "
-                                   "cache hits; emu = share of the second spent in emulated x86 code (the rest of cpu is native: "
-                                   "Wine, VKD3D, driver); dco = why compiles missed the disk cache and what happened to the code "
-                                   "compiled instead; io = page faults that read storage, and storage reads; with FEX_STATSLOG_PROFILE=1, "
-                                   "'# hitch' / '# stall' = Main ran emulated code / no emulated code for 100ms or more, with the other "
-                                   "threads that were busy in emulated code meanwhile; jobwait = the game's frame wait loop: tries that "
-                                   "found "
-                                   "nothing to run (idle) or found jobs, time paused, longest uninterrupted idle wait; frames = time from "
-                                   "one game frame "
-                                   "start to the next (count, average, median, 90th/99th percentile, longest, how many took 40/50/67/100ms "
-                                   "or more), frames10s = the same over 10 seconds; '# frame' = a frame of 50ms or more with what Main and "
-                                   "the busy threads were doing in it; codelock = FEX's code invalidation lock: exclusive locks taken, how "
-                                   "many waited 1ms "
-                                   "or more, polite waits that ran out, longest wait and hold (max codelock = a compile's longest wait "
-                                   "for it); logger work = the log thread's own work between two sampled seconds; susp = times threads stopped "
-                                   "for a suspend request in emulated code (time suspended shows as fex:suspended); probe = the stall "
-                                   "probe's longest waits this second, stalls[...] on a '# frame' line = its waits of 2ms or more during "
-                                   "that frame; '# prio' = thread priority changes (FEX_PRIO); '# cores' = thread core changes (FEX_MAINCORE, "
-                                   "FEX_HELPER_CORES); '# server' = wineserver nice (FEX_SERVER_NICE); sched main/server = Linux view of "
-                                   "the main thread and the wineserver: CPU time (run), time ready but without a CPU (wait), nice, allowed "
-                                   "CPUs, and which CPU it was on while runnable (sampled every 10ms); sched threads = the busiest threads "
-                                   "(Linux name/tid run+wait ms @last CPU); sched procs 5s = other processes of this user by CPU use; waits main = handles the "
-                                   "main thread waited on this second (kind, /latency = a swapchain frame latency handle, +N = released N more "
-                                   "times, calls, ms sampled waiting @caller, timeout ms); '# latency' = what FEX_FRAMELATENCY found and did; '# smc' = a page whose own code kept writing to it, "
-                                   "so it stays writable and its code checks itself (FEX_SMC_HOTPAGE); sched queue = what "
-                                   "vkd3d's queue thread (it hands the game's GPU work and each present to the driver) was doing, sampled every "
-                                   "10ms: running, or the Linux call it waited in (ioctl(request) = a GPU driver call, ppoll/futex = waiting "
-                                   "for another thread, a fence or the display server); gpu = GPU clock (average, lowest and highest of 50ms "
-                                   "samples), busy = the GPU's busy share in the driver's last window, cap = highest clock allowed now, levels = "
-                                   "the power levels allowed (0 = fastest; a launcher's power control or heat raises the first), temperature; "
-                                   "cores busy% = how busy each CPU was, whoever ran there (? = can't tell), the game's CPUs' busy time split "
-                                   "into this process, the wineserver and others (other apps, Android, the launcher, the kernel), paused = "
-                                   "share of the second the kernel had a CPU out of use, runnable = runnable tasks of the whole system, cpu "
-                                   "pressure = share of the second some task waited for a CPU; '# cgroup' = the Android groups the main "
-                                   "thread and the wineserver are in; rumble = the game's XInputSetState calls (FEX_RUMBLE): calls, changes "
-                                   "of strength, changes sent to the controller and how long Wine took for each\n",
-                                   AppName, GetCurrentProcessId());
+  auto Header =
+    fextl::fmt::format("# FEX stats for {} (pid {}), one block per second. cpu = thread CPU time; jit = time/blocks compiled; "
+                       "smc = writes to translated code; sigbus = unaligned atomic fixups; sig = time in exception "
+                       "handling; miss = lookup cache misses; lock = lookup cache lock time; x87fb = x87 fallbacks; dc = disk "
+                       "cache hits; emu = share of the second spent in emulated x86 code (the rest of cpu is native: "
+                       "Wine, VKD3D, driver); dco = why compiles missed the disk cache and what happened to the code "
+                       "compiled instead; io = page faults that read storage, and storage reads; with FEX_STATSLOG_PROFILE=1, "
+                       "'# hitch' / '# stall' = Main ran emulated code / no emulated code for 100ms or more, with the other "
+                       "threads that were busy in emulated code meanwhile; jobwait = the game's frame wait loop: tries that "
+                       "found "
+                       "nothing to run (idle) or found jobs, time paused, longest uninterrupted idle wait; frames = time from "
+                       "one game frame "
+                       "start to the next (count, average, median, 90th/99th percentile, longest, how many took 40/50/67/100ms "
+                       "or more), frames10s = the same over 10 seconds; '# frame' = a frame of 50ms or more with what Main and "
+                       "the busy threads were doing in it; codelock = FEX's code invalidation lock: exclusive locks taken, how "
+                       "many waited 1ms "
+                       "or more, polite waits that ran out, longest wait and hold (max codelock = a compile's longest wait "
+                       "for it); logger work = the log thread's own work between two sampled seconds; susp = times threads stopped "
+                       "for a suspend request in emulated code (time suspended shows as fex:suspended); probe = the stall "
+                       "probe's longest waits this second, stalls[...] on a '# frame' line = its waits of 2ms or more during "
+                       "that frame; '# prio' = thread priority changes (FEX_PRIO); '# cores' = thread core changes (FEX_MAINCORE, "
+                       "FEX_HELPER_CORES); '# server' = wineserver nice (FEX_SERVER_NICE); sched main/server = Linux view of "
+                       "the main thread and the wineserver: CPU time (run), time ready but without a CPU (wait), nice, allowed "
+                       "CPUs, and which CPU it was on while runnable (sampled every 10ms); sched threads = the busiest threads "
+                       "(Linux name/tid run+wait ms @last CPU); sched procs 5s = other processes of this user by CPU use; waits main = "
+                       "handles the "
+                       "main thread waited on this second (kind, /latency = a swapchain frame latency handle, +N = released N more "
+                       "times, calls, ms sampled waiting @caller, timeout ms); '# latency' = what FEX_FRAMELATENCY found and did; '# smc' "
+                       "= a page whose own code kept writing to it, "
+                       "so it stays writable and its code checks itself (FEX_SMC_HOTPAGE); sched queue = what "
+                       "vkd3d's queue thread (it hands the game's GPU work and each present to the driver) was doing, sampled every "
+                       "10ms: running, or the Linux call it waited in (ioctl(request) = a GPU driver call, ppoll/futex = waiting "
+                       "for another thread, a fence or the display server); gpu = GPU clock (average, lowest and highest of 50ms "
+                       "samples), busy = the GPU's busy share in the driver's last window, cap = highest clock allowed now, levels = "
+                       "the power levels allowed (0 = fastest; a launcher's power control or heat raises the first), temperature; "
+                       "cores busy% = how busy each CPU was, whoever ran there (? = can't tell), the game's CPUs' busy time split "
+                       "into this process, the wineserver and others (other apps, Android, the launcher, the kernel), paused = "
+                       "share of the second the kernel had a CPU out of use, runnable = runnable tasks of the whole system, cpu "
+                       "pressure = share of the second some task waited for a CPU; system busy = the whole device's busy CPU "
+                       "time in cores by kind (user, low prio = user at lowered priority, kernel, irq), this process, the "
+                       "wineserver, app group = this app's Android group (the launcher's own process and Wine's processes), "
+                       "app user = all processes of the app's user; memory = free memory, swap, the kernel's reclaim (swap "
+                       "out/in, pages scanned to free memory by kswapd or by allocating tasks, stalls = allocations that had to "
+                       "reclaim, refaults = evicted file pages read again), pressure = share of the second tasks waited for "
+                       "memory or storage, this process's resident, swapped and GPU memory; '# cgroup' = the Android groups the main "
+                       "thread and the wineserver are in; rumble = the game's XInputSetState calls (FEX_RUMBLE): calls, changes "
+                       "of strength, changes sent to the controller and how long Wine took for each\n",
+                       AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
   fwrite(Header.data(), 1, Header.size(), File);

@@ -138,8 +138,9 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "a frame cap that sleeps inside vkQueuePresentKHR gets its wait slept out before the present, without "
                       "holding the VkQueue the game's compute and copy queues share ('cap' line)");
   SetupVkd3dFexSwitch("FEX_VKD3D_FRAME_START", L"VKD3D_FEX_FRAME_START",
-                      "the game's next frame starts as late as the measured waiting allows, so it reads input closer to when "
-                      "the frame is shown ('frame start' line)");
+                      "the game's next frame starts as late as the measured waiting allows (up to 20 ms, changing by at most "
+                      "0.2 ms per frame up and 1 ms down, from VKD3D fex3 on), so it reads input closer to when the frame is "
+                      "shown ('frame start' line)");
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
 
