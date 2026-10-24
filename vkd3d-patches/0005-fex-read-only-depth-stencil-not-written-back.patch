@@ -1,0 +1,270 @@
+From b25f20d78f0ec9e7af510233bf6c01ecd600508e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 12:47:00 +0000
+Subject: [PATCH] FEX: don't write read-only depth-stencil planes back at the
+ end of a render pass
+
+vkd3d begins every render pass with LOAD and STORE for each attachment. A depth-stencil plane in a read-only layout
+can't be written in the pass (a pipeline that writes it or a clear of it ends the pass first, and the next one starts
+in a writable layout), yet STORE makes a tiler copy the whole plane out of tile memory at the end of each such pass.
+Such planes now end with STORE_OP_NONE, which keeps the contents untouched. When only one plane is read-only, the
+stencil plane gets an attachment of its own with its own store op. A plane cleared at the begin (folded clear) keeps
+STORE.
+
+In the build 59 log D2R ran ~70 render passes per frame and stored ~270 MB of attachments per frame; the GPU sat at its
+680 MHz maximum and needed ~38 ms per frame in fights.
+
+VKD3D_FEX_DS_STORE_NONE=0 turns it off (on when unset). The pass report's header says whether it is on, and its
+per-second line counts the passes whose depth-stencil wasn't written back and the bytes kept in tile memory.
+---
+ libs/vkd3d/command.c        | 59 +++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/device.c         |  1 +
+ libs/vkd3d/fex_pass_meter.c | 35 +++++++++++++++++-----
+ libs/vkd3d/vkd3d_private.h  |  5 ++++
+ 4 files changed, 93 insertions(+), 7 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 1680fc3..df7340c 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7514,6 +7514,59 @@ static void d3d12_command_list_check_render_pass_barrier(struct d3d12_command_li
+     }
+ }
+ 
++/* FEX: store ops of the depth-stencil attachment for this begin. A plane in a read-only layout can't be written in the
++ * pass: a pipeline that writes it or a clear of it ends the pass first and the next one starts in a writable layout
++ * (update_graphics_pipeline, clear_attachment). So nothing needs to go back to memory at its end, which on a tiler is a
++ * copy of the whole plane out of tile memory per pass. STORE_OP_NONE keeps the contents as long as nothing is written.
++ * A plane that is cleared at this begin (folded clear) is written and keeps STORE. Returns true when pStencilAttachment
++ * was pointed at fex_stencil, which the caller points back at dsv after vkCmdBeginRendering. */
++static bool d3d12_command_list_fex_ds_store_ops(struct d3d12_command_list *list)
++{
++    struct vkd3d_rendering_info *ri = &list->rendering_info;
++    bool depth_ro, stencil_ro, split = false;
++
++    ri->dsv.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    if (!list->device->fex_ds_store_none || !ri->dsv.imageView || ri->dsv.loadOp != VK_ATTACHMENT_LOAD_OP_LOAD)
++        return false;
++
++    switch (ri->dsv.imageLayout)
++    {
++        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
++        case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL:
++        case VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL:
++        case VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL:
++            depth_ro = stencil_ro = true;
++            break;
++        case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL:
++            depth_ro = true;
++            stencil_ro = false;
++            break;
++        case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL:
++            depth_ro = false;
++            stencil_ro = true;
++            break;
++        default:
++            return false;
++    }
++
++    if (ri->info.pDepthAttachment && ri->info.pStencilAttachment && depth_ro != stencil_ro)
++    {
++        /* One plane read-only: the stencil plane gets an attachment of its own with its own store op. */
++        ri->fex_stencil = ri->dsv;
++        ri->fex_stencil.storeOp = stencil_ro ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
++        ri->info.pStencilAttachment = &ri->fex_stencil;
++        split = true;
++        if (depth_ro)
++            ri->dsv.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
++    }
++    else if (ri->info.pDepthAttachment ? depth_ro : stencil_ro)
++    {
++        ri->dsv.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
++    }
++
++    return split;
++}
++
+ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list,
+         enum vkd3d_pipeline_type pipeline_type)
+ {
+@@ -7521,6 +7574,7 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+     struct d3d12_graphics_pipeline_state *graphics;
+     uint32_t fex_fold_rt_mask = 0;
+     bool fex_fold_ds = false;
++    bool fex_stencil_split;
+     uint32_t fex_pass_kind;
+     bool pipeline_ok;
+ 
+@@ -7564,6 +7618,8 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+         d3d12_command_list_emit_render_pass_transition(list, VKD3D_RENDER_PASS_TRANSITION_MODE_BEGIN);
+     }
+ 
++    fex_stencil_split = d3d12_command_list_fex_ds_store_ops(list);
++
+     if (list->device->fex_pass_meter)
+     {
+         const struct vkd3d_format *fex_color_formats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+@@ -7588,6 +7644,9 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+     d3d12_command_list_debug_mark_begin_region(list, "RenderPass");
+     VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, &list->rendering_info.info));
+ 
++    if (fex_stencil_split)
++        list->rendering_info.info.pStencilAttachment = &list->rendering_info.dsv;
++
+     /* Folded clears only apply to this begin; a resumed pass must load what this one stored. */
+     while (fex_fold_rt_mask)
+         list->rendering_info.rtv[vkd3d_bitmask_iter32(&fex_fold_rt_mask)].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index ab8e9ce..dea69aa 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -10048,6 +10048,7 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+     device->timestamp_profiler = vkd3d_timestamp_profiler_init(device);
+ #endif
+     device->fex_fold_clears = vkd3d_fex_fold_clears_enabled();
++    device->fex_ds_store_none = vkd3d_fex_ds_store_none_enabled();
+     vkd3d_fex_timeline_init();
+     device->fex_pass_meter = vkd3d_fex_pass_meter_init(device);
+ 
+diff --git a/libs/vkd3d/fex_pass_meter.c b/libs/vkd3d/fex_pass_meter.c
+index dc02e02..8b0c550 100644
+--- a/libs/vkd3d/fex_pass_meter.c
++++ b/libs/vkd3d/fex_pass_meter.c
+@@ -87,6 +87,7 @@ struct vkd3d_fex_pass_meter
+     uint32_t line_count;
+     uint64_t lists, list_ticks, passes, pass_ticks, draws, clears, clear_ticks, lost, unordered;
+     uint64_t load_bytes, store_bytes, clear_bytes, loads, stores, cleared;
++    uint64_t ds_kept, ds_kept_bytes, ds_half_kept; /* read-only depth-stencil not written back (STORE_OP_NONE) */
+     uint64_t window_start_ns;
+ 
+     /* Counted by recording threads. */
+@@ -431,7 +432,6 @@ static void fex_pass_account(struct vkd3d_fex_pass_meter *meter, const struct vk
+     if (sig->has_depth || sig->has_stencil)
+     {
+         uint8_t load = sig->has_depth ? sig->depth_load : sig->stencil_load;
+-        uint8_t store = sig->has_depth ? sig->depth_store : sig->stencil_store;
+ 
+         if (load == VK_ATTACHMENT_LOAD_OP_LOAD)
+         {
+@@ -443,10 +443,19 @@ static void fex_pass_account(struct vkd3d_fex_pass_meter *meter, const struct vk
+             meter->cleared++;
+             meter->clear_bytes += area * sig->ds_bytes;
+         }
+-        if (store == VK_ATTACHMENT_STORE_OP_STORE)
++        /* Packed: 2 = STORE_OP_NONE. A plane still stored counts the whole attachment as stored. */
++        if ((sig->has_depth && sig->depth_store == VK_ATTACHMENT_STORE_OP_STORE) ||
++                (sig->has_stencil && sig->stencil_store == VK_ATTACHMENT_STORE_OP_STORE))
+         {
+             meter->stores++;
+             meter->store_bytes += area * sig->ds_bytes;
++            if ((sig->has_depth && sig->depth_store == 2) || (sig->has_stencil && sig->stencil_store == 2))
++                meter->ds_half_kept++;
++        }
++        else if ((!sig->has_depth || sig->depth_store == 2) && (!sig->has_stencil || sig->stencil_store == 2))
++        {
++            meter->ds_kept++;
++            meter->ds_kept_bytes += area * sig->ds_bytes;
+         }
+     }
+ }
+@@ -522,6 +531,14 @@ bool vkd3d_fex_fold_clears_enabled(void)
+     return vkd3d_get_env_var("VKD3D_FEX_FOLD_CLEARS", env, sizeof(env)) && !strcmp(env, "1");
+ }
+ 
++/* On unless VKD3D_FEX_DS_STORE_NONE=0: FEX builds before it knew this switch don't set it. */
++bool vkd3d_fex_ds_store_none_enabled(void)
++{
++    char env[16];
++
++    return !vkd3d_get_env_var("VKD3D_FEX_DS_STORE_NONE", env, sizeof(env)) || strcmp(env, "0");
++}
++
+ void vkd3d_fex_pass_meter_count_clears(struct d3d12_device *device, uint32_t folded, uint32_t own_pass)
+ {
+     struct vkd3d_fex_pass_meter *meter = device->fex_pass_meter;
+@@ -548,10 +565,10 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+         const VkPhysicalDeviceVulkan12Properties *props = &meter->device->device_info.vulkan_1_2_properties;
+ 
+         len = vkd3d_fex_report_append(text, sizeof(text), len,
+-                "# gpu passes: driver %s (%s), id %u, timestamp tick %.2f ns, clear folding %s; command.c lines are from"
+-                " vkd3d-proton 3.0b + FEX patches\n",
++                "# gpu passes: driver %s (%s), id %u, timestamp tick %.2f ns, clear folding %s, read-only depth-stencil"
++                " not written back %s; command.c lines are from vkd3d-proton 3.0b + FEX patches\n",
+                 props->driverName, props->driverInfo, props->driverID, meter->ns_per_tick,
+-                meter->device->fex_fold_clears ? "on" : "off");
++                meter->device->fex_fold_clears ? "on" : "off", meter->device->fex_ds_store_none ? "on" : "off");
+     }
+ 
+     clears_folded = vkd3d_atomic_uint32_exchange_explicit(&meter->clears_folded, 0, vkd3d_memory_order_relaxed);
+@@ -560,10 +577,12 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+     len = vkd3d_fex_report_append(text, sizeof(text), len,
+             "  gpu lists=%"PRIu64" gpu=%.1fms | passes=%"PRIu64" gpu=%.1fms draws=%"PRIu64" | clear passes=%"PRIu64" gpu=%.1fms"
+             " | clears folded=%u own pass=%u | attachments loaded=%"PRIu64" %.0fMB cleared=%"PRIu64" stored=%"PRIu64" %.0fMB"
++            " | depth-stencil not written back=%"PRIu64" %.0fMB (one plane only %"PRIu64")"
+             " | lost=%"PRIu64" dropped=%"PRIu64" over %.2fs\n",
+             meter->lists, meter->list_ticks * ms, meter->passes, meter->pass_ticks * ms, meter->draws,
+             meter->clears, meter->clear_ticks * ms, clears_folded, clears_own_pass, meter->loads,
+-            meter->load_bytes / 1048576.0, meter->cleared, meter->stores, meter->store_bytes / 1048576.0, meter->lost,
++            meter->load_bytes / 1048576.0, meter->cleared, meter->stores, meter->store_bytes / 1048576.0,
++            meter->ds_kept, meter->ds_kept_bytes / 1048576.0, meter->ds_half_kept, meter->lost,
+             meter->dropped, seconds);
+ 
+     /* Top passes by GPU time. */
+@@ -628,6 +647,7 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+     meter->lists = meter->list_ticks = meter->passes = meter->pass_ticks = meter->draws = 0;
+     meter->clears = meter->clear_ticks = meter->lost = meter->unordered = 0;
+     meter->load_bytes = meter->store_bytes = meter->clear_bytes = meter->loads = meter->stores = meter->cleared = 0;
++    meter->ds_kept = meter->ds_kept_bytes = meter->ds_half_kept = 0;
+     pthread_mutex_lock(&meter->pending_lock);
+     meter->dropped = 0;
+     pthread_mutex_unlock(&meter->pending_lock);
+@@ -718,7 +738,8 @@ struct vkd3d_fex_pass_meter *vkd3d_fex_pass_meter_init(struct d3d12_device *devi
+     char env[16];
+ 
+     vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_pass_report.flags, VKD3D_FEX_REPORT_FLAG_DEVICE |
+-            (device->fex_fold_clears ? VKD3D_FEX_REPORT_FLAG_FOLD_CLEARS : 0), vkd3d_memory_order_release);
++            (device->fex_fold_clears ? VKD3D_FEX_REPORT_FLAG_FOLD_CLEARS : 0) |
++            (device->fex_ds_store_none ? VKD3D_FEX_REPORT_FLAG_DS_STORE_NONE : 0), vkd3d_memory_order_release);
+ 
+     if (!vkd3d_get_env_var("VKD3D_FEX_PASSES", env, sizeof(env)) || strcmp(env, "1"))
+         return NULL;
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index c7f5394..8dd302b 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2790,6 +2790,8 @@ struct vkd3d_rendering_info
+     VkRenderingInfo info;
+     VkRenderingAttachmentInfo rtv[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+     VkRenderingAttachmentInfo dsv;
++    /* FEX: the stencil plane's attachment when only one plane of the DSV is read-only (its own store op). */
++    VkRenderingAttachmentInfo fex_stencil;
+     VkRenderingFragmentShadingRateAttachmentInfoKHR vrs;
+     uint32_t state_flags;
+     uint32_t rtv_mask;
+@@ -3040,6 +3042,7 @@ struct vkd3d_timestamp_profiler_submitted_work;
+ #define VKD3D_FEX_REPORT_FLAG_PRESLEEP 0x8u    /* present report: cap pre-sleep is on */
+ #define VKD3D_FEX_REPORT_FLAG_GRADUAL_START 0x10u /* present report: frame start pacing changes gradually */
+ #define VKD3D_FEX_REPORT_FLAG_MARGIN_CAUSED 0x20u /* present report: only frames the hold-back made late grow the margin */
++#define VKD3D_FEX_REPORT_FLAG_DS_STORE_NONE 0x40u /* pass report: read-only depth-stencil planes aren't written back */
+ #define VKD3D_FEX_REPORT_FLAG_DEVICE 0x80000000u /* a D3D12 device was created */
+ struct vkd3d_fex_report
+ {
+@@ -3334,6 +3337,7 @@ void vkd3d_fex_pass_meter_submit_list(struct d3d12_command_list *list);
+ void vkd3d_fex_pass_meter_free_list(struct d3d12_command_list *list);
+ void vkd3d_fex_pass_meter_count_clears(struct d3d12_device *device, uint32_t folded, uint32_t own_pass);
+ bool vkd3d_fex_fold_clears_enabled(void);
++bool vkd3d_fex_ds_store_none_enabled(void);
+ void d3d12_command_list_invalidate_all_state(struct d3d12_command_list *list);
+ 
+ void d3d12_command_list_debug_mark_label(struct d3d12_command_list *list, const char *tag,
+@@ -5518,6 +5522,7 @@ struct d3d12_device
+ #endif
+     struct vkd3d_fex_pass_meter *fex_pass_meter;
+     bool fex_fold_clears;
++    bool fex_ds_store_none;
+     uint64_t shader_interface_key;
+     uint32_t device_has_dgc_templates;
+ 
+-- 
+2.43.0
+
