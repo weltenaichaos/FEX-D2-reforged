@@ -67,6 +67,15 @@ namespace {
     // slow frames allow (see EnvironmentVariablesHandling.h).
     {"FEX_VKD3D_CAP_PRESLEEP", "1"},
     {"FEX_VKD3D_FRAME_START", "1"},
+    // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
+    // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
+    // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
+    {"FEX_LOADER_CORES", "little"},
+    {"FEX_LOADER_WATCH", "1"},
+    // Build 62: during play, unpack cache hits not in read-ahead memory are left to the game to unpack (1.9 ms average
+    // disk reads during play in the fex10 run, around the 100-140 ms streaming hitches), and read-ahead is shorter
+    // (see ARM64EC/NativeUnpackCache.cpp).
+    {"FEX_UNPACK_CACHE_PLAY", "1"},
   };
 
   // In the order the stats log lists them.
@@ -84,6 +93,7 @@ namespace {
     "FEX_UNPACK_CACHE_RESET",
     "FEX_UNPACK_CACHE_READAHEAD_MB",
     "FEX_UNPACK_CACHE_DIRECT",
+    "FEX_UNPACK_CACHE_PLAY",
     "FEX_GAME_FILES_UNCACHED",
     "FEX_GAME_FILES_MS",
     "FEX_UNPACK_CACHE_SKIP_ADLER",
@@ -102,6 +112,8 @@ namespace {
     "FEX_MAINCORE_WAIT",
     "FEX_HELPER_CORES",
     "FEX_SERVER_NICE",
+    "FEX_LOADER_CORES",
+    "FEX_LOADER_WATCH",
     "FEX_SCHEDLOG",
     "FEX_GPULOG",
     "FEX_FRAMELATENCY",

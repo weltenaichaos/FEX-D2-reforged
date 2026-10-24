@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstdint>
 #include <string_view>
 
 namespace FEX::Windows {
@@ -45,8 +46,35 @@ namespace FEX::Windows {
 //
 //   FEX_SERVER_NICE=N  run the wineserver at Linux nice N (D2R default -10; "off" leaves it alone)
 //
+// Loader threads. In the fex10 run (FEX build 61) one thread of D2R's (tid 576) ran almost only code in a private
+// allocation next to D2R_loader.dll (the game's protection/loader code), not in D2R.exe or any loaded module. In 36% of
+// the play time it was busy: a CreateEventW / WaitForMultipleObjects / CloseHandle loop at ~0.65 of a big core, plus ~0.25
+// of a core of extra wineserver work. In those phases calm play had 3 times as many frames of 40 ms or more (0.25 a
+// second against 0.08), fights 7 times as many (4.0 against 0.6), and the main thread waited twice as long for a CPU. It
+// ran on the same big cores as the game's workers and the wineserver.
+//
+//   FEX_LOADER_CORES=little  every thread that runs at 25% of a core or more for 2 seconds with at least 6 of 8 samples
+//                      of its code (4 a second) outside any loaded module goes to the slowest cores (0-2 on the Thor)
+//                      for good, at the Linux level: GameNative's container lets Wine use cores 3-7 only, but Linux lets
+//                      the process use all 8. Its Linux cores are checked 4 times a second and set back when something
+//                      changed them (the D2R default).
+//   FEX_LOADER_CORES=off     leave them where Wine puts them
+//
+// Each loader thread found gets a "# loader: ..." line, and every second a "loader" line with how long it ran and how
+// long it waited for a CPU. With the stats log, its calls get a "loader calls" line too (see ARM64EC/LoaderWatch.h).
+//
 // FEX's own threads (named FEX*) keep their priorities. Checked every 2 seconds, since a game can change priorities and
 // affinities at any time. Each change is written to the FEX_STATSLOG log as a "# prio ...", "# cores ..." or
 // "# server ..." line.
 void StartPriorityGuard(std::string_view AppName);
+
+// Every emulated thread registers as it starts and unregisters as it ends (ARM64EC ThreadInit/ThreadTerm), so the guard
+// knows its Linux tid and can see which guest code it runs. BlockHeader points at the thread's InlineJITBlockHeader;
+// the guard reads it only while the thread is registered, and GuardThreadEnded waits for any such read to finish.
+void GuardThreadStarted(uint32_t TID, int LinuxTid, uint64_t Teb, const volatile uint64_t* BlockHeader);
+void GuardThreadEnded(uint32_t TID);
+
+// Called on the guard's thread for every loader thread it finds (see FEX_LOADER_CORES), with its TEB, and again with Teb 0
+// when it ended. Set before StartPriorityGuard.
+void SetLoaderThreadHook(void (*Hook)(uint32_t TID, uint64_t Teb));
 } // namespace FEX::Windows

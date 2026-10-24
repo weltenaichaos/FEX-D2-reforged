@@ -1769,8 +1769,8 @@ namespace {
     fextl::vector<ProbeEvent> ProbeEvents;
   };
 
-  // Up to eight, see StatsLogSetLineProvider.
-  constexpr size_t MaxLineProviders = 8;
+  // Up to twelve, see StatsLogSetLineProvider.
+  constexpr size_t MaxLineProviders = 12;
   std::atomic<fextl::string (*)()> LineProviders[MaxLineProviders] {};
   // Called with every sample of the main thread, see StatsLogSetMainSampleHook.
   std::atomic<void (*)(uint64_t)> MainSampleHook {};

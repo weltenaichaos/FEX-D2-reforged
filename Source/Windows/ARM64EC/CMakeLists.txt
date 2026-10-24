@@ -1,6 +1,7 @@
 add_library(arm64ecfex SHARED
   FrameLatency.cpp
   GameFiles.cpp
+  LoaderWatch.cpp
   Module.cpp
   Module.S
   NativeMD5.c

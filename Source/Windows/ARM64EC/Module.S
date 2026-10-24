@@ -89,6 +89,15 @@ rumble_hit:
   add x9, x9, #:lo12:NativeRumbleTarget
 rumble_done:
 
+  // A call from one of the game's loader threads (its TEB in FEXLoaderWatch[1..4], see LoaderWatch.h) into CreateEventW,
+  // CloseHandle or WaitForMultipleObjects runs FEX's counting wrapper instead, which calls the one it was going to. Only
+  // x16 and x17, as above; [0] stays 0 until a loader thread is found.
+  adrp x16, FEXLoaderWatch
+  add x16, x16, #:lo12:FEXLoaderWatch
+  ldr x17, [x16]
+  cbnz x17, loader_watch_check
+loader_watch_done:
+
   // Either return to an exit thunk (return to ARM64EC function) or call an entry thunk (call to ARM64EC function).
   // It is assumed that a 'blr x16' instruction is only ever used to call into x86 code from an exit thunk, and that all
   // exported ARM64EC functions have a 4-byte offset to their entry thunk immediately before their first instruction.
@@ -170,6 +179,73 @@ wait_watch_check:
   stlr lr, [x16]
   ldursw x23, [x17, #-0x4]
   b wait_watch_done
+
+loader_watch_check:
+  ldr x17, [x16, #8]
+  cmp x17, x18
+  b.eq loader_watch_thread
+  ldr x17, [x16, #16]
+  cmp x17, x18
+  b.eq loader_watch_thread
+  ldr x17, [x16, #24]
+  cmp x17, x18
+  b.eq loader_watch_thread
+  ldr x17, [x16, #32]
+  cmp x17, x18
+  b.ne loader_watch_done
+loader_watch_thread:
+  ldr x17, [x16, #40]
+  cmp x17, x9
+  b.eq loader_watch_create
+  ldr x17, [x16, #48]
+  cmp x17, x9
+  b.eq loader_watch_create
+  ldr x17, [x16, #56]
+  cmp x17, x9
+  b.eq loader_watch_create
+  ldr x17, [x16, #64]
+  cmp x17, x9
+  b.eq loader_watch_create
+  ldr x17, [x16, #72]
+  cmp x17, x9
+  b.eq loader_watch_close
+  ldr x17, [x16, #80]
+  cmp x17, x9
+  b.eq loader_watch_close
+  ldr x17, [x16, #88]
+  cmp x17, x9
+  b.eq loader_watch_close
+  ldr x17, [x16, #96]
+  cmp x17, x9
+  b.eq loader_watch_close
+  ldr x17, [x16, #104]
+  cmp x17, x9
+  b.eq loader_watch_wait
+  ldr x17, [x16, #112]
+  cmp x17, x9
+  b.eq loader_watch_wait
+  ldr x17, [x16, #120]
+  cmp x17, x9
+  b.eq loader_watch_wait
+  ldr x17, [x16, #128]
+  cmp x17, x9
+  b.eq loader_watch_wait
+  b loader_watch_done
+loader_watch_create:
+  str x9, [x16, #136] // FEXLoaderWatch[17]: the CreateEventW entry called
+  adrp x9, NativeLoaderCreateEventTarget
+  add x9, x9, #:lo12:NativeLoaderCreateEventTarget
+  b loader_watch_done
+loader_watch_close:
+  str x9, [x16, #144] // [18]: the CloseHandle entry
+  adrp x9, NativeLoaderCloseHandleTarget
+  add x9, x9, #:lo12:NativeLoaderCloseHandleTarget
+  b loader_watch_done
+loader_watch_wait:
+  str x9, [x16, #152] // [19]: the WaitForMultipleObjects entry
+  adrp x9, NativeLoaderWaitTarget
+  add x9, x9, #:lo12:NativeLoaderWaitTarget
+  b loader_watch_done
 
 .global ExitFunctionSuspendPoint
 ExitFunctionSuspendPoint:
@@ -301,3 +377,8 @@ NATIVE_REDIRECT NativeMD5Transform, #FEXNativeMD5Transform
 NATIVE_REDIRECT NativeJobSystemGet, #FEXNativeJobSystemGet, "mov x0, x30"
   // XInputSetState(index, vibration), entered from ExitFunctionEC above (the Redirect stub is unused).
 NATIVE_REDIRECT NativeRumble, #FEXNativeRumbleSetState
+  // The loader call watch's wrappers (LoaderWatch.cpp), entered from ExitFunctionEC above. Each also gets lr and sp after
+  // its arguments, for the x64 return address (lr, or [sp] when lr is X64ReturnInstr, see ret_sp_misaligned).
+NATIVE_REDIRECT NativeLoaderCreateEvent, #FEXNativeLoaderCreateEventW, "mov x4, x30; mov x5, sp"
+NATIVE_REDIRECT NativeLoaderCloseHandle, #FEXNativeLoaderCloseHandle, "mov x1, x30; mov x2, sp"
+NATIVE_REDIRECT NativeLoaderWait, #FEXNativeLoaderWaitForMultiple, "mov x4, x30; mov x5, sp"

@@ -2,6 +2,7 @@
 #include "Windows/Common/LinuxSys.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 namespace FEX::Windows::Linux {
@@ -191,6 +192,17 @@ int GetPid() {
 
 int GetTid() {
   return static_cast<int>(Syscall(NR_gettid));
+}
+
+bool ReadOwnMemory(uint64_t Address, void* Out, size_t Size) {
+  // Opened once; -2 = not tried yet. Two threads opening it at once only leaks one descriptor.
+  static std::atomic<int> Fd {-2};
+  int Mem = Fd.load(std::memory_order_acquire);
+  if (Mem == -2) {
+    Mem = Open("/proc/self/mem");
+    Fd.store(Mem >= 0 ? Mem : -1, std::memory_order_release);
+  }
+  return Mem >= 0 && Size && Address < (1ull << 63) && Pread(Mem, Out, Size, Address) == static_cast<int64_t>(Size);
 }
 
 int GetNice(int Tid) {

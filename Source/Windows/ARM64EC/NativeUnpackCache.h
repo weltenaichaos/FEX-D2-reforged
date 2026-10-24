@@ -43,6 +43,9 @@ struct FEXUnpackCacheCounters {
   uint64_t MD5Stores;
   uint64_t AheadDirect; // read-ahead chunks read with direct reads, past the kernel's file cache
   uint64_t CacheDrops;  // reads and writes of data.bin dropped from the kernel's file cache afterwards
+  uint64_t PlayLookups;   // lookups while playing (few lookups a second, see FEX_UNPACK_CACHE_PLAY)
+  uint64_t PlaySkips;     // of those, hits not in read-ahead memory, left to the game to unpack instead of read from disk
+  uint64_t PlaySkipBytes;
 };
 extern struct FEXUnpackCacheCounters FEXUnpackCacheStats;
 

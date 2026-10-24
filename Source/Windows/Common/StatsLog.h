@@ -38,7 +38,7 @@ void StatsLogDiskCacheHit(uint64_t GuestRIP);
 void StatsLogWatchImage(uint64_t Base);
 
 // Adds the lines Provider returns (each indented and ending in a newline, or nothing) to every per-second block.
-// Provider runs on the log thread. Up to eight providers, in the order they were set.
+// Provider runs on the log thread. Up to twelve providers, in the order they were set.
 void StatsLogSetLineProvider(fextl::string (*Provider)());
 
 // Hook gets every sample (one per 2ms) of the main thread on the log thread: the native function it is in, or 0 while it

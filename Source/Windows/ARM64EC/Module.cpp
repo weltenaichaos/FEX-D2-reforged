@@ -52,9 +52,11 @@ $end_info$
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/ThreadPlacer.h"
 #include "Windows/Common/PriorityGuard.h"
+#include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/Switches.h"
 #include "FrameLatency.h"
 #include "Rumble.h"
+#include "LoaderWatch.h"
 #include "GameFiles.h"
 #include "NativeRedirect.h"
 #include "Vkd3dReport.h"
@@ -946,6 +948,7 @@ NTSTATUS ProcessInit() {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
   FEX::Windows::StartThreadPlacer(AppConfigName);
+  LoaderWatch::Init(StatsLog);
   FEX::Windows::StartPriorityGuard(AppConfigName);
   FrameLatency::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
   Rumble::Init(StatsLog);
@@ -1368,6 +1371,9 @@ NTSTATUS ThreadInit() {
     if (StatAllocHandler) {
       Thread->ThreadStats = StatAllocHandler->AllocateSlot(ThreadTID);
     }
+    // For the priority guard's loader thread search: its Linux tid and the JIT block it runs.
+    FEX::Windows::GuardThreadStarted(ThreadTID, FEX::Windows::Linux::GetTid(), reinterpret_cast<uint64_t>(NtCurrentTeb()),
+                                     &Thread->CurrentFrame->State.InlineJITBlockHeader);
   }
 
   CPUArea.ThreadState() = Thread;
@@ -1412,6 +1418,8 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
     }
 
     Threads.erase(it);
+    // Before the thread's state is freed below: the guard reads its InlineJITBlockHeader only while it is registered.
+    FEX::Windows::GuardThreadEnded(static_cast<uint32_t>(ThreadTID));
     if (StatAllocHandler) {
       StatAllocHandler->DeallocateSlot(CPUArea.ThreadState()->ThreadStats);
     }

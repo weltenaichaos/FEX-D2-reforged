@@ -11,7 +11,10 @@
 #include <FEXCore/Utils/Threads.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <iterator>
+#include <mutex>
 #include <ntstatus.h>
 #include <windef.h>
 #include <winternl.h>
@@ -85,6 +88,7 @@ namespace {
 
   enum class PrioMode { Keep, Clamp, Normal };
   enum class CoreMode { Off, Big, Fast };
+  enum class LoaderMode { Off, Find, Little };
 
   struct Config {
     PrioMode Prio;
@@ -97,7 +101,97 @@ namespace {
     uint32_t MainTID;    // the thread that started the process (FEX's process init runs on it)
     int MainLinuxTid;    // its Linux tid
     uint32_t EaseWaitMs; // FEX_MAINCORE_WAIT, 0 = never let the main thread off its core
+    LoaderMode Loader;   // FEX_LOADER_CORES
   };
+
+  // Loader threads, see FEX_LOADER_CORES in PriorityGuard.h.
+  constexpr uint32_t LoaderSamples = 8;              // per 2 s round, one every 250 ms
+  constexpr uint32_t LoaderMinSamples = 6;           // samples that resolved to guest code, and at least 3 in 4 of them outside modules
+  constexpr uint64_t LoaderBusyNs = 500'000'000;     // run time in a 2 s round: 25% of a core
+  constexpr uint32_t LoaderGameRounds = 3;           // busy rounds in module code before a thread isn't sampled for a while
+  constexpr uint32_t LoaderSkipRounds = 30;          // 1 minute
+  constexpr size_t MaxLoaderThreads = 4;
+  constexpr uint32_t MaxCheckNotes = 24;             // "# loader: checked ..." lines, the first check of each busy thread
+
+  // The emulated threads, see GuardThreadStarted.
+  struct Registered {
+    uint32_t TID;
+    int LinuxTid;
+    uint64_t Teb;
+    const volatile uint64_t* BlockHeader;
+  };
+  constexpr size_t MaxRegistered = 4096;
+  std::mutex RegistryLock;
+  Registered Registry[MaxRegistered];
+  size_t RegistryCount {};
+  std::atomic<void (*)(uint32_t, uint64_t)> LoaderHook {};
+
+  // The per-second "loader" line: written by the guard once a second, read by the stats log thread.
+  struct LoaderLineEntry {
+    uint32_t TID;
+    int LinuxTid;
+    uint64_t Mask;
+    int Processor;
+    double RunMs;
+    double WaitMs;
+  };
+  std::mutex LoaderLineLock;
+  LoaderLineEntry LoaderLine[MaxLoaderThreads];
+  size_t LoaderLineCount {};
+
+  fextl::string LoaderStatsLine() {
+    std::scoped_lock Lock {LoaderLineLock};
+    if (!LoaderLineCount) {
+      return {};
+    }
+    fextl::string Out = "  loader";
+    for (size_t i = 0; i < LoaderLineCount; ++i) {
+      const auto& E = LoaderLine[i];
+      Out += fextl::fmt::format("{} tid={} (Linux {}) cores {:#x}, last on CPU {}: ran {:.0f} ms/s, waited {:.0f} ms/s for a CPU", i ? ";" : "",
+                                E.TID, E.LinuxTid, E.Mask, E.Processor, E.RunMs, E.WaitMs);
+    }
+    Out += "\n";
+    return Out;
+  }
+
+  // Mirrors of FEXCore's CPUBackend::JITCodeHeader / JITCodeTail (Interface/Core/CPUBackend.h), as in StatsLog.cpp.
+  struct JITCodeTailMirror {
+    size_t Size;
+    uint64_t RIP;
+    size_t GuestSize;
+  };
+
+  // Where a sampled JIT block's guest code is: Valid when it could be read, Outside when that is not in any loaded
+  // module (private or mapped memory rather than an image).
+  struct CodeClass {
+    uint64_t Header;
+    bool Valid;
+    bool Outside;
+    uint64_t RIP;
+    uint64_t Base;
+  };
+
+  CodeClass ClassifyBlock(uint64_t Header) {
+    CodeClass R {.Header = Header};
+    uint32_t OffsetToTail {};
+    JITCodeTailMirror Tail {};
+    // The block may have been freed since it was sampled: read through /proc/self/mem, which fails safely.
+    if (!Header || !Linux::ReadOwnMemory(Header, &OffsetToTail, sizeof(OffsetToTail)) || !OffsetToTail ||
+        !Linux::ReadOwnMemory(Header + OffsetToTail, &Tail, sizeof(Tail)) || !Tail.RIP) {
+      return R;
+    }
+    MEMORY_BASIC_INFORMATION Info {};
+    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Tail.RIP), MemoryBasicInformation, &Info, sizeof(Info), nullptr) !=
+          STATUS_SUCCESS ||
+        Info.State != MEM_COMMIT) {
+      return R;
+    }
+    R.Valid = true;
+    R.RIP = Tail.RIP;
+    R.Base = reinterpret_cast<uintptr_t>(Info.AllocationBase);
+    R.Outside = Info.Type != MEM_IMAGE;
+    return R;
+  }
 
   struct Tracked {
     fextl::string Name;
@@ -112,6 +206,17 @@ namespace {
     uint32_t Fixes;
     uint32_t CoreFixes;
     uint32_t SeenAt;
+    bool Main;
+    // Loader thread detection, see FEX_LOADER_CORES.
+    int LinuxTid; // 0 = not an emulated thread, or not registered yet
+    uint64_t Teb;
+    uint64_t Samples[LoaderSamples]; // JIT block headers sampled this round
+    uint32_t SampleCount;
+    uint64_t LastRunNs; // its Linux run time at the last round, 0 = not read yet
+    uint32_t GameRounds;
+    uint32_t SkipUntil;
+    uint32_t Checks;
+    bool Loader;
   };
 
   // nice value Wine on Linux gives an effective priority (server/thread.c apply_thread_priority, nice_limit -19).
@@ -440,6 +545,224 @@ namespace {
     }
   }
 
+  uint64_t Counter() {
+    uint64_t Value {};
+    __asm volatile("isb; mrs %[Res], CNTVCT_EL0" : [Res] "=r"(Value));
+    return Value;
+  }
+
+  uint64_t CounterFrequency() {
+    uint64_t Value {};
+    __asm volatile("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Value));
+    return Value ? Value : 1;
+  }
+
+  // Finds loader threads and keeps them on the slowest cores, see FEX_LOADER_CORES in PriorityGuard.h.
+  struct LoaderThread {
+    uint32_t TID;
+    int LinuxTid;
+    fextl::string StatusPath; // /proc/self/task/<tid>/status
+    fextl::string SchedPath;  // .../schedstat
+    fextl::string StatPath;   // .../stat
+    uint32_t Resets;
+    uint32_t Failures;
+    uint32_t RetryAt; // tick before which a failed core change isn't tried again
+    bool HaveSched;
+    uint64_t LastRunNs;
+    uint64_t LastWaitNs;
+  };
+
+  struct LoaderFinder {
+    const Config* C;
+    fextl::vector<LoaderThread> Threads;
+    uint32_t Tick;
+    uint32_t CheckNotes;
+    uint64_t LastSecond; // counter value at the last per-second line
+  };
+
+  // Every 250 ms: one code sample of each emulated thread that could still be a loader thread, and the loader threads'
+  // Linux cores; once a second the "loader" line's figures.
+  void LoaderTick(LoaderFinder& F, fextl::unordered_map<uint32_t, Tracked>& Threads) {
+    ++F.Tick;
+    {
+      // Held while reading BlockHeader: ThreadTerm unregisters a thread (taking this lock) before freeing its state.
+      std::scoped_lock Lock {RegistryLock};
+      for (size_t i = 0; i < RegistryCount; ++i) {
+        const auto& R = Registry[i];
+        const auto It = Threads.find(R.TID);
+        if (It == Threads.end()) {
+          continue;
+        }
+        auto& T = It->second;
+        if (T.LinuxTid != R.LinuxTid) {
+          // New, or a new thread with an old one's TID.
+          T.LinuxTid = R.LinuxTid;
+          T.SampleCount = T.GameRounds = T.SkipUntil = T.Checks = 0;
+          T.LastRunNs = 0;
+          T.Loader = false;
+        }
+        if (!T.Named || T.FEX || T.Main || T.Loader || T.SampleCount >= LoaderSamples) {
+          continue;
+        }
+        T.Samples[T.SampleCount++] = *R.BlockHeader;
+      }
+    }
+
+    const uint64_t Want = F.C->Loader == LoaderMode::Little ? F.C->LittleMask : 0;
+    const bool Second = F.Tick % 4 == 0;
+    const uint64_t Now = Second ? Counter() : 0;
+    const double Elapsed = Second && F.LastSecond ? static_cast<double>(Now - F.LastSecond) / static_cast<double>(CounterFrequency()) : 0.0;
+    LoaderLineEntry Line[MaxLoaderThreads] {};
+    size_t LineCount {};
+    for (auto& L : F.Threads) {
+      if (Want && F.Tick >= L.RetryAt) {
+        // The thread's own mask: sched_getaffinity would leave out CPUs the kernel has paused for a moment.
+        const uint64_t Own = Linux::ReadAllowedMask(L.StatusPath.c_str());
+        if (Own && Own != Want) {
+          const int Result = Linux::SetAffinity(L.LinuxTid, Want);
+          if (Result) {
+            ++L.Failures;
+            L.RetryAt = F.Tick + 40; // 10 s
+          }
+          if (++L.Resets <= 3 || L.Resets % 50 == 0) {
+            StatsLogNote(fextl::fmt::format("loader: tid={} (Linux {}) Linux cores were {:#x}; set back to {:#x}, result {}, change #{}", L.TID,
+                                            L.LinuxTid, Own, Want, Result, L.Resets));
+          }
+        }
+      }
+      if (Second && LineCount < MaxLoaderThreads) {
+        Linux::SchedStat S {};
+        if (Linux::ReadSchedStat(L.SchedPath.c_str(), S)) {
+          Linux::TaskStat Stat {};
+          auto& E = Line[LineCount++];
+          E.TID = L.TID;
+          E.LinuxTid = L.LinuxTid;
+          E.Mask = Linux::GetAffinity(L.LinuxTid);
+          E.Processor = Linux::ReadTaskStat(L.StatPath.c_str(), Stat) ? Stat.Processor : -1;
+          if (L.HaveSched && Elapsed > 0.1) {
+            E.RunMs = static_cast<double>(S.RunNs - L.LastRunNs) / 1e6 / Elapsed;
+            E.WaitMs = static_cast<double>(S.WaitNs - L.LastWaitNs) / 1e6 / Elapsed;
+          }
+          L.LastRunNs = S.RunNs;
+          L.LastWaitNs = S.WaitNs;
+          L.HaveSched = true;
+        }
+      }
+    }
+    if (Second) {
+      F.LastSecond = Now;
+      std::scoped_lock Lock {LoaderLineLock};
+      std::copy(Line, Line + LineCount, LoaderLine);
+      LoaderLineCount = LineCount;
+    }
+  }
+
+  // Every 2 s round: which busy threads ran loader code in this round's samples.
+  void LoaderRound(LoaderFinder& F, fextl::unordered_map<uint32_t, Tracked>& Threads, uint32_t Round) {
+    const uint64_t Want = F.C->Loader == LoaderMode::Little ? F.C->LittleMask : 0;
+    for (auto& [TID, T] : Threads) {
+      const uint32_t N = T.SampleCount;
+      T.SampleCount = 0;
+      if (!T.LinuxTid || T.FEX || T.Main || T.Loader) {
+        continue;
+      }
+      Linux::SchedStat S {};
+      if (!Linux::ReadSchedStat(fextl::fmt::format("/proc/self/task/{}/schedstat", T.LinuxTid).c_str(), S)) {
+        continue;
+      }
+      const uint64_t RunNs = T.LastRunNs ? S.RunNs - T.LastRunNs : 0;
+      T.LastRunNs = std::max<uint64_t>(S.RunNs, 1);
+      if (Round < T.SkipUntil || RunNs < LoaderBusyNs || N < LoaderMinSamples) {
+        continue;
+      }
+
+      // Each distinct block resolved once.
+      CodeClass Seen[LoaderSamples];
+      size_t SeenCount {};
+      uint32_t Valid {}, Outside {};
+      const CodeClass* Example {};
+      for (uint32_t i = 0; i < N; ++i) {
+        const CodeClass* K {};
+        for (size_t j = 0; j < SeenCount && !K; ++j) {
+          K = Seen[j].Header == T.Samples[i] ? &Seen[j] : nullptr;
+        }
+        if (!K) {
+          Seen[SeenCount] = ClassifyBlock(T.Samples[i]);
+          K = &Seen[SeenCount++];
+        }
+        if (K->Valid) {
+          ++Valid;
+          Outside += K->Outside ? 1 : 0;
+          if (!Example || (K->Outside && !Example->Outside)) {
+            Example = K;
+          }
+        }
+      }
+      ++T.Checks;
+      const double Busy = static_cast<double>(RunNs) / 2e7; // % of a core over the 2 s round
+      const bool IsLoader = Valid >= LoaderMinSamples && Outside * 4 >= Valid * 3;
+      const fextl::string Where = Example ? fextl::fmt::format(" (e.g. guest code {:X} in the {} at {:X})", Example->RIP,
+                                                               Example->Outside ? "allocation" : "module", Example->Base) :
+                                            fextl::string {};
+      if (!IsLoader) {
+        if (T.Checks == 1 && F.CheckNotes < MaxCheckNotes) {
+          ++F.CheckNotes;
+          StatsLogNote(fextl::fmt::format("loader: checked tid={} {} (Linux {}) at {:.0f}% of a core: {} of {} code samples outside modules{}; "
+                                          "not a loader thread",
+                                          TID, T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Outside, Valid, Where));
+        }
+        if (++T.GameRounds >= LoaderGameRounds) {
+          T.GameRounds = 0;
+          T.SkipUntil = Round + LoaderSkipRounds;
+        }
+        continue;
+      }
+
+      T.Loader = true;
+      if (F.Threads.size() >= MaxLoaderThreads) {
+        StatsLogNote(fextl::fmt::format("loader: tid={} (Linux {}) at {:.0f}% of a core ran {} of {} code samples outside modules{}, but {} "
+                                        "loader threads are kept already; left where it is",
+                                        TID, T.LinuxTid, Busy, Outside, Valid, Where, F.Threads.size()));
+        continue;
+      }
+      LoaderThread L {.TID = TID, .LinuxTid = T.LinuxTid};
+      L.StatusPath = fextl::fmt::format("/proc/self/task/{}/status", T.LinuxTid);
+      L.SchedPath = fextl::fmt::format("/proc/self/task/{}/schedstat", T.LinuxTid);
+      L.StatPath = fextl::fmt::format("/proc/self/task/{}/stat", T.LinuxTid);
+      const uint64_t Before = Linux::GetAffinity(T.LinuxTid);
+      const int Result = Want ? Linux::SetAffinity(T.LinuxTid, Want) : 0;
+      if (Result) {
+        ++L.Failures;
+        L.RetryAt = F.Tick + 40;
+      }
+      StatsLogNote(fextl::fmt::format(
+        "loader: tid={} {} (Linux {}) at {:.0f}% of a core ran {} of {} code samples outside any loaded module{}: a loader thread; {}", TID,
+        T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Outside, Valid, Where,
+        Want                                     ? fextl::fmt::format("Linux cores {:#x} -> {:#x} (the slowest), result {} (FEX_LOADER_CORES=off leaves it)",
+                                                                      Before, Want, Result) :
+        F.C->Loader == LoaderMode::Little ? fextl::string("left where it is: the slowest cores aren't known") :
+                                            fextl::string("left where it is (FEX_LOADER_CORES=find)")));
+      F.Threads.push_back(std::move(L));
+      if (const auto Hook = LoaderHook.load(std::memory_order_acquire)) {
+        Hook(TID, T.Teb);
+      }
+    }
+
+    // Loader threads that ended (or whose TID a new thread has now).
+    for (auto It = F.Threads.begin(); It != F.Threads.end();) {
+      const auto Found = Threads.find(It->TID);
+      if (Found != Threads.end() && Found->second.Loader && Found->second.LinuxTid == It->LinuxTid) {
+        ++It;
+        continue;
+      }
+      StatsLogNote(fextl::fmt::format("loader: tid={} (Linux {}) ended", It->TID, It->LinuxTid));
+      if (const auto Hook = LoaderHook.load(std::memory_order_acquire)) {
+        Hook(It->TID, 0);
+      }
+      It = F.Threads.erase(It);
+    }
+  }
+
   void* GuardThread(void* Arg) {
     const auto* C = static_cast<Config*>(Arg);
     const uint32_t SelfTID = GetCurrentThreadId();
@@ -465,6 +788,7 @@ namespace {
     MainKeeper Keeper {.Tid = C->Cores == CoreMode::Fast ? C->MainLinuxTid : 0, .EaseMs = C->EaseWaitMs};
     Keeper.StatusPath = fextl::fmt::format("/proc/self/task/{}/status", Keeper.Tid);
     uint64_t KeepFast {}, KeepWide {};
+    LoaderFinder Finder {.C = C};
 
     for (;;) {
       const LONG Base = C->Prio != PrioMode::Keep ? CheckClass(Round == 0) : 8;
@@ -500,6 +824,7 @@ namespace {
         auto [It, New] = Threads.try_emplace(TID);
         auto& T = It->second;
         T.SeenAt = Round;
+        T.Teb = reinterpret_cast<uintptr_t>(Basic.TebBaseAddress);
         if (New) {
           T.FirstBase = Basic.BasePriority;
           T.FirstPriority = Basic.Priority;
@@ -518,7 +843,8 @@ namespace {
           T.KeepCores = !(T.Name == "FEXStatsLog" || T.Name == "FEXPrioGuard" || T.Name == "FEXThreadPin" || T.Name == "FEXFrameLatency" ||
                           T.Name == "FEXRumble" || T.Name == "FEXFileCache");
         }
-        Entries.push_back({Next, TID, Basic, &T, TID == C->MainTID || T.Name == "Main"});
+        T.Main = TID == C->MainTID || T.Name == "Main";
+        Entries.push_back({Next, TID, Basic, &T, T.Main});
       }
 
       // The cores the game gave its own threads: the most common affinity among threads other than FEX's and the main
@@ -601,6 +927,10 @@ namespace {
         NtClose(H);
       }
 
+      if (C->Loader != LoaderMode::Off) {
+        LoaderRound(Finder, Threads, Round);
+      }
+
       if (Handles.empty() && !ReportedWalkFailure) {
         ReportedWalkFailure = true;
         StatsLogNote(fextl::fmt::format("prio: can't list the process's threads, NtGetNextThread status={:#x}", static_cast<uint32_t>(WalkStatus)));
@@ -639,6 +969,9 @@ namespace {
         LARGE_INTEGER Interval {.QuadPart = -2'500'000}; // 250ms
         NtDelayExecution(FALSE, &Interval);
         KeepMainCore(Keeper, KeepFast, KeepWide);
+        if (C->Loader != LoaderMode::Off) {
+          LoaderTick(Finder, Threads);
+        }
       }
     }
     return nullptr;
@@ -661,6 +994,9 @@ void StartPriorityGuard(std::string_view AppName) {
 
   const char* Helpers = Switch("FEX_HELPER_CORES");
   C->HelpersLittle = Helpers && Helpers[0] == 'l';
+
+  const char* Loader = Switch("FEX_LOADER_CORES");
+  C->Loader = !Loader || Loader[0] == 'o' || Loader[0] == '0' ? LoaderMode::Off : Loader[0] == 'f' ? LoaderMode::Find : LoaderMode::Little;
 
   const char* ServerNice = Switch("FEX_SERVER_NICE");
   if (ServerNice && ServerNice[0] != 'o' && (ServerNice[0] == '-' || (ServerNice[0] >= '0' && ServerNice[0] <= '9'))) {
@@ -690,15 +1026,55 @@ void StartPriorityGuard(std::string_view AppName) {
   StatsLogNote(C->ServerNiceOn ? fextl::fmt::format("server: wineserver to nice {} (FEX_SERVER_NICE=off leaves it alone)", C->ServerNice) :
                                  fextl::string("server: wineserver nice left alone"));
 
-  if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn) {
+  StatsLogNote(C->Loader == LoaderMode::Little ?
+                 fextl::string("loader: threads running at 25% of a core or more mostly outside any loaded module (the game's protection/loader "
+                               "code) go to the slowest cores at the Linux level, checked every 250 ms (FEX_LOADER_CORES=off leaves them, =find "
+                               "only finds them)") :
+               C->Loader == LoaderMode::Find ?
+                 fextl::string("loader: threads running mostly outside any loaded module are found and logged, left where they are "
+                               "(FEX_LOADER_CORES=little moves them to the slowest cores)") :
+                 fextl::string("loader: off (FEX_LOADER_CORES=little moves threads running mostly outside any loaded module to the slowest cores)"));
+
+  if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && C->Loader == LoaderMode::Off) {
     delete C;
     return;
   }
-  if (C->Cores == CoreMode::Fast || C->HelpersLittle) {
+  if (C->Cores == CoreMode::Fast || C->HelpersLittle || C->Loader == LoaderMode::Little) {
     DetectCores(*C);
+  }
+  if (C->Loader != LoaderMode::Off) {
+    StatsLogSetLineProvider(LoaderStatsLine);
   }
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
   Thread = FEXCore::Threads::Thread::Create(GuardThread, C, {.LowPriority = false, .Internal = true}, "FEXPrioGuard");
+}
+
+void GuardThreadStarted(uint32_t TID, int LinuxTid, uint64_t Teb, const volatile uint64_t* BlockHeader) {
+  std::scoped_lock Lock {RegistryLock};
+  const Registered R {.TID = TID, .LinuxTid = LinuxTid, .Teb = Teb, .BlockHeader = BlockHeader};
+  for (size_t i = 0; i < RegistryCount; ++i) {
+    if (Registry[i].TID == TID) {
+      Registry[i] = R;
+      return;
+    }
+  }
+  if (RegistryCount < MaxRegistered) {
+    Registry[RegistryCount++] = R;
+  }
+}
+
+void GuardThreadEnded(uint32_t TID) {
+  std::scoped_lock Lock {RegistryLock};
+  for (size_t i = 0; i < RegistryCount; ++i) {
+    if (Registry[i].TID == TID) {
+      Registry[i] = Registry[--RegistryCount];
+      return;
+    }
+  }
+}
+
+void SetLoaderThreadHook(void (*Hook)(uint32_t TID, uint64_t Teb)) {
+  LoaderHook.store(Hook, std::memory_order_release);
 }
 } // namespace FEX::Windows

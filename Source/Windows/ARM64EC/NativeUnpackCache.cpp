@@ -29,6 +29,16 @@ $end_info$
 // "thrashing" to the kernel and to Android's memory killer. The data is copied into our own memory anyway, so data.bin is
 // read through a Linux file of its own: read-ahead with direct reads (storage to our memory, no file cache), other reads
 // and writes are dropped from the file cache right after.
+//
+// While playing (FEX_UNPACK_CACHE_PLAY, from build 62): an area load looks up thousands of streams a second, play a few
+// to a few hundred (the game streaming in the area around the player). In the fex10 run (FEX build 61) hits during play
+// that weren't in read-ahead memory took 1.9 ms each on average to read from disk, up to 3.6 ms in busy seconds
+// (59 hits, 214 ms in one second), while the game's own unpacking of the same ~59 KB stream takes ~0.3 ms in FEX's
+// native inflate (~190 MB/s in that log) plus the game's own setup. The streaming hitches of 100-140 ms had the main
+// thread in these reads and in the game's own file reads. Read-ahead during play read 1.9 GB, two thirds of it never
+// used, on the storage the main thread's file reads wait for. So while fewer than PlayMaxLookups lookups came in the last and in the current PlayWindowMs, a hit
+// that isn't in read-ahead memory counts as a miss (the game unpacks it itself), and read-ahead reads PlayAheadChunks
+// past a hit instead of AheadChunks. Loads keep the full cache.
 
 #include "NativeUnpackCache.h"
 #include "Windows/Common/LinuxSys.h"
@@ -79,6 +89,9 @@ constexpr size_t RecentDiskChunks = 16;   // chunks of recent hits read from dis
 constexpr uint64_t NoChunk = ~0ull;
 constexpr uint64_t DefaultReadAheadMB = 64;
 constexpr uint64_t PageSize = 4096; // direct reads need buffer, offset and size in multiples of the storage block size
+constexpr uint64_t PlayWindowMs = 250;
+constexpr uint32_t PlayMaxLookups = 125; // per PlayWindowMs; loads have 1000-5500 lookups a second, play 0-500
+constexpr uint64_t PlayAheadChunks = 2;
 
 struct FileHeader {
   char Magic[8];
@@ -167,6 +180,13 @@ struct Cache {
   uint64_t AheadClock {};
   uint64_t RecentDisk[RecentDiskChunks] {}; // chunk + 1, 0 = empty
   size_t RecentDiskNext {};
+
+  // Telling play from loads by the lookup rate, see FEX_UNPACK_CACHE_PLAY above.
+  bool PlayGate {};
+  uint64_t WindowTicks {1};
+  std::atomic<uint64_t> WindowStart {};
+  std::atomic<uint32_t> WindowLookups {};
+  std::atomic<uint32_t> LastWindowLookups {};
 };
 
 Cache* TheCache {};
@@ -413,8 +433,8 @@ void RequestChunksLocked(Cache* C, uint64_t First, uint64_t Count) {
   }
 }
 
-// Copies the entry's data out of read-ahead memory if all of it is there, and asks for the chunks after it.
-bool CopyFromMemory(Cache* C, const Entry& E, uint8_t* Out) {
+// Copies the entry's data out of read-ahead memory if all of it is there, and asks for Distance chunks after it.
+bool CopyFromMemory(Cache* C, const Entry& E, uint8_t* Out, uint64_t Distance) {
   const uint64_t First = E.Offset / ChunkSize;
   const uint64_t Last = (E.Offset + E.Produced - 1) / ChunkSize;
   if (!E.Produced || Last - First + 1 > MaxHitChunks) {
@@ -438,7 +458,7 @@ bool CopyFromMemory(Cache* C, const Entry& E, uint8_t* Out) {
       S.Used = true;
       Pinned[Chunk - First] = Index;
     }
-    RequestChunksLocked(C, Last + 1, AheadChunks);
+    RequestChunksLocked(C, Last + 1, Distance);
   }
   uint64_t Done {};
   for (uint64_t Chunk = First; Chunk <= Last; ++Chunk) {
@@ -454,9 +474,9 @@ bool CopyFromMemory(Cache* C, const Entry& E, uint8_t* Out) {
   return true;
 }
 
-// A hit had to be read from disk. When it follows another recent one in data.bin, the hits are coming in sequence:
-// read its chunk and the ones after it into memory.
-void NoteDiskHit(Cache* C, const Entry& E) {
+// A hit wasn't in read-ahead memory. When it follows another recent one in data.bin, the hits are coming in sequence:
+// read its chunk and the Distance ones after it into memory.
+void NoteDiskHit(Cache* C, const Entry& E, uint64_t Distance) {
   const uint64_t Chunk = E.Offset / ChunkSize;
   std::scoped_lock Guard {C->AheadLock};
   bool Sequential = false;
@@ -466,7 +486,7 @@ void NoteDiskHit(Cache* C, const Entry& E) {
   C->RecentDisk[C->RecentDiskNext] = Chunk + 1;
   C->RecentDiskNext = (C->RecentDiskNext + 1) % RecentDiskChunks;
   if (Sequential) {
-    RequestChunksLocked(C, Chunk, AheadChunks + 1);
+    RequestChunksLocked(C, Chunk, Distance + 1);
   }
 }
 
@@ -565,6 +585,23 @@ void* ReaderThread(void*) {
 }
 } // namespace
 
+namespace {
+// True while the game is playing rather than loading, see FEX_UNPACK_CACHE_PLAY above: fewer than PlayMaxLookups lookups in
+// the previous window (counted as none when it ended more than a window ago) and so far in this one.
+bool Playing(Cache* C, uint64_t Now) {
+  if (!C->PlayGate) {
+    return false;
+  }
+  uint64_t Start = C->WindowStart.load(std::memory_order_relaxed);
+  if (Now - Start >= C->WindowTicks && C->WindowStart.compare_exchange_strong(Start, Now, std::memory_order_relaxed)) {
+    const uint32_t Ended = C->WindowLookups.exchange(0, std::memory_order_relaxed);
+    C->LastWindowLookups.store(Now - Start >= 2 * C->WindowTicks ? 0 : Ended, std::memory_order_relaxed);
+  }
+  const uint32_t InWindow = C->WindowLookups.fetch_add(1, std::memory_order_relaxed) + 1;
+  return InWindow < PlayMaxLookups && C->LastWindowLookups.load(std::memory_order_relaxed) < PlayMaxLookups;
+}
+} // namespace
+
 extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t OutCap, uint32_t* Produced, uint32_t* Trailer) {
   auto* C = TheCache;
   if (!C) {
@@ -572,6 +609,11 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
   }
   const uint64_t Start = ReadTicks();
   __atomic_fetch_add(&FEXUnpackCacheStats.Lookups, 1, __ATOMIC_RELAXED);
+  const bool Play = Playing(C, Start);
+  if (Play) {
+    __atomic_fetch_add(&FEXUnpackCacheStats.PlayLookups, 1, __ATOMIC_RELAXED);
+  }
+  const uint64_t Distance = Play ? PlayAheadChunks : AheadChunks;
 
   Entry E;
   {
@@ -590,7 +632,7 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
   const bool Ahead = C->ReadAheadReady.load(std::memory_order_acquire);
   uint64_t Now = ReadTicks();
   bool Good = false;
-  if (Ahead && CopyFromMemory(C, E, Out)) {
+  if (Ahead && CopyFromMemory(C, E, Out, Distance)) {
     const uint64_t Copied = ReadTicks();
     __atomic_fetch_add(&FEXUnpackCacheStats.RamHits, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&FEXUnpackCacheStats.RamTicks, Copied - Now, __ATOMIC_RELAXED);
@@ -604,7 +646,13 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
   }
   if (!Good) {
     if (Ahead) {
-      NoteDiskHit(C, E);
+      NoteDiskHit(C, E, Distance);
+    }
+    if (Play) {
+      // Left to the game: its own unpacking is faster than this read, see FEX_UNPACK_CACHE_PLAY above. The entry stays.
+      __atomic_fetch_add(&FEXUnpackCacheStats.PlaySkips, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&FEXUnpackCacheStats.PlaySkipBytes, E.Produced, __ATOMIC_RELAXED);
+      return 0;
     }
     const bool Read = ReadEntry(C, Out, E.Offset, E.Produced);
     const uint64_t ReadDone = ReadTicks();
@@ -1003,6 +1051,9 @@ bool Init(bool MD5Cache) {
   if (C->ReadAheadSlots && C->ReadAheadSlots < AheadChunks + MaxHitChunks) {
     C->ReadAheadSlots = AheadChunks + MaxHitChunks;
   }
+  const char* PlayEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_PLAY");
+  C->PlayGate = PlayEnv && PlayEnv[0] == '1';
+  C->WindowTicks = std::max<uint64_t>(TickFrequency * PlayWindowMs / 1000, 1);
   OpenTicks = ReadTicks();
   TheCache = C;
   FEXUnpackCacheEnabled = 1;
@@ -1026,6 +1077,12 @@ bool Init(bool MD5Cache) {
                                                 Reset ? " (reset)" : Started ? " (new)" : "", C->Entries.size(), (C->DataEnd - HeaderSize) >> 20, Dir,
                                                 Skipped, MaxGB, C->Full ? ", full" : "",
                                                 C->ReadAheadSlots ? fextl::fmt::format("{} MB", C->ReadAheadSlots * ChunkSize >> 20) : fextl::string("off")));
+  FEX::Windows::StatsLogNote(
+    C->PlayGate ? fextl::fmt::format("unpack cache: while playing (under {} lookups per {} ms) hits not in read-ahead memory are left to the "
+                                     "game to unpack instead of read from disk, read-ahead {} MB past a hit instead of {} "
+                                     "(FEX_UNPACK_CACHE_PLAY=0 turns it off)",
+                                     PlayMaxLookups, PlayWindowMs, PlayAheadChunks * ChunkSize >> 20, AheadChunks * ChunkSize >> 20) :
+                  fextl::string("unpack cache: play and loads alike, every hit read (FEX_UNPACK_CACHE_PLAY=1 leaves disk hits during play to the game)"));
   return true;
 }
 
@@ -1050,7 +1107,7 @@ fextl::string StatsLine() {
   const auto MB = [](uint64_t Bytes) {
     return static_cast<double>(Bytes) / (1024.0 * 1024.0);
   };
-  if (!D.Lookups && !D.Stores && !D.Written && !D.Dropped && !D.Failures && !D.AheadChunks && !D.AdlerSkips && !D.MD5Lookups) {
+  if (!D.Lookups && !D.Stores && !D.Written && !D.Dropped && !D.Failures && !D.AheadChunks && !D.AdlerSkips && !D.MD5Lookups && !D.PlaySkips) {
     return {};
   }
   uint64_t Size, Waiting;
@@ -1062,12 +1119,12 @@ fextl::string StatsLine() {
   // hit: total time per hit, then ram = hits copied from read-ahead memory, disk = time reading the others, verify =
   // hashing all of them. ahead = chunks the read-ahead thread read (direct = of those, read past the file cache; wasted =
   // dropped unused). uncached = reads and writes dropped from the file cache. adler = checks of a hit's output answered
-  // without computing them.
-  return fextl::fmt::format("  ucache lookups={} key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms ram={}/{:.1f}ms disk={:.1f}ms verify={:.1f}ms "
+  // without computing them. play = lookups while playing / of those left to the game (not in read-ahead memory) / their MB.
+  return fextl::fmt::format("  ucache lookups={} play={}/{}/{:.1f}MB key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms ram={}/{:.1f}ms disk={:.1f}ms verify={:.1f}ms "
                             "ahead={}/{:.1f}MB/{:.1f}ms direct={} wasted={} uncached={} adler={}/{:.1f}MB stored={}/{:.1f}MB/{:.1f}ms "
                             "written={}/{:.1f}ms "
                             "waiting={:.1f}MB dropped={} failed={} size={}MB writer={}{} md5cache={}/{}/{:.1f}MB/{:.1f}ms stored={}\n",
-                            D.Lookups, Ms(D.KeyTicks), D.Hits, MB(D.HitBytes), Ms(D.HitTicks), D.RamHits, Ms(D.RamTicks), Ms(D.DiskTicks),
+                            D.Lookups, D.PlayLookups, D.PlaySkips, MB(D.PlaySkipBytes), Ms(D.KeyTicks), D.Hits, MB(D.HitBytes), Ms(D.HitTicks), D.RamHits, Ms(D.RamTicks), Ms(D.DiskTicks),
                             Ms(D.VerifyTicks), D.AheadChunks, MB(D.AheadBytes), Ms(D.AheadTicks), D.AheadDirect, D.AheadWasted,
                             D.CacheDrops, D.AdlerSkips, MB(D.AdlerSkipBytes), D.Stores, MB(D.StoreBytes), Ms(D.StoreTicks), D.Written,
                             Ms(D.WriteTicks), MB(Waiting), D.Dropped, D.Failures, Size >> 20, WriterState.load(std::memory_order_relaxed),

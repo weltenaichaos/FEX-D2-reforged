@@ -35,6 +35,9 @@ int64_t ReadSmallFile(const char* Path, char* Buffer, size_t Size);
 int GetPid();
 // The calling thread's Linux tid.
 int GetTid();
+// Reads Size bytes of this process's memory at Address through /proc/self/mem. False where any of it isn't mapped
+// (it never faults), and no wineserver round trip, unlike NtReadVirtualMemory.
+bool ReadOwnMemory(uint64_t Address, void* Out, size_t Size);
 
 // Nice value of a Linux thread (tid; a pid names its first thread), or a value below -100 on failure.
 int GetNice(int Tid);
