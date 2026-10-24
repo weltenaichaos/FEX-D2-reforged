@@ -1,0 +1,1216 @@
+From 0362ad4c6cc44c3198bca0c5daa4bcc31cfec705 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 16:18:26 +0000
+Subject: [PATCH] FEX: frame start margin recovers 1 ms per 60 frames; per-draw
+ GPU timing of the costliest pass
+
+Two changes from the b61 log with VKD3D fex8 (Jesse, 2026-10-24):
+
+1. Frame start margin shrinks by 1 ms per 60 frames (2 s) without a late
+   frame, was 150 (5 s). Each fight pushed it to 8-12 ms and it then
+   stayed above 5 ms for 30-45 s; medium scenes (GPU 60-90% busy) took
+   53-66 ms from frame start to screen in those seconds against ~45 ms
+   with a margin of 3-5 ms (105 of 190 medium seconds were affected).
+   Late frames came at changes of scene whatever the margin was (none in
+   85 s of medium scenes at a margin of 3-5 ms). Replaying the run's
+   margin steps with the faster decay gives ~45.7 ms for medium scenes
+   (51.4 measured).
+
+2. Draw timing in the pass meter (VKD3D_FEX_PASSES=1, off with
+   VKD3D_FEX_DRAWS=0). Fights are GPU-bound at 26-29 FPS and the main
+   pass costs ~11-20 us of GPU time per draw while shading ~1.2 fragments
+   per pixel. Once a second the meter thread arms one sample for the
+   kind of pass with the most GPU time (50+ draws per pass); the first
+   command list to begin such a pass takes it and writes a top-of-pipe
+   timestamp before every draw (up to 2040), one before
+   vkCmdBeginRendering and an all-commands one after vkCmdEndRendering.
+   The report shows time per draw (to the next draw's timestamp) as a
+   histogram, draws after a pipeline change vs not, small vs large draws,
+   the slowest draws, and the 4 costliest pipelines with the driver's
+   shader statistics (VK_KHR_pipeline_executable_properties, enabled when
+   the driver has it: waves per core, instructions, registers, texture and
+   memory instructions, spills, sync stalls; the driver's statistic names
+   are listed once). Every 4th sample instead writes all-commands
+   timestamps around every 8th draw (the driver waits for the GPU to go
+   idle first) and compares those draws alone with the same pipelines'
+   time per draw in the last normal sample: about the same means the GPU
+   doesn't overlap draws. The pool is reset on the host between samples
+   (hostQueryReset), the sample's pipeline states hold an internal
+   reference until the thread has read their statistics, and a sample in
+   a list that is reset or freed without submitting is dropped. The
+   '#' notes now go out with the first 10 reports only and the pass-end
+   line is left out of reports that carry a draw sample, so both fit in
+   the 4 KB report.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WLFWPd69Fe8cXrKbfompEp
+---
+ libs/vkd3d/device.c         |   9 +
+ libs/vkd3d/fex_pass_meter.c | 872 +++++++++++++++++++++++++++++++++++-
+ libs/vkd3d/swapchain.c      |  12 +-
+ libs/vkd3d/vkd3d_private.h  |   7 +
+ libs/vkd3d/vulkan_procs.h   |   4 +
+ 5 files changed, 892 insertions(+), 12 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index dea69aa..04e887e 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -87,6 +87,8 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION(KHR_CALIBRATED_TIMESTAMPS, KHR_calibrated_timestamps),
+     VK_EXTENSION(KHR_COOPERATIVE_MATRIX, KHR_cooperative_matrix),
+     VK_EXTENSION(KHR_UNIFIED_IMAGE_LAYOUTS, KHR_unified_image_layouts),
++    /* FEX draw timing (fex_pass_meter.c): the driver's own statistics of the costliest pipelines' shaders. */
++    VK_EXTENSION(KHR_PIPELINE_EXECUTABLE_PROPERTIES, KHR_pipeline_executable_properties),
+ #ifdef _WIN32
+     VK_EXTENSION(KHR_EXTERNAL_MEMORY_WIN32, KHR_external_memory_win32),
+     VK_EXTENSION(KHR_EXTERNAL_SEMAPHORE_WIN32, KHR_external_semaphore_win32),
+@@ -2245,6 +2247,13 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_prepend_struct(&info->features2, &info->unified_image_layouts_features);
+     }
+ 
++    if (vulkan_info->KHR_pipeline_executable_properties)
++    {
++        info->pipeline_executable_properties_features.sType =
++                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
++        vk_prepend_struct(&info->features2, &info->pipeline_executable_properties_features);
++    }
++
+     VK_CALL(vkGetPhysicalDeviceFeatures2(device->vk_physical_device, &info->features2));
+     VK_CALL(vkGetPhysicalDeviceProperties2(device->vk_physical_device, &info->properties2));
+ 
+diff --git a/libs/vkd3d/fex_pass_meter.c b/libs/vkd3d/fex_pass_meter.c
+index 8c1cd0a..d85e247 100644
+--- a/libs/vkd3d/fex_pass_meter.c
++++ b/libs/vkd3d/fex_pass_meter.c
+@@ -17,6 +17,13 @@
+  *   left after clipping and fragment shader runs.
+  * - graphics pipeline binds.
+  *
++ * Draw timing (VKD3D fex9), to tell what the costliest pass spends its GPU time on draw by draw: once a second, one pass
++ * of the kind with the most GPU time gets a top-of-pipe timestamp before every draw (when the GPU's command processor
++ * got to the draw; it is held back while the GPU is busy, so the time to the next draw is about what the draw cost).
++ * The report groups the draws by pipeline and adds the driver's own statistics of the costliest pipelines' shaders
++ * (VK_KHR_pipeline_executable_properties). Every 4th sample instead times every 8th draw alone, with the GPU idle before
++ * and after it: alone about as long as in the normal flow means the GPU doesn't overlap draws.
++ *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+  * License as published by the Free Software Foundation; either
+@@ -42,6 +49,69 @@
+ #define FEX_PASS_STATS_VALUES 4u   /* input assembly vertices, vertex shader runs, primitives after clipping, fragment
+                                     * shader runs (in this order: the order of their bits) */
+ 
++/* Draw timing (VKD3D fex9). */
++#define FEX_DRAW_MAX 2040u          /* draws timed in one sampled pass; the end timestamp goes at slot draw_count */
++#define FEX_DRAW_PSOS 512u          /* pipelines told apart in one sample */
++#define FEX_DRAW_HASH 1024u         /* open addressing: pipeline state -> index + 1 */
++#define FEX_DRAW_ISO_EVERY 8u       /* isolated samples: one draw in this many runs alone */
++#define FEX_DRAW_ISO_MAX 1000u
++#define FEX_DRAW_SLOT_ISO 2048u     /* isolated draw k: before at FEX_DRAW_SLOT_ISO + 2k, after at + 2k + 1 */
++#define FEX_DRAW_SLOT_BEGIN 4094u   /* top of pipe before vkCmdBeginRendering */
++#define FEX_DRAW_SLOTS 4096u
++#define FEX_DRAW_ISO_ROUND 4u       /* every 4th sample is an isolated one */
++#define FEX_DRAW_MIN_DRAWS 50u      /* only a kind of pass with this many draws per pass gets sampled */
++#define FEX_DRAW_FIRST_PUBLISH 10u  /* the '#' notes go out with the first reports, samples only after them */
++#define FEX_DRAW_TOP_PSOS 4u
++
++#define FEX_DRAW_FLAG_DIRECT 0x1u   /* vertices known on the CPU */
++#define FEX_DRAW_FLAG_NEW_PSO 0x2u  /* another VkPipeline than the draw before */
++
++enum { FEX_DRAW_IDLE, FEX_DRAW_ARMED, FEX_DRAW_RECORDING, FEX_DRAW_SUBMITTED };
++
++struct fex_draw_rec
++{
++    uint16_t pso;      /* index into psos, 0xffff = too many pipelines */
++    uint16_t flags;
++    uint32_t vertices; /* indices or vertices x instances, direct draws only */
++};
++
++struct fex_draw_pso
++{
++    struct d3d12_pipeline_state *state; /* internal reference held until the sample is resolved */
++    VkPipeline pipeline;                /* the one bound at its first draw */
++    uint64_t vs_hash, ps_hash;          /* the game's shaders (D3D bytecode hashes) */
++};
++
++struct fex_draw_pso_sum
++{
++    uint64_t ticks, vertices;
++    uint32_t count, direct;
++};
++
++struct vkd3d_fex_draw_sample
++{
++    /* Written by the recording thread that took the sample. */
++    struct fex_draw_rec draws[FEX_DRAW_MAX];
++    uint16_t iso_draw[FEX_DRAW_ISO_MAX];
++    struct fex_draw_pso psos[FEX_DRAW_PSOS];
++    uint16_t hash[FEX_DRAW_HASH];
++    uint32_t draw_count, pso_count, iso_count;
++    VkPipeline prev_pipeline;
++    uint16_t sig;
++    bool isolate, truncated, iso_open, ended, pso_overflow;
++    uint64_t submit_ns;
++
++    /* The meter thread's scratch space while it resolves the sample. */
++    struct fex_draw_pso_sum sums[FEX_DRAW_PSOS];
++    double iso_us[FEX_DRAW_ISO_MAX];
++};
++
++struct fex_draw_norm
++{
++    uint64_t vs_hash, ps_hash;
++    double us;
++};
++
+ /* Read by FEX (found by export name in d3d12core.dll). */
+ struct vkd3d_fex_report vkd3d_fex_pass_report = { 0x50584546u /* 'FEXP' */, 1u, 0u, 0u, { 0 } };
+ 
+@@ -117,6 +187,26 @@ struct vkd3d_fex_pass_meter
+ 
+     /* Counted by recording threads. */
+     uint32_t clears_folded, clears_own_pass;
++
++    /* Draw timing (VKD3D fex9). */
++    VkQueryPool draw_pool;              /* VK_NULL_HANDLE: off */
++    struct vkd3d_fex_draw_sample *draw_sample;
++    uint32_t draw_state;                /* FEX_DRAW_*; the sample belongs to the thread while IDLE or SUBMITTED */
++    uint32_t draw_hot_sig;              /* the kind of pass to sample */
++    uint32_t draw_round;
++    bool draw_stats;                    /* the driver's shader statistics can be read */
++    uint64_t *draw_results;             /* (value, available) per query */
++    char draw_text[2560];               /* the last resolved sample's lines, published once */
++    size_t draw_text_len;
++    uint32_t publishes;
++    struct fex_draw_norm draw_norm[FEX_DRAW_PSOS]; /* last normal sample: time per draw by pipeline */
++    uint32_t draw_norm_count;
++    uint32_t draw_samples;              /* resolved samples, numbered in the report */
++    uint32_t draw_abandoned;            /* taken but never submitted (list reset or freed), counted by any thread */
++    uint32_t draw_lost;                 /* submitted, results never came or the pass's end was missed */
++    uint32_t draw_arm_sig;
++    double draw_arm_avg_ms;             /* the sampled kind's average pass time the second before */
++    bool draw_names_sent;               /* the driver's statistic names went out once */
+ };
+ 
+ static const char *fex_pass_op_name(uint8_t op)
+@@ -278,6 +368,139 @@ static void fex_pass_add_record(struct d3d12_command_list *list, const struct vk
+     list->fex_pass.records[list->fex_pass.records_count++] = *rec;
+ }
+ 
++/* Draw timing (VKD3D fex9). The sample's pipelines hold an internal reference so their VkPipelines still exist when the
++ * meter thread asks the driver for their shader statistics. */
++static void fex_draw_release(struct vkd3d_fex_draw_sample *s)
++{
++    uint32_t i;
++
++    for (i = 0; i < s->pso_count; i++)
++    {
++        if (s->psos[i].state)
++            d3d12_pipeline_state_dec_ref(s->psos[i].state);
++        s->psos[i].state = NULL;
++    }
++    s->pso_count = 0;
++}
++
++/* The list is reset or freed with the sample never submitted: its commands never run, the queries stay unwritten. */
++static void fex_draw_abandon(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    struct vkd3d_fex_draw_sample *s = list->fex_pass.draw;
++
++    list->fex_pass.draw = NULL;
++    list->fex_pass.draw_open = false;
++    if (!meter || !s)
++        return;
++    fex_draw_release(s);
++    vkd3d_atomic_uint32_increment(&meter->draw_abandoned, vkd3d_memory_order_relaxed);
++    vkd3d_atomic_uint32_store_explicit(&meter->draw_state, FEX_DRAW_IDLE, vkd3d_memory_order_release);
++}
++
++static uint16_t fex_draw_pso_index(struct vkd3d_fex_draw_sample *s, struct d3d12_command_list *list)
++{
++    struct d3d12_pipeline_state *state = list->state;
++    struct fex_draw_pso *pso;
++    uint32_t h, n, index;
++    size_t i;
++
++    if (!state)
++        return 0xffff;
++
++    h = (uint32_t)(((uintptr_t)state >> 4) * 2654435761u) % FEX_DRAW_HASH;
++    for (n = 0; n < FEX_DRAW_HASH; n++, h = (h + 1) % FEX_DRAW_HASH)
++    {
++        if (!s->hash[h])
++            break;
++        if (s->psos[s->hash[h] - 1].state == state)
++            return s->hash[h] - 1;
++    }
++    if (n == FEX_DRAW_HASH || s->pso_count >= FEX_DRAW_PSOS)
++    {
++        s->pso_overflow = true;
++        return 0xffff;
++    }
++
++    index = s->pso_count++;
++    pso = &s->psos[index];
++    pso->state = state;
++    pso->pipeline = list->current_pipeline;
++    pso->vs_hash = pso->ps_hash = 0;
++    if (d3d12_pipeline_state_is_graphics(state))
++    {
++        for (i = 0; i < state->graphics.stage_count && i < VKD3D_MAX_SHADER_STAGES; i++)
++        {
++            if (state->graphics.stages[i].stage == VK_SHADER_STAGE_VERTEX_BIT)
++                pso->vs_hash = state->graphics.code[i].meta.hash;
++            else if (state->graphics.stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
++                pso->ps_hash = state->graphics.code[i].meta.hash;
++        }
++    }
++    d3d12_pipeline_state_inc_ref(state);
++    s->hash[h] = index + 1;
++    return index;
++}
++
++/* Before every draw of the sampled pass: a top of pipe timestamp at the draw's slot. An isolated draw also gets an
++ * all-commands timestamp before it (the driver waits for the GPU to go idle first) and one before whatever comes next. */
++static void fex_draw_stamp(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    struct vkd3d_fex_draw_sample *s = list->fex_pass.draw;
++    struct fex_draw_rec *rec;
++    uint32_t i;
++
++    if (s->iso_open)
++    {
++        VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                meter->draw_pool, FEX_DRAW_SLOT_ISO + 2 * (s->iso_count - 1) + 1));
++        s->iso_open = false;
++    }
++    if (s->draw_count >= FEX_DRAW_MAX)
++    {
++        s->truncated = true;
++        return;
++    }
++
++    i = s->draw_count++;
++    rec = &s->draws[i];
++    rec->pso = fex_draw_pso_index(s, list);
++    rec->flags = list->current_pipeline != s->prev_pipeline ? FEX_DRAW_FLAG_NEW_PSO : 0;
++    rec->vertices = 0;
++    s->prev_pipeline = list->current_pipeline;
++
++    if (s->isolate && !(i % FEX_DRAW_ISO_EVERY) && s->iso_count < FEX_DRAW_ISO_MAX)
++    {
++        VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                meter->draw_pool, FEX_DRAW_SLOT_ISO + 2 * s->iso_count));
++        s->iso_draw[s->iso_count++] = i;
++        s->iso_open = true;
++    }
++    VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
++            meter->draw_pool, i));
++}
++
++/* Right after vkCmdEndRendering: the end timestamp waits for everything in the pass. */
++static void fex_draw_end(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    struct vkd3d_fex_draw_sample *s = list->fex_pass.draw;
++
++    if (s->iso_open)
++    {
++        VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                meter->draw_pool, FEX_DRAW_SLOT_ISO + 2 * (s->iso_count - 1) + 1));
++        s->iso_open = false;
++    }
++    VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++            meter->draw_pool, s->draw_count));
++    s->ended = true;
++    list->fex_pass.draw_open = false;
++}
++
+ void vkd3d_fex_pass_meter_begin_list(struct d3d12_command_list *list)
+ {
+     struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
+@@ -289,6 +512,8 @@ void vkd3d_fex_pass_meter_begin_list(struct d3d12_command_list *list)
+     list->fex_pass.stats_next = list->fex_pass.stats_end = 0;
+     list->fex_pass.binds = 0;
+     list->fex_pass.stats_active = false;
++    if (list->fex_pass.draw)
++        fex_draw_abandon(list);
+     if (!meter || !(list->vk_queue_flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)))
+         return;
+ 
+@@ -393,6 +618,23 @@ void vkd3d_fex_pass_meter_begin_pass(struct d3d12_command_list *list, const VkRe
+         }
+     }
+     list->fex_pass.pass_active = true;
++
++    /* A sampled pass that was dropped without its end: the sample can't be used. */
++    if (list->fex_pass.draw_open)
++        list->fex_pass.draw_open = false;
++    if (meter->draw_pool && kind != VKD3D_FEX_PASS_KIND_CLEAR && !list->fex_pass.draw &&
++            vkd3d_atomic_uint32_load_explicit(&meter->draw_state, vkd3d_memory_order_acquire) == FEX_DRAW_ARMED &&
++            current->sig == vkd3d_atomic_uint32_load_explicit(&meter->draw_hot_sig, vkd3d_memory_order_relaxed) &&
++            vkd3d_atomic_uint32_compare_exchange(&meter->draw_state, FEX_DRAW_ARMED, FEX_DRAW_RECORDING,
++            vkd3d_memory_order_acq_rel, vkd3d_memory_order_relaxed) == FEX_DRAW_ARMED)
++    {
++        list->fex_pass.draw = meter->draw_sample;
++        list->fex_pass.draw_open = true;
++        meter->draw_sample->sig = current->sig;
++        VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
++                meter->draw_pool, FEX_DRAW_SLOT_BEGIN));
++    }
++
+     fex_pass_write_begin(list, current->pair);
+ }
+ 
+@@ -402,10 +644,14 @@ void vkd3d_fex_pass_meter_inside_pass(struct d3d12_command_list *list)
+     struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+ 
+-    if (!meter || !list->fex_pass.pass_active || list->fex_pass.current.inside_pair == VKD3D_FEX_PASS_NO_QUERY)
++    if (!meter || !list->fex_pass.pass_active)
+         return;
+-    VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+-            meter->pool, 2 * list->fex_pass.current.inside_pair));
++    if (list->fex_pass.current.inside_pair != VKD3D_FEX_PASS_NO_QUERY)
++        VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
++                meter->pool, 2 * list->fex_pass.current.inside_pair));
++    /* The pass's first draw comes right after this. */
++    if (list->fex_pass.draw_open)
++        fex_draw_stamp(list);
+ }
+ 
+ void vkd3d_fex_pass_meter_vertices(struct d3d12_command_list *list, uint64_t vertices)
+@@ -414,6 +660,13 @@ void vkd3d_fex_pass_meter_vertices(struct d3d12_command_list *list, uint64_t ver
+         return;
+     list->fex_pass.current.vertices += vertices;
+     list->fex_pass.current.direct_draws++;
++    if (list->fex_pass.draw_open && !list->fex_pass.draw->truncated && list->fex_pass.draw->draw_count)
++    {
++        struct fex_draw_rec *rec = &list->fex_pass.draw->draws[list->fex_pass.draw->draw_count - 1];
++
++        rec->vertices = vertices > UINT32_MAX ? UINT32_MAX : (uint32_t)vertices;
++        rec->flags |= FEX_DRAW_FLAG_DIRECT;
++    }
+ }
+ 
+ void vkd3d_fex_pass_meter_pipeline_bind(struct d3d12_command_list *list)
+@@ -438,6 +691,8 @@ void vkd3d_fex_pass_meter_draw(struct d3d12_command_list *list)
+ {
+     if (list->fex_pass.pass_active)
+         list->fex_pass.current.draws++;
++    if (list->fex_pass.draw_open)
++        fex_draw_stamp(list);
+ }
+ 
+ void vkd3d_fex_pass_meter_end_pass(struct d3d12_command_list *list, unsigned int line)
+@@ -445,6 +700,9 @@ void vkd3d_fex_pass_meter_end_pass(struct d3d12_command_list *list, unsigned int
+     if (!list->device->fex_pass_meter || !list->fex_pass.pass_active)
+         return;
+ 
++    if (list->fex_pass.draw_open)
++        fex_draw_end(list);
++
+     fex_pass_end_stats(list);
+     fex_pass_write_end(list, list->fex_pass.current.pair);
+     list->fex_pass.current.end_line = line > 0xffff ? 0xffff : line;
+@@ -458,10 +716,24 @@ void vkd3d_fex_pass_meter_submit_list(struct d3d12_command_list *list)
+     uint64_t now;
+     size_t i;
+ 
+-    if (!meter || !list->fex_pass.records_count)
++    if (!meter)
+         return;
+ 
+     now = vkd3d_get_current_time_ns();
++
++    /* Hand the draw sample to the meter thread. A list submitted again later writes the same queries again: the
++     * thread checks that the timestamps run in order. */
++    if (list->fex_pass.draw)
++    {
++        list->fex_pass.draw->submit_ns = now;
++        list->fex_pass.draw = NULL;
++        list->fex_pass.draw_open = false;
++        vkd3d_atomic_uint32_store_explicit(&meter->draw_state, FEX_DRAW_SUBMITTED, vkd3d_memory_order_release);
++    }
++
++    if (!list->fex_pass.records_count)
++        return;
++
+     pthread_mutex_lock(&meter->pending_lock);
+     for (i = 0; i < list->fex_pass.records_count; i++)
+     {
+@@ -481,6 +753,8 @@ void vkd3d_fex_pass_meter_submit_list(struct d3d12_command_list *list)
+ 
+ void vkd3d_fex_pass_meter_free_list(struct d3d12_command_list *list)
+ {
++    if (list->fex_pass.draw)
++        fex_draw_abandon(list);
+     vkd3d_free(list->fex_pass.records);
+     list->fex_pass.records = NULL;
+     list->fex_pass.records_size = 0;
+@@ -759,6 +1033,511 @@ void vkd3d_fex_pass_meter_count_clears(struct d3d12_device *device, uint32_t fol
+         vkd3d_atomic_uint32_add(&meter->clears_own_pass, own_pass, vkd3d_memory_order_relaxed);
+ }
+ 
++/* Driver shader statistics shown per pipeline (Turnip's names), the rest only listed once by name. */
++static const struct
++{
++    const char *name;
++    const char *label;
++    bool skip_zero;
++}
++fex_draw_stat_names[] =
++{
++    { "Max Waves Per Core", "waves", false },
++    { "Instruction Count", "inst", false },
++    { "Registers used", "full", false },
++    { "Half-registers used", "half", false },
++    { "cat5 instructions", "tex", false },
++    { "cat6 instructions", "mem", false },
++    { "LDP Count", "spill-ld", true },
++    { "STP Count", "spill-st", true },
++    { "Estimated cycles stalled on SY", "sy", true },
++    { "Estimated cycles stalled on SS", "ss", true },
++    { "Loops", "loops", true },
++};
++
++static double fex_draw_stat_value(const VkPipelineExecutableStatisticKHR *st)
++{
++    switch (st->format)
++    {
++        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: return st->value.b32;
++        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: return (double)st->value.i64;
++        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: return (double)st->value.u64;
++        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: return st->value.f64;
++        default: return 0.0;
++    }
++}
++
++/* The driver's statistics of a pipeline's shaders: " | FS w128 waves 16 inst 120 ...". With names set, also lists
++ * every statistic name of the first shader (once per run, so a renamed statistic still shows up). */
++static size_t fex_draw_describe_shaders(struct vkd3d_fex_pass_meter *meter, VkPipeline pipeline, char *buf,
++        size_t size, size_t len, char *names, size_t names_size)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &meter->device->vk_procs;
++    VkPipelineExecutablePropertiesKHR props[8];
++    VkPipelineExecutableStatisticKHR stats[48];
++    VkPipelineExecutableInfoKHR exe_info;
++    size_t names_len = 0;
++    VkPipelineInfoKHR info;
++    uint32_t count, n, i, j, k;
++
++    if (!meter->draw_stats || !pipeline)
++        return len;
++
++    memset(&info, 0, sizeof(info));
++    info.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
++    info.pipeline = pipeline;
++    memset(props, 0, sizeof(props));
++    for (i = 0; i < ARRAY_SIZE(props); i++)
++        props[i].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
++    count = ARRAY_SIZE(props);
++    if (VK_CALL(vkGetPipelineExecutablePropertiesKHR(meter->device->vk_device, &info, &count, props)) < 0)
++        return vkd3d_fex_report_append(buf, size, len, " | no shader statistics");
++
++    for (i = 0; i < count; i++)
++    {
++        /* The binning pass's copy of the vertex shader (position only) adds nothing here. */
++        if (strstr(props[i].name, "Binning") || strstr(props[i].name, "binning"))
++            continue;
++
++        memset(stats, 0, sizeof(stats));
++        for (k = 0; k < ARRAY_SIZE(stats); k++)
++            stats[k].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
++        memset(&exe_info, 0, sizeof(exe_info));
++        exe_info.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;
++        exe_info.pipeline = pipeline;
++        exe_info.executableIndex = i;
++        n = ARRAY_SIZE(stats);
++        if (VK_CALL(vkGetPipelineExecutableStatisticsKHR(meter->device->vk_device, &exe_info, &n, stats)) < 0)
++            continue;
++
++        len = vkd3d_fex_report_append(buf, size, len, " | %s w%u", props[i].name, props[i].subgroupSize);
++        for (j = 0; j < ARRAY_SIZE(fex_draw_stat_names); j++)
++        {
++            for (k = 0; k < n; k++)
++            {
++                double value;
++
++                if (strcmp(stats[k].name, fex_draw_stat_names[j].name))
++                    continue;
++                value = fex_draw_stat_value(&stats[k]);
++                if (value != 0.0 || !fex_draw_stat_names[j].skip_zero)
++                    len = vkd3d_fex_report_append(buf, size, len, " %s %.0f", fex_draw_stat_names[j].label, value);
++                break;
++            }
++        }
++
++        if (names && !names_len)
++        {
++            names_len = vkd3d_fex_report_append(names, names_size, names_len,
++                    "# gpu draws: the driver's shader statistics (%s):", props[i].name);
++            for (k = 0; k < n; k++)
++                names_len = vkd3d_fex_report_append(names, names_size, names_len, "%s %s", k ? "," : "",
++                        stats[k].name);
++            names_len = vkd3d_fex_report_append(names, names_size, names_len, "\n");
++        }
++    }
++    return len;
++}
++
++static int fex_draw_compare_double(const void *a, const void *b)
++{
++    double x = *(const double *)a, y = *(const double *)b;
++
++    return x < y ? -1 : x > y;
++}
++
++static const struct fex_draw_norm *fex_draw_find_norm(const struct vkd3d_fex_pass_meter *meter,
++        const struct fex_draw_pso *pso)
++{
++    uint32_t i;
++
++    for (i = 0; i < meter->draw_norm_count; i++)
++    {
++        if (meter->draw_norm[i].vs_hash == pso->vs_hash && meter->draw_norm[i].ps_hash == pso->ps_hash)
++            return &meter->draw_norm[i];
++    }
++    return NULL;
++}
++
++/* (value, available) of a draw pool slot, as read back into draw_results. */
++static bool fex_draw_result(const struct vkd3d_fex_pass_meter *meter, uint32_t slot, uint64_t *value)
++{
++    if (!meter->draw_results[2 * slot + 1])
++        return false;
++    *value = meter->draw_results[2 * slot];
++    return true;
++}
++
++static size_t fex_draw_describe_pass(struct vkd3d_fex_pass_meter *meter, uint64_t pass_ticks, char *buf, size_t size,
++        size_t len)
++{
++    const struct vkd3d_fex_draw_sample *s = meter->draw_sample;
++    const double ms = meter->ns_per_tick / 1e6;
++    const struct fex_pass_sig *sig = s->sig < FEX_PASS_MAX_SIGS ? &meter->sigs[s->sig] : NULL;
++
++    len = vkd3d_fex_report_append(buf, size, len, "  gpu draws #%u%s (pass %ux%u, %.2f ms",
++            meter->draw_samples, s->isolate ? " alone" : "", sig ? sig->width : 0, sig ? sig->height : 0,
++            pass_ticks * ms);
++    if (s->sig == meter->draw_arm_sig && meter->draw_arm_avg_ms > 0.0)
++        len = vkd3d_fex_report_append(buf, size, len, ", this kind averaged %.2f ms the second before",
++                meter->draw_arm_avg_ms);
++    return vkd3d_fex_report_append(buf, size, len, ")");
++}
++
++/* A normal sample: time per draw = from its timestamp to the next draw's. */
++static size_t fex_draw_describe_normal(struct vkd3d_fex_pass_meter *meter, char *buf, size_t size, size_t len)
++{
++    static const double bucket_us[] = { 2.0, 5.0, 10.0, 20.0, 50.0 };
++    static const char *const bucket_names[] = { "<2us", "2-5", "5-10", "10-20", "20-50", "50+" };
++    struct vkd3d_fex_draw_sample *s = meter->draw_sample;
++    const double us_per_tick = meter->ns_per_tick / 1000.0;
++    const double ms = meter->ns_per_tick / 1e6;
++    uint64_t begin, end, first, last, t0, t1, ticks;
++    uint64_t new_ticks = 0, same_ticks = 0, small_ticks = 0, large_ticks = 0, vertices = 0, timed_ticks = 0;
++    uint32_t new_count = 0, same_count = 0, small_count = 0, large_count = 0, direct = 0, timed = 0;
++    uint32_t bucket_count[6] = { 0 }, missing = 0, unordered = 0, used_psos = 0;
++    uint64_t bucket_ticks[6] = { 0 };
++    uint32_t slowest[4], slowest_count = 0, top[FEX_DRAW_TOP_PSOS], top_count = 0;
++    uint64_t slowest_ticks[4];
++    uint32_t i, j, n = s->draw_count;
++    char names[640];
++
++    names[0] = '\0';
++    if (!fex_draw_result(meter, FEX_DRAW_SLOT_BEGIN, &begin) || !fex_draw_result(meter, n, &end) ||
++            !fex_draw_result(meter, 0, &first) || !fex_draw_result(meter, n - 1, &last) || end < begin || end < last)
++    {
++        len = fex_draw_describe_pass(meter, 0, buf, size, len);
++        return vkd3d_fex_report_append(buf, size, len, ": timestamps missing\n");
++    }
++
++    memset(s->sums, 0, sizeof(*s->sums) * (s->pso_count ? s->pso_count : 1));
++    /* The last draw's time would include finishing the whole pass: shown apart. */
++    for (i = 0; i + 1 < n; i++)
++    {
++        const struct fex_draw_rec *rec = &s->draws[i];
++        double us;
++        unsigned int b;
++
++        if (!fex_draw_result(meter, i, &t0) || !fex_draw_result(meter, i + 1, &t1))
++        {
++            missing++;
++            continue;
++        }
++        if (t1 < t0)
++        {
++            unordered++;
++            continue;
++        }
++        ticks = t1 - t0;
++        us = ticks * us_per_tick;
++        timed++;
++        timed_ticks += ticks;
++
++        for (b = 0; b < ARRAY_SIZE(bucket_us) && us >= bucket_us[b]; b++)
++            ;
++        bucket_count[b]++;
++        bucket_ticks[b] += ticks;
++
++        if (rec->flags & FEX_DRAW_FLAG_NEW_PSO)
++        {
++            new_count++;
++            new_ticks += ticks;
++        }
++        else
++        {
++            same_count++;
++            same_ticks += ticks;
++        }
++        if (rec->flags & FEX_DRAW_FLAG_DIRECT)
++        {
++            direct++;
++            vertices += rec->vertices;
++            if (rec->vertices <= 64)
++            {
++                small_count++;
++                small_ticks += ticks;
++            }
++            else
++            {
++                large_count++;
++                large_ticks += ticks;
++            }
++        }
++        if (rec->pso < s->pso_count)
++        {
++            struct fex_draw_pso_sum *sum = &s->sums[rec->pso];
++
++            sum->ticks += ticks;
++            sum->count++;
++            if (rec->flags & FEX_DRAW_FLAG_DIRECT)
++            {
++                sum->vertices += rec->vertices;
++                sum->direct++;
++            }
++        }
++
++        /* The 4 slowest draws. */
++        for (j = slowest_count; j > 0 && slowest_ticks[j - 1] < ticks; j--)
++        {
++            if (j < ARRAY_SIZE(slowest))
++            {
++                slowest[j] = slowest[j - 1];
++                slowest_ticks[j] = slowest_ticks[j - 1];
++            }
++        }
++        if (j < ARRAY_SIZE(slowest))
++        {
++            slowest[j] = i;
++            slowest_ticks[j] = ticks;
++            if (slowest_count < ARRAY_SIZE(slowest))
++                slowest_count++;
++        }
++    }
++
++    /* The costliest pipelines; every pipeline's time per draw is kept for the next isolated sample. */
++    meter->draw_norm_count = 0;
++    for (i = 0; i < s->pso_count; i++)
++    {
++        if (!s->sums[i].count)
++            continue;
++        used_psos++;
++        meter->draw_norm[meter->draw_norm_count].vs_hash = s->psos[i].vs_hash;
++        meter->draw_norm[meter->draw_norm_count].ps_hash = s->psos[i].ps_hash;
++        meter->draw_norm[meter->draw_norm_count].us = s->sums[i].ticks * us_per_tick / s->sums[i].count;
++        meter->draw_norm_count++;
++
++        for (j = top_count; j > 0 && s->sums[top[j - 1]].ticks < s->sums[i].ticks; j--)
++        {
++            if (j < ARRAY_SIZE(top))
++                top[j] = top[j - 1];
++        }
++        if (j < ARRAY_SIZE(top))
++        {
++            top[j] = i;
++            if (top_count < ARRAY_SIZE(top))
++                top_count++;
++        }
++    }
++
++    len = fex_draw_describe_pass(meter, end - begin, buf, size, len);
++    len = vkd3d_fex_report_append(buf, size, len, ": %u draws%s, %u pipelines%s | %.2f ms in %u timed draws = %.1f us/draw"
++            " (last draw + finishing the pass %.2f ms, first draw began %.2f ms into the pass%s)",
++            n, s->truncated ? " (more not timed)" : "", used_psos, s->pso_overflow ? "+" : "", timed_ticks * ms, timed,
++            timed ? timed_ticks * us_per_tick / timed : 0.0, (end - last) * ms, first >= begin ? (first - begin) * ms : 0.0,
++            first >= begin && (first - begin) * 10 > end - begin ? ", tiled: the times are the last tile's" : "");
++    len = vkd3d_fex_report_append(buf, size, len, " | new pipeline %u draws %.1f us avg, same %u %.1f us",
++            new_count, new_count ? new_ticks * us_per_tick / new_count : 0.0,
++            same_count, same_count ? same_ticks * us_per_tick / same_count : 0.0);
++    len = vkd3d_fex_report_append(buf, size, len, " | per draw");
++    for (i = 0; i < ARRAY_SIZE(bucket_count); i++)
++        len = vkd3d_fex_report_append(buf, size, len, " %s %u (%.2f ms)", bucket_names[i], bucket_count[i],
++                bucket_ticks[i] * ms);
++    len = vkd3d_fex_report_append(buf, size, len, " | vtx/draw %.0f, <=64 vtx %u draws %.1f us, more %u %.1f us",
++            direct ? (double)vertices / direct : 0.0, small_count, small_count ? small_ticks * us_per_tick / small_count : 0.0,
++            large_count, large_count ? large_ticks * us_per_tick / large_count : 0.0);
++    if (slowest_count)
++    {
++        len = vkd3d_fex_report_append(buf, size, len, " | slowest");
++        for (i = 0; i < slowest_count; i++)
++            len = vkd3d_fex_report_append(buf, size, len, "%s #%u %.0f us (%u vtx%s)", i ? "," : "", slowest[i],
++                    slowest_ticks[i] * us_per_tick, s->draws[slowest[i]].vertices,
++                    (s->draws[slowest[i]].flags & FEX_DRAW_FLAG_NEW_PSO) ? ", new pipeline" : "");
++    }
++    if (missing || unordered)
++        len = vkd3d_fex_report_append(buf, size, len, " | missing %u, out of order %u", missing, unordered);
++    len = vkd3d_fex_report_append(buf, size, len, "\n");
++
++    for (i = 0; i < top_count; i++)
++    {
++        const struct fex_draw_pso_sum *sum = &s->sums[top[i]];
++        const struct fex_draw_pso *pso = &s->psos[top[i]];
++
++        len = vkd3d_fex_report_append(buf, size, len, "    pso %u: %u draws %.2f ms %.1f us/draw vtx/draw %.0f"
++                " vs %016"PRIx64" ps %016"PRIx64, i + 1, sum->count, sum->ticks * ms, sum->ticks * us_per_tick / sum->count,
++                sum->direct ? (double)sum->vertices / sum->direct : 0.0, pso->vs_hash, pso->ps_hash);
++        len = fex_draw_describe_shaders(meter, pso->pipeline, buf, size, len,
++                meter->draw_names_sent ? NULL : names, sizeof(names));
++        len = vkd3d_fex_report_append(buf, size, len, "\n");
++    }
++    if (names[0])
++    {
++        meter->draw_names_sent = true;
++        len = vkd3d_fex_report_append(buf, size, len, "%s", names);
++    }
++    return len;
++}
++
++/* An isolated sample: every 8th draw alone, the GPU idle before and after it. */
++static size_t fex_draw_describe_isolated(struct vkd3d_fex_pass_meter *meter, char *buf, size_t size, size_t len)
++{
++    struct vkd3d_fex_draw_sample *s = meter->draw_sample;
++    const double us_per_tick = meter->ns_per_tick / 1000.0;
++    double alone_sum = 0.0, matched_alone = 0.0, matched_normal = 0.0, small_sum = 0.0;
++    uint32_t i, timed = 0, matched = 0, small = 0;
++    uint64_t begin, end, t0, t1;
++
++    if (!fex_draw_result(meter, FEX_DRAW_SLOT_BEGIN, &begin) || !fex_draw_result(meter, s->draw_count, &end) ||
++            end < begin)
++    {
++        len = fex_draw_describe_pass(meter, 0, buf, size, len);
++        return vkd3d_fex_report_append(buf, size, len, ": timestamps missing\n");
++    }
++
++    for (i = 0; i < s->iso_count; i++)
++    {
++        const struct fex_draw_rec *rec = &s->draws[s->iso_draw[i]];
++        const struct fex_draw_norm *norm;
++        double us;
++
++        if (!fex_draw_result(meter, FEX_DRAW_SLOT_ISO + 2 * i, &t0) ||
++                !fex_draw_result(meter, FEX_DRAW_SLOT_ISO + 2 * i + 1, &t1) || t1 < t0)
++            continue;
++        us = (t1 - t0) * us_per_tick;
++        s->iso_us[timed++] = us;
++        alone_sum += us;
++        if ((rec->flags & FEX_DRAW_FLAG_DIRECT) && rec->vertices <= 64)
++        {
++            small++;
++            small_sum += us;
++        }
++        if (rec->pso < s->pso_count && (norm = fex_draw_find_norm(meter, &s->psos[rec->pso])))
++        {
++            matched++;
++            matched_alone += us;
++            matched_normal += norm->us;
++        }
++    }
++
++    len = fex_draw_describe_pass(meter, end - begin, buf, size, len);
++    len = vkd3d_fex_report_append(buf, size, len, ": %u draws, %u timed alone", s->draw_count, timed);
++    if (timed)
++    {
++        qsort(s->iso_us, timed, sizeof(*s->iso_us), fex_draw_compare_double);
++        len = vkd3d_fex_report_append(buf, size, len, ": avg %.1f us, median %.1f, 90%% under %.1f, <=64 vtx avg %.1f us"
++                " | the same pipelines in the last normal sample: alone %.1f us vs normal flow %.1f us per draw"
++                " (%u matched) = alone/normal %.2f", alone_sum / timed, s->iso_us[timed / 2],
++                s->iso_us[(timed * 9) / 10 < timed ? (timed * 9) / 10 : timed - 1],
++                small ? small_sum / small : 0.0, matched ? matched_alone / matched : 0.0,
++                matched ? matched_normal / matched : 0.0, matched,
++                matched_normal > 0.0 ? matched_alone / matched_normal : 0.0);
++    }
++    return vkd3d_fex_report_append(buf, size, len, "\n");
++}
++
++/* On the meter thread: reads a submitted sample once the GPU wrote its end, formats it and frees it. */
++static void fex_draw_resolve(struct vkd3d_fex_pass_meter *meter)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &meter->device->vk_procs;
++    const VkQueryResultFlags flags = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
++    struct vkd3d_fex_draw_sample *s = meter->draw_sample;
++    uint64_t *r = meter->draw_results;
++    VkDevice vk_device = meter->device->vk_device;
++    uint32_t n = s->draw_count;
++    bool late;
++    VkResult vr;
++
++    if (vkd3d_atomic_uint32_load_explicit(&meter->draw_state, vkd3d_memory_order_acquire) != FEX_DRAW_SUBMITTED)
++        return;
++
++    late = vkd3d_get_current_time_ns() - s->submit_ns > 2000000000ull;
++    if (!s->ended || !n)
++    {
++        /* No end timestamp to wait for: give the GPU time to finish before the queries are reset again. */
++        if (!late)
++            return;
++        meter->draw_lost++;
++        goto done;
++    }
++
++    memset(&r[2 * n], 0, 2 * sizeof(*r));
++    vr = VK_CALL(vkGetQueryPoolResults(vk_device, meter->draw_pool, n, 1, 2 * sizeof(*r), &r[2 * n],
++            2 * sizeof(*r), flags));
++    if (vr < 0 || !r[2 * n + 1])
++    {
++        if (late)
++        {
++            meter->draw_lost++;
++            goto done;
++        }
++        return;
++    }
++
++    memset(r, 0, 2 * sizeof(*r) * n);
++    memset(&r[2 * FEX_DRAW_SLOT_BEGIN], 0, 2 * sizeof(*r));
++    VK_CALL(vkGetQueryPoolResults(vk_device, meter->draw_pool, 0, n, 2 * sizeof(*r) * n, r, 2 * sizeof(*r), flags));
++    VK_CALL(vkGetQueryPoolResults(vk_device, meter->draw_pool, FEX_DRAW_SLOT_BEGIN, 1, 2 * sizeof(*r),
++            &r[2 * FEX_DRAW_SLOT_BEGIN], 2 * sizeof(*r), flags));
++    if (s->iso_count)
++    {
++        memset(&r[2 * FEX_DRAW_SLOT_ISO], 0, 4 * sizeof(*r) * s->iso_count);
++        VK_CALL(vkGetQueryPoolResults(vk_device, meter->draw_pool, FEX_DRAW_SLOT_ISO, 2 * s->iso_count,
++                4 * sizeof(*r) * s->iso_count, &r[2 * FEX_DRAW_SLOT_ISO], 2 * sizeof(*r), flags));
++    }
++
++    meter->draw_samples++;
++    meter->draw_text_len = 0;
++    if (s->isolate)
++        meter->draw_text_len = fex_draw_describe_isolated(meter, meter->draw_text, sizeof(meter->draw_text), 0);
++    else
++        meter->draw_text_len = fex_draw_describe_normal(meter, meter->draw_text, sizeof(meter->draw_text), 0);
++
++done:
++    fex_draw_release(s);
++    vkd3d_atomic_uint32_store_explicit(&meter->draw_state, FEX_DRAW_IDLE, vkd3d_memory_order_release);
++}
++
++/* On the meter thread, once a second: sets up the next sample for the kind of pass with the most GPU time (and at
++ * least FEX_DRAW_MIN_DRAWS draws per pass). A sample nobody took in the last second is set up again. */
++static void fex_draw_arm(struct vkd3d_fex_pass_meter *meter, uint32_t sig_count)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &meter->device->vk_procs;
++    struct vkd3d_fex_draw_sample *s = meter->draw_sample;
++    uint64_t best_ticks = 0;
++    uint32_t i, state, best = 0xffffffffu;
++
++    state = vkd3d_atomic_uint32_load_explicit(&meter->draw_state, vkd3d_memory_order_acquire);
++    if (state == FEX_DRAW_ARMED)
++    {
++        if (vkd3d_atomic_uint32_compare_exchange(&meter->draw_state, FEX_DRAW_ARMED, FEX_DRAW_IDLE,
++                vkd3d_memory_order_acq_rel, vkd3d_memory_order_acquire) != FEX_DRAW_ARMED)
++            return;
++    }
++    else if (state != FEX_DRAW_IDLE)
++        return;
++
++    for (i = 0; i < sig_count; i++)
++    {
++        const struct fex_pass_sig_stats *st = &meter->sig_stats[i];
++
++        if (!st->count || meter->sigs[i].kind == VKD3D_FEX_PASS_KIND_CLEAR ||
++                st->draws < (uint64_t)FEX_DRAW_MIN_DRAWS * st->count)
++            continue;
++        if (st->gpu_ticks > best_ticks)
++        {
++            best_ticks = st->gpu_ticks;
++            best = i;
++        }
++    }
++    if (best == 0xffffffffu)
++        return;
++
++    s->draw_count = s->pso_count = s->iso_count = 0;
++    s->prev_pipeline = VK_NULL_HANDLE;
++    s->sig = 0xffff;
++    s->truncated = s->iso_open = s->ended = s->pso_overflow = false;
++    s->isolate = meter->draw_norm_count && meter->draw_round % FEX_DRAW_ISO_ROUND == FEX_DRAW_ISO_ROUND - 1;
++    s->submit_ns = 0;
++    memset(s->hash, 0, sizeof(s->hash));
++    meter->draw_round++;
++    meter->draw_arm_sig = best;
++    meter->draw_arm_avg_ms = meter->sig_stats[best].gpu_ticks * (meter->ns_per_tick / 1e6) / meter->sig_stats[best].count;
++
++    /* No GPU work uses the pool now: the last sample was read back, lost for 2 s, or never submitted. */
++    VK_CALL(vkResetQueryPool(meter->device->vk_device, meter->draw_pool, 0, FEX_DRAW_SLOTS));
++    vkd3d_atomic_uint32_store_explicit(&meter->draw_hot_sig, best, vkd3d_memory_order_relaxed);
++    vkd3d_atomic_uint32_store_explicit(&meter->draw_state, FEX_DRAW_ARMED, vkd3d_memory_order_release);
++}
++
+ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+ {
+     static char text[VKD3D_FEX_REPORT_SIZE];
+@@ -767,8 +1546,12 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+     uint32_t top_sigs[8], top_lines[12];
+     unsigned int top_sig_count = 0, top_line_count = 0;
+     uint32_t i, j, sig_count;
++    bool draw_sample;
+     size_t len = 0;
+ 
++    /* The '#' notes are logged once each by FEX: only the first reports carry them, so the draw samples that come
++     * after them fit the 4 KB report. */
++    if (meter->publishes < FEX_DRAW_FIRST_PUBLISH)
+     {
+         const VkPhysicalDeviceVulkan12Properties *props = &meter->device->device_info.vulkan_1_2_properties;
+ 
+@@ -787,6 +1570,17 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+                     " CPU count: each tile replays its geometry), 'vs' = vertex shader runs, 'prims' = primitives"
+                     " left after clipping, 'fs' = fragment shader runs (/px = per pixel of the pass); " :
+                     "no pipeline statistics on this driver; ");
++        if (meter->draw_pool)
++            len = vkd3d_fex_report_append(text, sizeof(text), len,
++                    "# gpu draws (VKD3D fex9): once a second one pass of the kind with the most GPU time (50+ draws) gets"
++                    " a GPU timestamp before every draw; a draw's time = from its timestamp to the next draw's (the"
++                    " command processor is held back while the GPU is busy, so about what the draw cost); 'new"
++                    " pipeline' = another pipeline than the draw before; 'pso N' = the costliest pipelines with the"
++                    " driver's shader statistics%s; every 4th sample ('alone') times every 8th draw alone with the GPU"
++                    " idle before and after it: alone/normal about 1 = the GPU doesn't overlap draws\n",
++                    meter->draw_stats ? " (w = threads per wave, waves = waves per core, inst = instructions,"
++                    " full/half = registers, tex = texture and mem = memory instructions, spill-ld/st = register"
++                    " spills, sy/ss = estimated stall cycles)" : " (none on this driver)");
+     }
+ 
+     clears_folded = vkd3d_atomic_uint32_exchange_explicit(&meter->clears_folded, 0, vkd3d_memory_order_relaxed);
+@@ -813,6 +1607,19 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+     }
+     len = vkd3d_fex_report_append(text, sizeof(text), len, "\n");
+ 
++    /* The last draw sample, once. */
++    draw_sample = meter->draw_text_len != 0;
++    if (draw_sample)
++    {
++        uint32_t abandoned = vkd3d_atomic_uint32_load_explicit(&meter->draw_abandoned, vkd3d_memory_order_relaxed);
++
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "%s", meter->draw_text);
++        if (abandoned || meter->draw_lost)
++            len = vkd3d_fex_report_append(text, sizeof(text), len, "  gpu draw samples not used: list reset before"
++                    " submitting %u, no result %u\n", abandoned, meter->draw_lost);
++        meter->draw_text_len = 0;
++    }
++
+     /* Top passes by GPU time. */
+     sig_count = vkd3d_atomic_uint32_load_explicit(&meter->sig_count, vkd3d_memory_order_acquire);
+     for (i = 0; i < sig_count; i++)
+@@ -846,8 +1653,8 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+         len = vkd3d_fex_report_append(text, sizeof(text), len, "\n");
+     }
+ 
+-    /* What ended the passes. */
+-    for (i = 0; i < meter->line_count; i++)
++    /* What ended the passes (the same lines every second: left out when a draw sample needs the room). */
++    for (i = 0; i < meter->line_count && !draw_sample; i++)
+     {
+         for (j = top_line_count; j > 0 && meter->line_stats[top_lines[j - 1]].count < meter->line_stats[i].count; j--)
+         {
+@@ -874,6 +1681,9 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+ 
+     vkd3d_fex_report_publish(&vkd3d_fex_pass_report, text, len);
+ 
++    if (++meter->publishes > FEX_DRAW_FIRST_PUBLISH && meter->draw_pool)
++        fex_draw_arm(meter, sig_count);
++
+     memset(meter->sig_stats, 0, sizeof(meter->sig_stats));
+     meter->line_count = 0;
+     meter->lists = meter->list_ticks = meter->passes = meter->pass_ticks = meter->draws = 0;
+@@ -967,6 +1777,8 @@ static void *fex_pass_meter_thread(void *arg)
+ 
+         while (fex_pass_resolve_some(meter))
+             ;
++        if (meter->draw_pool)
++            fex_draw_resolve(meter);
+ 
+         now = vkd3d_get_current_time_ns();
+         if (now - meter->window_start_ns >= 1000000000ull)
+@@ -1034,11 +1846,47 @@ struct vkd3d_fex_pass_meter *vkd3d_fex_pass_meter_init(struct d3d12_device *devi
+         }
+     }
+ 
++    /* Draw timing: the meter thread resets the queries on the host between samples (the sampled pass is inside a
++     * render pass, where they can't be reset). */
++    if (meter->shape && device->device_info.vulkan_1_2_features.hostQueryReset &&
++            (!vkd3d_get_env_var("VKD3D_FEX_DRAWS", env, sizeof(env)) || strcmp(env, "0")))
++    {
++        memset(&pool_info, 0, sizeof(pool_info));
++        pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++        pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++        pool_info.queryCount = FEX_DRAW_SLOTS;
++        if (!(meter->draw_sample = vkd3d_calloc(1, sizeof(*meter->draw_sample))) ||
++                !(meter->draw_results = vkd3d_calloc(2 * FEX_DRAW_SLOTS, sizeof(*meter->draw_results))) ||
++                VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &meter->draw_pool)) != VK_SUCCESS)
++        {
++            WARN("FEX pass meter: no draw timing.\n");
++            vkd3d_free(meter->draw_sample);
++            vkd3d_free(meter->draw_results);
++            meter->draw_sample = NULL;
++            meter->draw_results = NULL;
++            meter->draw_pool = VK_NULL_HANDLE;
++        }
++        else
++        {
++            VK_CALL(vkResetQueryPool(device->vk_device, meter->draw_pool, 0, FEX_DRAW_SLOTS));
++            meter->draw_state = FEX_DRAW_IDLE;
++            meter->draw_hot_sig = 0xffffffffu;
++            meter->draw_arm_sig = 0xffffffffu;
++            meter->draw_stats = device->vk_info.KHR_pipeline_executable_properties &&
++                    device->device_info.pipeline_executable_properties_features.pipelineExecutableInfo &&
++                    vk_procs->vkGetPipelineExecutablePropertiesKHR && vk_procs->vkGetPipelineExecutableStatisticsKHR;
++        }
++    }
++
+     pthread_mutex_init(&meter->sig_lock, NULL);
+     pthread_mutex_init(&meter->pending_lock, NULL);
+ 
+     if (pthread_create(&meter->thread, NULL, fex_pass_meter_thread, meter))
+     {
++        if (meter->draw_pool)
++            VK_CALL(vkDestroyQueryPool(device->vk_device, meter->draw_pool, NULL));
++        vkd3d_free(meter->draw_sample);
++        vkd3d_free(meter->draw_results);
+         if (meter->stats_pool)
+             VK_CALL(vkDestroyQueryPool(device->vk_device, meter->stats_pool, NULL));
+         VK_CALL(vkDestroyQueryPool(device->vk_device, meter->pool, NULL));
+@@ -1051,8 +1899,9 @@ struct vkd3d_fex_pass_meter *vkd3d_fex_pass_meter_init(struct d3d12_device *devi
+ 
+     vkd3d_atomic_uint32_or((uint32_t *)&vkd3d_fex_pass_report.flags, VKD3D_FEX_REPORT_FLAG_ON |
+             (meter->shape ? VKD3D_FEX_REPORT_FLAG_PASS_SHAPE : 0), vkd3d_memory_order_release);
+-    INFO("FEX pass meter on (pass shape %s, pipeline statistics %s).\n", meter->shape ? "on" : "off",
+-            meter->stats_pool ? "on" : "off");
++    INFO("FEX pass meter on (pass shape %s, pipeline statistics %s, draw timing %s, shader statistics %s).\n",
++            meter->shape ? "on" : "off", meter->stats_pool ? "on" : "off", meter->draw_pool ? "on" : "off",
++            meter->draw_stats ? "on" : "off");
+     return meter;
+ }
+ 
+@@ -1070,6 +1919,13 @@ void vkd3d_fex_pass_meter_deinit(struct vkd3d_fex_pass_meter *meter)
+     VK_CALL(vkDestroyQueryPool(meter->device->vk_device, meter->pool, NULL));
+     if (meter->stats_pool)
+         VK_CALL(vkDestroyQueryPool(meter->device->vk_device, meter->stats_pool, NULL));
++    if (meter->draw_pool)
++    {
++        fex_draw_release(meter->draw_sample);
++        VK_CALL(vkDestroyQueryPool(meter->device->vk_device, meter->draw_pool, NULL));
++    }
++    vkd3d_free(meter->draw_sample);
++    vkd3d_free(meter->draw_results);
+     pthread_mutex_destroy(&meter->sig_lock);
+     pthread_mutex_destroy(&meter->pending_lock);
+     vkd3d_free(meter->pending);
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 117884b..7a8a731 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -2151,7 +2151,8 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+             chain->frame_latency, chain->frame_latency_internal,
+             target_interval_ns ? 1e9 / (double)target_interval_ns : 0.0,
+             chain->fex_start.enable ? (chain->fex_done.enable ?
+-                    "on (up to 30 ms, a busy GPU counts as spare time, GPU finish seen as it happens: VKD3D fex8)" :
++                    "on (up to 30 ms, a busy GPU counts as spare time, GPU finish seen as it happens, margin 1 ms smaller"
++                    " per 60 frames without a late one: VKD3D fex9)" :
+                     "on (up to 30 ms, a busy GPU counts as spare time: VKD3D fex6)") :
+                     vkd3d_fex_frame_start_on ? "off (no game latency handle)" : "off",
+             vkd3d_fex_present_presleep_on ? "on (grid from every held present, no checks without it: VKD3D fex8)" : "off",
+@@ -3629,8 +3630,11 @@ static void *dxgi_vk_swap_chain_fex_done_worker(void *chain_)
+ #define FEX_START_MARGIN_UP_NS 3000000ll   /* margin added for each frame the hold-back made late */
+ /* Frames without one before the margin shrinks by 1 ms. Build 58 shrank it by 1 ms per 600 frames (20 s): after loading
+  * hitches had pushed it to 30 ms it stayed above the spare time for the rest of the run, so nothing was held back and
+- * every frame reached the screen ~17 ms later than with the hold-back. */
+-#define FEX_START_MARGIN_DOWN_FRAMES 150u
++ * every frame reached the screen ~17 ms later than with the hold-back. Up to VKD3D fex8 it shrank by 1 ms per 150 frames
++ * (5 s): in the b61 run with fex8 each fight left it at 8-12 ms for the next 30-45 s, and medium scenes (GPU 60-90%
++ * busy) then took 53-66 ms to the screen against 45 ms with a margin of 3-5 ms (105 of 190 such seconds). Late frames
++ * came at the changes of scene whatever the margin was (none in 85 s of medium scenes with a margin of 3-5 ms). */
++#define FEX_START_MARGIN_DOWN_FRAMES 60u
+ #define FEX_START_NEAR_NS 1000000ll        /* less spare than this while held back: the frame nearly came late */
+ #define FEX_START_LATE_NS 2000000ll        /* this much past its time while held back: the frame came late */
+ /* Most hold-back: 30 ms from VKD3D fex8 on (was 20). In the b61 run with VKD3D fex4 the hold-back sat at 20 ms for 78
+@@ -3730,7 +3734,7 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+             chain->fex_start.spare_count++;
+ 
+         /* The margin covers how much the game's frame times vary beyond what the last frames showed: each frame the
+-         * hold-back made late makes it 3 ms bigger, 150 frames (5 s) without one make it 1 ms smaller. A frame that would
++         * hold-back made late makes it 3 ms bigger, 60 frames (2 s) without one make it 1 ms smaller. A frame that would
+          * have come late even without the hold-back (a loading hitch, the device busy with other work) was not made
+          * late by it and leaves the margin alone; its spare time still keeps the hold-back down while it is among the
+          * last frames. */
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 80b94cb..9beb751 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -148,6 +148,7 @@ struct vkd3d_vulkan_info
+     bool KHR_calibrated_timestamps;
+     bool KHR_cooperative_matrix;
+     bool KHR_unified_image_layouts;
++    bool KHR_pipeline_executable_properties;
+     /* EXT device extensions */
+     bool EXT_conditional_rendering;
+     bool EXT_conservative_rasterization;
+@@ -3144,6 +3145,7 @@ struct vkd3d_fex_pass_record
+     uint64_t vertices;     /* vertices (indices) x instances of the direct draws */
+ };
+ struct vkd3d_fex_pass_meter;
++struct vkd3d_fex_draw_sample;
+ 
+ /* FEX clear folding (command.c, VKD3D_FEX_FOLD_CLEARS=1): a full Clear*View made while no render pass runs waits here
+  * and becomes the load op of the next render pass that uses the same view, instead of a render pass of its own that
+@@ -3328,6 +3330,10 @@ struct d3d12_command_list
+         bool pass_active;
+         bool list_active;
+         bool stats_active;   /* a pipeline statistics query of ours is running (begun outside the pass) */
++        /* Draw timing (VKD3D fex9): the meter's one draw sample while this list records or holds it (not yet
++         * submitted), NULL otherwise; draw_open while its pass still runs. */
++        struct vkd3d_fex_draw_sample *draw;
++        bool draw_open;
+     } fex_pass;
+ 
+     struct
+@@ -5108,6 +5114,7 @@ struct vkd3d_physical_device_info
+     VkPhysicalDeviceCooperativeMatrix2FeaturesNV cooperative_matrix2_features_nv;
+     VkPhysicalDeviceAntiLagFeaturesAMD anti_lag_amd;
+     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified_image_layouts_features;
++    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeline_executable_properties_features;
+ 
+     VkPhysicalDeviceFeatures2 features2;
+ 
+diff --git a/libs/vkd3d/vulkan_procs.h b/libs/vkd3d/vulkan_procs.h
+index de0fd68..e042943 100644
+--- a/libs/vkd3d/vulkan_procs.h
++++ b/libs/vkd3d/vulkan_procs.h
+@@ -202,6 +202,10 @@ VK_DEVICE_PFN(vkResetQueryPool)
+ /* VK_KHR_push_descriptor */
+ VK_DEVICE_EXT_PFN(vkCmdPushDescriptorSetKHR)
+ 
++/* VK_KHR_pipeline_executable_properties */
++VK_DEVICE_EXT_PFN(vkGetPipelineExecutablePropertiesKHR)
++VK_DEVICE_EXT_PFN(vkGetPipelineExecutableStatisticsKHR)
++
+ /* VK_KHR_ray_tracing_pipeline */
+ VK_DEVICE_EXT_PFN(vkCreateRayTracingPipelinesKHR)
+ VK_DEVICE_EXT_PFN(vkGetRayTracingShaderGroupHandlesKHR)
+-- 
+2.43.0
+
