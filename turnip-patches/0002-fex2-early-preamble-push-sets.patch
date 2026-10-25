@@ -1,0 +1,156 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 53c1d61..d5c9ad5 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -5229,6 +5229,14 @@ tu_push_descriptor_set_update_layout(struct tu_device *device,
+       set->mapped_ptr = static_cast<uint32_t *>(new_buf);
+       set->host_size = layout->size;
+    }
++
++   /* FEX link, TU_FEX_COMPILE_PUSH_SPECULATE: shaders may load through this
++    * set ahead of the draw (early preamble), also through bindings the
++    * application didn't push since the layout changed. Make those null
++    * descriptors (all zero, size 0) instead of leftover bytes.
++    */
++   if (tu_fex_compile(device->fex) & TU_FEX_COMPILE_PUSH_SPECULATE)
++      memset(set->mapped_ptr, 0, layout->size);
+    return VK_SUCCESS;
+ }
+ 
+diff --git a/src/freedreno/vulkan/tu_descriptor_set.cc b/src/freedreno/vulkan/tu_descriptor_set.cc
+index 18b9299..26dd543 100644
+--- a/src/freedreno/vulkan/tu_descriptor_set.cc
++++ b/src/freedreno/vulkan/tu_descriptor_set.cc
+@@ -29,6 +29,7 @@
+ #include "tu_buffer.h"
+ #include "tu_buffer_view.h"
+ #include "tu_device.h"
++#include "tu_fex.h"
+ #include "tu_image.h"
+ #include "tu_rmv.h"
+ #include "tu_sampler.h"
+@@ -185,6 +186,19 @@ tu_CreateDescriptorSetLayout(
+ 
+    uint32_t dynamic_offset_size = 0;
+ 
++   /* FEX link, TU_FEX_COMPILE_PUSH_SPECULATE: a push set is written by
++    * vkCmdPushDescriptorSet, not by the application's descriptor buffer, so
++    * with descriptor buffers it stays fully bound like a push set without
++    * them (unpushed bindings are zeroed, see
++    * tu_push_descriptor_set_update_layout).
++    */
++   const bool db_partially_bound =
++      (pCreateInfo->flags &
++       VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) &&
++      !((pCreateInfo->flags &
++         VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) &&
++        (tu_fex_compile(device->fex) & TU_FEX_COMPILE_PUSH_SPECULATE));
++
+    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
+       const VkDescriptorSetLayoutBinding *binding = bindings + j;
+       uint32_t b = binding->binding;
+@@ -202,8 +216,7 @@ tu_CreateDescriptorSetLayout(
+           * have been defined with the equivalent of ...
+           * VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT"
+           */
+-         (pCreateInfo->flags &
+-          VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) ||
++         db_partially_bound ||
+          (variable_flags && j < variable_flags->bindingCount &&
+           (variable_flags->pBindingFlags[j] &
+            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT));
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index 54909f8..d14ed2b 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -97,6 +97,11 @@ tu_fex_device_init(struct tu_device *dev)
+       status |= TU_FEX_STATUS_NOT_A7XX;
+    }
+ 
++   /* Read once: it changes compiled shaders (part of the layout hash). */
++   fex->compile = chan->compile & TU_FEX_COMPILE_MASK;
++   if (fex->compile & TU_FEX_COMPILE_PUSH_SPECULATE)
++      status |= TU_FEX_STATUS_PUSH_SPECULATE;
++
+    chan->patch = TU_FEX_PATCH;
+    snprintf(chan->driver, sizeof(chan->driver), "Mesa " PACKAGE_VERSION " fex%d",
+             TU_FEX_PATCH);
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 284d9da..e4c32a1 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -11,6 +11,8 @@
+  *  - asks for GPU hardware counters around render passes; the driver reserves
+  *    them through KGSL and has the GPU write them, with the always-on timer,
+  *    into a ring of slots FEX reads once a second.
++ *  - picks shader compile options once, before the driver loads
++ *    (tu_fex_channel::compile, read when a device is created).
+  * Without the variable (or with a block that fails the checks) the driver
+  * behaves like stock Turnip.
+  *
+@@ -26,7 +28,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 1
++#define TU_FEX_PATCH 2
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -39,6 +41,16 @@
+ #define TU_FEX_MODE_PUSH_REUSE 0x2u
+ #define TU_FEX_MODE_MASK 0x3u
+ 
++/* tu_fex_channel::compile bits (FEX, before the driver loads) */
++/* Push descriptor sets made with VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT
++ * count as fully bound, like push sets without that flag: vkCmdPushDescriptorSet
++ * writes them, not the application's descriptor buffer. Loads through them can
++ * then run in the early preamble (a7xx), ahead of the draw's waves, which the
++ * vkd3d root constant buffers of D3D12 games need. Bindings never pushed since
++ * the set's layout changed are null descriptors (zeroed), so such a load reads 0. */
++#define TU_FEX_COMPILE_PUSH_SPECULATE 0x1u
++#define TU_FEX_COMPILE_MASK 0x1u
++
+ /* tu_fex_channel::status bits (driver) */
+ #define TU_FEX_STATUS_ATTACHED 0x1u      /* a device read the channel */
+ #define TU_FEX_STATUS_DESC_PATCH 0x2u    /* mode bits are honored (a7xx) */
+@@ -47,6 +59,7 @@
+ #define TU_FEX_STATUS_NOT_KGSL 0x10u     /* counters need KGSL */
+ #define TU_FEX_STATUS_RING_FAILED 0x20u  /* ring allocation failed */
+ #define TU_FEX_STATUS_NOT_A7XX 0x40u     /* descriptor patch is a7xx only */
++#define TU_FEX_STATUS_PUSH_SPECULATE 0x80u /* TU_FEX_COMPILE_PUSH_SPECULATE honored */
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -63,7 +76,8 @@ struct tu_fex_channel {
+    uint32_t counter_count;    /* entries used in counters[] */
+    uint32_t sample_min_draws; /* sample render passes with at least this many draws, 0 = none */
+    uint32_t ring_slots;       /* slots wanted (power of two), 0 = 4096 */
+-   uint32_t reserved0[2];
++   uint32_t compile;          /* TU_FEX_COMPILE_*, read when a device is created (fex2) */
++   uint32_t reserved0;
+    /* 0x020 */
+    struct tu_fex_counter counters[TU_FEX_MAX_COUNTERS];
+    /* 0x1a0: written by FEX while the game runs */
+@@ -141,6 +155,7 @@ struct tu_fex_cmd_state {
+ struct tu_fex_device {
+    struct tu_fex_channel *chan;
+    bool desc_patch;            /* mode bits honored */
++   uint32_t compile;           /* TU_FEX_COMPILE_* for this device */
+    uint32_t counter_count;     /* == chan->counter_count */
+    uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
+    uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];
+@@ -155,6 +170,13 @@ struct tu_fex_device {
+ };
+ 
+ void tu_fex_device_init(struct tu_device *dev);
++
++/* TU_FEX_COMPILE_* bits in effect (0 without a channel). */
++static inline uint32_t
++tu_fex_compile(const struct tu_fex_device *fex)
++{
++   return fex ? fex->compile : 0;
++}
+ void tu_fex_device_finish(struct tu_device *dev);
+ 
+ /* Mode for a command buffer begun now (0 without a channel). */

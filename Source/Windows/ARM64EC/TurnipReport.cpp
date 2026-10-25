@@ -129,11 +129,15 @@ namespace {
     }
     char Driver[sizeof(Chan->Driver) + 1] {};
     memcpy(Driver, Chan->Driver, sizeof(Chan->Driver));
+    const char* EarlyPreamble = (Status & T::StatusPushSpeculate)                 ? "ON" :
+                                !(Chan->Compile & T::CompilePushSpeculate) ? "off (FEX_TU_EARLY_PREAMBLE=0)" :
+                                Chan->Patch < 2                            ? "NOT available (driver older than fex2)" :
+                                                                             "NOT honored";
     FEX::Windows::StatsLogNote(fextl::fmt::format(
-      "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; "
-      "counters: {}",
+      "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, {} of {} "
+      "GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", Chan->CountersReserved, Chan->CounterCount,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, Chan->CountersReserved, Chan->CounterCount,
       (Status & T::StatusNotKgsl) ? " (not KGSL)" : "", (Status & T::StatusRingFailed) ? ", ring allocation FAILED" : "",
       Chan->RingCount, Chan->SlotSize, Counters.empty() ? "-" : Counters));
   }

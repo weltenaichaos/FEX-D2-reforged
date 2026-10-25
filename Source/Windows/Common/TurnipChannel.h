@@ -9,7 +9,9 @@
 //    and one game run compares both ways;
 //  - reserves the GPU counters listed in 'Counters' through KGSL and has the GPU write them, with its always-on timer,
 //    around every render pass with at least 'SampleMinDraws' draws into a ring of slots FEX reads once a second;
-//  - counts descriptor updates, invalidated sets and push descriptor reuse per mode.
+//  - counts descriptor updates, invalidated sets and push descriptor reuse per mode;
+//  - reads 'Compile' once when the device is created (fex2 and later): CompilePushSpeculate lets loads through push
+//    descriptor sets (vkd3d's root constant buffers) run in the shader's early preamble, ahead of the draw's waves.
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -23,6 +25,8 @@ constexpr uint32_t MaxCounters = 24;
 constexpr uint32_t ModeChangedOnly = 0x1;
 constexpr uint32_t ModePushReuse = 0x2;
 
+constexpr uint32_t CompilePushSpeculate = 0x1;
+
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
 constexpr uint32_t StatusCounters = 0x4;
@@ -30,6 +34,7 @@ constexpr uint32_t StatusRing = 0x8;
 constexpr uint32_t StatusNotKgsl = 0x10;
 constexpr uint32_t StatusRingFailed = 0x20;
 constexpr uint32_t StatusNotA7xx = 0x40;
+constexpr uint32_t StatusPushSpeculate = 0x80; // fex2 and later: CompilePushSpeculate honored
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -52,7 +57,8 @@ struct Channel {
   uint32_t CounterCount;
   uint32_t SampleMinDraws;
   uint32_t RingSlots;
-  uint32_t Reserved0[2];
+  uint32_t Compile; // 0x018, Compile*: read once when the driver creates a device (fex2 and later; fex1 ignores it)
+  uint32_t Reserved0;
   Counter Counters[MaxCounters]; // 0x020
   // 0x1a0: written by FEX while the game runs
   volatile uint32_t Mode;
@@ -96,6 +102,7 @@ struct Slot {
 };
 
 static_assert(sizeof(Counter) == 16);
+static_assert(offsetof(Channel, Compile) == 0x18);
 static_assert(offsetof(Channel, Mode) == 0x1a0);
 static_assert(offsetof(Channel, Status) == 0x1b0);
 static_assert(offsetof(Channel, RingCpu) == 0x1f0);

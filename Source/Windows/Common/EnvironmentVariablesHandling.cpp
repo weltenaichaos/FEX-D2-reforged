@@ -314,6 +314,10 @@ namespace {
     Chan->SampleMinDraws = MinDraws ? static_cast<uint32_t>(strtoul(MinDraws, nullptr, 10)) : 100;
     Chan->RingSlots = 4096;
 
+    // FEX_TU_EARLY_PREAMBLE: 1 (default) = loads through push descriptor sets (vkd3d's root constant buffers) may run
+    // in the early preamble, ahead of the draw (driver fex2 and later); 0 = stock.
+    Chan->Compile = SwitchOff(Switch("FEX_TU_EARLY_PREAMBLE")) ? 0 : Turnip::CompilePushSpeculate;
+
     const auto Text = fextl::fmt::format("{:x}", reinterpret_cast<uintptr_t>(Chan));
     auto WineSetEnv = reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv);
     const NTSTATUS SetStatus = WineSetEnv("TU_FEX_CHANNEL", Text.c_str());
@@ -323,10 +327,11 @@ namespace {
       return;
     }
     TurnipChannelPtr = Chan;
-    StatsLogNote(fextl::fmt::format("turnip: FEX link TU_FEX_CHANNEL={} set: descriptor fix {}, {} GPU counters asked for, passes with "
-                                    "{}+ draws timed and counted; only FEX's Turnip build (fex1 and later) answers, a '# turnip: "
-                                    "driver' note follows once it did",
+    StatsLogNote(fextl::fmt::format("turnip: FEX link TU_FEX_CHANNEL={} set: descriptor fix {}, early preamble for root constant "
+                                    "buffers {}, {} GPU counters asked for, passes with {}+ draws timed and counted; only FEX's "
+                                    "Turnip build (fex1 and later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
+                                    Chan->Compile ? "asked for (FEX_TU_EARLY_PREAMBLE=1, driver fex2 and later)" : "off (FEX_TU_EARLY_PREAMBLE=0)",
                                     Chan->CounterCount, Chan->SampleMinDraws));
   }
 } // namespace

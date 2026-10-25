@@ -99,6 +99,17 @@ namespace FEX::Windows {
 //                          stalls and draw overlap, shader core occupancy/starvation, wave life, wave cycle split,
 //                          texture latency); 0 = none
 //   FEX_TU_SAMPLE_DRAWS=N  passes with at least N draws are timed and counted (default 100)
+//   FEX_TU_EARLY_PREAMBLE=1  (the D2R default from build 71, driver fex2 and later) push descriptor sets count as written,
+//                          so the lighting shaders' reads of vkd3d's root constant buffers can run in the early
+//                          preamble, ahead of the draw's pixel waves, as Qualcomm's driver does for D3D11 games. Build
+//                          70 counted ~12k GPU cycles per main pass draw for a ~9.7k cycle wave, and the shaders'
+//                          preambles (~730 instructions, ~108 memory reads, 47 branches) ran inside each draw's first
+//                          wave ('Early preamble = false'): with descriptor buffers stock Turnip treats every binding
+//                          as possibly unwritten, so no read through it may run before the draw. With the switch the
+//                          preamble is ~250 branch-free instructions and early ('Early preamble = true' in the shader
+//                          copies); bindings not pushed since the push set's layout changed read as empty (null
+//                          descriptors). The driver reads it once at device creation; it is part of the shaders' cache
+//                          key, so shaders are compiled anew once. 0 = stock.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report both.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

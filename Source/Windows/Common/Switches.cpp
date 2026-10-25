@@ -120,6 +120,13 @@ namespace {
     {"FEX_TU_DESC", "0"},
     {"FEX_TU_COUNTERS", "1"},
     {"FEX_TU_SAMPLE_DRAWS", "100"},
+    // Build 71: build 70 found the main pass's lighting draws each wait for their setup step (the shader preamble: ~730
+    // instructions, ~108 memory reads, 47 branches) inside the draw's first pixel wave. Qualcomm's own driver and stock
+    // Turnip run it ahead of the draw ('early preamble'), but Turnip refuses here: with vkd3d's descriptor buffers it
+    // treats the push set holding the root constant buffers as maybe not written, so those reads can't run early.
+    // FEX's Turnip fex2 treats push sets as written (unpushed slots read as empty), and the preamble shrinks to ~250
+    // branch-free instructions that run early (checked on the PC with the game's 4 lighting shaders).
+    {"FEX_TU_EARLY_PREAMBLE", "1"},
   };
 
   // In the order the stats log lists them.
@@ -179,6 +186,7 @@ namespace {
     "FEX_TU_DESC",
     "FEX_TU_COUNTERS",
     "FEX_TU_SAMPLE_DRAWS",
+    "FEX_TU_EARLY_PREAMBLE",
   };
 
   bool UseD2RDefaults {};
