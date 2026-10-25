@@ -78,10 +78,6 @@ jobs:
         run: |
           set -e
           ndk="$GITHUB_WORKSPACE/$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          # NDK r29 build fixes from the reference recipe (no-ops where they don't apply)
-          sed -i 's/typedef const native_handle_t\* buffer_handle_t;/typedef void\* buffer_handle_t;/g' include/android_stub/cutils/native_handle.h || true
-          sed -i 's/, hnd->handle/, (void \*)hnd->handle/g' src/util/u_gralloc/u_gralloc_fallback.c || true
-          sed -i 's/native_buffer->handle->/((const native_handle_t \*)native_buffer->handle)->/g' src/vulkan/runtime/vk_android.c || true
           export CFLAGS="-D__ANDROID__ -Wno-error -Wno-deprecated-declarations -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types"
           export CXXFLAGS="$CFLAGS"
           cat > android-aarch64.txt <<EOF
