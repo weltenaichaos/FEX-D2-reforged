@@ -2,6 +2,7 @@
 #include "Windows/Common/EnvironmentVariablesHandling.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/Switches.h"
+#include "Windows/Common/TurnipChannel.h"
 
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
@@ -226,6 +227,93 @@ namespace {
                                     "show the new preamble size. FEX_TU_NOPREAMBLE=0 turns it off",
                                     Before, After, static_cast<uint32_t>(SetStatus)));
   }
+
+  Turnip::Channel* TurnipChannelPtr {};
+  uint32_t TurnipDesc {};
+
+  bool SwitchOff(const char* Value) {
+    return !Value || (Value[0] == '0' && !Value[1]);
+  }
+
+  // See EnvironmentVariablesHandling.h and TurnipChannel.h. The driver reads TU_FEX_CHANNEL when the game's Vulkan
+  // device is created; a stock Turnip ignores it.
+  void SetupTurnipChannel(FARPROC SetUnixEnv) {
+    if (SwitchOff(Switch("FEX_TU_CHANNEL"))) {
+      StatsLogNote("turnip: no FEX link (FEX_TU_CHANNEL=0): FEX's Turnip build behaves like stock Turnip");
+      return;
+    }
+    if (!SetUnixEnv) {
+      StatsLogNote("turnip: this Wine has no __wine_set_unix_env, TU_FEX_CHANNEL can't be set: no FEX link to the driver");
+      return;
+    }
+
+    void* Base {};
+    SIZE_T Size = 0x1000;
+    const NTSTATUS AllocStatus = NtAllocateVirtualMemory(NtCurrentProcess(), &Base, 0, &Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (AllocStatus != 0 || !Base) {
+      StatsLogNote(fextl::fmt::format("turnip: the FEX link's memory can't be allocated (status {:#x})", static_cast<uint32_t>(AllocStatus)));
+      return;
+    }
+    auto* Chan = static_cast<Turnip::Channel*>(Base);
+    Chan->Magic = Turnip::Magic;
+    Chan->Version = Turnip::Version;
+    Chan->Size = sizeof(Turnip::Channel);
+
+    // FEX_TU_DESC: 0 stock, 1 always on, alt (default) = on in every other second (TurnipReport flips it; without the
+    // stats log nothing flips it, so it stays on).
+    const char* Desc = Switch("FEX_TU_DESC");
+    TurnipDesc = SwitchOff(Desc) ? 0 : (Desc[0] == 'a' || Desc[0] == 'A') ? 2 : 1;
+    Chan->Mode = TurnipDesc ? (Turnip::ModeChangedOnly | Turnip::ModePushReuse) : 0;
+
+    // FEX_TU_COUNTERS: 1 (default) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at least this many
+    // draws get timed and counted (default 100: the main pass and the depth prepass in towns and fights).
+    if (!SwitchOff(Switch("FEX_TU_COUNTERS"))) {
+      static constexpr struct {
+        uint32_t Group, Countable;
+      } List[] = {
+        {Turnip::GroupSp, 0},   // SP_BUSY_CYCLES
+        {Turnip::GroupSp, 8},   // SP_WAVE_CONTEXTS
+        {Turnip::GroupSp, 9},   // SP_WAVE_CONTEXT_CYCLES
+        {Turnip::GroupSp, 14},  // SP_FS_STAGE_DURATION_CYCLES
+        {Turnip::GroupSp, 4},   // SP_STALL_CYCLES_TP
+        {Turnip::GroupSp, 21},  // SP_WAVE_FETCH_CYCLES
+        {Turnip::GroupSp, 51},  // SP_ICL1_REQUESTS
+        {Turnip::GroupSp, 52},  // SP_ICL1_MISSES
+        {Turnip::GroupSp, 85},  // SP_ICL1_MISS_FETCH_CYCLES
+        {Turnip::GroupSp, 142}, // SP_STCHE_MISS_INC_FS
+        {Turnip::GroupSp, 44},  // SP_FS_INSTRUCTIONS
+        {Turnip::GroupTp, 7},   // TP_L1_CACHELINE_MISSES
+        {Turnip::GroupTp, 2},   // TP_LATENCY_CYCLES
+        {Turnip::GroupTp, 3},   // TP_LATENCY_TRANS
+        {Turnip::GroupHlsq, 55}, // HLSQ_SPTROC_STCHE_MISS_INC_FS
+      };
+      static_assert(std::size(List) <= Turnip::MaxCounters);
+      for (const auto& C : List) {
+        auto& Out = Chan->Counters[Chan->CounterCount++];
+        Out.Group = C.Group;
+        Out.Countable = C.Countable;
+        Out.Result = 1;
+      }
+    }
+    const char* MinDraws = Switch("FEX_TU_SAMPLE_DRAWS");
+    Chan->SampleMinDraws = MinDraws ? static_cast<uint32_t>(strtoul(MinDraws, nullptr, 10)) : 100;
+    Chan->RingSlots = 4096;
+
+    const auto Text = fextl::fmt::format("{:x}", reinterpret_cast<uintptr_t>(Chan));
+    auto WineSetEnv = reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv);
+    const NTSTATUS SetStatus = WineSetEnv("TU_FEX_CHANNEL", Text.c_str());
+    if (SetStatus != 0) {
+      StatsLogNote(fextl::fmt::format("turnip: TU_FEX_CHANNEL can't be set (status {:#x}): no FEX link to the driver",
+                                      static_cast<uint32_t>(SetStatus)));
+      return;
+    }
+    TurnipChannelPtr = Chan;
+    StatsLogNote(fextl::fmt::format("turnip: FEX link TU_FEX_CHANNEL={} set: descriptor fix {}, {} GPU counters asked for, passes with "
+                                    "{}+ draws timed and counted; only FEX's Turnip build (fex1 and later) answers, a '# turnip: "
+                                    "driver' note follows once it did",
+                                    Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
+                                    Chan->CounterCount, Chan->SampleMinDraws));
+  }
 } // namespace
 
 void SetupEnvironmentVariableValues(HMODULE NtDll) {
@@ -256,6 +344,7 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
   SetupTurnipNoPreamble(Sym);
+  SetupTurnipChannel(Sym);
 
   // On an ARM system we are expecting uncached memory to have marked overhead due to atomic memory usage.
   // If `tu_override_uncached_as_cache_coherent` isn't already controlled by the user, then set it here.
@@ -278,4 +367,13 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
     WineSetEnv("tu_override_uncached_as_cache_coherent", "true");
   }
 }
+
+namespace Turnip {
+  Channel* GetChannel() {
+    return TurnipChannelPtr;
+  }
+  uint32_t DescSwitch() {
+    return TurnipDesc;
+  }
+} // namespace Turnip
 } // namespace FEX::Windows

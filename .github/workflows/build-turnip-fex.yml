@@ -1,0 +1,180 @@
+# Build FEX's Turnip (Mesa freedreno Vulkan) driver for Android/KGSL and package it as an
+# adrenotools driver zip (libvulkan_freedreno.so + meta.json) that GameNative imports as a
+# GPU driver.
+#
+# Mesa tag MESA_TAG plus this repo's turnip-patches/*.patch, in name order. The patches add
+# the FEX link (TU_FEX_CHANNEL, see Source/Windows/Common/TurnipChannel.h): a descriptor
+# cache fix FEX turns on and off each second, and GPU counters around big render passes for
+# FEX's stats log. Without FEX's link the driver behaves like stock Turnip.
+#
+# Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
+name: Build Turnip (FEX)
+
+on:
+  push:
+    branches: [ d2r/clean ]
+    paths: [ .github/workflows/build-turnip-fex.yml, turnip-patches/** ]
+  workflow_dispatch:
+
+env:
+  MESA_TAG: mesa-26.3.0-rc2
+  MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
+  FEX_PATCH: fex1
+  NDK: android-ndk-r29
+  SDK: "34"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout FEX patches
+        uses: actions/checkout@v4
+        with:
+          path: fex-src
+          sparse-checkout: turnip-patches
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build flex bison glslang-tools zip unzip python3-pip pkg-config
+          pip install --user --break-system-packages meson mako pyyaml || pip install --user meson mako pyyaml
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Mesa
+        run: |
+          git clone --depth 1 --branch "$MESA_TAG" https://gitlab.freedesktop.org/mesa/mesa.git mesa \
+            || git clone --depth 1 --branch "$MESA_TAG" https://github.com/chaotic-cx/mesa-mirror.git mesa
+          cd mesa
+          test "$(git rev-parse HEAD)" = "$MESA_COMMIT"
+          cat VERSION
+
+      - name: Apply FEX patches
+        working-directory: mesa
+        run: |
+          for p in ../fex-src/turnip-patches/*.patch; do
+            echo "Applying $p"
+            git apply --verbose "$p"
+          done
+          git diff --stat
+
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK }}
+          key: ${{ env.NDK }}-linux
+
+      - name: Download Android NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL "https://dl.google.com/android/repository/${NDK}-linux.zip" -o ndk.zip
+          unzip -q ndk.zip
+          rm ndk.zip
+
+      - name: Build
+        working-directory: mesa
+        run: |
+          set -e
+          ndk="$GITHUB_WORKSPACE/$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # NDK r29 build fixes from the reference recipe (no-ops where they don't apply)
+          sed -i 's/typedef const native_handle_t\* buffer_handle_t;/typedef void\* buffer_handle_t;/g' include/android_stub/cutils/native_handle.h || true
+          sed -i 's/, hnd->handle/, (void \*)hnd->handle/g' src/util/u_gralloc/u_gralloc_fallback.c || true
+          sed -i 's/native_buffer->handle->/((const native_handle_t \*)native_buffer->handle)->/g' src/vulkan/runtime/vk_android.c || true
+          export CFLAGS="-D__ANDROID__ -Wno-error -Wno-deprecated-declarations -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types"
+          export CXXFLAGS="$CFLAGS"
+          cat > android-aarch64.txt <<EOF
+          [binaries]
+          ar = '$ndk/llvm-ar'
+          c = ['$ndk/aarch64-linux-android$SDK-clang']
+          cpp = ['$ndk/aarch64-linux-android$SDK-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+          c_ld = '$ndk/ld.lld'
+          cpp_ld = '$ndk/ld.lld'
+          strip = '$ndk/llvm-strip'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=$ndk/pkg-config', '/usr/bin/pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+          sed -i 's/^          //' android-aarch64.txt
+          cat android-aarch64.txt
+          CC=gcc CXX=g++ meson setup build-android \
+            --cross-file android-aarch64.txt \
+            --prefix "$GITHUB_WORKSPACE/turnip-out" \
+            -Dbuildtype=release \
+            -Dstrip=true \
+            -Dplatforms=android \
+            -Dvideo-codecs= \
+            -Dplatform-sdk-version=36 \
+            -Dandroid-stub=true \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dvulkan-beta=true \
+            -Dfreedreno-kmds=kgsl \
+            -Degl=disabled \
+            -Dandroid-libbacktrace=disabled
+          ninja -C build-android install
+
+      - name: Verify
+        run: |
+          so="$GITHUB_WORKSPACE/turnip-out/lib/libvulkan_freedreno.so"
+          ls -la "$so"
+          file "$so"
+          strings "$so" | grep -q TU_FEX_CHANNEL
+          strings "$so" | grep -E "^Mesa .* fex%d$|fex pass ring" | head
+          strings "$so" | grep -q "fex pass ring"
+
+      - name: Package adrenotools zip
+        run: |
+          cd "$GITHUB_WORKSPACE/turnip-out/lib"
+          MESA_VERSION=$(cat "$GITHUB_WORKSPACE/mesa/VERSION" | tr -d '[:space:]')
+          cat > meta.json <<EOF
+          {
+            "schemaVersion": 1,
+            "name": "Turnip ${MESA_VERSION} FEX ${FEX_PATCH} (build ${{ github.run_number }})",
+            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix and GPU counters via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
+            "author": "FEX-D2-reforged",
+            "packageVersion": "${{ github.run_number }}",
+            "vendor": "Mesa",
+            "driverVersion": "Vulkan 1.4",
+            "minApi": 28,
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+          sed -i 's/^          //' meta.json
+          cat meta.json
+          python3 -c "import json; json.load(open('meta.json'))"
+          zip -q "$GITHUB_WORKSPACE/turnip-${MESA_VERSION}-${FEX_PATCH}.zip" libvulkan_freedreno.so meta.json
+          echo "ZIPNAME=turnip-${MESA_VERSION}-${FEX_PATCH}.zip" >> "$GITHUB_ENV"
+          echo "MESA_VERSION=${MESA_VERSION}" >> "$GITHUB_ENV"
+          unzip -l "$GITHUB_WORKSPACE/turnip-${MESA_VERSION}-${FEX_PATCH}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: turnip-fex
+          path: ${{ env.ZIPNAME }}
+          retention-days: 30
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: turnip-${{ env.MESA_VERSION }}-${{ env.FEX_PATCH }}-${{ github.run_number }}
+          name: Turnip ${{ env.MESA_VERSION }} FEX ${{ env.FEX_PATCH }} (build ${{ github.run_number }})
+          files: ${{ env.ZIPNAME }}
+          prerelease: true
+          body: |
+            Mesa ${{ env.MESA_TAG }} Turnip Vulkan driver for Adreno (Android, KGSL), with this repo's
+            turnip-patches. Import in GameNative as a GPU driver (adrenotools zip).
+            fex1: with FEX's link (FEX build 69 and later, TU_FEX_CHANNEL), descriptor updates in direct
+            render passes invalidate only the descriptor sets whose address changed instead of all 8, and
+            an identical push descriptor update keeps its old copy (FEX turns this on in every other
+            second); the GPU counts shader core, instruction cache, descriptor cache and texture events
+            around render passes with 100+ draws for FEX's stats log. Without FEX's link it behaves like
+            stock Turnip.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

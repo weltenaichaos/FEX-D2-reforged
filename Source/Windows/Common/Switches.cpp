@@ -106,7 +106,20 @@ namespace {
     // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14
     // dependent memory reads and ~300 cycles of setup, not hidden (the copies say 'Early preamble = false'). Turnip then
     // compiles without that preamble (IR3_SHADER_DEBUG=nopreamble, see EnvironmentVariablesHandling.h).
-    {"FEX_TU_NOPREAMBLE", "1"},
+    // Build 69: back off; b68 showed no change (main pass 13.3-14.1 us/draw with and without), and the dependent reads
+    // just moved into every wave.
+    {"FEX_TU_NOPREAMBLE", "0"},
+    // Build 69: FEX's own Turnip build (turnip-patches/). Stock Turnip invalidates the GPU's descriptor caches of all 8
+    // descriptor sets on every descriptor update, and vkd3d pushes the root constants' descriptors (a push set) before
+    // nearly every draw, so every draw of the ~1,000 in a fight's main pass starts with cold descriptor caches. FEX hands
+    // the driver a link (TU_FEX_CHANNEL, see Common/TurnipChannel.h): in direct passes only the sets whose address changed
+    // get invalidated, an identical push keeps its old copy, and FEX turns this on in every other second so one run
+    // compares both ways ('turnip' lines, ARM64EC/TurnipReport.cpp). The driver also has the GPU count shader-core,
+    // texture and cache events around the big passes.
+    {"FEX_TU_CHANNEL", "1"},
+    {"FEX_TU_DESC", "alt"},
+    {"FEX_TU_COUNTERS", "1"},
+    {"FEX_TU_SAMPLE_DRAWS", "100"},
   };
 
   // In the order the stats log lists them.
@@ -162,6 +175,10 @@ namespace {
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",
     "FEX_TU_NOPREAMBLE",
+    "FEX_TU_CHANNEL",
+    "FEX_TU_DESC",
+    "FEX_TU_COUNTERS",
+    "FEX_TU_SAMPLE_DRAWS",
   };
 
   bool UseD2RDefaults {};

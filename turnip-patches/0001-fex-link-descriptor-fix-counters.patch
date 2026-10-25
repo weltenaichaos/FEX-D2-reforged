@@ -1,0 +1,928 @@
+diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
+index b019710..471ee1a 100644
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -42,6 +42,7 @@ libtu_files = files(
+   'tu_cs_breadcrumbs.cc',
+   'tu_cs.cc',
+   'tu_device.cc',
++  'tu_fex.cc',
+   'tu_descriptor_set.cc',
+   'tu_dynamic_rendering.cc',
+   'tu_event.cc',
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 856f29f..53c1d61 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -3375,6 +3375,13 @@ tu6_sysmem_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+ 
+    tu_set_render_mode<CHIP>(cs, {RM6_DIRECT_RENDER});
+ 
++   /* FEX link: TU_FEX_MODE_CHANGED_ONLY descriptor updates in this pass only
++    * invalidate the sets that changed since the pass began, so begin with
++    * all of them invalidated.
++    */
++   if (CHIP == A7XX && cmd->device->fex && cmd->device->fex->desc_patch)
++      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP, .gfx_bindless = 0xff));
++
+    /* A7XX TODO: blob doesn't use CP_SKIP_IB2_ENABLE_* */
+    tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+    tu_cs_emit(cs, 0x0);
+@@ -4048,6 +4055,9 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+    tu6_emit_tile_store_cs<CHIP>(cmd, &cmd->tile_store_cs);
+    tu_cs_end(&cmd->tile_store_cs);
+ 
++   /* FEX link: GPU counters and time around the whole tiled pass */
++   const uint64_t fex_seq = tu_fex_pass_begin(cmd, &cmd->cs, false);
++
+    tu6_tile_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx, fdm_offsets);
+ 
+ #ifdef HAVE_PERFETTO
+@@ -4118,6 +4128,8 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+ 
+    tu6_tile_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
+ 
++   tu_fex_pass_end(cmd, &cmd->cs, fex_seq);
++
+    /* Outside of renderpasses we assume all draw states are disabled. We do
+     * this outside the draw CS for the normal case where 3d gmem stores aren't
+     * used. Do this before emitting subsampled blits.
+@@ -4169,8 +4181,13 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+ 
+    trace_start_draw_ib_sysmem(&cmd->trace, &cmd->cs, cmd);
+ 
++   /* FEX link: GPU counters and time around the pass's draws */
++   const uint64_t fex_seq = tu_fex_pass_begin(cmd, &cmd->cs, true);
++
+    tu_cs_emit_call(&cmd->cs, &cmd->draw_cs);
+ 
++   tu_fex_pass_end(cmd, &cmd->cs, fex_seq);
++
+    trace_end_draw_ib_sysmem(&cmd->trace, &cmd->cs);
+ 
+    tu6_sysmem_render_end<CHIP>(cmd, &cmd->cs, rp_ctx);
+@@ -4500,6 +4517,13 @@ tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
+    tu_cache_init(&cmd_buffer->state.renderpass_cache);
+    cmd_buffer->usage_flags = pBeginInfo->flags;
+ 
++   /* FEX link: the mode is fixed for the whole command buffer. Until a render
++    * pass begins in it, the GPU's descriptor caches are unknown: invalidate
++    * every set. */
++   cmd_buffer->state.fex.mode = tu_fex_begin_cmdbuf(cmd_buffer->device);
++   cmd_buffer->state.fex.desc_cum = 0xff;
++   cmd_buffer->state.fex.cmdbuf_seq = (uint32_t)((uintptr_t)cmd_buffer >> 4);
++
+    tu_cs_begin(&cmd_buffer->cs);
+    tu_cs_begin(&cmd_buffer->draw_cs);
+    tu_cs_begin(&cmd_buffer->draw_epilogue_cs);
+@@ -4777,6 +4801,8 @@ tu6_emit_descriptor_sets(struct tu_cmd_buffer *cmd,
+       tu_get_descriptors_state(cmd, bind_point);
+    uint32_t sp_bindless_base_reg, hlsq_bindless_base_reg;
+    struct tu_cs *cs, state_cs;
++   bool fex_delta = false;
++   uint32_t fex_mask = 0;
+ 
+    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+       sp_bindless_base_reg = __SP_GFX_BINDLESS_BASE_DESCRIPTOR<CHIP>(0, {}).reg;
+@@ -4786,6 +4812,25 @@ tu6_emit_descriptor_sets(struct tu_cmd_buffer *cmd,
+          1 + 2 * descriptors_state->max_sets_bound :
+          0;
+ 
++      /* FEX link (tu_fex.h), TU_FEX_MODE_CHANGED_ONLY: in direct (sysmem)
++       * passes invalidate only the sets whose address changed since the pass
++       * began (tu6_sysmem_render_begin invalidates all of them). Tiled passes
++       * replay the draws once per tile, so there every update keeps
++       * invalidating all sets.
++       */
++      if (CHIP == A7XX &&
++          (cmd->state.fex.mode & TU_FEX_MODE_CHANGED_ONLY)) {
++         struct tu_fex_cmd_state *fex = &cmd->state.fex;
++         for (unsigned i = 0; i < MAX_SETS; i++) {
++            if (descriptors_state->set_iova[i] != fex->desc_prev[i])
++               fex->desc_cum |= 1u << i;
++         }
++         memcpy(fex->desc_prev, descriptors_state->set_iova,
++                sizeof(fex->desc_prev));
++         fex_delta = true;
++         fex_mask = fex->desc_cum & 0xff;
++      }
++
+       if (CHIP == A6XX) {
+          cmd->state.desc_sets =
+             tu_cs_draw_state(&cmd->sub_cs, &state_cs,
+@@ -4794,7 +4839,8 @@ tu6_emit_descriptor_sets(struct tu_cmd_buffer *cmd,
+       } else {
+          cmd->state.desc_sets =
+             tu_cs_draw_state(&cmd->sub_cs, &state_cs,
+-                             2 + bindless_pkt_size +
++                             (fex_delta ? (fex_mask ? 5 : 0) + 5 : 2) +
++                             bindless_pkt_size +
+                              (descriptors_state->max_dynamic_offset_size ? 3 : 0));
+       }
+       cs = &state_cs;
+@@ -4831,12 +4877,29 @@ tu6_emit_descriptor_sets(struct tu_cmd_buffer *cmd,
+       }
+    }
+ 
+-   tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
+-      .cs_bindless = bind_point == VK_PIPELINE_BIND_POINT_COMPUTE ? CHIP == A6XX ? 0x1f : 0xff : 0,
+-      .gfx_bindless = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? CHIP == A6XX ? 0x1f : 0xff : 0,
+-   ));
++   if (fex_delta) {
++      if (fex_mask) {
++         tu_cond_exec_start(cs, CP_COND_EXEC_0_RENDER_MODE_SYSMEM);
++         tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP, .gfx_bindless = fex_mask));
++         tu_cond_exec_end(cs);
++      }
++      tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(RENDER_MODE) |
++                             CP_COND_REG_EXEC_0_GMEM |
++                             CP_COND_REG_EXEC_0_BINNING);
++      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP, .gfx_bindless = 0xff));
++      tu_cond_exec_end(cs);
++   } else {
++      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
++         .cs_bindless = bind_point == VK_PIPELINE_BIND_POINT_COMPUTE ? CHIP == A6XX ? 0x1f : 0xff : 0,
++         .gfx_bindless = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? CHIP == A6XX ? 0x1f : 0xff : 0,
++      ));
++   }
+ 
+    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
++      if (cmd->device->fex) {
++         tu_fex_count_desc(cmd->device, cmd->state.fex.mode,
++                           fex_delta ? util_bitcount(fex_mask) : 8);
++      }
+       assert(cs->cur == cs->end); /* validate draw state size */
+       /* note: this also avoids emitting draw states before renderpass clears,
+        * which may use the 3D clear path (for MSAA cases)
+@@ -5169,6 +5232,51 @@ tu_push_descriptor_set_update_layout(struct tu_device *device,
+    return VK_SUCCESS;
+ }
+ 
++/* Copies a push descriptor set's contents into the command stream and points
++ * the set at the copy.
++ *
++ * FEX link, TU_FEX_MODE_PUSH_REUSE: a graphics push with the same bytes as the
++ * previous one keeps that copy, so the set's address doesn't change and
++ * TU_FEX_MODE_CHANGED_ONLY doesn't invalidate its descriptor cache.
++ */
++static bool
++tu_push_descriptor_set_place(struct tu_cmd_buffer *cmd,
++                             struct tu_descriptor_set *set,
++                             const struct tu_descriptor_set_layout *layout,
++                             VkPipelineBindPoint bind_point)
++{
++   struct tu_fex_cmd_state *fex = &cmd->state.fex;
++   const bool fex_graphics = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
++                             cmd->device->fex;
++   if (fex_graphics && (fex->mode & TU_FEX_MODE_PUSH_REUSE) &&
++       fex->push_prev_map && fex->push_prev_size == layout->size &&
++       !memcmp(fex->push_prev_map, set->mapped_ptr, layout->size)) {
++      set->va = fex->push_prev_iova;
++      tu_fex_count_push(cmd->device, fex->mode, true);
++      return true;
++   }
++
++   struct tu_cs_memory set_mem;
++   VkResult result = tu_cs_alloc(&cmd->sub_cs,
++                                 DIV_ROUND_UP(layout->size, FDL6_TEX_CONST_DWORDS * 4),
++                                 FDL6_TEX_CONST_DWORDS, &set_mem);
++   if (result != VK_SUCCESS) {
++      vk_command_buffer_set_error(&cmd->vk, result);
++      return false;
++   }
++
++   memcpy(set_mem.map, set->mapped_ptr, layout->size);
++   set->va = set_mem.iova;
++
++   if (fex_graphics) {
++      fex->push_prev_map = set_mem.map;
++      fex->push_prev_iova = set_mem.iova;
++      fex->push_prev_size = layout->size;
++      tu_fex_count_push(cmd->device, fex->mode, false);
++   }
++   return true;
++}
++
+ template <chip CHIP>
+ static void
+ tu_push_descriptor_set(struct tu_cmd_buffer *cmd,
+@@ -5181,16 +5289,7 @@ tu_push_descriptor_set(struct tu_cmd_buffer *cmd,
+    struct tu_descriptor_set *set =
+       &tu_get_descriptors_state(cmd, bind_point)->push_set;
+ 
+-   struct tu_cs_memory set_mem;
+-   VkResult result = tu_cs_alloc(&cmd->sub_cs,
+-                                 DIV_ROUND_UP(layout->size, FDL6_TEX_CONST_DWORDS * 4),
+-                                 FDL6_TEX_CONST_DWORDS, &set_mem);
+-   if (result != VK_SUCCESS) {
+-      vk_command_buffer_set_error(&cmd->vk, result);
+-      return;
+-   }
+-
+-   result = tu_push_descriptor_set_update_layout(cmd->device, set, layout);
++   VkResult result = tu_push_descriptor_set_update_layout(cmd->device, set, layout);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd->vk, result);
+       return;
+@@ -5200,8 +5299,8 @@ tu_push_descriptor_set(struct tu_cmd_buffer *cmd,
+                                    info->descriptorWriteCount,
+                                    info->pDescriptorWrites, 0, NULL);
+ 
+-   memcpy(set_mem.map, set->mapped_ptr, layout->size);
+-   set->va = set_mem.iova;
++   if (!tu_push_descriptor_set_place(cmd, set, layout, bind_point))
++      return;
+ 
+    const VkDescriptorSet desc_set[] = { tu_descriptor_set_to_handle(set) };
+    vk_common_CmdBindDescriptorSets(tu_cmd_buffer_to_handle(cmd), bind_point,
+@@ -5247,16 +5346,7 @@ tu_CmdPushDescriptorSetWithTemplate2KHR(
+    struct tu_descriptor_set *set =
+       &tu_get_descriptors_state(cmd, templ->bind_point)->push_set;
+ 
+-   struct tu_cs_memory set_mem;
+-   VkResult result = tu_cs_alloc(&cmd->sub_cs,
+-                                 DIV_ROUND_UP(layout->size, FDL6_TEX_CONST_DWORDS * 4),
+-                                 FDL6_TEX_CONST_DWORDS, &set_mem);
+-   if (result != VK_SUCCESS) {
+-      vk_command_buffer_set_error(&cmd->vk, result);
+-      return;
+-   }
+-
+-   result = tu_push_descriptor_set_update_layout(cmd->device, set, layout);
++   VkResult result = tu_push_descriptor_set_update_layout(cmd->device, set, layout);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd->vk, result);
+       return;
+@@ -5267,8 +5357,8 @@ tu_CmdPushDescriptorSetWithTemplate2KHR(
+       pPushDescriptorSetWithTemplateInfo->descriptorUpdateTemplate,
+       pPushDescriptorSetWithTemplateInfo->pData);
+ 
+-   memcpy(set_mem.map, set->mapped_ptr, layout->size);
+-   set->va = set_mem.iova;
++   if (!tu_push_descriptor_set_place(cmd, set, layout, templ->bind_point))
++      return;
+ 
+    const VkDescriptorSet desc_set[] = { tu_descriptor_set_to_handle(set) };
+    vk_common_CmdBindDescriptorSets(
+@@ -6705,6 +6795,7 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+       cmd->state.index_size = secondary->state.index_size; /* for restart index update */
+    }
+    cmd->state.dirty = ~0u; /* TODO: set dirty only what needs to be */
++   cmd->state.fex.desc_cum = 0xff; /* FEX link: secondaries changed the caches */
+ 
+    if (!cmd->state.lrz.gpu_dir_tracking && cmd->state.pass) {
+       /* After a secondary command buffer is executed, LRZ is not valid
+@@ -7155,6 +7246,26 @@ tu_feedback_invalidate(struct tu_cmd_buffer *cmd)
+                             TU_STAGE_BR, TU_STAGE_BR, true);
+ }
+ 
++/* FEX link: a render pass that starts here begins with all descriptor caches
++ * invalidated (tu6_sysmem_render_begin), so changed-only tracking restarts
++ * from the sets bound now. A resumed pass continues GPU state this command
++ * buffer doesn't know: invalidate every set until the next pass. */
++static void
++tu_fex_render_pass_begin(struct tu_cmd_buffer *cmd, bool resuming)
++{
++   struct tu_fex_cmd_state *fex = &cmd->state.fex;
++   if (!(fex->mode & TU_FEX_MODE_CHANGED_ONLY))
++      return;
++   if (resuming) {
++      fex->desc_cum = 0xff;
++      return;
++   }
++   fex->desc_cum = 0;
++   memcpy(fex->desc_prev,
++          tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS)->set_iova,
++          sizeof(fex->desc_prev));
++}
++
+ template <chip CHIP>
+ VKAPI_ATTR void VKAPI_CALL
+ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+@@ -7181,6 +7292,7 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+    cmd->state.framebuffer = fb;
+    tu_set_render_area(cmd, &pRenderPassBegin->renderArea,
+                       pRenderPassBegin->pNext);
++   tu_fex_render_pass_begin(cmd, false);
+    cmd->state.fdm_per_layer = pass->has_layered_fdm;
+ 
+    if (pass->attachment_count > 0) {
+@@ -7457,6 +7569,7 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    bool resuming = pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT;
+    bool suspending = pRenderingInfo->flags & VK_RENDERING_SUSPENDING_BIT;
+    cmd->state.suspending = suspending;
++   tu_fex_render_pass_begin(cmd, resuming);
+    cmd->state.resuming = resuming;
+ 
+    if (!resuming && cmd->device->dbg_renderpass_stomp_cs) {
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 14c38d7..3e412eb 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -15,6 +15,7 @@
+ #include "tu_cs.h"
+ #include "tu_descriptor_set.h"
+ #include "tu_device.h"
++#include "tu_fex.h"
+ #include "tu_image.h"
+ #include "tu_lrz.h"
+ #include "tu_pass.h"
+@@ -543,6 +544,9 @@ struct tu_cmd_state
+    struct tu_draw_state shader_const;
+    struct tu_draw_state desc_sets;
+    struct tu_draw_state load_state;
++
++   /* FEX link (tu_fex.h) */
++   struct tu_fex_cmd_state fex;
+    struct tu_draw_state compute_load_state;
+    struct tu_draw_state prim_order_gmem;
+ 
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 4f15084..9475e58 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include "tu_device.h"
++#include "tu_fex.h"
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ #include "git_sha1.h"
+@@ -3284,6 +3285,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    device->vis_stream_count = 0;
+ 
++   tu_fex_device_init(device);
++
+    *pDevice = tu_device_to_handle(device);
+    return VK_SUCCESS;
+ 
+@@ -3347,6 +3350,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    if (!device)
+       return;
+ 
++   tu_fex_device_finish(device);
++
+    tu_memory_trace_finish(device);
+ 
+    if (FD_RD_DUMP(ENABLE))
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index 5ef943a..19f09bc 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -460,6 +460,9 @@ struct tu_device
+ 
+    struct tu_autotune *autotune;
+ 
++   /* FEX link (tu_fex.h), NULL without TU_FEX_CHANNEL */
++   struct tu_fex_device *fex;
++
+    struct breadcrumbs_context *breadcrumbs_ctx;
+ 
+    struct tu_cs *dbg_cmdbuf_stomp_cs;
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+new file mode 100644
+index 0000000..54909f8
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -0,0 +1,360 @@
++/*
++ * Copyright © 2026 FEX-D2-reforged contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * FEX link, see tu_fex.h.
++ */
++
++#include "tu_fex.h"
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#ifdef TU_HAS_KGSL
++#ifndef __user
++#define __user
++#endif
++#include "msm_kgsl.h"
++#endif
++
++#include "tu_cmd_buffer.h"
++#include "tu_cs.h"
++#include "tu_device.h"
++#include "tu_knl.h"
++
++static int
++tu_fex_ioctl(int fd, unsigned long request, void *arg)
++{
++   int ret;
++   do {
++      ret = ioctl(fd, request, arg);
++   } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++   return ret == -1 ? -errno : ret;
++}
++
++/* The address comes from the environment, which a child process can inherit
++ * with a value that means nothing there: check that the memory is readable
++ * (write() fails with EFAULT instead of faulting) before looking at it. */
++static bool
++tu_fex_readable(const void *ptr, size_t size)
++{
++   int fds[2];
++   if (pipe(fds) != 0)
++      return false;
++   bool ok = write(fds[1], ptr, size) == (ssize_t)size;
++   close(fds[0]);
++   close(fds[1]);
++   return ok;
++}
++
++static struct tu_fex_channel *
++tu_fex_find_channel(void)
++{
++   const char *text = getenv("TU_FEX_CHANNEL");
++   if (!text || !*text)
++      return NULL;
++   char *end = NULL;
++   unsigned long long addr = strtoull(text, &end, 16);
++   if (!addr || (end && *end) || (addr & 7))
++      return NULL;
++   struct tu_fex_channel *chan = (struct tu_fex_channel *)(uintptr_t)addr;
++   if (!tu_fex_readable(chan, sizeof(*chan)))
++      return NULL;
++   if (chan->magic != TU_FEX_MAGIC || chan->version != TU_FEX_VERSION ||
++       chan->size != sizeof(*chan) || chan->counter_count > TU_FEX_MAX_COUNTERS)
++      return NULL;
++   return chan;
++}
++
++/* Only one device at a time owns the counters and the ring. */
++static simple_mtx_t tu_fex_owner_lock = SIMPLE_MTX_INITIALIZER;
++static struct tu_device *tu_fex_owner;
++
++void
++tu_fex_device_init(struct tu_device *dev)
++{
++   struct tu_fex_channel *chan = tu_fex_find_channel();
++   if (!chan)
++      return;
++
++   struct tu_fex_device *fex =
++      (struct tu_fex_device *)calloc(1, sizeof(struct tu_fex_device));
++   if (!fex)
++      return;
++   fex->chan = chan;
++   fex->kgsl_fd = -1;
++   dev->fex = fex;
++
++   uint32_t status = TU_FEX_STATUS_ATTACHED;
++   if (dev->physical_device->info->chip == 7) {
++      fex->desc_patch = true;
++      status |= TU_FEX_STATUS_DESC_PATCH;
++   } else {
++      status |= TU_FEX_STATUS_NOT_A7XX;
++   }
++
++   chan->patch = TU_FEX_PATCH;
++   snprintf(chan->driver, sizeof(chan->driver), "Mesa " PACKAGE_VERSION " fex%d",
++            TU_FEX_PATCH);
++   __atomic_fetch_add(&chan->devices, 1, __ATOMIC_RELAXED);
++
++   simple_mtx_lock(&tu_fex_owner_lock);
++   bool owner = !tu_fex_owner;
++   if (owner)
++      tu_fex_owner = dev;
++   simple_mtx_unlock(&tu_fex_owner_lock);
++
++   if (owner && chan->sample_min_draws) {
++      const bool kgsl = !strcmp(dev->instance->knl->name, "kgsl");
++      if (!kgsl)
++         status |= TU_FEX_STATUS_NOT_KGSL;
++
++      fex->counter_count = chan->counter_count;
++      uint32_t reserved = 0;
++      for (uint32_t i = 0; i < fex->counter_count; i++) {
++         struct tu_fex_counter *c = &chan->counters[i];
++         c->reg = 0;
++         c->result = 1;
++         if (!kgsl)
++            continue;
++#ifdef TU_HAS_KGSL
++         struct kgsl_perfcounter_get get = {};
++         get.groupid = c->group;
++         get.countable = c->countable;
++         int ret = tu_fex_ioctl(dev->physical_device->local_fd,
++                                IOCTL_KGSL_PERFCOUNTER_GET, &get);
++         c->result = ret < 0 ? ret : 0;
++         if (ret >= 0 && get.offset) {
++            fex->reserved[i] = true;
++            fex->counter_reg[i] = get.offset;
++            fex->counter_reg_hi[i] = get.offset_hi;
++            c->reg = get.offset;
++            reserved++;
++         }
++#endif
++      }
++      fex->kgsl_fd = kgsl ? dev->physical_device->local_fd : -1;
++      chan->counters_reserved = reserved;
++      if (reserved)
++         status |= TU_FEX_STATUS_COUNTERS;
++
++      uint32_t count = chan->ring_slots ? chan->ring_slots : 4096;
++      if (count & (count - 1))
++         count = 4096;
++      uint32_t slot_size = sizeof(struct tu_fex_slot) +
++                           2 * sizeof(uint64_t) * fex->counter_count;
++      slot_size = ALIGN_POT(slot_size, 64);
++      VkResult result = tu_bo_init_new(dev, NULL, &fex->ring_bo,
++                                       (uint64_t)count * slot_size,
++                                       TU_BO_ALLOC_NO_FLAGS, "fex pass ring");
++      if (result == VK_SUCCESS) {
++         result = tu_bo_map(dev, fex->ring_bo, NULL);
++         if (result != VK_SUCCESS) {
++            tu_bo_finish(dev, fex->ring_bo);
++            fex->ring_bo = NULL;
++         }
++      } else {
++         fex->ring_bo = NULL;
++      }
++      if (fex->ring_bo) {
++         fex->ring_map = (uint8_t *)fex->ring_bo->map;
++         fex->ring_iova = fex->ring_bo->iova;
++         fex->ring_count = count;
++         fex->slot_size = slot_size;
++         fex->sample_min_draws = chan->sample_min_draws;
++         memset(fex->ring_map, 0, (size_t)count * slot_size);
++         chan->ring_count = count;
++         chan->slot_size = slot_size;
++         if (!chan->ring_next)
++            chan->ring_next = 1;
++         __atomic_store_n(&chan->ring_cpu, (uint64_t)(uintptr_t)fex->ring_map,
++                          __ATOMIC_RELEASE);
++         status |= TU_FEX_STATUS_RING;
++      } else {
++         status |= TU_FEX_STATUS_RING_FAILED;
++      }
++   }
++
++   __atomic_fetch_or(&chan->status, status, __ATOMIC_RELEASE);
++}
++
++void
++tu_fex_device_finish(struct tu_device *dev)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex)
++      return;
++
++   if (fex->ring_bo) {
++      /* FEX reads the ring with NtReadVirtualMemory, which fails cleanly once
++       * the mapping is gone; take the address away first. */
++      __atomic_store_n(&fex->chan->ring_cpu, 0, __ATOMIC_RELEASE);
++      __atomic_fetch_and(&fex->chan->status, ~TU_FEX_STATUS_RING, __ATOMIC_RELEASE);
++      tu_bo_finish(dev, fex->ring_bo);
++   }
++
++#ifdef TU_HAS_KGSL
++   if (fex->kgsl_fd >= 0) {
++      for (uint32_t i = 0; i < fex->counter_count; i++) {
++         if (!fex->reserved[i])
++            continue;
++         struct kgsl_perfcounter_put put = {};
++         put.groupid = fex->chan->counters[i].group;
++         put.countable = fex->chan->counters[i].countable;
++         tu_fex_ioctl(fex->kgsl_fd, IOCTL_KGSL_PERFCOUNTER_PUT, &put);
++         fex->chan->counters[i].reg = 0;
++      }
++      fex->chan->counters_reserved = 0;
++      __atomic_fetch_and(&fex->chan->status, ~TU_FEX_STATUS_COUNTERS, __ATOMIC_RELEASE);
++   }
++#endif
++
++   simple_mtx_lock(&tu_fex_owner_lock);
++   if (tu_fex_owner == dev)
++      tu_fex_owner = NULL;
++   simple_mtx_unlock(&tu_fex_owner_lock);
++
++   free(fex);
++   dev->fex = NULL;
++}
++
++uint32_t
++tu_fex_begin_cmdbuf(struct tu_device *dev)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->desc_patch)
++      return 0;
++   uint32_t mode = __atomic_load_n(&fex->chan->mode, __ATOMIC_RELAXED) & TU_FEX_MODE_MASK;
++   __atomic_fetch_add(&fex->chan->cmdbufs[mode & TU_FEX_MODE_CHANGED_ONLY], 1,
++                      __ATOMIC_RELAXED);
++   return mode;
++}
++
++void
++tu_fex_count_desc(struct tu_device *dev, uint32_t mode, uint32_t sets_flushed)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex)
++      return;
++   const uint32_t i = mode & TU_FEX_MODE_CHANGED_ONLY;
++   __atomic_fetch_add(&fex->chan->desc_emits[i], 1, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&fex->chan->desc_sets_flushed[i], sets_flushed, __ATOMIC_RELAXED);
++}
++
++void
++tu_fex_count_push(struct tu_device *dev, uint32_t mode, bool reused)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex)
++      return;
++   const uint32_t i = mode & TU_FEX_MODE_CHANGED_ONLY;
++   __atomic_fetch_add(&fex->chan->push_total[i], 1, __ATOMIC_RELAXED);
++   if (reused)
++      __atomic_fetch_add(&fex->chan->push_reused[i], 1, __ATOMIC_RELAXED);
++}
++
++static void
++tu_fex_emit_read(struct tu_device *dev, struct tu_cs *cs, uint32_t reg,
++                 uint32_t reg_hi, uint64_t iova)
++{
++   if (reg_hi == reg + 1) {
++      tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
++      tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(reg) | CP_REG_TO_MEM_0_CNT(2) |
++                        CP_REG_TO_MEM_0_IS_64B);
++      tu_cs_emit_qw(cs, iova);
++   } else {
++      tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
++      tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(reg) | CP_REG_TO_MEM_0_CNT(1));
++      tu_cs_emit_qw(cs, iova);
++      if (reg_hi) {
++         tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
++         tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(reg_hi) | CP_REG_TO_MEM_0_CNT(1));
++         tu_cs_emit_qw(cs, iova + 4);
++      }
++   }
++}
++
++static void
++tu_fex_emit_sample(struct tu_device *dev, struct tu_fex_device *fex,
++                   struct tu_cs *cs, uint64_t slot_iova, bool end)
++{
++   /* Everything before has to be done for the numbers to belong to the pass. */
++   tu_cs_emit_wfi(cs);
++
++   const uint32_t ts_reg = TU_CALLX(dev, __CP_ALWAYS_ON_COUNTER)({}).reg;
++   tu_fex_emit_read(dev, cs, ts_reg, ts_reg + 1,
++                    slot_iova + (end ? offsetof(struct tu_fex_slot, ts_end)
++                                     : offsetof(struct tu_fex_slot, ts_begin)));
++
++   const uint64_t values = slot_iova + sizeof(struct tu_fex_slot) +
++                           (end ? fex->counter_count * sizeof(uint64_t) : 0);
++   for (uint32_t i = 0; i < fex->counter_count; i++) {
++      if (!fex->reserved[i])
++         continue;
++      tu_fex_emit_read(dev, cs, fex->counter_reg[i], fex->counter_reg_hi[i],
++                       values + i * sizeof(uint64_t));
++   }
++}
++
++uint64_t
++tu_fex_pass_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool sysmem)
++{
++   struct tu_device *dev = cmd->device;
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->ring_map || !fex->sample_min_draws)
++      return 0;
++
++   const uint32_t draws = cmd->state.rp.drawcall_count;
++   if (draws < fex->sample_min_draws) {
++      __atomic_fetch_add(&fex->chan->passes_small, 1, __ATOMIC_RELAXED);
++      return 0;
++   }
++
++   const uint64_t seq =
++      __atomic_fetch_add(&fex->chan->ring_next, 1, __ATOMIC_RELAXED);
++   const uint32_t index = (uint32_t)(seq & (fex->ring_count - 1));
++   struct tu_fex_slot *slot =
++      (struct tu_fex_slot *)(fex->ring_map + (size_t)index * fex->slot_size);
++
++   const struct tu_render_pass *pass = cmd->state.pass;
++   slot->done = 0;
++   slot->draws = draws;
++   slot->width = (uint16_t)MIN2(cmd->state.render_areas[0].extent.width, 0xffff);
++   slot->height = (uint16_t)MIN2(cmd->state.render_areas[0].extent.height, 0xffff);
++   slot->mode = (uint8_t)cmd->state.fex.mode;
++   slot->sysmem = sysmem;
++   slot->colors = pass ? (uint8_t)MIN2(pass->subpasses[0].color_count, 255) : 0;
++   slot->attachments = pass ? (uint8_t)MIN2(pass->attachment_count, 255) : 0;
++   slot->format0 = pass && pass->attachment_count ? (uint32_t)pass->attachments[0].format : 0;
++   slot->cmdbuf = cmd->state.fex.cmdbuf_seq;
++   slot->seq = seq;
++
++   tu_fex_emit_sample(dev, fex, cs, fex->ring_iova + (uint64_t)index * fex->slot_size,
++                      false);
++   return seq;
++}
++
++void
++tu_fex_pass_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint64_t seq)
++{
++   struct tu_device *dev = cmd->device;
++   struct tu_fex_device *fex = dev->fex;
++   if (!seq || !fex || !fex->ring_map)
++      return;
++
++   const uint32_t index = (uint32_t)(seq & (fex->ring_count - 1));
++   const uint64_t slot_iova = fex->ring_iova + (uint64_t)index * fex->slot_size;
++   tu_fex_emit_sample(dev, fex, cs, slot_iova, true);
++
++   /* The done mark goes last, once the values have landed. */
++   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
++   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 3);
++   tu_cs_emit_qw(cs, slot_iova + offsetof(struct tu_fex_slot, done));
++   tu_cs_emit(cs, (uint32_t)seq);
++
++   __atomic_fetch_add(&fex->chan->passes_sampled, 1, __ATOMIC_RELAXED);
++}
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+new file mode 100644
+index 0000000..284d9da
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -0,0 +1,173 @@
++/*
++ * Copyright © 2026 FEX-D2-reforged contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * FEX link ("TU_FEX_CHANNEL"): FEX (the x86 emulator running the game) hands
++ * this driver a block of memory in the same process, by address, in the
++ * environment variable TU_FEX_CHANNEL=<hex address>. Through it FEX
++ *  - picks how graphics descriptor caches are invalidated (tu_fex_channel::mode,
++ *    read at vkBeginCommandBuffer, so FEX can switch it every second and one
++ *    game run compares both ways), and
++ *  - asks for GPU hardware counters around render passes; the driver reserves
++ *    them through KGSL and has the GPU write them, with the always-on timer,
++ *    into a ring of slots FEX reads once a second.
++ * Without the variable (or with a block that fails the checks) the driver
++ * behaves like stock Turnip.
++ *
++ * The layout is shared with FEX (Source/Windows/ARM64EC/TurnipReport.cpp in
++ * FEX-D2-reforged); change both together and bump TU_FEX_VERSION.
++ */
++
++#ifndef TU_FEX_H
++#define TU_FEX_H
++
++#include <stdint.h>
++
++#define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
++#define TU_FEX_VERSION 1
++/* Patch level of this driver build, shown in FEX's log. */
++#define TU_FEX_PATCH 1
++#define TU_FEX_MAX_COUNTERS 24
++
++/* tu_fex_channel::mode bits */
++/* In direct (sysmem) render passes, invalidate the bindless descriptor cache
++ * only for descriptor sets whose address changed, instead of all 8 on every
++ * descriptor update. Tiled (gmem) passes and compute stay stock. */
++#define TU_FEX_MODE_CHANGED_ONLY 0x1u
++/* A graphics push descriptor update with the same bytes as the previous one
++ * keeps the previous copy (same address), so it changes nothing. */
++#define TU_FEX_MODE_PUSH_REUSE 0x2u
++#define TU_FEX_MODE_MASK 0x3u
++
++/* tu_fex_channel::status bits (driver) */
++#define TU_FEX_STATUS_ATTACHED 0x1u      /* a device read the channel */
++#define TU_FEX_STATUS_DESC_PATCH 0x2u    /* mode bits are honored (a7xx) */
++#define TU_FEX_STATUS_COUNTERS 0x4u      /* at least one counter reserved */
++#define TU_FEX_STATUS_RING 0x8u          /* slot ring allocated */
++#define TU_FEX_STATUS_NOT_KGSL 0x10u     /* counters need KGSL */
++#define TU_FEX_STATUS_RING_FAILED 0x20u  /* ring allocation failed */
++#define TU_FEX_STATUS_NOT_A7XX 0x40u     /* descriptor patch is a7xx only */
++
++struct tu_fex_counter {
++   uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
++   uint32_t countable; /* FEX: countable in that group */
++   uint32_t reg;       /* driver: dword offset of the counter's low half, 0 = not reserved */
++   int32_t result;     /* driver: 0 reserved, -errno failed, 1 not tried */
++};
++
++struct tu_fex_channel {
++   /* 0x000: written by FEX before the driver loads */
++   uint32_t magic;            /* TU_FEX_MAGIC */
++   uint32_t version;          /* TU_FEX_VERSION */
++   uint32_t size;             /* sizeof(struct tu_fex_channel) */
++   uint32_t counter_count;    /* entries used in counters[] */
++   uint32_t sample_min_draws; /* sample render passes with at least this many draws, 0 = none */
++   uint32_t ring_slots;       /* slots wanted (power of two), 0 = 4096 */
++   uint32_t reserved0[2];
++   /* 0x020 */
++   struct tu_fex_counter counters[TU_FEX_MAX_COUNTERS];
++   /* 0x1a0: written by FEX while the game runs */
++   volatile uint32_t mode; /* TU_FEX_MODE_* for command buffers begun from now on */
++   uint32_t reserved1[3];
++   /* 0x1b0: written by the driver */
++   volatile uint32_t status; /* TU_FEX_STATUS_* */
++   uint32_t patch;           /* TU_FEX_PATCH */
++   volatile uint32_t devices;
++   uint32_t counters_reserved;
++   char driver[48]; /* "Mesa <version> fex<patch>" */
++   /* 0x1f0 */
++   uint64_t ring_cpu;   /* CPU address of the slot ring, 0 = none */
++   uint32_t ring_count; /* slots (power of two) */
++   uint32_t slot_size;  /* bytes per slot */
++   /* 0x200: sequence number the next sampled pass gets; slots in use are [1, ring_next) */
++   volatile uint64_t ring_next;
++   /* 0x208: statistics, [0] = mode without CHANGED_ONLY, [1] = with it */
++   volatile uint64_t cmdbufs[2];
++   volatile uint64_t desc_emits[2];        /* graphics descriptor updates emitted */
++   volatile uint64_t desc_sets_flushed[2]; /* descriptor sets invalidated by them in direct passes */
++   volatile uint64_t push_total[2];        /* graphics push descriptor updates */
++   volatile uint64_t push_reused[2];       /* ... that kept the previous copy */
++   volatile uint64_t passes_sampled;
++   volatile uint64_t passes_small; /* fewer draws than sample_min_draws */
++   uint64_t reserved2[8];
++};
++
++/* One sampled render pass. FEX reads a slot once done == (uint32_t)seq. */
++struct tu_fex_slot {
++   uint64_t seq;       /* 0: driver, when the pass is recorded */
++   uint32_t draws;     /* 8 */
++   uint16_t width;     /* 12: render area */
++   uint16_t height;    /* 14 */
++   uint8_t mode;       /* 16: TU_FEX_MODE_* the pass was recorded with */
++   uint8_t sysmem;     /* 17: 1 direct (sysmem), 0 tiled (gmem) */
++   uint8_t colors;     /* 18: color attachments of the first subpass */
++   uint8_t attachments;/* 19 */
++   uint32_t format0;   /* 20: VkFormat of attachment 0 */
++   uint32_t done;      /* 24: GPU, written last */
++   uint32_t cmdbuf;    /* 28: low bits of the command buffer's sequence number */
++   uint64_t ts_begin;  /* 32: CP_ALWAYS_ON_COUNTER (19.2 MHz) */
++   uint64_t ts_end;    /* 40 */
++   /* 48: counter values at the pass start [counter_count], then at its end [counter_count] */
++   uint64_t values[];
++};
++
++#ifdef __cplusplus
++static_assert(sizeof(struct tu_fex_counter) == 16, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, mode) == 0x1a0, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, status) == 0x1b0, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, ring_cpu) == 0x1f0, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, ring_next) == 0x200, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, cmdbufs) == 0x208, "layout shared with FEX");
++static_assert(sizeof(struct tu_fex_channel) == 0x2a8, "layout shared with FEX");
++static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
++
++struct tu_device;
++struct tu_cmd_buffer;
++struct tu_cs;
++struct tu_bo;
++
++/* Per command buffer state, part of tu_cmd_state (zeroed at begin). */
++struct tu_fex_cmd_state {
++   uint32_t mode;      /* TU_FEX_MODE_* for this command buffer */
++   bool desc_full_next;/* next graphics descriptor update invalidates all sets */
++   uint32_t desc_cum;  /* sets whose address changed since the last reset */
++   uint64_t desc_prev[8];
++   const void *push_prev_map; /* previous graphics push copy */
++   uint64_t push_prev_iova;
++   uint32_t push_prev_size;
++   uint32_t cmdbuf_seq;
++};
++
++struct tu_fex_device {
++   struct tu_fex_channel *chan;
++   bool desc_patch;            /* mode bits honored */
++   uint32_t counter_count;     /* == chan->counter_count */
++   uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
++   uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];
++   bool reserved[TU_FEX_MAX_COUNTERS];
++   int kgsl_fd;
++   struct tu_bo *ring_bo;
++   uint8_t *ring_map;
++   uint64_t ring_iova;
++   uint32_t ring_count;
++   uint32_t slot_size;
++   uint32_t sample_min_draws;
++};
++
++void tu_fex_device_init(struct tu_device *dev);
++void tu_fex_device_finish(struct tu_device *dev);
++
++/* Mode for a command buffer begun now (0 without a channel). */
++uint32_t tu_fex_begin_cmdbuf(struct tu_device *dev);
++
++/* Statistics (no-ops without a channel). */
++void tu_fex_count_desc(struct tu_device *dev, uint32_t mode, uint32_t sets_flushed);
++void tu_fex_count_push(struct tu_device *dev, uint32_t mode, bool reused);
++
++/* Render pass sampling: begin returns a slot sequence number (0 = not
++ * sampled) to pass to end. Both emit into cs (outside the draw IB). */
++uint64_t tu_fex_pass_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool sysmem);
++void tu_fex_pass_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint64_t seq);
++#endif
++
++#endif /* TU_FEX_H */

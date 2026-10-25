@@ -60,6 +60,7 @@ $end_info$
 #include "GameFiles.h"
 #include "NativeRedirect.h"
 #include "Vkd3dReport.h"
+#include "TurnipReport.h"
 
 #include <atomic>
 #include <cstdint>
@@ -969,6 +970,7 @@ NTSTATUS ProcessInit() {
   GameFiles::Init(StatsLog);
   if (StatsLog) {
     Vkd3dReport::Init();
+    TurnipReport::Init();
     if (!HotPageFaults) {
       FEX::Windows::StatsLogNote("smc: every write to translated code faults and invalidates its page (upstream; FEX_SMC_HOTPAGE=16 "
                                  "stops that for pages that keep faulting)");
