@@ -74,6 +74,12 @@ namespace {
     // worker threads, whose code is in the remapped D2R.exe).
     {"FEX_LOADER_CORES", "little"},
     {"FEX_LOADER_WATCH", "1"},
+    // Build 65: in the build 64 log the loader search also moved a game thread (tid 784) to the slowest cores at 2:37. The
+    // protection put int3 into the game's own code, and the handler that resolves each one (~800 a second) is protection
+    // code, so the thread's samples looked like a loader's. On the slow cores it took twice the CPU, a whole core at
+    // 3:12-3:24, right where the game rubber banded before the last area change. A thread that raises this many exceptions
+    // within 2 s in the main exe's code is a game thread: never moved, moved back if it was (see PriorityGuard.h).
+    {"FEX_LOADER_GAME_EXCEPTIONS", "400"},
     // Build 62: during play, unpack cache hits not in read-ahead memory are left to the game to unpack (1.9 ms average
     // disk reads during play in the fex10 run, around the 100-140 ms streaming hitches), and read-ahead is shorter
     // (see ARM64EC/NativeUnpackCache.cpp).
@@ -121,6 +127,7 @@ namespace {
     "FEX_SERVER_NICE",
     "FEX_LOADER_CORES",
     "FEX_LOADER_WATCH",
+    "FEX_LOADER_GAME_EXCEPTIONS",
     "FEX_SCHEDLOG",
     "FEX_GPULOG",
     "FEX_FRAMELATENCY",

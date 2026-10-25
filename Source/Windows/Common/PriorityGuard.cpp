@@ -104,6 +104,7 @@ namespace {
     LoaderMode Loader;   // FEX_LOADER_CORES
     uint64_t ExeBase;    // the main exe's image range as loaded, before any protection remaps it
     uint64_t ExeEnd;
+    uint32_t GameExcPerRound; // FEX_LOADER_GAME_EXCEPTIONS, 0 = off
   };
 
   // Loader threads, see FEX_LOADER_CORES in PriorityGuard.h.
@@ -114,6 +115,8 @@ namespace {
   constexpr uint32_t LoaderSkipRounds = 30;          // 1 minute
   constexpr size_t MaxModuleKinds = 64;              // cached image kinds, see ModuleKinds
   constexpr size_t MaxLoaderThreads = 4;
+  constexpr size_t MaxGameThreads = 4; // game threads found by their exceptions, on the "loader" line
+  constexpr uint32_t MaxGameNotes = 16;
   constexpr uint32_t MaxCheckNotes = 24;             // "# loader: checked ..." lines, for busy threads found not to be loader threads
 
   // The emulated threads, see GuardThreadStarted.
@@ -122,6 +125,7 @@ namespace {
     int LinuxTid;
     uint64_t Teb;
     const volatile uint64_t* BlockHeader;
+    const volatile uint64_t* GameExceptions;
   };
   constexpr size_t MaxRegistered = 4096;
   std::mutex RegistryLock;
@@ -137,9 +141,12 @@ namespace {
     int Processor;
     double RunMs;
     double WaitMs;
+    bool Game;          // a game thread found by its exceptions in the game's code, not a loader thread
+    double GameExcPerS; // those exceptions a second
   };
+  constexpr size_t MaxLineEntries = MaxLoaderThreads + MaxGameThreads;
   std::mutex LoaderLineLock;
-  LoaderLineEntry LoaderLine[MaxLoaderThreads];
+  LoaderLineEntry LoaderLine[MaxLineEntries];
   size_t LoaderLineCount {};
 
   fextl::string LoaderStatsLine() {
@@ -150,8 +157,11 @@ namespace {
     fextl::string Out = "  loader";
     for (size_t i = 0; i < LoaderLineCount; ++i) {
       const auto& E = LoaderLine[i];
-      Out += fextl::fmt::format("{} tid={} (Linux {}) cores {:#x}, last on CPU {}: ran {:.0f} ms/s, waited {:.0f} ms/s for a CPU", i ? ";" : "",
-                                E.TID, E.LinuxTid, E.Mask, E.Processor, E.RunMs, E.WaitMs);
+      Out += fextl::fmt::format("{}{} tid={} (Linux {}) cores {:#x}, last on CPU {}: ran {:.0f} ms/s, waited {:.0f} ms/s for a CPU",
+                                i ? ";" : "", E.Game ? " game thread" : "", E.TID, E.LinuxTid, E.Mask, E.Processor, E.RunMs, E.WaitMs);
+      if (E.Game) {
+        Out += fextl::fmt::format(", {:.0f} exceptions/s in the game's code", E.GameExcPerS);
+      }
     }
     Out += "\n";
     return Out;
@@ -283,6 +293,11 @@ namespace {
     uint32_t SkipUntil;
     uint32_t Checks;
     bool Loader;
+    // Exceptions it raised in the main exe's code (see FEX_LOADER_GAME_EXCEPTIONS): the count read every 250 ms, the count
+    // at the last round, and whether it is a game thread for good.
+    uint64_t GameExc;
+    uint64_t GameExcAtRound;
+    bool GameThread;
   };
 
   // nice value Wine on Linux gives an effective priority (server/thread.c apply_thread_priority, nice_limit -19).
@@ -636,14 +651,18 @@ namespace {
     bool HaveSched;
     uint64_t LastRunNs;
     uint64_t LastWaitNs;
+    uint64_t Before;      // its Linux cores before it was moved
+    uint64_t LastGameExc; // game threads: the exception count at the last "loader" line
   };
 
   struct LoaderFinder {
     const Config* C;
     ModuleKinds Kinds;
     fextl::vector<LoaderThread> Threads;
+    fextl::vector<LoaderThread> GameThreads; // found by their exceptions in the game's code, see FEX_LOADER_GAME_EXCEPTIONS
     uint32_t Tick;
     uint32_t CheckNotes;
+    uint32_t GameNotes;
     uint64_t LastSecond; // counter value at the last per-second line
   };
 
@@ -661,6 +680,7 @@ namespace {
           continue;
         }
         auto& T = It->second;
+        T.GameExc = R.GameExceptions ? *R.GameExceptions : 0;
         if (T.LinuxTid != R.LinuxTid) {
           // New, or a new thread with an old one's TID.
           T.LinuxTid = R.LinuxTid;
@@ -668,8 +688,10 @@ namespace {
           T.InProtection = T.InGame = T.InNative = T.Unread = T.BusyRounds = 0;
           T.LastRunNs = 0;
           T.Loader = false;
+          T.GameThread = false;
+          T.GameExcAtRound = T.GameExc;
         }
-        if (!T.Named || T.FEX || T.Main || T.Loader || T.SampleCount >= LoaderSamples) {
+        if (!T.Named || T.FEX || T.Main || T.Loader || T.GameThread || T.SampleCount >= LoaderSamples) {
           continue;
         }
         T.Samples[T.SampleCount++] = *R.BlockHeader;
@@ -680,8 +702,27 @@ namespace {
     const bool Second = F.Tick % 4 == 0;
     const uint64_t Now = Second ? Counter() : 0;
     const double Elapsed = Second && F.LastSecond ? static_cast<double>(Now - F.LastSecond) / static_cast<double>(CounterFrequency()) : 0.0;
-    LoaderLineEntry Line[MaxLoaderThreads] {};
+    LoaderLineEntry Line[MaxLineEntries] {};
     size_t LineCount {};
+    const auto Sched = [&](LoaderThread& L, LoaderLineEntry& E) {
+      Linux::SchedStat S {};
+      if (!Linux::ReadSchedStat(L.SchedPath.c_str(), S)) {
+        return false;
+      }
+      Linux::TaskStat Stat {};
+      E.TID = L.TID;
+      E.LinuxTid = L.LinuxTid;
+      E.Mask = Linux::GetAffinity(L.LinuxTid);
+      E.Processor = Linux::ReadTaskStat(L.StatPath.c_str(), Stat) ? Stat.Processor : -1;
+      if (L.HaveSched && Elapsed > 0.1) {
+        E.RunMs = static_cast<double>(S.RunNs - L.LastRunNs) / 1e6 / Elapsed;
+        E.WaitMs = static_cast<double>(S.WaitNs - L.LastWaitNs) / 1e6 / Elapsed;
+      }
+      L.LastRunNs = S.RunNs;
+      L.LastWaitNs = S.WaitNs;
+      L.HaveSched = true;
+      return true;
+    };
     for (auto& L : F.Threads) {
       if (Want && F.Tick >= L.RetryAt) {
         // The thread's own mask: sched_getaffinity would leave out CPUs the kernel has paused for a moment.
@@ -698,24 +739,28 @@ namespace {
           }
         }
       }
-      if (Second && LineCount < MaxLoaderThreads) {
-        Linux::SchedStat S {};
-        if (Linux::ReadSchedStat(L.SchedPath.c_str(), S)) {
-          Linux::TaskStat Stat {};
-          auto& E = Line[LineCount++];
-          E.TID = L.TID;
-          E.LinuxTid = L.LinuxTid;
-          E.Mask = Linux::GetAffinity(L.LinuxTid);
-          E.Processor = Linux::ReadTaskStat(L.StatPath.c_str(), Stat) ? Stat.Processor : -1;
-          if (L.HaveSched && Elapsed > 0.1) {
-            E.RunMs = static_cast<double>(S.RunNs - L.LastRunNs) / 1e6 / Elapsed;
-            E.WaitMs = static_cast<double>(S.WaitNs - L.LastWaitNs) / 1e6 / Elapsed;
-          }
-          L.LastRunNs = S.RunNs;
-          L.LastWaitNs = S.WaitNs;
-          L.HaveSched = true;
-        }
+      if (Second && LineCount < MaxLoaderThreads && Sched(L, Line[LineCount])) {
+        ++LineCount;
       }
+    }
+    for (auto& L : F.GameThreads) {
+      if (!Second || LineCount >= MaxLineEntries) {
+        break;
+      }
+      const auto Found = Threads.find(L.TID);
+      if (Found == Threads.end() || Found->second.LinuxTid != L.LinuxTid) {
+        continue;
+      }
+      auto& E = Line[LineCount];
+      const bool HadSched = L.HaveSched;
+      if (!Sched(L, E)) {
+        continue;
+      }
+      E.Game = true;
+      const uint64_t Exc = Found->second.GameExc;
+      E.GameExcPerS = HadSched && Elapsed > 0.1 ? static_cast<double>(Exc - L.LastGameExc) / Elapsed : 0.0;
+      L.LastGameExc = Exc;
+      ++LineCount;
     }
     if (Second) {
       F.LastSecond = Now;
@@ -725,13 +770,58 @@ namespace {
     }
   }
 
+  // A thread that raised GameExc exceptions in the main exe's code this round runs the game's own code, whatever its
+  // samples say (see FEX_LOADER_GAME_EXCEPTIONS): it is never moved, and goes back to its cores if it was moved.
+  void MarkGameThread(LoaderFinder& F, uint32_t TID, Tracked& T, uint64_t GameExc) {
+    T.GameThread = true;
+    fextl::string Moved;
+    if (T.Loader) {
+      T.Loader = false;
+      const auto It =
+        std::find_if(F.Threads.begin(), F.Threads.end(), [&](const LoaderThread& L) { return L.TID == TID && L.LinuxTid == T.LinuxTid; });
+      if (It != F.Threads.end()) {
+        const uint64_t Now = Linux::GetAffinity(T.LinuxTid);
+        const int Result = It->Before ? Linux::SetAffinity(T.LinuxTid, It->Before) : 0;
+        Moved = It->Before ?
+                  fextl::fmt::format("; it had been moved as a loader thread: Linux cores {:#x} -> {:#x}, result {}", Now, It->Before, Result) :
+                  fextl::string("; it had been found as a loader thread, its cores weren't changed");
+        if (const auto Hook = LoaderHook.load(std::memory_order_acquire)) {
+          Hook(TID, 0);
+        }
+        F.Threads.erase(It);
+      }
+    }
+    if (F.GameNotes < MaxGameNotes) {
+      ++F.GameNotes;
+      StatsLogNote(fextl::fmt::format("loader: tid={} {} (Linux {}) raised {} exceptions in the game's own code (main exe) in 2 s: a game "
+                                      "thread, never moved to the slowest cores{} (FEX_LOADER_GAME_EXCEPTIONS=0 turns this off)",
+                                      TID, T.Name.empty() ? "-" : T.Name, T.LinuxTid, GameExc, Moved));
+    }
+    if (F.GameThreads.size() < MaxGameThreads) {
+      LoaderThread L {.TID = TID, .LinuxTid = T.LinuxTid};
+      L.StatusPath = fextl::fmt::format("/proc/self/task/{}/status", T.LinuxTid);
+      L.SchedPath = fextl::fmt::format("/proc/self/task/{}/schedstat", T.LinuxTid);
+      L.StatPath = fextl::fmt::format("/proc/self/task/{}/stat", T.LinuxTid);
+      L.LastGameExc = T.GameExc;
+      F.GameThreads.push_back(std::move(L));
+    }
+  }
+
   // Every 2 s round: which busy threads ran loader code in this round's samples.
   void LoaderRound(LoaderFinder& F, fextl::unordered_map<uint32_t, Tracked>& Threads, uint32_t Round) {
     const uint64_t Want = F.C->Loader == LoaderMode::Little ? F.C->LittleMask : 0;
     for (auto& [TID, T] : Threads) {
       const uint32_t N = T.SampleCount;
       T.SampleCount = 0;
-      if (!T.LinuxTid || T.FEX || T.Main || T.Loader) {
+      if (!T.LinuxTid || T.FEX || T.Main) {
+        continue;
+      }
+      const uint64_t GameExc = T.GameExc - T.GameExcAtRound;
+      T.GameExcAtRound = T.GameExc;
+      if (F.C->GameExcPerRound && !T.GameThread && GameExc >= F.C->GameExcPerRound) {
+        MarkGameThread(F, TID, T, GameExc);
+      }
+      if (T.Loader || T.GameThread) {
         continue;
       }
       Linux::SchedStat S {};
@@ -815,6 +905,7 @@ namespace {
       L.SchedPath = fextl::fmt::format("/proc/self/task/{}/schedstat", T.LinuxTid);
       L.StatPath = fextl::fmt::format("/proc/self/task/{}/stat", T.LinuxTid);
       const uint64_t Before = Linux::GetAffinity(T.LinuxTid);
+      L.Before = Before;
       const int Result = Want ? Linux::SetAffinity(T.LinuxTid, Want) : 0;
       if (Result) {
         ++L.Failures;
@@ -844,6 +935,15 @@ namespace {
         Hook(It->TID, 0);
       }
       It = F.Threads.erase(It);
+    }
+    for (auto It = F.GameThreads.begin(); It != F.GameThreads.end();) {
+      const auto Found = Threads.find(It->TID);
+      if (Found != Threads.end() && Found->second.GameThread && Found->second.LinuxTid == It->LinuxTid) {
+        ++It;
+        continue;
+      }
+      StatsLogNote(fextl::fmt::format("loader: game thread tid={} (Linux {}) ended", It->TID, It->LinuxTid));
+      It = F.GameThreads.erase(It);
     }
   }
 
@@ -1086,6 +1186,8 @@ void StartPriorityGuard(std::string_view AppName) {
   if (const auto* Nt = C->ExeBase ? RtlImageNtHeader(reinterpret_cast<HMODULE>(C->ExeBase)) : nullptr) {
     C->ExeEnd = C->ExeBase + Nt->OptionalHeader.SizeOfImage;
   }
+  const char* GameExc = Switch("FEX_LOADER_GAME_EXCEPTIONS");
+  C->GameExcPerRound = GameExc && GameExc[0] >= '0' && GameExc[0] <= '9' ? static_cast<uint32_t>(std::clamp(atoi(GameExc), 0, 1'000'000)) : 0;
 
   const char* ServerNice = Switch("FEX_SERVER_NICE");
   if (ServerNice && ServerNice[0] != 'o' && (ServerNice[0] == '-' || (ServerNice[0] >= '0' && ServerNice[0] <= '9'))) {
@@ -1127,6 +1229,16 @@ void StartPriorityGuard(std::string_view AppName) {
                                     Exe) :
                  fextl::string("loader: off (FEX_LOADER_CORES=little moves threads running mostly the game's protection code to the slowest "
                                "cores)"));
+  if (C->Loader != LoaderMode::Off) {
+    StatsLogNote(C->GameExcPerRound ? fextl::fmt::format("loader: a thread that raises {} or more exceptions within 2 s in the game's own "
+                                                         "code (the {}) is a game "
+                                                         "thread: never moved to the slowest cores, moved back if it was "
+                                                         "(FEX_LOADER_GAME_EXCEPTIONS=0 turns this off)",
+                                                         C->GameExcPerRound, Exe) :
+                                      fextl::string("loader: threads aren't told apart by their exceptions in the game's own code "
+                                                    "(FEX_LOADER_GAME_EXCEPTIONS=400 "
+                                                    "keeps threads raising 400 or more within 2 s off the slowest cores)"));
+  }
 
   if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && C->Loader == LoaderMode::Off) {
     delete C;
@@ -1143,9 +1255,9 @@ void StartPriorityGuard(std::string_view AppName) {
   Thread = FEXCore::Threads::Thread::Create(GuardThread, C, {.LowPriority = false, .Internal = true}, "FEXPrioGuard");
 }
 
-void GuardThreadStarted(uint32_t TID, int LinuxTid, uint64_t Teb, const volatile uint64_t* BlockHeader) {
+void GuardThreadStarted(uint32_t TID, int LinuxTid, uint64_t Teb, const volatile uint64_t* BlockHeader, const volatile uint64_t* GameExceptions) {
   std::scoped_lock Lock {RegistryLock};
-  const Registered R {.TID = TID, .LinuxTid = LinuxTid, .Teb = Teb, .BlockHeader = BlockHeader};
+  const Registered R {.TID = TID, .LinuxTid = LinuxTid, .Teb = Teb, .BlockHeader = BlockHeader, .GameExceptions = GameExceptions};
   for (size_t i = 0; i < RegistryCount; ++i) {
     if (Registry[i].TID == TID) {
       Registry[i] = R;

@@ -151,6 +151,9 @@ struct ThreadCPUArea {
 
 struct FrontendThreadData {
   bool InLockedRWXRead {};
+  // Guest exceptions this thread raised in the main exe's code (an int3 the protection put into the game's code, say),
+  // written only by the thread itself; the priority guard reads it to tell game threads from loader threads.
+  uint64_t GameExceptions {};
 };
 
 namespace {
@@ -160,6 +163,9 @@ fextl::unique_ptr<Exception::ECSyscallHandler> SyscallHandler;
 fextl::unique_ptr<FEX::Windows::StatAlloc> StatAllocHandler;
 std::optional<FEX::Windows::InvalidationTracker> InvalidationTracker;
 bool NtDllExtendedEFlags {};
+// The main exe's range as loaded (before D2R's protection remaps it at the same base), for FrontendThreadData::GameExceptions.
+uint64_t MainExeBase {};
+uint64_t MainExeSize {};
 std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
@@ -652,6 +658,10 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
   CrashRecord::Note(CrashRecord::Kind::Guest, GuestRec.ExceptionCode, Context.Pc, CrashRecord::FaultAddress(GuestRec), GuestContext.Pc);
+  if (GuestContext.Pc - MainExeBase < MainExeSize) {
+    auto* Frontend = GetFrontendThreadData(Thread);
+    __atomic_store_n(&Frontend->GameExceptions, Frontend->GameExceptions + 1, __ATOMIC_RELAXED);
+  }
   if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
     GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
   } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {
@@ -915,6 +925,10 @@ NTSTATUS ProcessInit() {
 
   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
   HandleImageMap(reinterpret_cast<uint64_t>(MainModule), true);
+  if (const auto* Nt = MainModule ? RtlImageNtHeader(reinterpret_cast<HMODULE>(MainModule)) : nullptr) {
+    MainExeBase = reinterpret_cast<uint64_t>(MainModule);
+    MainExeSize = Nt->OptionalHeader.SizeOfImage;
+  }
 
   HandleImageMap(NtDllBase);
 
@@ -1375,9 +1389,10 @@ NTSTATUS ThreadInit() {
     if (StatAllocHandler) {
       Thread->ThreadStats = StatAllocHandler->AllocateSlot(ThreadTID);
     }
-    // For the priority guard's loader thread search: its Linux tid and the JIT block it runs.
+    // For the priority guard's loader thread search: its Linux tid, the JIT block it runs and its exceptions in the
+    // game's own code.
     FEX::Windows::GuardThreadStarted(ThreadTID, FEX::Windows::Linux::GetTid(), reinterpret_cast<uint64_t>(NtCurrentTeb()),
-                                     &Thread->CurrentFrame->State.InlineJITBlockHeader);
+                                     &Thread->CurrentFrame->State.InlineJITBlockHeader, &GetFrontendThreadData(Thread)->GameExceptions);
   }
 
   CPUArea.ThreadState() = Thread;

@@ -72,8 +72,20 @@ namespace FEX::Windows {
 //   FEX_LOADER_CORES=find    find and log them, leave them where they are
 //   FEX_LOADER_CORES=off     leave them where Wine puts them
 //
+// Game threads. In the build 64 log the guard moved a second thread (tid 784) to the slowest cores at 2:37. Its samples
+// were mostly protection code, but it runs the game's own code: the protection replaced instructions in D2R.exe with
+// int3, and each one is an exception (~800 a second, nearly all of the run's) that the protection's handler resolves
+// and continues, so most of the thread's time is in that handler. On the slow cores it needed twice the CPU for the same
+// work, and in its busy phase at 3:12-3:24 it took a whole slow core, right before the area change where the game
+// rubber banded. The loader thread (tid 584) raises few exceptions (its NtContinue time was 1/65 of tid 784's).
+//
+//   FEX_LOADER_GAME_EXCEPTIONS=N  a thread that raises N or more exceptions in the main exe's code within a 2 second
+//                      round is a game thread: it is never moved to the slowest cores, and moved back if it was (the D2R
+//                      default 400; 0 turns this off)
+//
 // Each loader thread found gets a "# loader: ..." line, and every second a "loader" line with how long it ran and how
-// long it waited for a CPU. With the stats log, its calls get a "loader calls" line too (see ARM64EC/LoaderWatch.h).
+// long it waited for a CPU; game threads found this way are on it too, with their exceptions in the game's code a
+// second. With the stats log, a loader thread's calls get a "loader calls" line too (see ARM64EC/LoaderWatch.h).
 //
 // FEX's own threads (named FEX*) keep their priorities. Checked every 2 seconds, since a game can change priorities and
 // affinities at any time. Each change is written to the FEX_STATSLOG log as a "# prio ...", "# cores ..." or
@@ -81,9 +93,10 @@ namespace FEX::Windows {
 void StartPriorityGuard(std::string_view AppName);
 
 // Every emulated thread registers as it starts and unregisters as it ends (ARM64EC ThreadInit/ThreadTerm), so the guard
-// knows its Linux tid and can see which guest code it runs. BlockHeader points at the thread's InlineJITBlockHeader;
-// the guard reads it only while the thread is registered, and GuardThreadEnded waits for any such read to finish.
-void GuardThreadStarted(uint32_t TID, int LinuxTid, uint64_t Teb, const volatile uint64_t* BlockHeader);
+// knows its Linux tid and can see which guest code it runs. BlockHeader points at the thread's InlineJITBlockHeader,
+// GameExceptions at its count of exceptions raised in the main exe's code; the guard reads them only while the thread
+// is registered, and GuardThreadEnded waits for any such read to finish.
+void GuardThreadStarted(uint32_t TID, int LinuxTid, uint64_t Teb, const volatile uint64_t* BlockHeader, const volatile uint64_t* GameExceptions);
 void GuardThreadEnded(uint32_t TID);
 
 // Called on the guard's thread for every loader thread it finds (see FEX_LOADER_CORES), with its TEB, and again with Teb 0
