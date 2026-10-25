@@ -122,6 +122,51 @@ namespace {
     StatsLogNote(fextl::fmt::format("vkd3d: {}=1 (status {:#x}): {} (only FEX's VKD3D build reads it; {}=0 turns it off)", Var,
                                     static_cast<uint32_t>(SetStatus), What, SwitchName));
   }
+
+  // See EnvironmentVariablesHandling.h: hands the switch's list of pixel shader hashes to FEX's vkd3d-proton build.
+  void SetupVkd3dShaderCopy() {
+    const char* Value = Switch("FEX_VKD3D_SHADER_COPY");
+    static constexpr wchar_t VarText[] = L"VKD3D_FEX_SHADER_COPY";
+    UNICODE_STRING Name {sizeof(VarText) - sizeof(wchar_t), sizeof(VarText), const_cast<wchar_t*>(VarText)};
+
+    wchar_t Old[512];
+    UNICODE_STRING OldValue {0, sizeof(Old) - sizeof(wchar_t), Old};
+    const NTSTATUS QueryStatus = RtlQueryEnvironmentVariable_U(nullptr, &Name, &OldValue);
+    if (QueryStatus != StatusVariableNotFound) {
+      StatsLogNote(fextl::fmt::format("vkd3d: VKD3D_FEX_SHADER_COPY={} was already set, left alone",
+                                      QueryStatus == 0 ? Narrow(Old, OldValue.Length / sizeof(wchar_t)) : fextl::string("?")));
+      return;
+    }
+    if (!Value || (Value[0] == '0' && !Value[1])) {
+      StatsLogNote("vkd3d: VKD3D_FEX_SHADER_COPY not set (FEX_VKD3D_SHADER_COPY off): no shaders are copied into the log");
+      return;
+    }
+
+    // Only hex digits and separators reach vkd3d.
+    wchar_t Text[512];
+    size_t Len = 0;
+    size_t Hashes = 0;
+    bool InHash = false;
+    for (const char* p = Value; *p && Len + 1 < std::size(Text); ++p) {
+      const char c = *p;
+      const bool Hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+      if (!Hex && c != ',' && c != ';' && c != ' ') {
+        StatsLogNote(fextl::fmt::format("vkd3d: FEX_VKD3D_SHADER_COPY={} isn't a list of hex shader hashes: no shaders are copied", Value));
+        return;
+      }
+      Hashes += Hex && !InHash;
+      InHash = Hex;
+      Text[Len++] = static_cast<wchar_t>(c);
+    }
+    Text[Len] = 0;
+    UNICODE_STRING New {static_cast<USHORT>(Len * sizeof(wchar_t)), static_cast<USHORT>((Len + 1) * sizeof(wchar_t)), Text};
+    const NTSTATUS SetStatus = RtlSetEnvironmentVariable(nullptr, &Name, &New);
+    StatsLogNote(fextl::fmt::format("vkd3d: VKD3D_FEX_SHADER_COPY={} (status {:#x}): the D3D bytecode, PSO and root signature of these {} "
+                                    "pixel shaders, and for the first four the SPIR-V, the other stages and the driver's compiled "
+                                    "code, go into this log as 'shader copy' blocks; rendering is unchanged (VKD3D fex13 and later; "
+                                    "FEX_VKD3D_SHADER_COPY=0 turns it off)",
+                                    Narrow(Text, Len), static_cast<uint32_t>(SetStatus), Hashes));
+  }
 } // namespace
 
 void SetupEnvironmentVariableValues(HMODULE NtDll) {
@@ -148,6 +193,7 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "each frame goes to the window system only once the GPU has drawn it, because GameNative's X server "
                       "shows an image as soon as it gets it and one handed over earlier showed an older frame (VKD3D fex12 "
                       "and later; 'screen handoff' line)");
+  SetupVkd3dShaderCopy();
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
 

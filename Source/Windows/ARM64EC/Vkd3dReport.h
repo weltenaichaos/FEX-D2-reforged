@@ -9,6 +9,9 @@
 // a note says whether it is FEX's build and which of its features are on, and a '# cap' note whether GameNative's frame
 // cap layer (liblsfg-vk-layer.so, which sleeps in vkQueuePresentKHR) is loaded and what its config caps. Build 56 adds
 // the 'frame start' (frame start pacing) and 'cap' (cap pre-sleep) lines.
+// Build 67 (VKD3D fex13) also writes out the export vkd3d_fex_shader_copy: copies of the shaders FEX_VKD3D_SHADER_COPY
+// names, their PSOs and the driver's compiled code, at most 192 KB of log a second, as 'shader copy N begin/end' notes
+// around '  sc N' lines (base64, or '|' text lines with '+' continuations).
 namespace Vkd3dReport {
 // Call on the process's first thread, in process init, when the stats log is on.
 void Init();

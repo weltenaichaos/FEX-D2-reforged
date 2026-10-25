@@ -94,6 +94,13 @@ namespace {
     // frame over ~41 ms before the GPU finished it. FEX's vkd3d-proton build (fex12) then waits for the GPU before
     // vkQueuePresentKHR (see EnvironmentVariablesHandling.h).
     {"FEX_VKD3D_PRESENT_DRAWN", "1"},
+    // Build 67: no change to the game. With the hitches gone, fights are GPU-bound at 23-29 FPS, and ~20 ms of a 45 ms
+    // fight frame is the main pass, where a few lighting pixel shaders of ~7,000 instructions take 12-29 us a draw.
+    // FEX's vkd3d-proton build (fex13) copies these shaders (by D3D bytecode hash, costliest first), their PSOs and
+    // the driver's compiled code into the stats log, so their cost can be taken apart off the device (see
+    // EnvironmentVariablesHandling.h, ARM64EC/Vkd3dReport.cpp).
+    {"FEX_VKD3D_SHADER_COPY", "5ff3d3024d2fe860,5b7fecfba4c4c6b0,fb5d9d516da6de30,0e155e00b71ab675,2d370003cb44c8a1,"
+                              "2f7464fc8033e6be,1071ee16e09ed9f2,ef0fa3aad756de0d,d04262aee603ba0a"},
   };
 
   // In the order the stats log lists them.
@@ -147,6 +154,7 @@ namespace {
     "FEX_VKD3D_FRAME_START",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
+    "FEX_VKD3D_SHADER_COPY",
   };
 
   bool UseD2RDefaults {};

@@ -1,0 +1,803 @@
+From 9f4c78a14e29b47f5f79ebb4749534650f7bb031 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 19:38:52 +0000
+Subject: [PATCH] FEX: copy the costliest pixel shaders, their PSOs and the
+ driver's compiled code for FEX's stats log
+
+VKD3D_FEX_SHADER_COPY names pixel shaders by D3D bytecode hash. Their D3D
+bytecode, PSO summary and root signature, and for the first four the SPIR-V,
+the other stages' bytecode and the driver's compiled code and statistics go
+into the exported vkd3d_fex_shader_copy table. Rendering is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WLFWPd69Fe8cXrKbfompEp
+---
+ libs/d3d12core/d3d12core.def |   1 +
+ libs/vkd3d/device.c          |   1 +
+ libs/vkd3d/fex_shader_copy.c | 604 +++++++++++++++++++++++++++++++++++
+ libs/vkd3d/meson.build       |   2 +-
+ libs/vkd3d/state.c           |  14 +
+ libs/vkd3d/vkd3d_private.h   |  49 +++
+ libs/vkd3d/vulkan_procs.h    |   1 +
+ 7 files changed, 671 insertions(+), 1 deletion(-)
+ create mode 100644 libs/vkd3d/fex_shader_copy.c
+
+diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
+index 600652e..7f05c5f 100644
+--- a/libs/d3d12core/d3d12core.def
++++ b/libs/d3d12core/d3d12core.def
+@@ -6,3 +6,4 @@ EXPORTS
+     vkd3d_fex_pass_report DATA
+     vkd3d_fex_present_report DATA
+     vkd3d_fex_gpu_report DATA
++    vkd3d_fex_shader_copy DATA
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 40d4c01..96861f2 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -10065,6 +10065,7 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+     device->fex_fold_clears = vkd3d_fex_fold_clears_enabled();
+     device->fex_ds_store_none = vkd3d_fex_ds_store_none_enabled();
+     vkd3d_fex_timeline_init();
++    vkd3d_fex_shader_copy_init();
+     device->fex_pass_meter = vkd3d_fex_pass_meter_init(device);
+ 
+     hash_map_init(&device->vertex_input_pipelines,
+diff --git a/libs/vkd3d/fex_shader_copy.c b/libs/vkd3d/fex_shader_copy.c
+new file mode 100644
+index 0000000..35f85d2
+--- /dev/null
++++ b/libs/vkd3d/fex_shader_copy.c
+@@ -0,0 +1,604 @@
++/*
++ * FEX shader copy (VKD3D fex13): copies the shaders VKD3D_FEX_SHADER_COPY names (pixel shaders by D3D bytecode
++ * hash, costliest first) into memory that FEX's stats log writes out, so the costly shaders can be studied off the
++ * device: the D3D bytecode, the PSO around them, the SPIR-V vkd3d hands the driver and the driver's compiled code.
++ * Nothing about rendering changes; the only side effect is that the driver compiles the first few listed shaders
++ * once more with its internal representations kept (no driver cache use for those few pipelines).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "vkd3d_private.h"
++#include <stdio.h>
++#include <string.h>
++#include <inttypes.h>
++
++/* Read by FEX (found by export name in d3d12core.dll). */
++struct vkd3d_fex_shader_copy vkd3d_fex_shader_copy = { 0x53584546u /* 'FEXS' */, 1u, 0u, 0u, 0u, 0u, { { 0 } } };
++
++#define FEX_COPY_HASHES 16u
++#define FEX_COPY_STAGES 32u
++#define FEX_COPY_ROOT_SIGS 16u
++#define FEX_COPY_BUDGET (16u << 20)
++#define FEX_COPY_TEXT 16384u
++
++/* Per listed pixel shader: what was copied already. */
++#define FEX_COPY_DONE_DXBC 0x1u
++#define FEX_COPY_DONE_PSO 0x2u
++#define FEX_COPY_DONE_SPIRV 0x4u
++#define FEX_COPY_DONE_CODE 0x8u    /* driver code copied */
++#define FEX_COPY_CLAIM_CODE 0x10u  /* a pipeline compile with internal representations kept is under way */
++
++static struct
++{
++    pthread_once_t once;
++    pthread_mutex_t lock;
++    bool enabled;
++    unsigned int hash_count;
++    vkd3d_shader_hash_t hashes[FEX_COPY_HASHES];
++    uint32_t done[FEX_COPY_HASHES];
++    vkd3d_shader_hash_t stages[FEX_COPY_STAGES];
++    unsigned int stage_count;
++    vkd3d_shader_hash_t root_sigs[FEX_COPY_ROOT_SIGS];
++    unsigned int root_sig_count;
++    size_t bytes;
++    bool device_done;
++} fex_copy = { PTHREAD_ONCE_INIT, PTHREAD_MUTEX_INITIALIZER };
++
++static void fex_copy_init_once(void)
++{
++    char env[1024];
++    const char *p;
++    char *end;
++    uint64_t h;
++
++    if (!vkd3d_get_env_var("VKD3D_FEX_SHADER_COPY", env, sizeof(env)))
++        return;
++
++    for (p = env; *p && fex_copy.hash_count < FEX_COPY_HASHES;)
++    {
++        while (*p == ',' || *p == ' ' || *p == ';')
++            p++;
++        if (!*p)
++            break;
++        h = strtoull(p, &end, 16);
++        if (end == p)
++            break;
++        if (h)
++            fex_copy.hashes[fex_copy.hash_count++] = h;
++        p = end;
++    }
++
++    fex_copy.enabled = fex_copy.hash_count != 0;
++    vkd3d_fex_shader_copy.listed = fex_copy.hash_count;
++    if (fex_copy.enabled)
++        vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_shader_copy.flags, VKD3D_FEX_REPORT_FLAG_ON,
++                vkd3d_memory_order_release);
++}
++
++static bool fex_copy_enabled(void)
++{
++    pthread_once(&fex_copy.once, fex_copy_init_once);
++    return fex_copy.enabled;
++}
++
++void vkd3d_fex_shader_copy_init(void)
++{
++    fex_copy_enabled();
++}
++
++/* 1-based position in the list, 0 when not listed. */
++static uint32_t fex_copy_rank(vkd3d_shader_hash_t hash)
++{
++    unsigned int i;
++
++    if (!hash)
++        return 0;
++    for (i = 0; i < fex_copy.hash_count; i++)
++        if (fex_copy.hashes[i] == hash)
++            return i + 1;
++    return 0;
++}
++
++/* Called with fex_copy.lock held. */
++static void fex_copy_publish_locked(vkd3d_shader_hash_t hash, uint64_t other, uint32_t kind, uint32_t rank,
++        uint32_t stage, const void *data, size_t size)
++{
++    struct vkd3d_fex_shader_blob *blob;
++    uint32_t n = vkd3d_fex_shader_copy.count;
++    void *copy;
++
++    if (n >= VKD3D_FEX_SHADER_COPY_MAX || size > UINT32_MAX || fex_copy.bytes + size > FEX_COPY_BUDGET ||
++            !(copy = vkd3d_malloc(size ? size : 1)))
++    {
++        vkd3d_fex_shader_copy.dropped++;
++        return;
++    }
++    if (size)
++        memcpy(copy, data, size);
++    fex_copy.bytes += size;
++
++    blob = &vkd3d_fex_shader_copy.blobs[n];
++    blob->hash = hash;
++    blob->other = other;
++    blob->kind = kind;
++    blob->rank = rank;
++    blob->size = (uint32_t)size;
++    blob->stage = stage;
++    blob->data = (uint64_t)(uintptr_t)copy;
++    /* FEX reads blobs[0 .. count) once count says so. */
++    vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_shader_copy.count, n + 1, vkd3d_memory_order_release);
++}
++
++static void fex_copy_publish_text_locked(vkd3d_shader_hash_t hash, uint32_t kind, uint32_t rank, const char *text)
++{
++    fex_copy_publish_locked(hash, 0, kind, rank, 0, text, strlen(text));
++}
++
++static void fex_copy_device_locked(struct d3d12_device *device)
++{
++    const VkPhysicalDeviceProperties *props = &device->device_info.properties2.properties;
++    const struct vkd3d_bindless_state *bindless = &device->bindless_state;
++    char *text;
++    size_t len = 0;
++    unsigned int i;
++
++    if (fex_copy.device_done || !(text = vkd3d_malloc(FEX_COPY_TEXT)))
++        return;
++    fex_copy.device_done = true;
++
++    len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++            "device %s, vendor %#x, device id %#x, driver id %u (layer driver id %u), driver %s (%s), api %u.%u.%u, "
++            "driver version %#x\n",
++            props->deviceName, props->vendorID, props->deviceID, device->device_info.vulkan_1_2_properties.driverID,
++            device->device_info.layer_driver_id, device->device_info.vulkan_1_2_properties.driverName,
++            device->device_info.vulkan_1_2_properties.driverInfo, VK_API_VERSION_MAJOR(props->apiVersion),
++            VK_API_VERSION_MINOR(props->apiVersion), VK_API_VERSION_PATCH(props->apiVersion), props->driverVersion);
++    len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++            "descriptor buffers %s, bindless flags %#x, bindless sets %u, cbv/srv/uav heap size %u, descriptor sizes "
++            "%zu/%zu, vkd3d config flags %#" PRIx64 ", graphics pipeline libraries %s, shader module identifiers %s\n",
++            d3d12_device_uses_descriptor_buffers(device) ? "on" : "off", bindless->flags, bindless->set_count,
++            bindless->cbv_srv_uav_count, bindless->descriptor_buffer_cbv_srv_uav_size,
++            bindless->descriptor_buffer_sampler_size, (uint64_t)vkd3d_config_flags,
++            device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary ? "yes" : "no",
++            device->device_info.shader_module_identifier_features.shaderModuleIdentifier ? "yes" : "no");
++    for (i = 0; i < bindless->set_count && i < VKD3D_MAX_BINDLESS_DESCRIPTOR_SETS; i++)
++    {
++        len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++                "bindless set %u: flags %#x, binding %u, vk descriptor type %u\n", i,
++                bindless->set_info[i].flags, bindless->set_info[i].binding_index,
++                bindless->set_info[i].vk_descriptor_type);
++    }
++    len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++            "pipeline executable info %s, internal representations call %s, max push descriptors %u, "
++            "subgroup size %u-%u\n",
++            device->device_info.pipeline_executable_properties_features.pipelineExecutableInfo ? "yes" : "no",
++            device->vk_procs.vkGetPipelineExecutableInternalRepresentationsKHR ? "yes" : "no",
++            device->device_info.push_descriptor_properties.maxPushDescriptors,
++            device->device_info.vulkan_1_3_properties.minSubgroupSize,
++            device->device_info.vulkan_1_3_properties.maxSubgroupSize);
++    fex_copy_publish_locked(0, 0, VKD3D_FEX_COPY_DEVICE, 0, 0, text, len);
++    vkd3d_free(text);
++}
++
++static const char *fex_copy_descriptor_type(enum vkd3d_shader_descriptor_type type)
++{
++    switch (type)
++    {
++        case VKD3D_SHADER_DESCRIPTOR_TYPE_CBV: return "b";
++        case VKD3D_SHADER_DESCRIPTOR_TYPE_SRV: return "t";
++        case VKD3D_SHADER_DESCRIPTOR_TYPE_UAV: return "u";
++        case VKD3D_SHADER_DESCRIPTOR_TYPE_SAMPLER: return "s";
++        default: return "?";
++    }
++}
++
++static size_t fex_copy_binding(char *text, size_t len, const struct vkd3d_shader_resource_binding *b)
++{
++    return vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++            "%s%u+%u space %u, table %u offset %u, visibility %u, flags %#x -> set %u binding %u",
++            fex_copy_descriptor_type(b->type), b->register_index, b->register_count, b->register_space,
++            b->descriptor_table, b->descriptor_offset, b->shader_visibility, b->flags, b->binding.set,
++            b->binding.binding);
++}
++
++static void fex_copy_pso_locked(struct d3d12_pipeline_state *state, const struct d3d12_pipeline_state_desc *desc,
++        vkd3d_shader_hash_t ps_hash, vkd3d_shader_hash_t vs_hash, uint32_t rank)
++{
++    const struct d3d12_root_signature *rs = state->root_signature;
++    const struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
++    const struct vkd3d_shader_root_parameter *param;
++    size_t len = 0;
++    unsigned int i;
++    char *text;
++
++    if (!(text = vkd3d_malloc(FEX_COPY_TEXT)))
++        return;
++
++    len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++            "pixel shader %016" PRIx64 " (rank %u): vertex shader %016" PRIx64 ", stages %u, topology type %u, "
++            "input elements %u, samples %u, sample mask %#x\n",
++            ps_hash, rank, vs_hash, (unsigned int)graphics->stage_count, desc->primitive_topology_type,
++            desc->input_layout.NumElements, desc->sample_desc.Count, desc->sample_mask);
++    len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "targets %u:", desc->rtv_formats.NumRenderTargets);
++    for (i = 0; i < desc->rtv_formats.NumRenderTargets && i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
++    {
++        const D3D12_RENDER_TARGET_BLEND_DESC *b = &desc->blend_state.RenderTarget[
++                desc->blend_state.IndependentBlendEnable ? i : 0];
++        len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++                " rt%u dxgi %u (blend %s %u/%u/%u alpha %u/%u/%u, logic %s, write mask %#x)", i,
++                desc->rtv_formats.RTFormats[i], b->BlendEnable ? "on" : "off", b->SrcBlend, b->DestBlend, b->BlendOp,
++                b->SrcBlendAlpha, b->DestBlendAlpha, b->BlendOpAlpha, b->LogicOpEnable ? "on" : "off",
++                b->RenderTargetWriteMask);
++    }
++    len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++            "\ndepth: dsv dxgi %u, test %s, write %s, func %u, stencil %s (front read %#x write %#x func %u), "
++            "depth bounds %s; alpha to coverage %s\n",
++            desc->dsv_format, desc->depth_stencil_state.DepthEnable ? "on" : "off",
++            desc->depth_stencil_state.DepthWriteMask ? "on" : "off", desc->depth_stencil_state.DepthFunc,
++            desc->depth_stencil_state.StencilEnable ? "on" : "off", desc->depth_stencil_state.FrontFace.StencilReadMask,
++            desc->depth_stencil_state.FrontFace.StencilWriteMask, desc->depth_stencil_state.FrontFace.StencilFunc,
++            desc->depth_stencil_state.DepthBoundsTestEnable ? "on" : "off",
++            desc->blend_state.AlphaToCoverageEnable ? "on" : "off");
++    len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++            "rasterizer: fill %u, cull %u, front ccw %u, depth bias %.3f clamp %.3f slope %.3f, depth clip %u, "
++            "conservative %u\n",
++            desc->rasterizer_state.FillMode, desc->rasterizer_state.CullMode,
++            desc->rasterizer_state.FrontCounterClockwise, desc->rasterizer_state.DepthBias,
++            desc->rasterizer_state.DepthBiasClamp, desc->rasterizer_state.SlopeScaledDepthBias,
++            desc->rasterizer_state.DepthClipEnable, desc->rasterizer_state.ConservativeRaster);
++
++    if (rs)
++    {
++        len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len,
++                "root signature %016" PRIx64 ": d3d12 flags %#x, parameters %u, tables mask %#" PRIx64
++                ", root constants mask %#" PRIx64 " (%u blocks), root descriptors raw va mask %#" PRIx64
++                ", push mask %#" PRIx64 ", bindings %u, static samplers %u, hoisted %u, graphics layout flags %#x "
++                "push stages %#x push range %u+%u sets %u, shader interface flags %#x\n",
++                rs->pso_compatibility_hash, rs->d3d12_flags, rs->parameter_count, rs->descriptor_table_mask,
++                rs->root_constant_mask, rs->root_constant_count, rs->root_descriptor_raw_va_mask,
++                rs->root_descriptor_push_mask, rs->binding_count, rs->static_sampler_count, rs->hoist_info.num_desc,
++                rs->graphics.flags, rs->graphics.vk_push_stages, rs->graphics.push_constant_range.offset,
++                rs->graphics.push_constant_range.size, rs->graphics.num_set_layouts,
++                d3d12_root_signature_get_shader_interface_flags(rs, VKD3D_PIPELINE_TYPE_GRAPHICS));
++        for (i = 0; i < rs->parameter_count && i < 64; i++)
++        {
++            param = &rs->parameters[i];
++            len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "param %u type %u: ", i, param->parameter_type);
++            if (param->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++                len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "table %u, %u bindings\n",
++                        param->descriptor_table.table_index, param->descriptor_table.binding_count);
++            else if (param->parameter_type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++                len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "constants %u+%u\n",
++                        param->constant.constant_index, param->constant.constant_count);
++            else if (param->descriptor.binding)
++            {
++                len = fex_copy_binding(text, len, param->descriptor.binding);
++                len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, ", raw va index %u\n",
++                        param->descriptor.raw_va_root_descriptor_index);
++            }
++            else
++                len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "root descriptor\n");
++        }
++        for (i = 0; i < rs->binding_count && i < 128; i++)
++        {
++            len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "binding %u: ", i);
++            len = fex_copy_binding(text, len, &rs->bindings[i]);
++            len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "\n");
++        }
++    }
++    else
++        len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "no root signature\n");
++
++    fex_copy_publish_locked(ps_hash, vs_hash, VKD3D_FEX_COPY_PSO, rank, 0, text, len);
++    vkd3d_free(text);
++
++    if (rs && rs->root_signature_blob && rs->root_signature_blob_size)
++    {
++        for (i = 0; i < fex_copy.root_sig_count; i++)
++            if (fex_copy.root_sigs[i] == rs->pso_compatibility_hash)
++                break;
++        if (i == fex_copy.root_sig_count && fex_copy.root_sig_count < FEX_COPY_ROOT_SIGS)
++        {
++            fex_copy.root_sigs[fex_copy.root_sig_count++] = rs->pso_compatibility_hash;
++            fex_copy_publish_locked(ps_hash, rs->pso_compatibility_hash, VKD3D_FEX_COPY_ROOT_SIG, rank, 0,
++                    rs->root_signature_blob, rs->root_signature_blob_size);
++        }
++    }
++}
++
++static vkd3d_shader_hash_t fex_copy_stage_hash(const struct d3d12_graphics_pipeline_state *graphics,
++        VkShaderStageFlagBits stage, int *index)
++{
++    struct vkd3d_shader_code code;
++    unsigned int i;
++
++    for (i = 0; i < graphics->stage_count && i < VKD3D_MAX_SHADER_STAGES; i++)
++    {
++        if (graphics->cached_desc.bytecode_stages[i] != stage)
++            continue;
++        if (index)
++            *index = i;
++        if (graphics->code[i].meta.hash)
++            return graphics->code[i].meta.hash;
++        /* Shader module identifier path: no SPIR-V meta yet, hash the bytecode like vkd3d-shader does. */
++        if (!graphics->cached_desc.bytecode[i].BytecodeLength)
++            return 0;
++        code.code = graphics->cached_desc.bytecode[i].pShaderBytecode;
++        code.size = graphics->cached_desc.bytecode[i].BytecodeLength;
++        return vkd3d_shader_hash(&code);
++    }
++    return 0;
++}
++
++void vkd3d_fex_shader_copy_pso(struct d3d12_pipeline_state *state, const struct d3d12_pipeline_state_desc *desc)
++{
++    const struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
++    vkd3d_shader_hash_t ps_hash, vs_hash;
++    int ps_index = -1;
++    unsigned int i, j;
++    uint32_t rank;
++
++    if (!fex_copy_enabled())
++        return;
++    if (!(ps_hash = fex_copy_stage_hash(graphics, VK_SHADER_STAGE_FRAGMENT_BIT, &ps_index)) ||
++            !(rank = fex_copy_rank(ps_hash)))
++        return;
++    vs_hash = fex_copy_stage_hash(graphics, VK_SHADER_STAGE_VERTEX_BIT, NULL);
++
++    pthread_mutex_lock(&fex_copy.lock);
++    fex_copy_device_locked(state->device);
++
++    if (!(fex_copy.done[rank - 1] & FEX_COPY_DONE_DXBC) && ps_index >= 0 &&
++            graphics->cached_desc.bytecode[ps_index].BytecodeLength)
++    {
++        fex_copy.done[rank - 1] |= FEX_COPY_DONE_DXBC;
++        fex_copy_publish_locked(ps_hash, 0, VKD3D_FEX_COPY_PS_DXBC, rank, VK_SHADER_STAGE_FRAGMENT_BIT,
++                graphics->cached_desc.bytecode[ps_index].pShaderBytecode,
++                graphics->cached_desc.bytecode[ps_index].BytecodeLength);
++    }
++
++    if (!(fex_copy.done[rank - 1] & FEX_COPY_DONE_PSO))
++    {
++        fex_copy.done[rank - 1] |= FEX_COPY_DONE_PSO;
++        fex_copy_pso_locked(state, desc, ps_hash, vs_hash, rank);
++    }
++
++    /* The other stages (vertex, hull, domain, geometry) of the first few: each distinct shader once. */
++    for (j = 0; rank <= VKD3D_FEX_SHADER_COPY_FULL && j < graphics->stage_count && j < VKD3D_MAX_SHADER_STAGES; j++)
++    {
++        const D3D12_SHADER_BYTECODE *code = &graphics->cached_desc.bytecode[j];
++        VkShaderStageFlagBits stage = graphics->cached_desc.bytecode_stages[j];
++        vkd3d_shader_hash_t hash;
++
++        if (stage == VK_SHADER_STAGE_FRAGMENT_BIT || !code->BytecodeLength)
++            continue;
++        if (!(hash = fex_copy_stage_hash(graphics, stage, NULL)))
++            continue;
++        for (i = 0; i < fex_copy.stage_count; i++)
++            if (fex_copy.stages[i] == hash)
++                break;
++        if (i < fex_copy.stage_count || fex_copy.stage_count >= FEX_COPY_STAGES)
++            continue;
++        fex_copy.stages[fex_copy.stage_count++] = hash;
++        fex_copy_publish_locked(ps_hash, hash, VKD3D_FEX_COPY_STAGE_DXBC, rank, stage, code->pShaderBytecode,
++                code->BytecodeLength);
++    }
++    pthread_mutex_unlock(&fex_copy.lock);
++}
++
++void vkd3d_fex_shader_copy_spirv(VkShaderStageFlagBits stage, const struct vkd3d_shader_code *spirv)
++{
++    uint32_t rank;
++
++    if (stage != VK_SHADER_STAGE_FRAGMENT_BIT || !spirv->code || !spirv->size || !fex_copy_enabled())
++        return;
++    if (!(rank = fex_copy_rank(spirv->meta.hash)) || rank > VKD3D_FEX_SHADER_COPY_FULL)
++        return;
++
++    pthread_mutex_lock(&fex_copy.lock);
++    if (!(fex_copy.done[rank - 1] & FEX_COPY_DONE_SPIRV))
++    {
++        fex_copy.done[rank - 1] |= FEX_COPY_DONE_SPIRV;
++        fex_copy_publish_locked(spirv->meta.hash, 0, VKD3D_FEX_COPY_PS_SPIRV, rank, VK_SHADER_STAGE_FRAGMENT_BIT,
++                spirv->code, spirv->size);
++    }
++    pthread_mutex_unlock(&fex_copy.lock);
++}
++
++/* True when this PSO's static pipeline should be compiled with the driver's internal representations kept: its pixel
++ * shader is one of the first few listed and no compile for it got them yet. */
++bool vkd3d_fex_shader_copy_claim_code(struct d3d12_pipeline_state *state)
++{
++    struct d3d12_device *device = state->device;
++    vkd3d_shader_hash_t ps_hash;
++    uint32_t rank;
++    bool claim = false;
++
++    if (!fex_copy_enabled() || !d3d12_pipeline_state_is_graphics(state))
++        return false;
++    if (!(ps_hash = fex_copy_stage_hash(&state->graphics, VK_SHADER_STAGE_FRAGMENT_BIT, NULL)) ||
++            !(rank = fex_copy_rank(ps_hash)) || rank > VKD3D_FEX_SHADER_COPY_FULL)
++        return false;
++
++    pthread_mutex_lock(&fex_copy.lock);
++    if (!(fex_copy.done[rank - 1] & (FEX_COPY_DONE_CODE | FEX_COPY_CLAIM_CODE)))
++    {
++        if (device->device_info.pipeline_executable_properties_features.pipelineExecutableInfo &&
++                device->vk_procs.vkGetPipelineExecutablePropertiesKHR &&
++                device->vk_procs.vkGetPipelineExecutableInternalRepresentationsKHR)
++        {
++            fex_copy.done[rank - 1] |= FEX_COPY_CLAIM_CODE;
++            claim = true;
++        }
++        else
++        {
++            fex_copy.done[rank - 1] |= FEX_COPY_DONE_CODE;
++            fex_copy_publish_text_locked(ps_hash, VKD3D_FEX_COPY_NOTE, rank,
++                    "the driver offers no pipeline executable internal representations, so its code can't be copied");
++        }
++    }
++    pthread_mutex_unlock(&fex_copy.lock);
++    return claim;
++}
++
++static size_t fex_copy_stat(char *text, size_t len, const VkPipelineExecutableStatisticKHR *stat)
++{
++    switch (stat->format)
++    {
++        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
++            return vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "%s = %s\n", stat->name,
++                    stat->value.b32 ? "true" : "false");
++        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
++            return vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "%s = %" PRId64 "\n", stat->name,
++                    stat->value.i64);
++        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
++            return vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "%s = %" PRIu64 "\n", stat->name,
++                    stat->value.u64);
++        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
++            return vkd3d_fex_report_append(text, FEX_COPY_TEXT, len, "%s = %.3f\n", stat->name, stat->value.f64);
++        default:
++            return len;
++    }
++}
++
++/* After the claimed compile: copies each executable's compiled code (the assembly, when the driver offers more than
++ * one representation) and statistics. */
++void vkd3d_fex_shader_copy_code(struct d3d12_pipeline_state *state, VkPipeline pipeline, VkResult vr)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
++    VkPipelineExecutableInternalRepresentationKHR *reps = NULL;
++    VkPipelineExecutableStatisticKHR stats[64];
++    VkPipelineExecutablePropertiesKHR props[8];
++    VkDevice vk_device = state->device->vk_device;
++    VkPipelineExecutableInfoKHR exe_info;
++    uint32_t count, rep_count, n, i, j;
++    vkd3d_shader_hash_t ps_hash;
++    VkPipelineInfoKHR info;
++    char note[512];
++    uint32_t rank;
++    size_t len;
++    char *text;
++    VkResult r;
++
++    ps_hash = fex_copy_stage_hash(&state->graphics, VK_SHADER_STAGE_FRAGMENT_BIT, NULL);
++    rank = fex_copy_rank(ps_hash);
++    if (!rank)
++        return;
++
++    pthread_mutex_lock(&fex_copy.lock);
++    fex_copy.done[rank - 1] &= ~FEX_COPY_CLAIM_CODE;
++    if (vr < 0 || !pipeline)
++    {
++        /* Let a later PSO with this pixel shader try again. */
++        pthread_mutex_unlock(&fex_copy.lock);
++        return;
++    }
++    fex_copy.done[rank - 1] |= FEX_COPY_DONE_CODE;
++
++    memset(&info, 0, sizeof(info));
++    info.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
++    info.pipeline = pipeline;
++    memset(props, 0, sizeof(props));
++    for (i = 0; i < ARRAY_SIZE(props); i++)
++        props[i].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
++    count = ARRAY_SIZE(props);
++    if ((r = VK_CALL(vkGetPipelineExecutablePropertiesKHR(vk_device, &info, &count, props))) < 0)
++    {
++        snprintf(note, sizeof(note), "vkGetPipelineExecutablePropertiesKHR failed (%d)", r);
++        fex_copy_publish_text_locked(ps_hash, VKD3D_FEX_COPY_NOTE, rank, note);
++        pthread_mutex_unlock(&fex_copy.lock);
++        return;
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        /* The binning pass's position-only copy of the vertex shader adds nothing. */
++        if (strstr(props[i].name, "Binning") || strstr(props[i].name, "binning"))
++            continue;
++
++        memset(&exe_info, 0, sizeof(exe_info));
++        exe_info.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;
++        exe_info.pipeline = pipeline;
++        exe_info.executableIndex = i;
++
++        /* Statistics first: small, and they say what the code below costs. */
++        if ((text = vkd3d_malloc(FEX_COPY_TEXT)))
++        {
++            len = vkd3d_fex_report_append(text, FEX_COPY_TEXT, 0, "executable %u: %s (%s), subgroup size %u\n", i,
++                    props[i].name, props[i].description, props[i].subgroupSize);
++            memset(stats, 0, sizeof(stats));
++            for (j = 0; j < ARRAY_SIZE(stats); j++)
++                stats[j].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
++            n = ARRAY_SIZE(stats);
++            if (VK_CALL(vkGetPipelineExecutableStatisticsKHR(vk_device, &exe_info, &n, stats)) >= 0)
++                for (j = 0; j < n; j++)
++                    len = fex_copy_stat(text, len, &stats[j]);
++            fex_copy_publish_locked(ps_hash, 0, VKD3D_FEX_COPY_STATS, rank, props[i].stages, text, len);
++            vkd3d_free(text);
++        }
++
++        rep_count = 0;
++        if ((r = VK_CALL(vkGetPipelineExecutableInternalRepresentationsKHR(vk_device, &exe_info, &rep_count,
++                NULL))) < 0 || !rep_count)
++        {
++            snprintf(note, sizeof(note), "executable %u (%s): no internal representations (%d, count %u)", i,
++                    props[i].name, r, rep_count);
++            fex_copy_publish_text_locked(ps_hash, VKD3D_FEX_COPY_NOTE, rank, note);
++            continue;
++        }
++        if (!(reps = vkd3d_calloc(rep_count, sizeof(*reps))))
++            break;
++        for (j = 0; j < rep_count; j++)
++            reps[j].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR;
++        /* Sizes first, then the text. */
++        if (VK_CALL(vkGetPipelineExecutableInternalRepresentationsKHR(vk_device, &exe_info, &rep_count, reps)) >= 0)
++        {
++            for (j = 0; j < rep_count; j++)
++                reps[j].pData = reps[j].dataSize ? vkd3d_malloc(reps[j].dataSize) : NULL;
++            r = VK_CALL(vkGetPipelineExecutableInternalRepresentationsKHR(vk_device, &exe_info, &rep_count, reps));
++            for (j = 0; j < rep_count; j++)
++            {
++                /* NIR is big and the final assembly is what runs; keep only the assembly when there is one. */
++                if (!reps[j].pData || !reps[j].dataSize || (rep_count > 1 && !strstr(reps[j].name, "ssembly") &&
++                        !strstr(reps[j].name, "ISA") && !strstr(reps[j].name, "isa")))
++                    continue;
++                if (reps[j].isText)
++                {
++                    size_t text_len = strnlen(reps[j].pData, reps[j].dataSize);
++                    size_t head_len;
++
++                    /* First line: which representation this is. */
++                    if ((text = vkd3d_malloc(text_len + 512)))
++                    {
++                        head_len = snprintf(text, 512, "executable %u %s: %s%s\n", i, props[i].name, reps[j].name,
++                                r == VK_INCOMPLETE ? " (driver says incomplete)" : "");
++                        head_len = min(head_len, 511);
++                        memcpy(text + head_len, reps[j].pData, text_len);
++                        fex_copy_publish_locked(ps_hash, 0, VKD3D_FEX_COPY_CODE, rank, props[i].stages, text,
++                                head_len + text_len);
++                        vkd3d_free(text);
++                    }
++                }
++                else
++                {
++                    snprintf(note, sizeof(note), "executable %u %s: %s is binary (%zu bytes), copied as is", i,
++                            props[i].name, reps[j].name, reps[j].dataSize);
++                    fex_copy_publish_text_locked(ps_hash, VKD3D_FEX_COPY_NOTE, rank, note);
++                    fex_copy_publish_locked(ps_hash, 1, VKD3D_FEX_COPY_CODE, rank, props[i].stages, reps[j].pData,
++                            reps[j].dataSize);
++                }
++            }
++            for (j = 0; j < rep_count; j++)
++                vkd3d_free(reps[j].pData);
++        }
++        vkd3d_free(reps);
++        reps = NULL;
++    }
++    pthread_mutex_unlock(&fex_copy.lock);
++}
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index e73112e..f908904 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -118,7 +118,7 @@ if enable_profiling
+   vkd3d_src += ['timestamp_profiler.c']
+ endif
+ 
+-vkd3d_src += ['fex_pass_meter.c', 'fex_timeline.c']
++vkd3d_src += ['fex_pass_meter.c', 'fex_timeline.c', 'fex_shader_copy.c']
+ 
+ vkd3d_lib = static_library('vkd3d-proton', vkd3d_src, glsl_generator.process(vkd3d_shaders), vkd3d_build, vkd3d_version,
+   dependencies        : [ vkd3d_common_dep, vkd3d_shader_dep ] + vkd3d_extra_libs,
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 1241a91..8cccb0b 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -2858,6 +2858,7 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
+             INFO("SPIR-V mismatch for cache reference!\n");
+     }
+ 
++    vkd3d_fex_shader_copy_spirv(stage, spirv_code);
+     return S_OK;
+ }
+ 
+@@ -4463,6 +4464,7 @@ static HRESULT d3d12_pipeline_state_graphics_create_shader_stages(
+             return hr;
+     }
+ 
++    vkd3d_fex_shader_copy_pso(state, desc);
+     return S_OK;
+ }
+ 
+@@ -6118,6 +6120,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     VkPipelineViewportStateCreateInfo vp_desc;
+     VkPipelineCreationFeedbackEXT feedback;
+     uint32_t stages_module_dup_mask = 0;
++    bool fex_copy_code = false;
+     VkPipeline vk_pipeline;
+     unsigned int i;
+     VkResult vr;
+@@ -6269,6 +6272,14 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     if (graphics->disable_optimization)
+         pipeline_desc.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+ 
++    /* FEX shader copy: the driver keeps its compiled code for the first few listed pixel shaders, once each. */
++    if (!key && !library_flags && vkd3d_fex_shader_copy_claim_code(state))
++    {
++        fex_copy_code = true;
++        pipeline_desc.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR |
++                VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
++    }
++
+     TRACE("Calling vkCreateGraphicsPipelines.\n");
+ 
+     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+@@ -6346,6 +6357,9 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+ 
+     TRACE("Completed vkCreateGraphicsPipelines.\n");
+ 
++    if (fex_copy_code)
++        vkd3d_fex_shader_copy_code(state, vr >= 0 ? vk_pipeline : VK_NULL_HANDLE, vr);
++
+     if (vr < 0)
+     {
+         ERR("Failed to create Vulkan graphics pipeline, vr %d.\n", vr);
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 7d0678a..a22d494 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3090,6 +3090,47 @@ extern struct vkd3d_fex_report vkd3d_fex_gpu_report;     /* magic 'FEXG' (VKD3D
+ void vkd3d_fex_report_publish(struct vkd3d_fex_report *report, const char *text, size_t len);
+ size_t vkd3d_fex_report_append(char *buf, size_t size, size_t len, const char *fmt, ...);
+ 
++/* FEX shader copy (fex_shader_copy.c, VKD3D fex13): VKD3D_FEX_SHADER_COPY lists pixel shaders by their D3D bytecode
++ * hash (16 hex digits, comma separated, costliest first). Their D3D bytecode, the PSO around them (vertex shader,
++ * targets, root signature) and, for the first VKD3D_FEX_SHADER_COPY_FULL of them, the SPIR-V and the driver's compiled
++ * code go into memory blocks FEX's stats log copies out (export vkd3d_fex_shader_copy). Nothing else changes. */
++#define VKD3D_FEX_SHADER_COPY_MAX 128u
++#define VKD3D_FEX_SHADER_COPY_FULL 4u
++enum vkd3d_fex_shader_copy_kind
++{
++    VKD3D_FEX_COPY_DEVICE = 1,   /* text: device, driver and descriptor model */
++    VKD3D_FEX_COPY_PS_DXBC = 2,  /* binary: the pixel shader's D3D bytecode */
++    VKD3D_FEX_COPY_STAGE_DXBC = 3, /* binary: another stage's D3D bytecode (other = its hash, stage = its stage) */
++    VKD3D_FEX_COPY_PS_SPIRV = 4, /* binary: the SPIR-V vkd3d gave the driver */
++    VKD3D_FEX_COPY_CODE = 5,     /* text: the driver's compiled code of one executable (stage = its stages; the first
++                                  * line names the executable and the representation) */
++    VKD3D_FEX_COPY_STATS = 6,    /* text: the driver's statistics of one executable (stage = its stages) */
++    VKD3D_FEX_COPY_PSO = 7,      /* text: vertex shader, targets, depth, blend, root signature mapping */
++    VKD3D_FEX_COPY_ROOT_SIG = 8, /* binary: the serialized D3D12 root signature (other = its compatibility hash) */
++    VKD3D_FEX_COPY_NOTE = 9,     /* text: why something could not be copied */
++};
++struct vkd3d_fex_shader_blob
++{
++    uint64_t hash;  /* pixel shader the entry belongs to, 0 for device info */
++    uint64_t other; /* see the kinds */
++    uint32_t kind;
++    uint32_t rank;  /* position in VKD3D_FEX_SHADER_COPY, 1 = first; 0 for device info */
++    uint32_t size;
++    uint32_t stage; /* VkShaderStageFlags the entry is about, 0 when not about one stage */
++    uint64_t data;  /* address of size bytes; never freed */
++};
++struct vkd3d_fex_shader_copy
++{
++    uint32_t magic; /* 'FEXS' */
++    uint32_t version;
++    volatile uint32_t count; /* blobs[0 .. count) are complete */
++    volatile uint32_t flags; /* VKD3D_FEX_REPORT_FLAG_ON when VKD3D_FEX_SHADER_COPY named shaders */
++    uint32_t listed;         /* how many hashes VKD3D_FEX_SHADER_COPY named */
++    uint32_t dropped;        /* entries not copied because the table or the byte budget was full */
++    struct vkd3d_fex_shader_blob blobs[VKD3D_FEX_SHADER_COPY_MAX];
++};
++extern struct vkd3d_fex_shader_copy vkd3d_fex_shader_copy; /* magic 'FEXS' (VKD3D fex13) */
++
+ /* FEX timeline (fex_timeline.c, VKD3D_FEX_TIMELINE=1): where each frame's time goes between the game's Present() and
+  * the image going to the window system, and what every queue thread spends its time on. */
+ enum vkd3d_fex_present_step
+@@ -3485,6 +3526,14 @@ void vkd3d_memory_transfer_queue_fex_collect(struct vkd3d_memory_transfer_queue
+ uint32_t vkd3d_fex_pass_meter_present(struct d3d12_device *device);
+ bool vkd3d_fex_fold_clears_enabled(void);
+ bool vkd3d_fex_ds_store_none_enabled(void);
++/* FEX shader copy hooks (fex_shader_copy.c): at the end of a graphics PSO's shader stage setup, after each
++ * DXBC -> SPIR-V compile (or SPIR-V cache load), and around the driver compile of a PSO's static pipeline. */
++/* Reads VKD3D_FEX_SHADER_COPY (once), so the table's flags are set before FEX sees the device. */
++void vkd3d_fex_shader_copy_init(void);
++void vkd3d_fex_shader_copy_pso(struct d3d12_pipeline_state *state, const struct d3d12_pipeline_state_desc *desc);
++void vkd3d_fex_shader_copy_spirv(VkShaderStageFlagBits stage, const struct vkd3d_shader_code *spirv);
++bool vkd3d_fex_shader_copy_claim_code(struct d3d12_pipeline_state *state);
++void vkd3d_fex_shader_copy_code(struct d3d12_pipeline_state *state, VkPipeline pipeline, VkResult vr);
+ void d3d12_command_list_invalidate_all_state(struct d3d12_command_list *list);
+ 
+ void d3d12_command_list_debug_mark_label(struct d3d12_command_list *list, const char *tag,
+diff --git a/libs/vkd3d/vulkan_procs.h b/libs/vkd3d/vulkan_procs.h
+index e042943..ef19234 100644
+--- a/libs/vkd3d/vulkan_procs.h
++++ b/libs/vkd3d/vulkan_procs.h
+@@ -205,6 +205,7 @@ VK_DEVICE_EXT_PFN(vkCmdPushDescriptorSetKHR)
+ /* VK_KHR_pipeline_executable_properties */
+ VK_DEVICE_EXT_PFN(vkGetPipelineExecutablePropertiesKHR)
+ VK_DEVICE_EXT_PFN(vkGetPipelineExecutableStatisticsKHR)
++VK_DEVICE_EXT_PFN(vkGetPipelineExecutableInternalRepresentationsKHR)
+ 
+ /* VK_KHR_ray_tracing_pipeline */
+ VK_DEVICE_EXT_PFN(vkCreateRayTracingPipelinesKHR)
+-- 
+2.43.0
+

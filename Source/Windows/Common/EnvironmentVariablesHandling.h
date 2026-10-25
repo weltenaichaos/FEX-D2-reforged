@@ -56,5 +56,16 @@ namespace FEX::Windows {
 //                            ~5 ms ahead, the cap held those presents). vkd3d now waits, without the VkQueue, until the
 //                            frame done thread saw the copy's fence before it calls vkQueuePresentKHR (at most 200 ms).
 //                            The 'screen handoff' line counts the frames the GPU wasn't done with and the wait.
+//   FEX_VKD3D_SHADER_COPY=<hashes> VKD3D_FEX_SHADER_COPY=<hashes> (the D2R default lists 9 lighting pixel shaders,
+//                            build 67, VKD3D fex13). Changes nothing in the game. Once build 66 fixed the hitches,
+//                            fights were GPU-bound (45-48 ms frames, 23-29 FPS); about 20 ms of such a frame is the main
+//                            pass, where uber pixel shaders of ~7,000 instructions and ~370 texture reads take 12-29 us
+//                            a draw (fex9 'gpu draws' lines). vkd3d copies each listed shader's D3D bytecode, its PSO
+//                            (targets, depth, blend, root signature mapping) and serialized root signature, and for the
+//                            first four also the SPIR-V it gives the driver, the PSO's other stages and the driver's
+//                            compiled code and statistics (the driver compiles those four pipelines once with its
+//                            internal representations kept). The stats log writes the copies out as 'shader copy'
+//                            blocks (see ARM64EC/Vkd3dReport.cpp) so the cost can be taken apart off the device.
+//                            FEX_VKD3D_SHADER_COPY=0 turns it off.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

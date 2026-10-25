@@ -2,7 +2,7 @@
 /*
 $info$
 tags: Bin|ARM64EC
-desc: Copies the GPU pass and present timing reports of FEX's vkd3d-proton build into the stats log
+desc: Copies the GPU pass and present timing reports of FEX's vkd3d-proton build into the stats log, and the shaders its shader copy took
 $end_info$
 */
 
@@ -15,6 +15,7 @@ $end_info$
 #include <FEXCore/fextl/vector.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <ntstatus.h>
@@ -61,6 +62,46 @@ namespace {
     // VKD3D fex11: new memory's zero fills, vkd3d's own transfer submissions, GPU time between render passes.
     {"vkd3d_fex_gpu_report", 0x47584546u /* 'FEXG' */, 0, 0, 0},
   };
+
+  // struct vkd3d_fex_shader_copy in vkd3d-patches/ (VKD3D fex13): a table of copies vkd3d took of chosen shaders, their
+  // PSOs and the driver's compiled code. Entries [0, Count) are complete; their bytes are never freed.
+  struct CopyHeader {
+    uint32_t Magic;
+    uint32_t Version;
+    uint32_t Count;
+    uint32_t Flags;
+    uint32_t Listed;
+    uint32_t Dropped;
+  };
+  struct CopyBlob {
+    uint64_t Hash; // the pixel shader the entry belongs to
+    uint64_t Other;
+    uint32_t Kind;
+    uint32_t Rank;
+    uint32_t Size;
+    uint32_t Stage;
+    uint64_t Data;
+  };
+  static_assert(sizeof(CopyHeader) == 24 && sizeof(CopyBlob) == 40);
+  constexpr uint32_t CopyMagic = 0x53584546u; // 'FEXS'
+  constexpr uint32_t CopyVersion = 1;
+  constexpr uint32_t CopyMax = 128;
+  // Output a second at most, so the copies spread over the first seconds of play instead of one long log write.
+  constexpr size_t CopyBytesPerSecond = 192 * 1024;
+  constexpr size_t CopyBase64Line = 96; // bytes per base64 line (128 characters)
+  constexpr size_t CopyTextLine = 1000; // longer text lines continue on '+' lines
+
+  struct CopyState {
+    uint64_t Address;
+    bool Announced;
+    bool DroppedNoted;
+    uint32_t Next; // first entry not written out yet
+    bool InBlob;   // Next is being written: Data holds its bytes
+    CopyBlob Blob;
+    fextl::vector<uint8_t> Data;
+    size_t Offset;  // bytes of Data written so far
+    uint64_t Check; // FNV-1a of the bytes written so far
+  } Copy;
 
   uint64_t ModuleAddress;
   bool NotFexBuild;
@@ -215,6 +256,138 @@ namespace {
     }
   }
 
+  const char* CopyKindName(uint32_t Kind) {
+    switch (Kind) {
+    case 1: return "device";
+    case 2: return "pixel shader dxbc";
+    case 3: return "stage dxbc";
+    case 4: return "pixel shader spirv";
+    case 5: return "driver code";
+    case 6: return "driver statistics";
+    case 7: return "pso";
+    case 8: return "root signature";
+    case 9: return "note";
+    default: return "unknown";
+    }
+  }
+
+  // Binary kinds go out as base64; text kinds as lines. Driver code is text unless vkd3d marked it binary (Other 1).
+  bool CopyIsText(const CopyBlob& B) {
+    return B.Kind == 1 || B.Kind == 6 || B.Kind == 7 || B.Kind == 9 || (B.Kind == 5 && B.Other != 1);
+  }
+
+  void CopyBase64(fextl::string& Out, uint32_t Index, const uint8_t* Bytes, size_t Size) {
+    static constexpr char Digits[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    Out += fextl::fmt::format("  sc {} ", Index);
+    for (size_t i = 0; i < Size; i += 3) {
+      const uint32_t b0 = Bytes[i];
+      const uint32_t b1 = i + 1 < Size ? Bytes[i + 1] : 0;
+      const uint32_t b2 = i + 2 < Size ? Bytes[i + 2] : 0;
+      const uint32_t v = (b0 << 16) | (b1 << 8) | b2;
+      Out += Digits[(v >> 18) & 63];
+      Out += Digits[(v >> 12) & 63];
+      Out += i + 1 < Size ? Digits[(v >> 6) & 63] : '=';
+      Out += i + 2 < Size ? Digits[v & 63] : '=';
+    }
+    Out += '\n';
+  }
+
+  // Writes the next part of the shader copy table, at most CopyBytesPerSecond of it.
+  void CopyLines(fextl::string& Out) {
+    CopyHeader H {};
+    if (!Copy.Address || !ReadMemory(Copy.Address, &H, sizeof(H)) || H.Magic != CopyMagic || H.Version != CopyVersion) {
+      return;
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (!(H.Flags & FlagOn)) {
+      return;
+    }
+    if (!Copy.Announced) {
+      Copy.Announced = true;
+      Out += fextl::fmt::format("# shader copy: FEX's VKD3D copies {} listed pixel shaders (FEX_VKD3D_SHADER_COPY) when the game "
+                                "creates their PSOs; each copy is a 'shader copy N begin' note, '  sc N' lines (base64 bytes, or "
+                                "'|' text lines with '+' continuations) and a 'shader copy N end' note with the byte count and "
+                                "FNV-1a check\n",
+                                H.Listed);
+    }
+    if (H.Dropped && !Copy.DroppedNoted) {
+      Copy.DroppedNoted = true;
+      Out += fextl::fmt::format("# shader copy: {} copies didn't fit vkd3d's table or byte budget and are missing\n", H.Dropped);
+    }
+
+    const size_t Start = Out.size();
+    const uint32_t Count = std::min(H.Count, CopyMax);
+    while (Out.size() - Start < CopyBytesPerSecond) {
+      if (!Copy.InBlob) {
+        if (Copy.Next >= Count) {
+          return;
+        }
+        if (!ReadMemory(Copy.Address + sizeof(CopyHeader) + Copy.Next * sizeof(CopyBlob), &Copy.Blob, sizeof(CopyBlob))) {
+          return;
+        }
+        if (Copy.Blob.Size > (64u << 20)) {
+          Out += fextl::fmt::format("# shader copy {}: {} bytes is more than a copy can be, skipped\n", Copy.Next, Copy.Blob.Size);
+          ++Copy.Next;
+          continue;
+        }
+        Copy.Data.resize(Copy.Blob.Size);
+        if (Copy.Blob.Size && !ReadMemory(Copy.Blob.Data, Copy.Data.data(), Copy.Blob.Size)) {
+          Out += fextl::fmt::format("# shader copy {}: its {} bytes at {:X} can't be read, skipped\n", Copy.Next, Copy.Blob.Size, Copy.Blob.Data);
+          ++Copy.Next;
+          continue;
+        }
+        const auto& B = Copy.Blob;
+        Out += fextl::fmt::format("# shader copy {} begin: {} of pixel shader {:016x} (rank {}), stage {:#x}, other {:016x}, {} bytes, "
+                                  "{}\n",
+                                  Copy.Next, CopyKindName(B.Kind), B.Hash, B.Rank, B.Stage, B.Other, B.Size, CopyIsText(B) ? "text" : "base64");
+        Copy.InBlob = true;
+        Copy.Offset = 0;
+        Copy.Check = 14695981039346656037ull;
+      }
+
+      const auto& B = Copy.Blob;
+      const uint8_t* Bytes = Copy.Data.data();
+      const size_t Size = Copy.Data.size();
+      while (Copy.Offset < Size && Out.size() - Start < CopyBytesPerSecond) {
+        size_t End;
+        if (CopyIsText(B)) {
+          // One line of text, cut at CopyTextLine.
+          End = Copy.Offset;
+          while (End < Size && Bytes[End] != '\n' && End - Copy.Offset < CopyTextLine) {
+            ++End;
+          }
+          const bool Continued = Copy.Offset > 0 && Bytes[Copy.Offset - 1] != '\n';
+          Out += fextl::fmt::format("  sc {} {}", Copy.Next, Continued ? '+' : '|');
+          // The check covers the text as written: carriage returns and zeros become spaces.
+          for (size_t i = Copy.Offset; i < End; ++i) {
+            const char c = Bytes[i] == '\r' || Bytes[i] == '\0' ? ' ' : static_cast<char>(Bytes[i]);
+            Out += c;
+            Copy.Check = (Copy.Check ^ static_cast<uint8_t>(c)) * 1099511628211ull;
+          }
+          Out += '\n';
+          if (End < Size && Bytes[End] == '\n') {
+            Copy.Check = (Copy.Check ^ '\n') * 1099511628211ull;
+            ++End;
+          }
+        } else {
+          End = std::min(Size, Copy.Offset + CopyBase64Line);
+          CopyBase64(Out, Copy.Next, Bytes + Copy.Offset, End - Copy.Offset);
+          for (size_t i = Copy.Offset; i < End; ++i) {
+            Copy.Check = (Copy.Check ^ Bytes[i]) * 1099511628211ull;
+          }
+        }
+        Copy.Offset = End;
+      }
+      if (Copy.Offset >= Size) {
+        Out += fextl::fmt::format("# shader copy {} end: {} bytes, fnv1a {:016x}\n", Copy.Next, Size, Copy.Check);
+        Copy.InBlob = false;
+        Copy.Data.clear();
+        Copy.Data.shrink_to_fit();
+        ++Copy.Next;
+      }
+    }
+  }
+
   fextl::string Lines() {
     fextl::string Out;
     if (NotFexBuild) {
@@ -232,6 +405,8 @@ namespace {
         S.LastSeq = 0;
         S.Flags = 0;
       }
+      Copy = {};
+      Copy.Address = FindExport(Module, "vkd3d_fex_shader_copy");
       ModuleAddress = Module;
       if (!Sources[Pass].Address && !Sources[Present].Address) {
         NotFexBuild = true;
@@ -248,12 +423,14 @@ namespace {
       const ReadResult R = ReadReport(S);
       if (R == ReadResult::Gone) {
         // Unloaded: look for it again next second.
-        Out += fextl::fmt::format("# vkd3d: d3d12core.dll at {:X} went away\n", ModuleAddress);
+        Out += fextl::fmt::format("# vkd3d: d3d12core.dll at {:X} went away{}\n", ModuleAddress,
+                                  Copy.InBlob ? fextl::fmt::format(" (shader copy {} cut off)", Copy.Next) : "");
         ModuleAddress = 0;
         Announced = false;
         for (auto& Other : Sources) {
           Other.Address = 0;
         }
+        Copy = {};
         return Out;
       }
       if (R == ReadResult::New) {
@@ -271,11 +448,14 @@ namespace {
                                GpuFlags & FlagSkipFreshClears ? "on" : "off";
       // fex11 and older don't know the flag, so off there can also mean an older VKD3D component.
       const char* DrawnState = PresentFlags & FlagPresentDrawn ? "on" : "off (or VKD3D older than fex12)";
+      CopyHeader CopyH {};
+      const bool HasCopy = Copy.Address && ReadMemory(Copy.Address, &CopyH, sizeof(CopyH)) && CopyH.Magic == CopyMagic;
+      const char* CopyState = !HasCopy ? "missing (VKD3D older than fex13)" : CopyH.Flags & FlagOn ? "on" : "off";
       Out.insert(0, fextl::fmt::format("# vkd3d: FEX's VKD3D build is loaded (d3d12core.dll at {:X}): clear folding {}, "
                                        "GPU pass meter {}, present timeline {}, cap pre-sleep {}, zero fills of never-used memory "
-                                       "skipped {}, frames to the screen only once drawn {}, frame start pacing {}\n",
+                                       "skipped {}, frames to the screen only once drawn {}, shader copy {}, frame start pacing {}\n",
                                        ModuleAddress, PassFlags & FlagFoldClears ? "on" : "off", PassFlags & FlagOn ? "on" : "off",
-                                       PresentState, PresentFlags & FlagCapPresleep ? "on" : "off", FreshState, DrawnState,
+                                       PresentState, PresentFlags & FlagCapPresleep ? "on" : "off", FreshState, DrawnState, CopyState,
                                        !(PresentFlags & FlagFrameStart) ? "off" :
                                        PresentFlags & FlagMarginCaused ? "on (gradual, margin only from frames it made late: VKD3D fex4 or "
                                                                          "later)" :
@@ -283,6 +463,7 @@ namespace {
                                                                          "on (build 56 style: an older VKD3D component is selected)"));
       Out += CapLayerNote();
     }
+    CopyLines(Out);
     return Out;
   }
 } // namespace
