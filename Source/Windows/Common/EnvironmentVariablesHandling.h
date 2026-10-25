@@ -67,5 +67,20 @@ namespace FEX::Windows {
 //                            internal representations kept). The stats log writes the copies out as 'shader copy'
 //                            blocks (see ARM64EC/Vkd3dReport.cpp) so the cost can be taken apart off the device.
 //                            FEX_VKD3D_SHADER_COPY=0 turns it off.
+//
+// Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
+// same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader
+// core runs it on one thread, and its results go into the constant file the other waves read, so they wait for it. In
+// D2R's lighting pixel shaders (build 67 copies) that preamble is ~720 instructions with 6-14 memory reads that each
+// wait for the one before, plus ~13 constant uploads, and the driver could not run it ahead ("Early preamble = false":
+// it uses branches and normal registers). The main pass draws ~1,000 small objects in fights, and its time follows
+// the draw count, not the shaded pixels: ~14.6 us more per draw (b67: 238 draws 5.4 ms, 963 draws 15.9 ms at
+// ~0.85M pixels each); a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9 'gpu draws').
+//
+//   FEX_TU_NOPREAMBLE=1  add nopreamble to IR3_SHADER_DEBUG in the Unix environment (the D2R default): the per-draw
+//                        work runs in each wave instead (from constants the short remaining preamble uploads in one
+//                        go), so a draw's pixels no longer wait on the chain of reads. Every shader is compiled anew
+//                        the first time (the flag is part of the driver's cache key).
+//   FEX_TU_NOPREAMBLE=0  leave IR3_SHADER_DEBUG alone
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

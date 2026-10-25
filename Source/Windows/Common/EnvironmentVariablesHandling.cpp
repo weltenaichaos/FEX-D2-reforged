@@ -167,6 +167,65 @@ namespace {
                                     "FEX_VKD3D_SHADER_COPY=0 turns it off)",
                                     Narrow(Text, Len), static_cast<uint32_t>(SetStatus), Hashes));
   }
+  // See EnvironmentVariablesHandling.h: Turnip's shader compiler reads IR3_SHADER_DEBUG from the Unix environment once,
+  // when the game's Vulkan device is created, long after this runs. Wine copied the Unix environment into the process
+  // environment at start, so a value set by the launcher can be read here and is kept.
+  void SetupTurnipNoPreamble(FARPROC SetUnixEnv) {
+    const char* Value = Switch("FEX_TU_NOPREAMBLE");
+    const bool On = Value && !(Value[0] == '0' && !Value[1]);
+    static constexpr wchar_t NameText[] = L"IR3_SHADER_DEBUG";
+    static constexpr wchar_t Flag[] = L"nopreamble";
+    constexpr size_t FlagLen = std::size(Flag) - 1;
+    UNICODE_STRING Name {sizeof(NameText) - sizeof(wchar_t), sizeof(NameText), const_cast<wchar_t*>(NameText)};
+
+    wchar_t Old[256];
+    UNICODE_STRING OldValue {0, static_cast<USHORT>(sizeof(Old) - (FlagLen + 2) * sizeof(wchar_t)), Old};
+    const NTSTATUS QueryStatus = RtlQueryEnvironmentVariable_U(nullptr, &Name, &OldValue);
+    size_t Len = QueryStatus == 0 ? OldValue.Length / sizeof(wchar_t) : 0;
+    const auto Before = Len ? Narrow(Old, Len) : fextl::string("-");
+
+    if (!On) {
+      StatsLogNote(fextl::fmt::format("turnip: IR3_SHADER_DEBUG={} left alone (FEX_TU_NOPREAMBLE off): the driver builds its "
+                                      "per-draw shader preambles",
+                                      Before));
+      return;
+    }
+    if (QueryStatus != 0 && QueryStatus != StatusVariableNotFound) {
+      StatsLogNote(fextl::fmt::format("turnip: IR3_SHADER_DEBUG can't be read (status {:#x}), left alone: the driver builds its "
+                                      "per-draw shader preambles",
+                                      static_cast<uint32_t>(QueryStatus)));
+      return;
+    }
+    if (HasFlag(Old, Len, Flag, FlagLen)) {
+      StatsLogNote(fextl::fmt::format("turnip: IR3_SHADER_DEBUG={} already turns the shader preambles off", Before));
+      return;
+    }
+    if (!SetUnixEnv) {
+      StatsLogNote("turnip: this Wine has no __wine_set_unix_env, IR3_SHADER_DEBUG can't be set: the driver builds its per-draw "
+                   "shader preambles");
+      return;
+    }
+
+    if (Len) {
+      Old[Len++] = L',';
+    }
+    for (size_t i = 0; i < FlagLen; ++i) {
+      Old[Len++] = Flag[i];
+    }
+    Old[Len] = 0;
+    const auto After = Narrow(Old, Len);
+    auto WineSetEnv = reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv);
+    const NTSTATUS SetStatus = WineSetEnv("IR3_SHADER_DEBUG", After.c_str());
+    UNICODE_STRING New {static_cast<USHORT>(Len * sizeof(wchar_t)), static_cast<USHORT>((Len + 1) * sizeof(wchar_t)), Old};
+    RtlSetEnvironmentVariable(nullptr, &Name, &New);
+    StatsLogNote(fextl::fmt::format("turnip: IR3_SHADER_DEBUG={} -> {} (status {:#x}): Turnip's shader compiler builds no long "
+                                    "per-draw preamble, the one-thread setup step that runs before any pixel of a draw is "
+                                    "shaded (6-14 memory reads one after another in the main lighting shaders); that work "
+                                    "moves into the shader and the constant uploads stay in a short preamble. The driver "
+                                    "compiles its shaders anew once (its cache key changes); the 'shader copy' statistics "
+                                    "show the new preamble size. FEX_TU_NOPREAMBLE=0 turns it off",
+                                    Before, After, static_cast<uint32_t>(SetStatus)));
+  }
 } // namespace
 
 void SetupEnvironmentVariableValues(HMODULE NtDll) {
@@ -196,6 +255,7 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
   SetupVkd3dShaderCopy();
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
+  SetupTurnipNoPreamble(Sym);
 
   // On an ARM system we are expecting uncached memory to have marked overhead due to atomic memory usage.
   // If `tu_override_uncached_as_cache_coherent` isn't already controlled by the user, then set it here.

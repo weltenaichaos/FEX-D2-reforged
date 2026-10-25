@@ -101,6 +101,12 @@ namespace {
     // EnvironmentVariablesHandling.h, ARM64EC/Vkd3dReport.cpp).
     {"FEX_VKD3D_SHADER_COPY", "5ff3d3024d2fe860,5b7fecfba4c4c6b0,fb5d9d516da6de30,0e155e00b71ab675,2d370003cb44c8a1,"
                               "2f7464fc8033e6be,1071ee16e09ed9f2,ef0fa3aad756de0d,d04262aee603ba0a"},
+    // Build 68: the main pass's time grows ~14.6 us per draw at about the same shaded pixel count (b67: 238 draws 5.4 ms,
+    // 963 draws 15.9 ms, ~0.85M pixels each), and a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9).
+    // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14
+    // dependent memory reads and ~300 cycles of setup, not hidden (the copies say 'Early preamble = false'). Turnip then
+    // compiles without that preamble (IR3_SHADER_DEBUG=nopreamble, see EnvironmentVariablesHandling.h).
+    {"FEX_TU_NOPREAMBLE", "1"},
   };
 
   // In the order the stats log lists them.
@@ -155,6 +161,7 @@ namespace {
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",
+    "FEX_TU_NOPREAMBLE",
   };
 
   bool UseD2RDefaults {};
