@@ -89,6 +89,11 @@ namespace {
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
     // fill where the block's pages were never used since the driver zeroed them (see EnvironmentVariablesHandling.h).
     {"FEX_VKD3D_SKIP_FRESH_CLEARS", "1"},
+    // Build 66: GameNative's window system shows a presented image without waiting for the GPU, so a frame handed over
+    // before the GPU drew it shows what the image held before (an older frame). In the build 65 log fights handed every
+    // frame over ~41 ms before the GPU finished it. FEX's vkd3d-proton build (fex12) then waits for the GPU before
+    // vkQueuePresentKHR (see EnvironmentVariablesHandling.h).
+    {"FEX_VKD3D_PRESENT_DRAWN", "1"},
   };
 
   // In the order the stats log lists them.
@@ -141,6 +146,7 @@ namespace {
     "FEX_VKD3D_CAP_PRESLEEP",
     "FEX_VKD3D_FRAME_START",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
+    "FEX_VKD3D_PRESENT_DRAWN",
   };
 
   bool UseD2RDefaults {};

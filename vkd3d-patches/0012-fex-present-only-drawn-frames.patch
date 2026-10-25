@@ -1,0 +1,359 @@
+From 26da04c8d52768f8f9b4dfd1b13a9e038b7ec267 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 18:40:19 +0000
+Subject: [PATCH] FEX: hand frames to the window system only once the GPU has
+ drawn them
+
+GameNative's window system takes no fence with a present. Its Vulkan
+wrapper's X11 WSI sends the image to the X server right after
+vkQueuePresentKHR has submitted (only MAILBOX waits for the GPU
+first), and the X server draws the window from that AHardwareBuffer on
+its next frame without waiting either; KGSL has no implicit sync
+between the two processes. An image handed over before the GPU got to
+the frame's copy into it is shown with what it held before: an older
+frame, or part of one. In a D2R log with GPU-bound fights, every frame
+was handed over ~0.5 ms after the game's Present() while the GPU
+finished it ~41-44 ms later; calm scenes, where the frame cap held the
+present, had the GPU ~5 ms ahead.
+
+With VKD3D_FEX_PRESENT_DRAWN=1 the present waits, after the cap
+pre-sleep and without holding the VkQueue, until the frame done thread
+has seen the copy's fence (at most 200 ms), then calls
+vkQueuePresentKHR. Frame start pacing measures against when the
+present would have returned without that wait, so a frame the GPU
+finished late still counts as late.
+
+A new 'screen handoff' line counts the presents, those the GPU was not
+done with when the queue thread was ready to present, and the wait
+(also with the switch off, as frames handed over unfinished). The
+present report flag 0x800 says the switch is on; the '# present:'
+note says whether it applies.
+---
+ libs/vkd3d/fex_timeline.c  | 56 ++++++++++++++++++++++++-
+ libs/vkd3d/swapchain.c     | 85 ++++++++++++++++++++++++++++++++++----
+ libs/vkd3d/vkd3d_private.h |  9 ++++
+ 3 files changed, 141 insertions(+), 9 deletions(-)
+
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index 0b07cc9..fed0b94 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -18,7 +18,7 @@
+ #include <inttypes.h>
+ 
+ #define FEX_TIMELINE_MAX_QUEUES 8u
+-#define FEX_TIMELINE_CONFIG_SIZE 768u
++#define FEX_TIMELINE_CONFIG_SIZE 1024u
+ 
+ /* Read by FEX (found by export name in d3d12core.dll). */
+ struct vkd3d_fex_report vkd3d_fex_present_report = { 0x54584546u /* 'FEXT' */, 1u, 0u, 0u, { 0 } };
+@@ -27,6 +27,7 @@ bool vkd3d_fex_timeline_on;
+ bool vkd3d_fex_frame_start_on;
+ bool vkd3d_fex_present_presleep_on;
+ bool vkd3d_fex_host_frame_done_on;
++bool vkd3d_fex_present_drawn_on;
+ 
+ struct fex_timeline_stat
+ {
+@@ -66,6 +67,9 @@ static struct
+     uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored;
+     bool cap_active;
+     uint64_t cap_step_ns, cap_guard_ns;
++    /* handoff to the window system (VKD3D fex12) */
++    uint32_t handoff_presents, handoff_unfinished, handoff_waited, handoff_gave_up;
++    struct fex_timeline_stat handoff_wait;
+ } fex_timeline;
+ 
+ static UINT64 fex_timeline_last_publish_ns;
+@@ -126,12 +130,14 @@ void vkd3d_fex_timeline_init(void)
+     /* On unless 0: FEX builds up to 61 don't set it. */
+     vkd3d_fex_host_frame_done_on = !(vkd3d_get_env_var("VKD3D_FEX_HOST_FRAME_DONE", env, sizeof(env)) &&
+             !strcmp(env, "0"));
++    vkd3d_fex_present_drawn_on = vkd3d_get_env_var("VKD3D_FEX_PRESENT_DRAWN", env, sizeof(env)) && !strcmp(env, "1");
+     vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_present_report.flags, VKD3D_FEX_REPORT_FLAG_DEVICE |
+             (vkd3d_fex_timeline_on ? VKD3D_FEX_REPORT_FLAG_ON : 0) |
+             (vkd3d_fex_frame_start_on ? VKD3D_FEX_REPORT_FLAG_FRAME_START | VKD3D_FEX_REPORT_FLAG_GRADUAL_START |
+                     VKD3D_FEX_REPORT_FLAG_MARGIN_CAUSED | VKD3D_FEX_REPORT_FLAG_BUSY_GPU_SPARE : 0) |
+             (vkd3d_fex_present_presleep_on ? VKD3D_FEX_REPORT_FLAG_PRESLEEP : 0) |
+-            (vkd3d_fex_host_frame_done_on ? VKD3D_FEX_REPORT_FLAG_HOST_FRAME_DONE : 0), vkd3d_memory_order_release);
++            (vkd3d_fex_host_frame_done_on ? VKD3D_FEX_REPORT_FLAG_HOST_FRAME_DONE : 0) |
++            (vkd3d_fex_present_drawn_on ? VKD3D_FEX_REPORT_FLAG_PRESENT_DRAWN : 0), vkd3d_memory_order_release);
+     vkd3d_atomic_uint64_store_explicit(&fex_timeline_last_publish_ns, vkd3d_get_current_time_ns(),
+             vkd3d_memory_order_relaxed);
+     if (vkd3d_fex_timeline_on)
+@@ -142,6 +148,8 @@ void vkd3d_fex_timeline_init(void)
+         INFO("FEX cap pre-sleep on.\n");
+     if (vkd3d_fex_host_frame_done_on)
+         INFO("FEX frame done signal from the CPU on.\n");
++    if (vkd3d_fex_present_drawn_on)
++        INFO("FEX drawn frames only on.\n");
+ }
+ 
+ uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type)
+@@ -238,6 +246,24 @@ void vkd3d_fex_timeline_cap(bool presleep, bool held_long, bool not_held, bool a
+     spinlock_release(&fex_timeline.lock);
+ }
+ 
++void vkd3d_fex_timeline_handoff(bool unfinished, bool waited, uint64_t wait_ns, bool gave_up)
++{
++    if (!vkd3d_fex_timeline_on)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    fex_timeline.handoff_presents++;
++    if (unfinished)
++        fex_timeline.handoff_unfinished++;
++    if (waited)
++    {
++        fex_timeline.handoff_waited++;
++        fex_timeline_add(&fex_timeline.handoff_wait, wait_ns);
++    }
++    if (gave_up)
++        fex_timeline.handoff_gave_up++;
++    spinlock_release(&fex_timeline.lock);
++}
++
+ void vkd3d_fex_timeline_gpu_frame(uint64_t ns, uint32_t pass_frame)
+ {
+     if (!vkd3d_fex_timeline_on || pass_frame >= ARRAY_SIZE(fex_timeline.gpu_frame))
+@@ -344,6 +370,8 @@ static void fex_timeline_publish(double seconds)
+     struct fex_timeline_stat vkq_wait, vkq_held;
+     uint32_t vkq_held_long;
+     uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored;
++    uint32_t handoff_presents, handoff_unfinished, handoff_waited, handoff_gave_up;
++    struct fex_timeline_stat handoff_wait;
+     uint64_t pacing_delay_ns, pacing_margin_ns, cap_step_ns, cap_guard_ns;
+     int64_t pacing_spare_min_ns, pacing_aim_ns;
+     uint32_t pacing_ceiling, pacing_gpu_bound;
+@@ -407,6 +435,16 @@ static void fex_timeline_publish(double seconds)
+     fex_timeline.cap_held_long = 0;
+     fex_timeline.cap_not_held = 0;
+     fex_timeline.cap_anchored = 0;
++    handoff_presents = fex_timeline.handoff_presents;
++    handoff_unfinished = fex_timeline.handoff_unfinished;
++    handoff_waited = fex_timeline.handoff_waited;
++    handoff_gave_up = fex_timeline.handoff_gave_up;
++    handoff_wait = fex_timeline.handoff_wait;
++    fex_timeline.handoff_presents = 0;
++    fex_timeline.handoff_unfinished = 0;
++    fex_timeline.handoff_waited = 0;
++    fex_timeline.handoff_gave_up = 0;
++    memset(&fex_timeline.handoff_wait, 0, sizeof(fex_timeline.handoff_wait));
+     spinlock_release(&fex_timeline.lock);
+ 
+     if (config[0])
+@@ -452,6 +490,20 @@ static void fex_timeline_publish(double seconds)
+                 "  cap n=%u | pre-slept %u | held 3ms+ in vkQueuePresentKHR %u (grid measured %u) | not held %u | pre-sleep %s,"
+                 " period %.2f ms, guard %.1f ms\n", cap_presents, cap_presleeps, cap_held_long, cap_anchored, cap_not_held,
+                 cap_active ? "on" : "waiting", cap_step_ns / 1e6, cap_guard_ns / 1e6);
++    if (handoff_presents)
++    {
++        len = vkd3d_fex_report_append(text, sizeof(text), len,
++                "  screen handoff n=%u | GPU not done with the frame yet when it was ready to go %u", handoff_presents,
++                handoff_unfinished);
++        if (vkd3d_fex_present_drawn_on)
++            len = vkd3d_fex_report_append(text, sizeof(text), len,
++                    " | waited for the GPU %u (avg %.1f ms, max %.1f ms, %.0f ms/s) | stopped waiting at 200 ms %u\n",
++                    handoff_waited, handoff_wait.count ? handoff_wait.sum_ns / 1e6 / handoff_wait.count : 0.0,
++                    handoff_wait.max_ns / 1e6, handoff_wait.sum_ns / 1e6 / seconds, handoff_gave_up);
++        else
++            len = vkd3d_fex_report_append(text, sizeof(text), len,
++                    " | handed over anyway (drawn frames only is off): the screen may show an older image for those\n");
++    }
+ 
+     for (i = 0; i < FEX_TIMELINE_MAX_QUEUES; i++)
+     {
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 72fba12..cf2b995 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -74,6 +74,7 @@ struct fex_frame_times
+     uint64_t qp_start_ns; /* vkQueuePresentKHR was called */
+     uint64_t qp_end_ns;   /* vkQueuePresentKHR returned */
+     uint64_t blit_value;  /* internal blit timeline value signalled by this frame's copy into the swapchain image */
++    uint64_t handoff_wait_ns; /* drawn frames only: how long the present waited for the GPU before vkQueuePresentKHR */
+     uint32_t pass_frame;  /* VKD3D_FEX_PASS_FRAME_*: whether the FEX pass meter put GPU timers into this frame */
+ };
+ 
+@@ -2133,14 +2134,14 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+ {
+     uint64_t target_interval_ns = chain->frame_rate_limit.target_interval_ns;
+     struct vkd3d_queue_family_info *const *families = chain->queue->device->queue_families;
+-    char text[768];
++    char text[1024];
+ 
+     if (!vkd3d_fex_timeline_on)
+         return;
+ 
+     snprintf(text, sizeof(text), "swapchain %ux%u, %u images (asked %u, game BufferCount %u), mode %s%s%s,"
+             " SyncInterval %u, present wait %s, game latency handle %s (max latency %u), internal latency %u,"
+-            " vkd3d limiter %.1f fps, frame start pacing %s, cap pre-sleep %s, frame done signal %s,"
++            " vkd3d limiter %.1f fps, frame start pacing %s, cap pre-sleep %s, frame done signal %s, drawn frames only %s,"
+             " VkQueues: graphics family %u x%u,"
+             " compute family %u x%u,"
+             " copy family %u x%u",
+@@ -2162,6 +2163,9 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+             vkd3d_fex_present_presleep_on ? "on (grid from every held present, no checks without it: VKD3D fex8)" : "off",
+             chain->fex_done.enable ? "from the CPU after the copy's fence, watched from its submit (VKD3D fex8)" :
+                     vkd3d_fex_host_frame_done_on ? "GPU submit (frame done thread failed)" : "GPU submit",
++            !vkd3d_fex_present_drawn_on ? "off" : chain->fex_done.enable ?
++                    "on (vkQueuePresentKHR only once the GPU finished the frame's copy: VKD3D fex12)" :
++                    "off (needs the frame done thread)",
+             families[VKD3D_QUEUE_FAMILY_GRAPHICS]->vk_family_index, families[VKD3D_QUEUE_FAMILY_GRAPHICS]->queue_count,
+             families[VKD3D_QUEUE_FAMILY_COMPUTE]->vk_family_index, families[VKD3D_QUEUE_FAMILY_COMPUTE]->queue_count,
+             families[VKD3D_QUEUE_FAMILY_TRANSFER]->vk_family_index, families[VKD3D_QUEUE_FAMILY_TRANSFER]->queue_count);
+@@ -2921,6 +2925,64 @@ static void dxgi_vk_swap_chain_fex_watch_blit(struct dxgi_vk_swap_chain *chain,
+     pthread_mutex_unlock(&chain->fex_start.gpu_lock);
+ }
+ 
++/* Drawn frames only (VKD3D fex12): the most a present waits for the GPU to finish its frame before it goes anyway. */
++#define FEX_DRAWN_MAX_WAIT_MS 200u
++
++/* Drawn frames only: waits until the GPU has finished this frame's copy into the swapchain image, without holding the
++ * VkQueue, and returns how long it waited.
++ *
++ * GameNative's window system takes no fence with a present: its Vulkan wrapper's X11 WSI sends the image to the X
++ * server as soon as vkQueuePresentKHR has submitted (only MAILBOX waits for the GPU first), and the X server draws the
++ * window from that AHardwareBuffer on its next frame without waiting either. KGSL has no implicit sync between the two
++ * processes. An image handed over before the GPU got to the frame's copy was shown with what it held before: the
++ * frame from 4 presents earlier, or part of it. In the build 65 log fights handed every frame over ~0.5 ms after the
++ * game's Present() and the GPU finished it ~41-44 ms later; calm scenes, where the cap held the present, had the GPU
++ * ~5 ms ahead. The picture jumping back to an older frame and forward again looks like rubber banding.
++ *
++ * The frame done thread sees the copy's fence signalled (it waits for it from its submit) and wakes this wait.
++ * Queue thread only (tracked_blit_value). */
++static uint64_t dxgi_vk_swap_chain_fex_wait_drawn(struct dxgi_vk_swap_chain *chain, uint64_t blit_value)
++{
++    bool unfinished, waited = false, gave_up = false;
++    uint64_t start_ns = 0, wait_ns = 0;
++#ifdef _WIN32
++    uint64_t now_ns, end_ns;
++#endif
++
++    if (!blit_value || !chain->fex_done.enable || blit_value > chain->fex_done.tracked_blit_value)
++        return 0;
++
++    pthread_mutex_lock(&chain->fex_done.lock);
++    unfinished = chain->fex_done.completed_blit < blit_value;
++    if (unfinished && vkd3d_fex_present_drawn_on)
++    {
++        waited = true;
++        start_ns = vkd3d_get_current_time_ns();
++#ifdef _WIN32
++        end_ns = start_ns + FEX_DRAWN_MAX_WAIT_MS * 1000000ull;
++        while (chain->fex_done.completed_blit < blit_value && !chain->fex_done.stop)
++        {
++            now_ns = vkd3d_get_current_time_ns();
++            if (now_ns >= end_ns)
++            {
++                gave_up = true;
++                break;
++            }
++            SleepConditionVariableSRW(&chain->fex_done.cond.cond, &chain->fex_done.lock.lock,
++                    (DWORD)((end_ns - now_ns + 999999ull) / 1000000ull), 0);
++        }
++#else
++        while (chain->fex_done.completed_blit < blit_value && !chain->fex_done.stop)
++            pthread_cond_wait(&chain->fex_done.cond, &chain->fex_done.lock);
++#endif
++        wait_ns = vkd3d_get_current_time_ns() - start_ns;
++    }
++    pthread_mutex_unlock(&chain->fex_done.lock);
++
++    vkd3d_fex_timeline_handoff(unfinished, waited, wait_ns, gave_up);
++    return wait_ns;
++}
++
+ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chain, uint64_t present_count, unsigned int retry_counter)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+@@ -3075,6 +3137,9 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+ 
+     chain->present.fex.hold_start_ns = vkd3d_get_current_time_ns();
+     fex_presleep_slept = vkd3d_fex_present_presleep_on && dxgi_vk_swap_chain_fex_presleep(chain);
++    /* After the cap pre-sleep, which a frame the GPU still works on spends anyway; the cap's own sleep in
++     * vkQueuePresentKHR aims at a due time, so a wait that ends before it costs nothing. */
++    chain->present.fex.handoff_wait_ns = dxgi_vk_swap_chain_fex_wait_drawn(chain, chain->present.fex.blit_value);
+ 
+     if (vkd3d_fex_timeline_on)
+         fex_t0 = vkd3d_get_current_time_ns();
+@@ -3678,7 +3743,7 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+ {
+     int64_t queue_wait, held, gpu_ahead, spare = 0, natural, lowest, target = 0, aim = 0, delay, step, margin, gpu_busy;
+     int64_t present_room, max_step, low[FEX_START_BUSY_RANK], v;
+-    uint64_t gpu_done_ns = 0, release_ns, now_ns, base_ns, hold_start_ns, gpu_frame_ns = 0;
++    uint64_t gpu_done_ns = 0, release_ns, now_ns, base_ns, hold_start_ns, gpu_frame_ns = 0, qp_end_ns;
+     bool late = false, caused = false, measured = false, held_back, gpu_noted = false, busy = false, unseen = false;
+     bool gpu_bound = false;
+     uint32_t slot, i, k, busy_frames, low_count;
+@@ -3699,16 +3764,22 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+     delay = (int64_t)chain->fex_start.delay_ns;
+     margin = (int64_t)chain->fex_start.margin_ns;
+     hold_start_ns = fex->hold_start_ns ? fex->hold_start_ns : fex->qp_start_ns;
++    /* Drawn frames only (VKD3D fex12): the present waited for the GPU between the cap pre-sleep and vkQueuePresentKHR.
++     * Everything below measures against when the present would have returned without that wait, as before: a frame
++     * the GPU finished late is still late, not a frame a cap held back. */
++    qp_end_ns = fex->qp_end_ns;
++    if (fex->handoff_wait_ns && qp_end_ns >= hold_start_ns + fex->handoff_wait_ns)
++        qp_end_ns -= fex->handoff_wait_ns;
+ 
+-    if (fex->call_ns && fex->pickup_ns && hold_start_ns && fex->qp_end_ns >= hold_start_ns && gpu_done_ns)
++    if (fex->call_ns && fex->pickup_ns && hold_start_ns && qp_end_ns >= hold_start_ns && gpu_done_ns)
+     {
+         measured = true;
+         /* The present waited this long for the queue thread (busy with the frame before), */
+         queue_wait = fex->pickup_ns > fex->call_ns ? (int64_t)(fex->pickup_ns - fex->call_ns) : 0;
+         /* and a frame cap held it this long (sleeping in vkQueuePresentKHR, or before it in the cap pre-sleep), which
+          * a later frame would only have saved as far as the GPU had the frame done before vkQueuePresentKHR returned. */
+-        held = (int64_t)(fex->qp_end_ns - hold_start_ns);
+-        gpu_ahead = (int64_t)fex->qp_end_ns - (int64_t)gpu_done_ns;
++        held = (int64_t)(qp_end_ns - hold_start_ns);
++        gpu_ahead = (int64_t)qp_end_ns - (int64_t)gpu_done_ns;
+         spare = queue_wait + min(held, gpu_ahead);
+         /* Busy GPU (fights): the GPU was still on the frame before when the game called Present(), so this frame's
+          * command lists, all given before Present(), waited for the GPU anyway and would have reached it just as early
+@@ -3725,7 +3796,7 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+              * frame's GPU time. */
+             if (gpu_busy > 0 && gpu_noted && gpu_done_ns > chain->fex_start.prev_gpu_done_ns)
+                 gpu_frame_ns = gpu_done_ns - chain->fex_start.prev_gpu_done_ns;
+-            present_room = queue_wait + held + max((int64_t)gpu_done_ns - (int64_t)fex->qp_end_ns, (int64_t)0);
++            present_room = queue_wait + held + max((int64_t)gpu_done_ns - (int64_t)qp_end_ns, (int64_t)0);
+             gpu_busy = min(gpu_busy, present_room);
+             if (gpu_busy > spare)
+             {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index be4ddb3..7d0678a 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3074,6 +3074,7 @@ struct vkd3d_timestamp_profiler_submitted_work;
+ #define VKD3D_FEX_REPORT_FLAG_PASS_SHAPE 0x100u /* pass report: tiles, vertices, samples and pipelines per pass */
+ #define VKD3D_FEX_REPORT_FLAG_HOST_FRAME_DONE 0x200u /* present report: frame done signalled from the CPU after a fence */
+ #define VKD3D_FEX_REPORT_FLAG_SKIP_FRESH_CLEARS 0x400u /* gpu report: zero fills of never-used chunk pages skipped */
++#define VKD3D_FEX_REPORT_FLAG_PRESENT_DRAWN 0x800u /* present report: frames go to the window system only once drawn */
+ #define VKD3D_FEX_REPORT_FLAG_DEVICE 0x80000000u /* a D3D12 device was created */
+ struct vkd3d_fex_report
+ {
+@@ -3133,6 +3134,10 @@ extern bool vkd3d_fex_present_presleep_on;
+ /* Frame done signal from the CPU (VKD3D_FEX_HOST_FRAME_DONE, on unless 0, swapchain.c): a thread waits for each
+  * present's copy fence and signals the frame done timeline with vkSignalSemaphore instead of an empty queue submit. */
+ extern bool vkd3d_fex_host_frame_done_on;
++/* Drawn frames only (VKD3D_FEX_PRESENT_DRAWN=1, VKD3D fex12, swapchain.c): vkQueuePresentKHR is only called once the
++ * GPU has finished the frame's copy into the swapchain image. GameNative's window system shows an image from the moment
++ * its present arrives, without waiting for the GPU, so an image handed over earlier showed what it held before. */
++extern bool vkd3d_fex_present_drawn_on;
+ void vkd3d_fex_timeline_init(void);
+ uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type);
+ void vkd3d_fex_timeline_queue_free_slot(uint32_t slot);
+@@ -3152,6 +3157,10 @@ void vkd3d_fex_timeline_cap(bool presleep, bool held_long, bool not_held, bool a
+         uint64_t guard_ns);
+ uint64_t vkd3d_fex_timeline_last_release(void);
+ void vkd3d_fex_timeline_config(const char *text);
++/* One present's handoff to the window system (VKD3D fex12): whether the GPU had the frame's copy done when the queue
++ * thread was ready to call vkQueuePresentKHR, and how long it then waited for it (gave_up: stopped waiting at the
++ * ceiling). */
++void vkd3d_fex_timeline_handoff(bool unfinished, bool waited, uint64_t wait_ns, bool gave_up);
+ void vkd3d_fex_timeline_tick(uint64_t now_ns);
+ 
+ /* FEX pass meter (fex_pass_meter.c): GPU time per render pass and command list, reported to FEX's stats log. */
+-- 
+2.43.0
+

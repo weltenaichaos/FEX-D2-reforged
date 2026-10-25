@@ -144,6 +144,10 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
   SetupVkd3dFexSwitch("FEX_VKD3D_SKIP_FRESH_CLEARS", L"VKD3D_FEX_SKIP_FRESH_CLEARS",
                       "new GPU memory that vkd3d places in block pages never used since the driver zeroed them skips its "
                       "zero fill (VKD3D fex11 and later; 'gpu memory' line)");
+  SetupVkd3dFexSwitch("FEX_VKD3D_PRESENT_DRAWN", L"VKD3D_FEX_PRESENT_DRAWN",
+                      "each frame goes to the window system only once the GPU has drawn it, because GameNative's X server "
+                      "shows an image as soon as it gets it and one handed over earlier showed an older frame (VKD3D fex12 "
+                      "and later; 'screen handoff' line)");
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
 

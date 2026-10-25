@@ -46,5 +46,15 @@ namespace FEX::Windows {
 //                            fills on Turnip, and all of the game's queues wait for it). Block pages nothing was placed in
 //                            since the driver zeroed the block are skipped. Suspected cause of the ~1 s of 50-55 ms frames
 //                            after each area load (build 63 log); the 'gpu memory' and 'gpu transfers' lines count it.
+//   FEX_VKD3D_PRESENT_DRAWN=1 VKD3D_FEX_PRESENT_DRAWN=1 (the D2R default, build 66, VKD3D fex12). GameNative's Vulkan
+//                            wrapper sends a presented image to its X server right after vkQueuePresentKHR submits (its
+//                            X11 WSI only waits for the GPU in MAILBOX mode), and the X server draws the window from that
+//                            AHardwareBuffer without a fence; KGSL has no implicit sync between the two processes. An image
+//                            handed over before the GPU got to the frame's copy into it shows what it held before: the
+//                            frame from 4 presents earlier, or part of it. In the build 65 log fights handed every frame
+//                            over ~0.5 ms after Present() while the GPU finished it ~41-44 ms later (calm scenes had it
+//                            ~5 ms ahead, the cap held those presents). vkd3d now waits, without the VkQueue, until the
+//                            frame done thread saw the copy's fence before it calls vkQueuePresentKHR (at most 200 ms).
+//                            The 'screen handoff' line counts the frames the GPU wasn't done with and the wait.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

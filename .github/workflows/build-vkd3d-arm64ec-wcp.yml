@@ -22,8 +22,8 @@ on:
 env:
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
   VKD3D_TAG: v3.0b
-  WCP_VERSION: 3.0b-arm64ec-fex11
-  WCP_VERSION_CODE: 12
+  WCP_VERSION: 3.0b-arm64ec-fex12
+  WCP_VERSION_CODE: 13
 
 jobs:
   build:
@@ -182,6 +182,10 @@ jobs:
             zero fills, times vkd3d's own transfer submissions and the GPU time between render
             passes by what the game recorded there. Pass timer results are reset once read, so a
             reused timer can't show an earlier frame's values.
+            From fex12 on, a frame goes to the window system only once the GPU has drawn it (on with
+            VKD3D_FEX_PRESENT_DRAWN=1): GameNative's X server shows an image as soon as the present
+            reaches it, without waiting for the GPU, so a frame handed over earlier showed an older
+            frame. A 'screen handoff' line counts the frames the GPU wasn't done with and the wait.
             Install in GameNative as a VKD3D
             content profile; it appears as `${{ env.WCP_VERSION }}`.
         env:
