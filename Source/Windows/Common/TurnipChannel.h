@@ -32,6 +32,7 @@ constexpr uint32_t StatusRingFailed = 0x20;
 constexpr uint32_t StatusNotA7xx = 0x40;
 
 // KGSL_PERFCOUNTER_GROUP_*
+constexpr uint32_t GroupCp = 0x0;
 constexpr uint32_t GroupHlsq = 0x4;
 constexpr uint32_t GroupTp = 0x9;
 constexpr uint32_t GroupSp = 0xA;

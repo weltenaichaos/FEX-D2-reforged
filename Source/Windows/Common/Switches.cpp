@@ -117,7 +117,7 @@ namespace {
     // compares both ways ('turnip' lines, ARM64EC/TurnipReport.cpp). The driver also has the GPU count shader-core,
     // texture and cache events around the big passes.
     {"FEX_TU_CHANNEL", "1"},
-    {"FEX_TU_DESC", "alt"},
+    {"FEX_TU_DESC", "0"},
     {"FEX_TU_COUNTERS", "1"},
     {"FEX_TU_SAMPLE_DRAWS", "100"},
   };

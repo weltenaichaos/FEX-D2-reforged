@@ -16,6 +16,7 @@ $end_info$
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <ntstatus.h>
 #include <windef.h>
 #include <winternl.h>
@@ -32,8 +33,32 @@ namespace {
     const char* Name;
   };
   constexpr CounterName Names[] = {
+    // build 70 list
+    {T::GroupCp, 0, "cycles"},
+    {T::GroupCp, 11, "ctx_done"},
+    {T::GroupCp, 15, "cp_idle"},
+    {T::GroupCp, 22, "cp_pipe_stall"},
+    {T::GroupHlsq, 2, "hlsq_sp_state_stall"},
+    {T::GroupHlsq, 11, "hlsq_fs_data_wait"},
+    {T::GroupHlsq, 12, "hlsq_dual_fs"},
+    {T::GroupHlsq, 22, "hlsq_fs_stall"},
     {T::GroupSp, 0, "sp_busy"},
     {T::GroupSp, 8, "waves"},
+    {T::GroupSp, 7, "sp_no_exec"},
+    {T::GroupSp, 69, "sp_starve_hlsq"},
+    {T::GroupSp, 10, "wave_life_cyc"},
+    {T::GroupSp, 11, "wave_life_n"},
+    {T::GroupSp, 97, "fs_waves_1x"},
+    {T::GroupSp, 98, "fs_waves_2x"},
+    {T::GroupSp, 101, "pixels"},
+    {T::GroupSp, 89, "wave_alu"},
+    {T::GroupSp, 20, "wave_wait"},
+    {T::GroupSp, 22, "wave_idle"},
+    {T::GroupSp, 24, "wave_long_sync"},
+    {T::GroupSp, 25, "wave_short_sync"},
+    {T::GroupSp, 119, "tex_lat_cyc"},
+    {T::GroupSp, 120, "tex_lat_n"},
+    // build 69 list
     {T::GroupSp, 9, "wave_cyc"},
     {T::GroupSp, 14, "fs_cyc"},
     {T::GroupSp, 4, "sp_stall_tp"},
@@ -61,13 +86,24 @@ namespace {
   // Slots the driver allocates are 48 bytes + 16 per counter, rounded up to 64.
   constexpr size_t MaxSlotSize = 1024;
 
-  struct ModeTotals {
+  // One kind of render pass: same size, attachments, first format, direct or tiled, and descriptor mode.
+  struct PassKind {
+    uint16_t Width, Height;
+    uint8_t Colors, Attachments, Sysmem, Mode;
+    uint32_t Format0;
     uint64_t Passes;
     uint64_t Draws;
     uint64_t Ticks;
-    uint64_t Pixels;
     uint64_t Values[T::MaxCounters];
+
+    bool Same(const T::Slot& S, uint8_t SlotMode) const {
+      return Width == S.Width && Height == S.Height && Colors == S.Colors && Attachments == S.Attachments &&
+             Sysmem == S.Sysmem && Mode == SlotMode && Format0 == S.Format0;
+    }
   };
+  constexpr size_t MaxKinds = 16;
+  // Kinds printed per second, the ones with the most GPU time.
+  constexpr size_t PrintKinds = 4;
 
   T::Channel* Chan {};
   bool NotedDriver {};
@@ -110,6 +146,119 @@ namespace {
     }
   }
 
+  int FindCounter(uint32_t Count, uint32_t Group, uint32_t Countable) {
+    for (uint32_t i = 0; i < Count; ++i) {
+      const auto& C = Chan->Counters[i];
+      if (C.Reg && C.Group == Group && C.Countable == Countable) {
+        return static_cast<int>(i);
+      }
+    }
+    return -1;
+  }
+
+  // One pass kind's line: time per draw, then what the counters say about the shader cores and what feeds them, then
+  // every counter per draw.
+  fextl::string KindLine(const PassKind& K, uint32_t Count, bool DescSeen) {
+    const double Ms = K.Ticks / 19200.0;
+    const double Draws = K.Draws ? static_cast<double>(K.Draws) : 1.0;
+    const auto Has = [&](uint32_t Group, uint32_t Countable) {
+      return FindCounter(Count, Group, Countable) >= 0;
+    };
+    const auto V = [&](uint32_t Group, uint32_t Countable) {
+      const int i = FindCounter(Count, Group, Countable);
+      return i < 0 ? 0.0 : static_cast<double>(K.Values[i]);
+    };
+    const auto Ratio = [](double A, double B) {
+      return B > 0 ? A / B : 0.0;
+    };
+    fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
+                                            K.Width, K.Height, K.Colors, K.Attachments, K.Format0, K.Sysmem ? "direct" : "tiled",
+                                            DescSeen ? (K.Mode ? " desc on" : " desc off") : "", K.Passes, K.Draws, Ms,
+                                            Ms * 1000.0 / Draws);
+    const double Cycles = V(T::GroupCp, 0);
+    if (Cycles > 0 && K.Ticks) {
+      Line += fextl::fmt::format(" at {:.0f} MHz", Cycles / (K.Ticks / 19.2));
+    }
+    if (!Count) {
+      return Line + '\n';
+    }
+
+    // Shader cores: how many are busy on average, how many waves each holds while busy, how many hold waves but run
+    // none, how many wait for the front end to hand them work.
+    const double Busy = V(T::GroupSp, 0);
+    if (Cycles > 0 && Has(T::GroupSp, 0)) {
+      Line += fextl::fmt::format(" | cores busy {:.2f}", Busy / Cycles);
+      if (Has(T::GroupSp, 8)) {
+        Line += fextl::fmt::format(", waves per busy core {:.2f}", Ratio(V(T::GroupSp, 8), Busy));
+      }
+      if (Has(T::GroupSp, 7)) {
+        Line += fextl::fmt::format(", cores stalled {:.2f}", V(T::GroupSp, 7) / Cycles);
+      }
+      if (Has(T::GroupSp, 69)) {
+        Line += fextl::fmt::format(", cores starved by hlsq {:.2f}", V(T::GroupSp, 69) / Cycles);
+      }
+    }
+    // Waves: how many per draw, how many pixels, how long one lives, where its cycles go.
+    if (Has(T::GroupSp, 97) || Has(T::GroupSp, 98)) {
+      const double W1 = V(T::GroupSp, 97), W2 = V(T::GroupSp, 98);
+      Line += fextl::fmt::format(" | fs waves/draw {:.1f} (2x {:.0f}%)", (W1 + W2) / Draws, 100.0 * Ratio(W2, W1 + W2));
+    }
+    if (Has(T::GroupSp, 101)) {
+      Line += fextl::fmt::format(", px/draw {:.0f}", V(T::GroupSp, 101) / Draws);
+    }
+    if (Has(T::GroupSp, 10) && Has(T::GroupSp, 11)) {
+      Line += fextl::fmt::format(", wave life {:.0f} cyc", Ratio(V(T::GroupSp, 10), V(T::GroupSp, 11)));
+    }
+    const double Waves = V(T::GroupSp, 8);
+    if (Waves > 0) {
+      static constexpr struct {
+        uint32_t Countable;
+        const char* Name;
+      } Split[] = {{89, "alu"}, {20, "wait"}, {22, "idle"}, {24, "long-sync"}, {25, "short-sync"}};
+      fextl::string Parts;
+      for (const auto& P : Split) {
+        if (Has(T::GroupSp, P.Countable)) {
+          Parts += fextl::fmt::format(" {} {:.0f}%", P.Name, 100.0 * V(T::GroupSp, P.Countable) / Waves);
+        }
+      }
+      if (!Parts.empty()) {
+        Line += " | wave cycles" + Parts;
+      }
+    }
+    if (Has(T::GroupSp, 119) && Has(T::GroupSp, 120)) {
+      Line += fextl::fmt::format(" | tex latency {:.0f} cyc", Ratio(V(T::GroupSp, 119), V(T::GroupSp, 120)));
+    }
+    // Front end and command processor, per GPU cycle (1.00 = the whole pass).
+    if (Cycles > 0) {
+      static constexpr struct {
+        uint32_t Group, Countable;
+        const char* Name;
+      } PerCycle[] = {{T::GroupHlsq, 12, "dual fs"},          {T::GroupHlsq, 2, "sp state stall"}, {T::GroupHlsq, 22, "fs stall"},
+                      {T::GroupHlsq, 11, "fs data wait"},     {T::GroupCp, 15, "cp idle"},         {T::GroupCp, 22, "cp pipe stall"}};
+      fextl::string Parts;
+      for (const auto& P : PerCycle) {
+        if (Has(P.Group, P.Countable)) {
+          Parts += fextl::fmt::format("{}{} {:.2f}", Parts.empty() ? "" : ", ", P.Name, V(P.Group, P.Countable) / Cycles);
+        }
+      }
+      if (!Parts.empty()) {
+        Line += " | per cycle: " + Parts;
+      }
+    }
+    if (Has(T::GroupCp, 11)) {
+      Line += fextl::fmt::format(" | contexts/draw {:.2f}", V(T::GroupCp, 11) / Draws);
+    }
+
+    Line += "; per draw:";
+    for (uint32_t i = 0; i < Count; ++i) {
+      const auto& C = Chan->Counters[i];
+      if (C.Reg) {
+        Line += fextl::fmt::format(" {} {:.1f}", CounterLabel(C.Group, C.Countable), static_cast<double>(K.Values[i]) / Draws);
+      }
+    }
+    return Line + '\n';
+  }
+
   fextl::string Lines() {
     const uint32_t Status = __atomic_load_n(&Chan->Status, __ATOMIC_ACQUIRE);
     // Pick the mode for the next second first, so the flip happens at a steady pace.
@@ -146,11 +295,17 @@ namespace {
       return Emits[i] ? fextl::fmt::format("{:.2f}", static_cast<double>(Flushed[i]) / Emits[i]) : fextl::string("-");
     };
     const uint64_t PushAll = Push[0] + Push[1];
-    Out += fextl::fmt::format("  turnip: desc {} this second | cmdbufs off {} on {} | updates off {} on {} | sets per update off {} on {} "
-                              "(stock 8) | push {} reused {:.0f}% | passes sampled {} small {}\n",
-                              (ModeThisSecond & T::ModeChangedOnly) ? "on" : "off", CmdBufs[0], CmdBufs[1], Emits[0], Emits[1],
-                              PerUpdate(0), PerUpdate(1), PushAll, PushAll ? 100.0 * (Reused[0] + Reused[1]) / PushAll : 0.0,
-                              Misc[0], Misc[1]);
+    const bool DescSeen = FEX::Windows::Turnip::DescSwitch() != 0 || CmdBufs[1] != 0;
+    if (DescSeen) {
+      Out += fextl::fmt::format("  turnip: desc {} this second | cmdbufs off {} on {} | updates off {} on {} | sets per update off {} on {} "
+                                "(stock 8) | push {} reused {:.0f}% | passes sampled {} small {}\n",
+                                (ModeThisSecond & T::ModeChangedOnly) ? "on" : "off", CmdBufs[0], CmdBufs[1], Emits[0], Emits[1],
+                                PerUpdate(0), PerUpdate(1), PushAll, PushAll ? 100.0 * (Reused[0] + Reused[1]) / PushAll : 0.0,
+                                Misc[0], Misc[1]);
+    } else {
+      Out += fextl::fmt::format("  turnip: cmdbufs {} | descriptor updates {} | push {} | passes sampled {} small {}\n", CmdBufs[0],
+                                Emits[0], PushAll, Misc[0], Misc[1]);
+    }
 
     const uint64_t RingCpu = __atomic_load_n(&Chan->RingCpu, __ATOMIC_ACQUIRE);
     const uint32_t RingCount = Chan->RingCount;
@@ -163,7 +318,9 @@ namespace {
 
     // Passes the GPU finished since last time. A slot not done yet stops the walk if it is recent (its command buffer
     // may still be queued), older ones are skipped (never submitted, or overwritten).
-    ModeTotals Totals[2] {};
+    PassKind Kinds[MaxKinds];
+    size_t KindCount = 0;
+    PassKind Other {};
     const uint64_t End = __atomic_load_n(&Chan->RingNext, __ATOMIC_ACQUIRE);
     if (End > NextSeq + RingCount) {
       NextSeq = End - RingCount;
@@ -186,47 +343,58 @@ namespace {
         continue;
       }
       ++NextSeq;
-      auto& M = Totals[(S.Mode & T::ModeChangedOnly) ? 1 : 0];
-      M.Passes++;
-      M.Draws += S.Draws;
-      M.Ticks += S.TsEnd - S.TsBegin;
-      M.Pixels += static_cast<uint64_t>(S.Width) * S.Height;
+      const uint8_t SlotMode = S.Mode & T::ModeChangedOnly;
+      PassKind* K = nullptr;
+      for (size_t i = 0; i < KindCount; ++i) {
+        if (Kinds[i].Same(S, SlotMode)) {
+          K = &Kinds[i];
+          break;
+        }
+      }
+      if (!K) {
+        K = KindCount < MaxKinds ? &Kinds[KindCount++] : &Other;
+        if (K != &Other) {
+          *K = {};
+          K->Width = S.Width;
+          K->Height = S.Height;
+          K->Colors = S.Colors;
+          K->Attachments = S.Attachments;
+          K->Sysmem = S.Sysmem;
+          K->Mode = SlotMode;
+          K->Format0 = S.Format0;
+        }
+      }
+      K->Passes++;
+      K->Draws += S.Draws;
+      K->Ticks += S.TsEnd - S.TsBegin;
       const uint64_t* Values = reinterpret_cast<const uint64_t*>(Buffer + sizeof(T::Slot));
       for (uint32_t i = 0; i < Count; ++i) {
         if (Chan->Counters[i].Reg) {
-          M.Values[i] += Values[Count + i] - Values[i];
+          K->Values[i] += Values[Count + i] - Values[i];
         }
       }
     }
 
-    for (int m = 0; m < 2; ++m) {
-      const auto& M = Totals[m];
-      if (!M.Passes || !M.Draws) {
-        continue;
+    // Biggest kinds first.
+    PassKind* Order[MaxKinds];
+    for (size_t i = 0; i < KindCount; ++i) {
+      Order[i] = &Kinds[i];
+    }
+    for (size_t i = 1; i < KindCount; ++i) {
+      for (size_t j = i; j > 0 && Order[j]->Ticks > Order[j - 1]->Ticks; --j) {
+        std::swap(Order[j], Order[j - 1]);
       }
-      const double Ms = M.Ticks / 19200.0;
-      fextl::string Line = fextl::fmt::format("  turnip pass {}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw); per draw:", m ? "on" : "off",
-                                              M.Passes, M.Draws, Ms, Ms * 1000.0 / M.Draws);
-      uint64_t IclReq = 0, IclMiss = 0, TpCyc = 0, TpTrans = 0;
-      for (uint32_t i = 0; i < Count; ++i) {
-        const auto& C = Chan->Counters[i];
-        if (!C.Reg) {
-          continue;
-        }
-        Line += fextl::fmt::format(" {} {:.1f}", CounterLabel(C.Group, C.Countable), static_cast<double>(M.Values[i]) / M.Draws);
-        if (C.Group == T::GroupSp && C.Countable == 51) IclReq = M.Values[i];
-        if (C.Group == T::GroupSp && C.Countable == 52) IclMiss = M.Values[i];
-        if (C.Group == T::GroupTp && C.Countable == 2) TpCyc = M.Values[i];
-        if (C.Group == T::GroupTp && C.Countable == 3) TpTrans = M.Values[i];
-      }
-      if (IclReq) {
-        Line += fextl::fmt::format(" | icl1 miss {:.2f}%", 100.0 * IclMiss / IclReq);
-      }
-      if (TpTrans) {
-        Line += fextl::fmt::format(" | tp latency {:.0f} cyc", static_cast<double>(TpCyc) / TpTrans);
-      }
-      Out += Line;
-      Out += '\n';
+    }
+    for (size_t i = PrintKinds; i < KindCount; ++i) {
+      Other.Passes += Order[i]->Passes;
+      Other.Draws += Order[i]->Draws;
+      Other.Ticks += Order[i]->Ticks;
+    }
+    for (size_t i = 0; i < KindCount && i < PrintKinds; ++i) {
+      Out += KindLine(*Order[i], Count, DescSeen);
+    }
+    if (Other.Passes) {
+      Out += fextl::fmt::format("  turnip pass other: {} passes, {} draws, gpu {:.1f} ms\n", Other.Passes, Other.Draws, Other.Ticks / 19200.0);
     }
     return Out;
   }

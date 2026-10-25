@@ -266,26 +266,41 @@ namespace {
     Chan->Mode = TurnipDesc ? (Turnip::ModeChangedOnly | Turnip::ModePushReuse) : 0;
 
     // FEX_TU_COUNTERS: 1 (default) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at least this many
-    // draws get timed and counted (default 100: the main pass and the depth prepass in towns and fights).
+    // draws get timed and counted (default 100: the main pass and the depth prepass in towns and fights). Build 70's
+    // list asks why the big lighting pass costs ~12 us per draw (b69): too few waves per draw and too few draws at once
+    // in the shader cores, or something ahead of them (command processor, shader state slots) holding draws back.
     if (!SwitchOff(Switch("FEX_TU_COUNTERS"))) {
       static constexpr struct {
         uint32_t Group, Countable;
       } List[] = {
+        // Clock and command processor: GPU cycles, how many state contexts the draws used, and whether the command
+        // processor waits on the GPU (pipe out stall) or the GPU on it (idle).
+        {Turnip::GroupCp, 0},  // CP_ALWAYS_COUNT (GPU cycles, shared with KGSL)
+        {Turnip::GroupCp, 11}, // CP_CONTEXT_DONE
+        {Turnip::GroupCp, 15}, // CP_SQE_IDLE
+        {Turnip::GroupCp, 22}, // CP_SQE_PIPE_OUT_STALL
+        // Shader front end: two pixel shader states active at once (draw overlap), waits for shader state room.
+        {Turnip::GroupHlsq, 2},  // HLSQ_STALL_CYCLES_SP_STATE
+        {Turnip::GroupHlsq, 11}, // HLSQ_FS_DATA_WAIT_PROGRAMMING
+        {Turnip::GroupHlsq, 12}, // HLSQ_DUAL_FS_PROG_ACTIVE
+        {Turnip::GroupHlsq, 22}, // HLSQ_FS_STALL_CYCLES
+        // Shader cores: occupancy, starvation, wave life, and what waves spend their cycles on.
         {Turnip::GroupSp, 0},   // SP_BUSY_CYCLES
         {Turnip::GroupSp, 8},   // SP_WAVE_CONTEXTS
-        {Turnip::GroupSp, 9},   // SP_WAVE_CONTEXT_CYCLES
-        {Turnip::GroupSp, 14},  // SP_FS_STAGE_DURATION_CYCLES
-        {Turnip::GroupSp, 4},   // SP_STALL_CYCLES_TP
-        {Turnip::GroupSp, 21},  // SP_WAVE_FETCH_CYCLES
-        {Turnip::GroupSp, 51},  // SP_ICL1_REQUESTS
-        {Turnip::GroupSp, 52},  // SP_ICL1_MISSES
-        {Turnip::GroupSp, 85},  // SP_ICL1_MISS_FETCH_CYCLES
-        {Turnip::GroupSp, 142}, // SP_STCHE_MISS_INC_FS
-        {Turnip::GroupSp, 44},  // SP_FS_INSTRUCTIONS
-        {Turnip::GroupTp, 7},   // TP_L1_CACHELINE_MISSES
-        {Turnip::GroupTp, 2},   // TP_LATENCY_CYCLES
-        {Turnip::GroupTp, 3},   // TP_LATENCY_TRANS
-        {Turnip::GroupHlsq, 55}, // HLSQ_SPTROC_STCHE_MISS_INC_FS
+        {Turnip::GroupSp, 7},   // SP_NON_EXECUTION_CYCLES
+        {Turnip::GroupSp, 69},  // SP_STARVE_CYCLES_HLSQ
+        {Turnip::GroupSp, 10},  // SP_STAGE_WAVE_CYCLES
+        {Turnip::GroupSp, 11},  // SP_STAGE_WAVE_SAMPLES
+        {Turnip::GroupSp, 97},  // SP_FS_STAGE_1X_WAVES
+        {Turnip::GroupSp, 98},  // SP_FS_STAGE_2X_WAVES
+        {Turnip::GroupSp, 101}, // SP_PIXELS
+        {Turnip::GroupSp, 89},  // SP_WAVE_ALU_CYCLES
+        {Turnip::GroupSp, 20},  // SP_WAVE_WAIT_CYCLES
+        {Turnip::GroupSp, 22},  // SP_WAVE_IDLE_CYCLES
+        {Turnip::GroupSp, 24},  // SP_WAVE_LONG_SYNC_CYCLES
+        {Turnip::GroupSp, 25},  // SP_WAVE_SHORT_SYNC_CYCLES
+        {Turnip::GroupSp, 119}, // SP_TEXTURE_FETCH_LATENCY_CYCLES
+        {Turnip::GroupSp, 120}, // SP_TEXTURE_FETCH_LATENCY_SAMPLES
       };
       static_assert(std::size(List) <= Turnip::MaxCounters);
       for (const auto& C : List) {

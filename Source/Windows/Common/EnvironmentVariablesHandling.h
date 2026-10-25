@@ -90,11 +90,14 @@ namespace FEX::Windows {
 // (~1,000 draws, ~14 us each in b67/b68) starts with cold descriptor caches for the texture heap too. FEX allocates a
 // link block and names it to the driver with TU_FEX_CHANNEL=<hex address> (Unix environment, __wine_set_unix_env):
 //   FEX_TU_CHANNEL=1       set up the link (the D2R default); 0 = none, the driver behaves like stock Turnip
-//   FEX_TU_DESC=alt        in direct (sysmem) passes invalidate only the sets whose address changed since the pass
-//                          began, and an identical push keeps its old copy; on in every other second, so one run
-//                          compares both ways (the D2R default; without the stats log it stays on). 1 = always, 0 = never
-//   FEX_TU_COUNTERS=1      reserve 15 GPU counters (shader core busy/waves/instruction cache/descriptor cache misses,
-//                          texture latency) through KGSL and record them around big passes (the D2R default); 0 = none
+//   FEX_TU_DESC=0          stock descriptor handling (the D2R default since build 70: build 69 measured no gain).
+//                          1 = in direct (sysmem) passes invalidate only the sets whose address changed since the
+//                          pass began, and an identical push keeps its old copy; alt = on in every other second, so
+//                          one run compares both ways (needs the stats log, without it alt stays on)
+//   FEX_TU_COUNTERS=1      reserve 24 GPU counters through KGSL and record them around big passes (the D2R default;
+//                          build 70: GPU cycles, state contexts, command processor idle/stall, shader front end
+//                          stalls and draw overlap, shader core occupancy/starvation, wave life, wave cycle split,
+//                          texture latency); 0 = none
 //   FEX_TU_SAMPLE_DRAWS=N  passes with at least N draws are timed and counted (default 100)
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report both.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
