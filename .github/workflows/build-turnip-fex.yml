@@ -12,7 +12,7 @@ name: Build Turnip (FEX)
 
 on:
   push:
-    branches: [ d2r/clean ]
+    branches: [ d2r/clean, 'claude/**' ]
     paths: [ .github/workflows/build-turnip-fex.yml, turnip-patches/** ]
   workflow_dispatch:
 
