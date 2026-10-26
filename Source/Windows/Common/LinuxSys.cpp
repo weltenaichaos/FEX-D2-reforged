@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 namespace FEX::Windows::Linux {
@@ -31,6 +32,7 @@ namespace {
   constexpr int64_t O_CLOEXEC = 0x80000;
   constexpr int64_t PRIO_PROCESS = 0;
   constexpr int64_t POSIX_FADV_DONTNEED = 4;
+  constexpr int64_t POSIX_FADV_WILLNEED = 3;
 
   struct Dirent64 {
     uint64_t Ino;
@@ -135,15 +137,20 @@ int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size) {
   return static_cast<int>(Syscall(NR_fadvise64, Fd, static_cast<int64_t>(Offset), static_cast<int64_t>(Size), POSIX_FADV_DONTNEED));
 }
 
+int ReadAhead(int Fd, uint64_t Offset, uint64_t Size) {
+  return static_cast<int>(Syscall(NR_fadvise64, Fd, static_cast<int64_t>(Offset), static_cast<int64_t>(Size), POSIX_FADV_WILLNEED));
+}
+
 bool Stat(const char* Path, FileInfo& Out) {
-  // struct stat of arm64 Linux (asm-generic): st_ino at byte 8, st_mode at 16, st_uid at 24, st_size at 48, 128 bytes in
-  // all.
+  // struct stat of arm64 Linux (asm-generic): st_dev first, st_ino at byte 8, st_mode at 16, st_uid at 24, st_size at
+  // 48, 128 bytes in all.
   alignas(8) uint8_t Buffer[128];
   if (Syscall(NR_newfstatat, AT_FDCWD, reinterpret_cast<intptr_t>(Path), reinterpret_cast<intptr_t>(Buffer), 0) != 0) {
     return false;
   }
   uint32_t Mode {};
   int64_t Size {};
+  memcpy(&Out.Dev, Buffer, sizeof(Out.Dev));
   memcpy(&Out.Inode, Buffer + 8, sizeof(Out.Inode));
   memcpy(&Mode, Buffer + 16, sizeof(Mode));
   memcpy(&Out.Uid, Buffer + 24, sizeof(Out.Uid));
@@ -358,6 +365,21 @@ bool PreadSchedStat(int Fd, SchedStat& Out) {
   Buffer[Len] = 0;
   const char* P = Buffer;
   return ParseU64(P, Out.RunNs) && ParseU64(P, Out.WaitNs) && ParseU64(P, Out.Slices);
+}
+
+bool ReadContextSwitches(const char* StatusPath, uint64_t& Voluntary, uint64_t& Involuntary) {
+  char Buffer[2048];
+  if (ReadSmallFile(StatusPath, Buffer, sizeof(Buffer)) <= 0) {
+    return false;
+  }
+  const char* V = strstr(Buffer, "\nvoluntary_ctxt_switches:");
+  const char* N = strstr(Buffer, "\nnonvoluntary_ctxt_switches:");
+  if (!V || !N) {
+    return false;
+  }
+  Voluntary = strtoull(V + 25, nullptr, 10);
+  Involuntary = strtoull(N + 28, nullptr, 10);
+  return true;
 }
 
 namespace {

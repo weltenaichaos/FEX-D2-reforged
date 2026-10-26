@@ -42,6 +42,11 @@ namespace {
     // Build 83: the main thread at nice -10 too. In the build 82 log other programs took most of its core for 6 s and 17 of
     // the run's 58 frames of 40 ms or more came then (see PriorityGuard.h).
     {"FEX_MAIN_NICE", "-10"},
+    // Build 87: the game's job workers at nice -10 in every other 10 s window, at nice 0 in the others (see
+    // PriorityGuard.h). In the build 86 log busy scenes had the main thread polling for their jobs ~12 ms a frame while
+    // each of the 4 workers waited 85-150 ms a second for a CPU. D2R asks for HIGHEST for them (nice -5); FEX_PRIO=normal
+    // put them at 0.
+    {"FEX_WORKER_NICE", "alt"},
     // Build 51: the main thread may leave its core while it waits 40 ms a second or more for it (see PriorityGuard.h).
     {"FEX_MAINCORE_WAIT", "40"},
     // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
@@ -107,6 +112,11 @@ namespace {
     // code that was dropped and runs again (D2R's protection decrypts its code pages on demand). Code that comes back the
     // same is now mapped again from the copy already in the buffer instead of placing another.
     {"FEX_CODE_REUSE", "1"},
+    // Build 87: a main thread read of 256 KB or more of a game data file is asked of storage whole before it runs (many
+    // requests at once instead of one read-ahead window after another). In the build 82-86 logs the main thread's cold
+    // reads went at ~180 MB/s, and one 3968 KB read at an area's entry took 18-23 ms in every run (see
+    // ARM64EC/GameFiles.cpp).
+    {"FEX_GAME_FILES_AHEAD", "256"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
@@ -214,6 +224,7 @@ namespace {
     "FEX_GAME_FILES_KEEP_MB",
     "FEX_GAME_FILES_GUARD_MB",
     "FEX_GAME_FILES_READ_WATCH",
+    "FEX_GAME_FILES_AHEAD",
     "FEX_UNPACK_CACHE_SKIP_ADLER",
     "FEX_NATIVE_ADLER_NEON",
     "FEX_NATIVE_MD5_CACHE",
@@ -232,6 +243,7 @@ namespace {
     "FEX_HELPER_CORES",
     "FEX_SERVER_NICE",
     "FEX_MAIN_NICE",
+    "FEX_WORKER_NICE",
     "FEX_LOADER_CORES",
     "FEX_LOADER_WATCH",
     "FEX_LOADER_GAME_EXCEPTIONS",

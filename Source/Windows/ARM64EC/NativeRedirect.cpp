@@ -31,6 +31,7 @@ $end_info$
 #include "FrameLatency.h"
 #include "NativeStats.h"
 #include "NativeUnpackCache.h"
+#include "Windows/Common/PriorityGuard.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/Switches.h"
 
@@ -803,6 +804,55 @@ namespace {
   } JobWaitStats;
   uint64_t JobWaitBackoff {};    // ticks
   uint64_t JobWaitEpisodeGap {}; // ticks: idle waits further apart than this start a new stretch
+  // Build 87: the main thread's time between two idle tries in a row (a try that found jobs ends a stretch), all of the
+  // run: the time it spent polling for jobs to finish. Main thread only writes it.
+  std::atomic<uint64_t> JobWaitSpinTicks {};
+  uint64_t JobWaitSpinShown {}; // at the last jobwait line
+
+  // Build 87: the job system's other users (its workers), by TEB, for FEX_WORKER_NICE (Common/PriorityGuard.h). A thread
+  // looks for its TEB in the list (written once per thread, then only read) and counts its call on a cache line of its own.
+  namespace JobWorkers {
+    constexpr size_t Max = 16;
+    std::atomic<uint64_t> Tebs[Max];
+    struct alignas(64) Counter {
+      std::atomic<uint64_t> Calls;
+    };
+    Counter Calls[Max];
+    uint64_t MainTeb {};
+
+    void Note() {
+      const uint64_t Teb = reinterpret_cast<uint64_t>(NtCurrentTeb());
+      if (Teb == MainTeb) {
+        return;
+      }
+      for (size_t i = 0; i < Max; ++i) {
+        uint64_t Seen = Tebs[i].load(std::memory_order_acquire);
+        if (Seen == 0 && Tebs[i].compare_exchange_strong(Seen, Teb, std::memory_order_acq_rel)) {
+          Seen = Teb;
+        }
+        if (Seen == Teb) {
+          Calls[i].Calls.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+      }
+    }
+
+    size_t Source(FEX::Windows::JobWorker* Out, size_t MaxOut, uint64_t* MainSpinNs) {
+      size_t N {};
+      for (size_t i = 0; i < Max && N < MaxOut; ++i) {
+        const uint64_t Teb = Tebs[i].load(std::memory_order_acquire);
+        if (!Teb) {
+          break;
+        }
+        Out[N++] = {Teb, Calls[i].Calls.load(std::memory_order_relaxed)};
+      }
+      if (MainSpinNs) {
+        const uint64_t Ticks = JobWaitSpinTicks.load(std::memory_order_relaxed);
+        *MainSpinNs = Ticks / TickFrequency * 1'000'000'000 + Ticks % TickFrequency * 1'000'000'000 / TickFrequency;
+      }
+      return N;
+    }
+  } // namespace JobWorkers
 
   fextl::string JobWaitStatsLine() {
     if (JobWait::State.load(std::memory_order_relaxed) != TargetState::Armed) {
@@ -812,12 +862,16 @@ namespace {
     const uint64_t Busy = JobWaitStats.Busy.exchange(0, std::memory_order_relaxed);
     const uint64_t Backoff = JobWaitStats.BackoffTicks.exchange(0, std::memory_order_relaxed);
     const uint64_t Longest = JobWaitStats.Longest.exchange(0, std::memory_order_relaxed);
+    const uint64_t Spin = JobWaitSpinTicks.load(std::memory_order_relaxed);
+    const uint64_t SpinNow = Spin - JobWaitSpinShown;
+    JobWaitSpinShown = Spin;
     if (!Waits && !Busy) {
       return {};
     }
     const double MsPerTick = 1000.0 / static_cast<double>(TickFrequency);
-    return fextl::fmt::format("  jobwait idle={} jobs={} paused={:.1f}ms longest={:.1f}ms\n", Waits, Busy,
-                              static_cast<double>(Backoff) * MsPerTick, static_cast<double>(Longest) * MsPerTick);
+    return fextl::fmt::format("  jobwait idle={} jobs={} paused={:.1f}ms longest={:.1f}ms spin={:.1f}ms\n", Waits, Busy,
+                              static_cast<double>(Backoff) * MsPerTick, static_cast<double>(Longest) * MsPerTick,
+                              static_cast<double>(SpinNow) * MsPerTick);
   }
 } // namespace
 
@@ -845,6 +899,11 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
     JobWait::Invalidate = Invalidate;
     JobWaitBackoff = JobWait::BackoffMicroseconds ? std::max<uint64_t>(JobWait::BackoffMicroseconds * TickFrequency / 1000000, 1) : 0;
     JobWaitEpisodeGap = std::max<uint64_t>(TickFrequency / 5000, 1); // 200 us
+    // Process init runs on the main thread.
+    JobWorkers::MainTeb = reinterpret_cast<uint64_t>(NtCurrentTeb());
+    if (JobWait::Enabled) {
+      FEX::Windows::SetJobWorkerSource(JobWorkers::Source);
+    }
     if (StatsLog) {
       FEX::Windows::StatsLogNameNative(reinterpret_cast<uint64_t>(&NativeJobSystemGetTarget), "fex:jobsystem");
     }
@@ -1113,8 +1172,9 @@ extern "C" uint64_t FEXNativeJobSystemGet(uint64_t ReturnAddress) {
   using namespace NativeRedirect;
   const uint64_t Object = JobWaitObject;
   // No shared counter for the other callers: workers call this around every queue operation, and a contended counter
-  // is the kind of cache line traffic this redirect is meant to reduce.
+  // is the kind of cache line traffic this redirect is meant to reduce. Each counts its calls on a line of its own.
   if (ReturnAddress != JobWaitReturn) {
+    JobWorkers::Note();
     return Object;
   }
   const uint64_t Queue = __atomic_load_n(reinterpret_cast<const uint64_t*>(Object + JobWait::QueueOffset), __ATOMIC_RELAXED);
@@ -1124,12 +1184,17 @@ extern "C" uint64_t FEXNativeJobSystemGet(uint64_t ReturnAddress) {
   const uint64_t Head = Queue + JobWait::ListOffset;
   if (__atomic_load_n(reinterpret_cast<const uint64_t*>(Head), __ATOMIC_ACQUIRE) != Head) {
     JobWaitStats.Busy.fetch_add(1, std::memory_order_relaxed);
+    // The job it runs now isn't waiting: the next idle try starts a new stretch.
+    JobWaitStats.LastWait.store(0, std::memory_order_relaxed);
     return Object;
   }
 
   const uint64_t Start = NowTicks();
-  if (Start - JobWaitStats.LastWait.load(std::memory_order_relaxed) > JobWaitEpisodeGap) {
+  const uint64_t Previous = JobWaitStats.LastWait.load(std::memory_order_relaxed);
+  if (Start - Previous > JobWaitEpisodeGap) {
     JobWaitStats.EpisodeStart.store(Start, std::memory_order_relaxed);
+  } else {
+    JobWaitSpinTicks.store(JobWaitSpinTicks.load(std::memory_order_relaxed) + (Start - Previous), std::memory_order_relaxed);
   }
   uint64_t Now = Start;
   if (JobWaitBackoff) {

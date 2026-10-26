@@ -1354,6 +1354,314 @@ namespace {
     }
   }
 
+
+  // Build 87: the game's job workers, see FEX_WORKER_NICE in PriorityGuard.h.
+  enum class WorkerMode { Off, Fixed, Alternate };
+  constexpr size_t MaxWorkers = 16;
+  constexpr uint64_t WorkerWindowSeconds = 10;    // as the stats log's frames10s lines, so each window has one
+  constexpr uint32_t WorkerWindowTicks = 40;      // without the stats log: 250 ms ticks
+
+  struct WorkerThread {
+    uint32_t TID;
+    int LinuxTid;
+    uint64_t Teb;
+    int Before; // its nice when found
+    int SchedFd;
+    char StatusPath[48];
+    bool Gone;
+    bool HavePrev;
+    Linux::SchedStat Prev;
+    uint64_t PrevVoluntary, PrevInvoluntary, PrevCalls;
+    uint32_t Sets, Failures;
+  };
+
+  // Per-second figures added up over a window, and over all whole windows of each half.
+  struct WorkerSums {
+    uint32_t Seconds;
+    uint32_t ThreadSeconds;
+    double RunMs, WaitMs, SpinMs;
+    uint64_t Runs, Slept, Preempted, Calls;
+  };
+
+  struct WorkerKeeper {
+    std::mutex Lock;
+    WorkerMode Mode;
+    int Nice;        // the raised half's nice
+    bool LeftAtZero; // the other half: nice 0 with FEX_PRIO=normal (what it gives every game thread), else each thread's own
+    WorkerThread Threads[MaxWorkers];
+    size_t Count;
+    uint32_t Tick;   // the guard's 250 ms ticks, for the halves without the stats log
+    bool Applied;
+    bool LastRaised;
+    uint32_t Changes; // nice changes made, all threads
+    uint32_t Failures;
+    // Stats log thread only.
+    uint64_t PrevSpinNs;
+    bool HaveSpin;
+    WorkerSums Window;
+    WorkerSums Totals[2]; // [0] the other half, [1] raised
+    uint32_t Windows[2];
+  };
+  WorkerKeeper* Workers {};
+  std::atomic<JobWorkerSource> WorkerSource {};
+
+  // Alternating halves follow the stats log's seconds: seconds 1-10 raised, 11-20 not, and so on.
+  bool RaisedInSecond(uint64_t Second) {
+    return ((Second - 1) / WorkerWindowSeconds) % 2 == 0;
+  }
+
+  // The half the current moment belongs to.
+  bool WorkersRaisedNow(const WorkerKeeper& K) {
+    if (K.Mode == WorkerMode::Fixed) {
+      return true;
+    }
+    if (const uint64_t Logged = StatsLogSecond()) {
+      return RaisedInSecond(Logged + 1);
+    }
+    return (K.Tick / WorkerWindowTicks) % 2 == 0;
+  }
+
+  int WantedNice(const WorkerKeeper& K, const WorkerThread& T, bool Raised) {
+    return Raised ? K.Nice : K.LeftAtZero ? 0 : T.Before;
+  }
+
+  // Under K.Lock.
+  void ApplyWorkerNice(WorkerKeeper& K, bool Raised) {
+    for (size_t i = 0; i < K.Count; ++i) {
+      auto& T = K.Threads[i];
+      if (T.Gone) {
+        continue;
+      }
+      const int Now = Linux::GetNice(T.LinuxTid);
+      if (Now < -100) {
+        T.Gone = true;
+        continue;
+      }
+      const int Want = WantedNice(K, T, Raised);
+      if (Now == Want) {
+        continue;
+      }
+      if (Linux::SetNice(T.LinuxTid, Want) == 0) {
+        ++T.Sets;
+        ++K.Changes;
+      } else {
+        ++T.Failures;
+        ++K.Failures;
+      }
+    }
+    K.Applied = true;
+    K.LastRaised = Raised;
+  }
+
+  // Every 250 ms on the guard's thread: takes in the threads the job system found, and keeps the nice of the half.
+  void KeepWorkers(WorkerKeeper& K, const Config& C, const LoaderFinder* Finder) {
+    ++K.Tick;
+    JobWorker Found[MaxWorkers];
+    uint64_t SpinNs {};
+    const auto Source = WorkerSource.load(std::memory_order_acquire);
+    const size_t N = Source ? Source(Found, MaxWorkers, &SpinNs) : 0;
+    for (size_t i = 0; i < N; ++i) {
+      {
+        std::scoped_lock Lock {K.Lock};
+        bool Known = false;
+        for (size_t j = 0; j < K.Count && !Known; ++j) {
+          Known = K.Threads[j].Teb == Found[i].Teb && !K.Threads[j].Gone;
+        }
+        if (Known) {
+          continue;
+        }
+      }
+      Registered R {};
+      {
+        std::scoped_lock Lock {RegistryLock};
+        for (size_t j = 0; j < RegistryCount; ++j) {
+          if (Registry[j].Teb == Found[i].Teb) {
+            R = Registry[j];
+            break;
+          }
+        }
+      }
+      if (!R.TID || R.TID == C.MainTID || R.LinuxTid <= 0) {
+        continue;
+      }
+      if (Finder && std::any_of(Finder->Threads.begin(), Finder->Threads.end(), [&](const LoaderThread& L) { return L.TID == R.TID; })) {
+        continue;
+      }
+      std::scoped_lock Lock {K.Lock};
+      // A slot of a thread that ended, or a new one.
+      size_t Slot = K.Count;
+      for (size_t j = 0; j < K.Count; ++j) {
+        if (K.Threads[j].Gone || K.Threads[j].Teb == Found[i].Teb) {
+          Slot = j;
+          break;
+        }
+      }
+      if (Slot == MaxWorkers) {
+        continue;
+      }
+      auto& T = K.Threads[Slot];
+      if (Slot < K.Count && T.SchedFd >= 0) {
+        Linux::Close(T.SchedFd);
+      }
+      T = {};
+      T.TID = R.TID;
+      T.LinuxTid = R.LinuxTid;
+      T.Teb = Found[i].Teb;
+      T.Before = Linux::GetNice(R.LinuxTid);
+      char Path[64];
+      snprintf(Path, sizeof(Path), "/proc/self/task/%d/schedstat", R.LinuxTid);
+      T.SchedFd = Linux::Open(Path);
+      snprintf(T.StatusPath, sizeof(T.StatusPath), "/proc/self/task/%d/status", R.LinuxTid);
+      T.PrevCalls = Found[i].Calls;
+      if (Slot == K.Count) {
+        ++K.Count;
+      }
+      const bool Raised = WorkersRaisedNow(K);
+      StatsLogNote(fextl::fmt::format("workers: tid={} (Linux {}) uses the game's job system: a job worker (#{}), nice {} when found, now {}",
+                                      T.TID, T.LinuxTid, K.Count, T.Before, WantedNice(K, T, Raised)));
+    }
+    if (K.Count) {
+      std::scoped_lock Lock {K.Lock};
+      ApplyWorkerNice(K, WorkersRaisedNow(K));
+    }
+  }
+
+  fextl::string WorkerHalfText(const WorkerKeeper& K, bool Raised) {
+    if (K.Mode == WorkerMode::Fixed) {
+      return fextl::fmt::format("nice {}", K.Nice);
+    }
+    if (Raised) {
+      return fextl::fmt::format("nice {} (raised half)", K.Nice);
+    }
+    return K.LeftAtZero ? fextl::string("nice 0 (other half)") : fextl::string("their own nice (other half)");
+  }
+
+  fextl::string WorkerSumsText(const WorkerSums& S) {
+    const double Secs = S.Seconds ? static_cast<double>(S.Seconds) : 1.0;
+    return fextl::fmt::format("{:.1f} threads ran {:.0f} ms/s, waited {:.0f} ms/s for a CPU, {:.0f} runs/s ({:.0f} us waited a run), "
+                              "slept {:.0f}/s, preempted {:.0f}/s, {:.0f}k job system calls/s; main thread spun {:.0f} ms/s in the frame "
+                              "wait loop",
+                              S.ThreadSeconds / Secs, S.RunMs / Secs, S.WaitMs / Secs, S.Runs / Secs,
+                              S.Runs ? S.WaitMs * 1000.0 / static_cast<double>(S.Runs) : 0.0, S.Slept / Secs, S.Preempted / Secs,
+                              S.Calls / Secs / 1000.0, S.SpinMs / Secs);
+  }
+
+  void AddSums(WorkerSums& To, const WorkerSums& From) {
+    To.Seconds += From.Seconds;
+    To.ThreadSeconds += From.ThreadSeconds;
+    To.RunMs += From.RunMs;
+    To.WaitMs += From.WaitMs;
+    To.SpinMs += From.SpinMs;
+    To.Runs += From.Runs;
+    To.Slept += From.Slept;
+    To.Preempted += From.Preempted;
+    To.Calls += From.Calls;
+  }
+
+  // Every second on the stats log thread: the "workers" line, a "# workers" line at the end of each 10 s window, and the
+  // switch to the next half right at the window's end.
+  fextl::string WorkersStatsLine() {
+    auto* KP = Workers;
+    if (!KP) {
+      return {};
+    }
+    auto& K = *KP;
+    const uint64_t Second = StatsLogSecond();
+    JobWorker Found[MaxWorkers];
+    uint64_t SpinNs {};
+    const auto Source = WorkerSource.load(std::memory_order_acquire);
+    const size_t N = Source ? Source(Found, MaxWorkers, &SpinNs) : 0;
+    const bool Raised = K.Mode == WorkerMode::Fixed || RaisedInSecond(Second);
+
+    std::scoped_lock Lock {K.Lock};
+    const double SpinMs = K.HaveSpin && SpinNs >= K.PrevSpinNs ? static_cast<double>(SpinNs - K.PrevSpinNs) / 1e6 : 0.0;
+    K.PrevSpinNs = SpinNs;
+    K.HaveSpin = Source != nullptr;
+    WorkerSums S {};
+    fextl::string Each;
+    for (size_t i = 0; i < K.Count; ++i) {
+      auto& T = K.Threads[i];
+      if (T.Gone) {
+        continue;
+      }
+      Linux::SchedStat Now {};
+      if (!Linux::PreadSchedStat(T.SchedFd, Now)) {
+        T.Gone = true;
+        Linux::Close(T.SchedFd);
+        T.SchedFd = -1;
+        Each += fextl::fmt::format(" {}:ended", T.TID);
+        continue;
+      }
+      uint64_t Voluntary {}, Involuntary {};
+      const bool HaveSwitches = Linux::ReadContextSwitches(T.StatusPath, Voluntary, Involuntary);
+      uint64_t Calls = T.PrevCalls;
+      for (size_t j = 0; j < N; ++j) {
+        if (Found[j].Teb == T.Teb) {
+          Calls = Found[j].Calls;
+        }
+      }
+      if (T.HavePrev) {
+        const double RunMs = static_cast<double>(Now.RunNs - T.Prev.RunNs) / 1e6;
+        const double WaitMs = static_cast<double>(Now.WaitNs - T.Prev.WaitNs) / 1e6;
+        const uint64_t Runs = Now.Slices - T.Prev.Slices;
+        const uint64_t Slept = HaveSwitches && Voluntary >= T.PrevVoluntary ? Voluntary - T.PrevVoluntary : 0;
+        const uint64_t Preempted = HaveSwitches && Involuntary >= T.PrevInvoluntary ? Involuntary - T.PrevInvoluntary : 0;
+        const uint64_t CallsNow = Calls >= T.PrevCalls ? Calls - T.PrevCalls : 0;
+        ++S.ThreadSeconds;
+        S.RunMs += RunMs;
+        S.WaitMs += WaitMs;
+        S.Runs += Runs;
+        S.Slept += Slept;
+        S.Preempted += Preempted;
+        S.Calls += CallsNow;
+        Each += fextl::fmt::format(" {}:{:.0f}+{:.0f}/{}/{}k", T.TID, RunMs, WaitMs, Runs, CallsNow / 1000);
+      }
+      T.Prev = Now;
+      if (HaveSwitches) {
+        T.PrevVoluntary = Voluntary;
+        T.PrevInvoluntary = Involuntary;
+      }
+      T.PrevCalls = Calls;
+      T.HavePrev = true;
+    }
+    S.SpinMs = SpinMs;
+
+    fextl::string Out;
+    if (S.ThreadSeconds) {
+      S.Seconds = 1;
+      Out = fextl::fmt::format("  workers {}: {} threads ran {:.0f} ms, waited {:.0f} ms for a CPU, {} runs ({:.0f} us waited a run), slept {}, "
+                               "preempted {}, {}k job system calls | tid:run+wait ms/runs/calls{}\n",
+                               WorkerHalfText(K, Raised), S.ThreadSeconds, S.RunMs, S.WaitMs, S.Runs, S.Runs ? S.WaitMs * 1000.0 / static_cast<double>(S.Runs) : 0.0,
+                               S.Slept, S.Preempted, S.Calls / 1000, Each);
+      AddSums(K.Window, S);
+    }
+
+    if (Second % WorkerWindowSeconds == 0) {
+      if (K.Window.Seconds) {
+        const bool Whole = K.Window.Seconds == WorkerWindowSeconds;
+        fextl::string Text = fextl::fmt::format("# workers: seconds {}-{} at {}: {}", Second - WorkerWindowSeconds + 1, Second,
+                                                WorkerHalfText(K, Raised), WorkerSumsText(K.Window));
+        if (Whole) {
+          AddSums(K.Totals[Raised ? 1 : 0], K.Window);
+          ++K.Windows[Raised ? 1 : 0];
+        } else {
+          Text += fextl::fmt::format(" (only {} s of it counted)", K.Window.Seconds);
+        }
+        if (K.Mode == WorkerMode::Alternate && K.Windows[0] && K.Windows[1]) {
+          Text += fextl::fmt::format(" | whole windows so far: raised {} windows: {} | other half {} windows: {}", K.Windows[1],
+                                     WorkerSumsText(K.Totals[1]), K.Windows[0], WorkerSumsText(K.Totals[0]));
+        }
+        Out += Text + "\n";
+      }
+      K.Window = {};
+      // The next window's half starts now, rather than at the guard's next tick.
+      if (K.Mode == WorkerMode::Alternate && K.Count) {
+        ApplyWorkerNice(K, RaisedInSecond(Second + 1));
+      }
+    }
+    return Out;
+  }
+
   void* GuardThread(void* Arg) {
     const auto* C = static_cast<Config*>(Arg);
     const uint32_t SelfTID = GetCurrentThreadId();
@@ -1585,6 +1893,9 @@ namespace {
         if (C->Loader != LoaderMode::Off) {
           LoaderTick(Finder, Threads);
         }
+        if (Workers) {
+          KeepWorkers(*Workers, *C, C->Loader != LoaderMode::Off ? &Finder : nullptr);
+        }
       }
     }
     return nullptr;
@@ -1632,6 +1943,24 @@ void StartPriorityGuard(std::string_view AppName) {
     C->MainNice = std::clamp(atoi(MainNice), -20, 19);
   }
 
+  WorkerMode WorkerNiceMode = WorkerMode::Off;
+  int WorkerNice = -10;
+  if (const char* W = Switch("FEX_WORKER_NICE"); W && W[0] && W[0] != 'o') {
+    const char* Number = W;
+    if (W[0] == 'a') {
+      WorkerNiceMode = WorkerMode::Alternate;
+      Number = W + 1;
+      while (*Number && *Number != '-' && (*Number < '0' || *Number > '9')) {
+        ++Number;
+      }
+    } else if (W[0] == '-' || (W[0] >= '0' && W[0] <= '9')) {
+      WorkerNiceMode = WorkerMode::Fixed;
+    }
+    if (*Number == '-' || (*Number >= '0' && *Number <= '9')) {
+      WorkerNice = std::clamp(atoi(Number), -20, 19);
+    }
+  }
+
   StatsLogNote(C->Prio == PrioMode::Keep ? fextl::fmt::format("prio: off, Windows thread priorities pass through to Linux nice "
                                                                "(FEX_PRIO=normal keeps every thread at nice 0)") :
                                            fextl::fmt::format("prio: {} in {}, checked every 2s (FEX_PRIO=keep turns it off)",
@@ -1667,6 +1996,18 @@ void StartPriorityGuard(std::string_view AppName) {
                                                   C->MainLinuxTid, C->MainNice) :
                                fextl::string("prio: main thread's nice left to Wine"));
 
+  StatsLogNote(WorkerNiceMode == WorkerMode::Alternate ?
+                 fextl::fmt::format("workers: the game's job workers (threads other than the main thread that use its job system) at nice {} "
+                                    "in every other 10 s window (seconds 1-10, 21-30, ...), {} in the others, checked every 250 ms; a "
+                                    "'workers' line every second and a '# workers' line per window compare the halves "
+                                    "(FEX_WORKER_NICE=-10 keeps them at -10, =off leaves them)",
+                                    WorkerNice, C->Prio == PrioMode::Normal ? "nice 0 (as FEX_PRIO=normal leaves them)" : "their own nice") :
+               WorkerNiceMode == WorkerMode::Fixed ?
+                 fextl::fmt::format("workers: the game's job workers (threads other than the main thread that use its job system) kept at "
+                                    "nice {}, checked every 250 ms (FEX_WORKER_NICE=off leaves them, =alt switches every 10 s)",
+                                    WorkerNice) :
+                 fextl::string("workers: the game's job workers' nice left alone (FEX_WORKER_NICE=alt raises it in every other 10 s window)"));
+
   const fextl::string Exe = fextl::fmt::format("main exe {:X}-{:X}", C->ExeBase, C->ExeEnd);
   StatsLogNote(C->Loader == LoaderMode::Little ?
                  fextl::fmt::format("loader: threads running at 25% of a core or more whose own code is mostly protection code (not in the {} "
@@ -1692,9 +2033,16 @@ void StartPriorityGuard(std::string_view AppName) {
   }
 
   if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && !C->MainNiceOn &&
-      C->Loader == LoaderMode::Off) {
+      C->Loader == LoaderMode::Off && WorkerNiceMode == WorkerMode::Off) {
     delete C;
     return;
+  }
+  if (WorkerNiceMode != WorkerMode::Off) {
+    Workers = new WorkerKeeper {};
+    Workers->Mode = WorkerNiceMode;
+    Workers->Nice = WorkerNice;
+    Workers->LeftAtZero = C->Prio == PrioMode::Normal;
+    StatsLogSetLineProvider(WorkersStatsLine);
   }
   if (C->Cores == CoreMode::Fast || C->HelpersLittle || C->Loader == LoaderMode::Little) {
     DetectCores(*C);
@@ -1733,5 +2081,9 @@ void GuardThreadEnded(uint32_t TID) {
 
 void SetLoaderThreadHook(void (*Hook)(uint32_t TID, uint64_t Teb)) {
   LoaderHook.store(Hook, std::memory_order_release);
+}
+
+void SetJobWorkerSource(JobWorkerSource Source) {
+  WorkerSource.store(Source, std::memory_order_release);
 }
 } // namespace FEX::Windows

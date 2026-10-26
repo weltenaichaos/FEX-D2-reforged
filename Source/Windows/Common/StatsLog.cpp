@@ -2122,8 +2122,8 @@ namespace {
     size_t BusyFrameLines;
   };
 
-  // Up to twelve, see StatsLogSetLineProvider.
-  constexpr size_t MaxLineProviders = 12;
+  // Up to sixteen, see StatsLogSetLineProvider.
+  constexpr size_t MaxLineProviders = 16;
   std::atomic<fextl::string (*)()> LineProviders[MaxLineProviders] {};
   // Called with every sample of the main thread, see StatsLogSetMainSampleHook.
   std::atomic<uint8_t (*)(uint64_t)> MainSampleHook {};
@@ -2307,6 +2307,7 @@ namespace {
   };
   fextl::unordered_map<uint32_t, CachedThreadName> ThreadNames;
   uint64_t LogSecond {}; // seconds logged so far, for the name cache
+  std::atomic<uint64_t> SharedSecond {}; // the same for other threads, see StatsLogSecond
 
   fextl::string QueryThreadNameUncached(uint32_t TID) {
     HANDLE Handle = OpenThreadForQuery(TID);
@@ -3503,6 +3504,7 @@ namespace {
       SampleFor1s(State);
       ++Seconds;
       LogSecond = Seconds;
+      SharedSecond.store(Seconds, std::memory_order_release);
       const uint64_t WorkStart = GetCounter();
 
       Current.clear();
@@ -3970,7 +3972,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "'# hitch' / '# stall' = Main ran emulated code / no emulated code for 100ms or more, with the other "
                        "threads that were busy in emulated code meanwhile; jobwait = the game's frame wait loop: tries that "
                        "found "
-                       "nothing to run (idle) or found jobs, time paused, longest uninterrupted idle wait; frames = time from "
+                       "nothing to run (idle) or found jobs, time paused, longest uninterrupted idle wait, spin = time between idle tries "
+                       "in a row (the main thread polling for the frame's jobs to finish); frames = time from "
                        "one game frame "
                        "start to the next (count, average, median, 90th/99th percentile, longest, how many took 40/50/67/100ms "
                        "or more), frames10s = the same over 10 seconds; '# frame' = a frame of 50ms or more with what Main and "
@@ -4038,10 +4041,16 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "when ReadFile returned, the main thread's and the other threads' reads with their wait, kept = reads whose "
                        "data was kept, MB by read since its last read = how much of the files was read between two reads of the same "
                        "MB (the budget that would have kept it; first = never read before), other files = reads of other files, slow "
-                       "main = the main thread's reads of 8ms or more (file@offset, size, wait, distance, kept); cpu clock = CPU "
+                       "main = the main thread's reads of 8ms or more (file@offset, size, wait, distance, kept), asked ahead = the "
+                       "main thread's big reads asked of storage whole before they ran (FEX_GAME_FILES_AHEAD): reads, MB, time "
+                       "spent asking and its calls, the reads' wait; cpu clock = CPU "
                        "clocks the kernel set (scaling_cur_freq, sampled every 10ms): the main thread's CPU while runnable, the "
                        "fastest core with its limits and governor, each core's average; '# busy frame' clock = the same over the "
-                       "frame\n",
+                       "frame; workers = the game's job workers (FEX_WORKER_NICE): their nice (raised or other half of the 10 s "
+                       "windows), CPU time, time ready but without a CPU, runs = times they got a CPU, the wait for each, slept = "
+                       "times they went to sleep, preempted = times another task took their CPU, the job system calls, then each "
+                       "worker as tid:run+wait ms/runs/calls; '# workers: seconds A-B' = a window's averages a second, with the "
+                       "main thread's polling time (spin), and the totals of each half so far\n",
                        AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
@@ -4117,6 +4126,10 @@ void StatsLogSetLineProvider(fextl::string (*Provider)()) {
       return;
     }
   }
+}
+
+uint64_t StatsLogSecond() {
+  return SharedSecond.load(std::memory_order_acquire);
 }
 
 void StatsLogSetMainSampleHook(uint8_t (*Hook)(uint64_t NativeTarget)) {

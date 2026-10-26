@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -130,6 +131,27 @@ namespace FEX::Windows {
 // long it waited for a CPU; game threads found this way are on it too, with their exceptions in the game's code a
 // second. With the stats log, a loader thread's calls get a "loader calls" line too (see ARM64EC/LoaderWatch.h).
 //
+// Job workers (build 87). D2R runs each frame's parallel tasks on a job system: the main thread queues them, worker
+// threads run them, and the main thread polls the queue until they are done (the frame wait loop, see
+// ARM64EC/NativeRedirect.cpp). In the build 86 log busy scenes had the main thread polling ~12 ms a frame (~380 ms a
+// second in the busiest seconds, 22% of its samples in the frame function that holds the loop) while each of the 4
+// workers ran 200-250 ms a second and waited 85-150 ms a second for a CPU (calm play 110 ms run, 35-50 ms waited). D2R
+// itself asks for HIGHEST for its workers (Wine: nice -5); FEX_PRIO=normal has put them at nice 0 since build 48, under
+// the main thread and the wineserver (both -10) and level with every other program's threads.
+//
+//   FEX_WORKER_NICE=alt  the workers at nice -10 in every other 10 s window (seconds 1-10, 21-30, ... of the stats log,
+//                      the same windows as its frames10s lines), at nice 0 (FEX_PRIO=normal; else their own) in the
+//                      others: one run compares both. "alt-5" uses -5. The D2R default in build 87.
+//   FEX_WORKER_NICE=N    keep them at nice N
+//   FEX_WORKER_NICE=off  leave them to Wine and FEX_PRIO
+//
+// A worker is a thread other than the main thread that calls the job system's getter (every queue operation does); loader
+// threads (FEX_LOADER_CORES) are left out. Their nice is checked every 250 ms. With the stats log, a "# workers: ..."
+// line names each one found, a "workers" line every second gives their CPU time, their wait for a CPU, how many times
+// they got one (runs) and the average wait for each, how many times they went to sleep (slept) or lost their CPU while
+// they could run (preempted), and their job system calls; a "# workers: seconds A-B ..." line closes each window with
+// its averages, the main thread's polling time, and the totals of each half so far.
+//
 // FEX's own threads (named FEX*) keep their priorities. Checked every 2 seconds, since a game can change priorities and
 // affinities at any time. Each change is written to the FEX_STATSLOG log as a "# prio ...", "# cores ..." or
 // "# server ..." line.
@@ -141,6 +163,16 @@ void StartPriorityGuard(std::string_view AppName);
 // is registered, and GuardThreadEnded waits for any such read to finish.
 void GuardThreadStarted(uint32_t TID, int LinuxTid, uint64_t Teb, const volatile uint64_t* BlockHeader, const volatile uint64_t* GameExceptions);
 void GuardThreadEnded(uint32_t TID);
+
+// Where the game's job workers come from (ARM64EC/NativeRedirect.cpp): fills Out with up to Max threads, other than the
+// main thread, that called the job system, by TEB, with their calls so far, and MainSpinNs with the main thread's time
+// spent polling the job queue in its frame wait loop so far. Returns how many. Runs on the guard's and the log's threads.
+struct JobWorker {
+  uint64_t Teb;
+  uint64_t Calls;
+};
+using JobWorkerSource = size_t (*)(JobWorker* Out, size_t Max, uint64_t* MainSpinNs);
+void SetJobWorkerSource(JobWorkerSource Source);
 
 // Called on the guard's thread for every loader thread it finds (see FEX_LOADER_CORES), with its TEB, and again with Teb 0
 // when it ended. Set before StartPriorityGuard.

@@ -86,6 +86,7 @@ namespace {
     uint64_t Inode;
     uint32_t FirstPiece; // its pieces in the stamp arrays
     uint32_t Pieces;
+    int Fd;              // FEXFileCache's own descriptor of it (open for good), for asking storage ahead
     char Name[32];
   };
 
@@ -121,6 +122,14 @@ namespace {
   std::atomic<bool> Armed {};
   uint64_t MainTeb {};
 
+  // Build 87, FEX_GAME_FILES_AHEAD: a read of AheadMin bytes or more by the main thread is asked of storage whole before
+  // ReadFile runs, in AheadPart pieces (one WILLNEED each; the kernel takes at most its read-ahead size per call). In the
+  // build 82-86 logs the main thread's cold reads went at ~180 MB/s: a 3968 KB read at an area's entry took 18-23 ms in
+  // every run. A buffered read the kernel doesn't have reads ahead one read-ahead window at a time, mostly with one
+  // request at storage, while UFS storage reads several GB/s with many requests queued.
+  uint64_t AheadMin {};
+  std::atomic<uint64_t> AheadPart {128 << 10}; // set once by FEXFileCache from the device's settings
+
   struct HandleSlot {
     uint64_t Handle;
     int32_t Watch;
@@ -149,6 +158,9 @@ namespace {
     uint64_t ReuseOther[Buckets];   // other threads' reads by how much anyone read since
     uint64_t OtherFiles, OtherFilesBytes; // reads of files that aren't watched
     uint64_t NoOffset;                    // reads of watched files whose offset couldn't be told
+    // Build 87: the main thread's reads asked ahead (FEX_GAME_FILES_AHEAD), their bytes, the time the asking took, its
+    // calls, and the reads' own wait.
+    uint64_t AheadReads, AheadBytes, AheadAskTicks, AheadCalls, AheadReadTicks, AheadLongest;
     SlowRead Slow[MaxSlowReads];
     size_t SlowCount;
     uint64_t SlowMore;
@@ -215,7 +227,7 @@ namespace {
   }
 
   // Follows the reads of a file of Size bytes from now on, if there is room. Its index, or -1.
-  int Watch(const char* Path, uint64_t Size, uint64_t Inode) {
+  int Watch(const char* Path, uint64_t Size, uint64_t Inode, int Fd) {
     const uint32_t Count = WatchedCount.load(std::memory_order_relaxed);
     const uint64_t Pieces = (Size >> PieceShift) + 1;
     if (!ReadWatchOn || !Inode || Count >= MaxFiles || PiecesUsed + Pieces > MaxPieces) {
@@ -225,6 +237,7 @@ namespace {
     W.Inode = Inode;
     W.FirstPiece = PiecesUsed;
     W.Pieces = static_cast<uint32_t>(Pieces);
+    W.Fd = Fd;
     const char* Slash = strrchr(Path, '/');
     snprintf(W.Name, sizeof(W.Name), "%s", Slash ? Slash + 1 : Path);
     PiecesUsed += static_cast<uint32_t>(Pieces);
@@ -257,7 +270,7 @@ namespace {
         return false;
       }
     }
-    Files[FileCount++] = {Fd, Canonical, Watch(Path, Size, Inode)};
+    Files[FileCount++] = {Fd, Canonical, Watch(Path, Size, Inode, Fd)};
     FileBytes += Size;
     if (Named < 6) {
       const char* Slash = strrchr(Path, '/');
@@ -407,6 +420,8 @@ namespace {
     }
   }
 
+  fextl::string StorageReadAhead(const char* Path);
+
   // The kernel's file cache ("Cached") and the device's available memory ("MemAvailable") from /proc/meminfo, in KB; 0
   // when unreadable.
   struct MemInfo {
@@ -517,6 +532,12 @@ namespace {
     if (ReadWatchOn) {
       FEX::Windows::StatsLogNote(fextl::fmt::format("game files: reads followed in {} of {} files ({} MB pieces)", WatchedCount.load(),
                                                     FileCount, PiecesUsed));
+    }
+    if (AheadMin) {
+      const fextl::string Device = Folder.empty() ? fextl::string("game folder not found") : StorageReadAhead(Folder.c_str());
+      FEX::Windows::StatsLogNote(fextl::fmt::format("game files: the main thread's reads of {} KB or more are asked of storage whole before "
+                                                    "they run, in {} KB parts ({}; FEX_GAME_FILES_AHEAD=0 turns it off)",
+                                                    AheadMin >> 10, AheadPart.load() >> 10, Device));
     }
 
     uint32_t ArmTries {};
@@ -735,6 +756,88 @@ namespace {
     }
   }
 
+  // Build 87: asks storage for all of a big read of a watched file at once, before the main thread's ReadFile runs (see
+  // AheadMin). The pieces are marked as read ahead first, so a drop pass meanwhile leaves them. The number of WILLNEED
+  // calls made, 0 when the file isn't watched or the offset can't be told.
+  uint32_t AskAhead(HANDLE File, bool HaveOffset, uint64_t Offset, uint64_t Bytes, uint64_t Now) {
+    const int Index = WatchOf(File, Now);
+    if (Index < 0) {
+      return 0;
+    }
+    if (!HaveOffset) {
+      // A read at the file position: it starts where the position is now.
+      IO_STATUS_BLOCK Io {};
+      PositionInformation Position {};
+      if (NtQueryInformationFile(File, &Io, &Position, sizeof(Position), static_cast<FILE_INFORMATION_CLASS>(ClassPosition)) != STATUS_SUCCESS ||
+          Position.CurrentByteOffset < 0) {
+        return 0;
+      }
+      Offset = static_cast<uint64_t>(Position.CurrentByteOffset);
+    }
+    const auto& W = Watched[Index];
+    if ((Offset >> PieceShift) >= W.Pieces) {
+      return 0;
+    }
+    const uint64_t Stamp = std::max<uint64_t>(AllClock.load(std::memory_order_relaxed), 1);
+    const uint64_t Last = std::min<uint64_t>((Offset + Bytes - 1) >> PieceShift, W.Pieces - 1);
+    for (uint64_t p = Offset >> PieceShift; p <= Last; ++p) {
+      AheadStamps[W.FirstPiece + p].store(Stamp, std::memory_order_relaxed);
+    }
+    const uint64_t End = Offset + Bytes;
+    const uint64_t Part = AheadPart.load(std::memory_order_relaxed);
+    uint32_t Calls {};
+    for (uint64_t At = Offset & ~uint64_t {4095}; At < End; At += Part) {
+      FEX::Windows::Linux::ReadAhead(W.Fd, At, std::min(Part, End - At));
+      ++Calls;
+    }
+    return Calls;
+  }
+
+  void NoteAhead(uint64_t Bytes, uint32_t Calls, uint64_t AskTicks, uint64_t ReadTicks) {
+    std::scoped_lock Guard {ReadLock};
+    auto& R = Reads;
+    ++R.AheadReads;
+    R.AheadBytes += Bytes;
+    R.AheadCalls += Calls;
+    R.AheadAskTicks += AskTicks;
+    R.AheadReadTicks += ReadTicks;
+    R.AheadLongest = std::max(R.AheadLongest, ReadTicks);
+  }
+
+  // The device a path is on and its read-ahead settings, for the log; sets AheadPart to the kernel's largest read-ahead
+  // per call when it can be read.
+  fextl::string StorageReadAhead(const char* Path) {
+    FEX::Windows::Linux::FileInfo Info {};
+    if (!FEX::Windows::Linux::Stat(Path, Info)) {
+      return "device unknown";
+    }
+    const uint64_t Major = (Info.Dev >> 8) & 0xfff;
+    const uint64_t Minor = (Info.Dev & 0xff) | ((Info.Dev >> 12) & 0xfff00);
+    auto ReadKB = [&](const char* Name) -> int64_t {
+      char Text[32];
+      for (const char* Up : {"", "../"}) {
+        char SysPath[96];
+        snprintf(SysPath, sizeof(SysPath), "/sys/dev/block/%llu:%llu/%squeue/%s", static_cast<unsigned long long>(Major),
+                 static_cast<unsigned long long>(Minor), Up, Name);
+        if (FEX::Windows::Linux::ReadSmallFile(SysPath, Text, sizeof(Text)) > 0) {
+          return strtoll(Text, nullptr, 10);
+        }
+      }
+      return -1;
+    };
+    const int64_t ReadAheadKB = ReadKB("read_ahead_kb");
+    const int64_t MaxSectorsKB = ReadKB("max_sectors_kb");
+    // The kernel's cap per WILLNEED call: the larger of the two (its read-ahead pages and its largest request).
+    const int64_t CapKB = std::max(ReadAheadKB, MaxSectorsKB);
+    if (CapKB >= 128) {
+      AheadPart.store(static_cast<uint64_t>(std::min<int64_t>(CapKB, 2048)) << 10, std::memory_order_relaxed);
+    }
+    auto Text = [](int64_t KB) {
+      return KB < 0 ? fextl::string("unreadable") : fextl::fmt::format("{} KB", KB);
+    };
+    return fextl::fmt::format("device {}:{}, read-ahead {}, largest request {}", Major, Minor, Text(ReadAheadKB), Text(MaxSectorsKB));
+  }
+
   double MB(uint64_t Bytes) {
     return static_cast<double>(Bytes) / (1024.0 * 1024.0);
   }
@@ -754,7 +857,7 @@ namespace {
       R = Reads;
       Reads = {};
     }
-    if (!R.Reads && !R.OtherFiles) {
+    if (!R.Reads && !R.OtherFiles && !R.AheadReads) {
       return {};
     }
     const double MsPerTick = 1000.0 / static_cast<double>(CounterFreq);
@@ -773,12 +876,17 @@ namespace {
     return fextl::fmt::format(
       "  game reads: {} reads {:.1f} MB ({} queued {:.1f} MB) | main {} reads {:.1f} MB {:.1f} ms (longest {:.1f}), kept {} {:.1f} MB "
       "{:.1f} ms | others {} {:.1f} MB {:.1f} ms (longest {:.1f}), kept {} {:.1f} MB {:.1f} ms | MB by read since its last read "
-      "{}: main {}, main by its own {}, others {} | other files {} reads {:.1f} MB{}{}\n",
+      "{}: main {}, main by its own {}, others {} | other files {} reads {:.1f} MB{}{}{}\n",
       R.Reads, MB(R.Bytes), R.Queued, MB(R.QueuedBytes), R.MainReads, MB(R.MainBytes), Ms(R.MainTicks), Ms(R.MainLongest), R.MainKeptReads,
       MB(R.MainKeptBytes), Ms(R.MainKeptTicks), R.OtherReads, MB(R.OtherBytes), Ms(R.OtherTicks), Ms(R.OtherLongest), R.OtherKeptReads,
       MB(R.OtherKeptBytes), Ms(R.OtherKeptTicks), "<128M/<512M/<1G/<2G/<4G/<8G/more/first", Histogram(R.ReuseMain),
       Histogram(R.ReuseMainOwn), Histogram(R.ReuseOther), R.OtherFiles, MB(R.OtherFilesBytes),
-      R.NoOffset ? fextl::fmt::format(", {} without offset", R.NoOffset) : fextl::string(), Slow);
+      R.NoOffset ? fextl::fmt::format(", {} without offset", R.NoOffset) : fextl::string(),
+      R.AheadReads ? fextl::fmt::format(" | asked ahead: {} main reads {:.1f} MB, asking {:.2f} ms ({} calls), reads {:.1f} ms (longest {:.1f})",
+                                        R.AheadReads, MB(R.AheadBytes), Ms(R.AheadAskTicks), R.AheadCalls, Ms(R.AheadReadTicks),
+                                        Ms(R.AheadLongest)) :
+                     fextl::string(),
+      Slow);
   }
 
   fextl::string StatsLine() {
@@ -830,6 +938,8 @@ void Init(bool StatsLog) {
   if (!ReadWatchOn) {
     KeepMB = 0;
   }
+  // KB; needs the read watch (it finds the reads).
+  AheadMin = ReadWatchOn ? Number("FEX_GAME_FILES_AHEAD", 0, 0, 1 << 20) << 10 : 0;
   // A quarter for what anyone read lately (an area load's own readahead and re-reads), the rest for the main thread's
   // reads.
   KeepRecent = (KeepMB << 20) / 4;
@@ -866,6 +976,12 @@ extern "C" BOOL FEXNativeReadFile(HANDLE File, void* Buffer, DWORD Bytes, DWORD*
   auto* Overlapped = *reinterpret_cast<X64Overlapped* const*>(Sp + (ReturnOnStack ? 0x28 : 0x20));
   const uint64_t Offset = Overlapped ? (static_cast<uint64_t>(Overlapped->OffsetHigh) << 32) | Overlapped->Offset : 0;
   const uint64_t Start = GetCounter();
+  uint32_t AskCalls {};
+  uint64_t Asked = Start;
+  if (AheadMin && Bytes >= AheadMin && WatchedCount.load(std::memory_order_relaxed) && reinterpret_cast<uint64_t>(NtCurrentTeb()) == MainTeb) {
+    AskCalls = AskAhead(File, Overlapped != nullptr, Offset, Bytes, Start);
+    Asked = GetCounter();
+  }
   const BOOL Result = Real(File, Buffer, Bytes, Read, Overlapped);
   const uint64_t End = GetCounter();
   if (!WatchedCount.load(std::memory_order_relaxed)) {
@@ -878,6 +994,9 @@ extern "C" BOOL FEXNativeReadFile(HANDLE File, void* Buffer, DWORD Bytes, DWORD*
   if (Result || Queued) {
     const uint64_t Got = Queued ? Bytes : Read ? *Read : Overlapped ? Overlapped->InternalHigh : Bytes;
     NoteRead(File, Offset, Overlapped != nullptr, Got, Queued, End - Start, Start);
+  }
+  if (AskCalls) {
+    NoteAhead(Bytes, AskCalls, Asked - Start, End - Asked);
   }
   *LastError = Error;
   return Result;

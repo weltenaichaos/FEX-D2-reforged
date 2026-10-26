@@ -19,10 +19,15 @@ int OpenRead(const char* Path, bool Direct);
 // Drops a range of a file from the kernel's file cache (posix_fadvise DONTNEED; pages not yet written are only queued
 // for writing). 0 or a negative errno.
 int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size);
+// Asks storage for a range of a file now (posix_fadvise WILLNEED): the reads are queued and the call returns without
+// waiting for them. The kernel takes at most its read-ahead size per call (the device's read_ahead_kb, or its largest
+// request size), so a bigger range needs several calls. 0 or a negative errno.
+int ReadAhead(int Fd, uint64_t Offset, uint64_t Size);
 // What a path names (following symbolic links), from fstatat. False when it can't be looked at.
 struct FileInfo {
   uint64_t Size;
   uint64_t Inode;
+  uint64_t Dev; // the device it is on (st_dev: major << 8 | minor, plus the high bits of both)
   uint32_t Uid; // the owner
   bool Regular;
   bool Directory;
@@ -80,6 +85,9 @@ struct SchedStat {
 bool ReadSchedStat(const char* Path, SchedStat& Out);
 // The same from a schedstat file kept open (read again from its start).
 bool PreadSchedStat(int Fd, SchedStat& Out);
+// How many times a thread gave up its CPU to wait (voluntary_ctxt_switches) and how many times another task took it while it
+// could run (nonvoluntary_ctxt_switches), from its status file ("/proc/self/task/<tid>/status").
+bool ReadContextSwitches(const char* StatusPath, uint64_t& Voluntary, uint64_t& Involuntary);
 
 // The pid of a process of this user named Name (its comm, or the file name of one of its first three arguments), other
 // than this one; 0 when there is none.
