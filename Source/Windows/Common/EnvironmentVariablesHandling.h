@@ -95,9 +95,11 @@ namespace FEX::Windows {
 //                          pass began, and an identical push keeps its old copy; alt = on in every other second, so
 //                          one run compares both ways (needs the stats log, without it alt stays on)
 //   FEX_TU_COUNTERS=1      reserve 24 GPU counters through KGSL and record them around big passes (the D2R default;
-//                          build 70: GPU cycles, state contexts, command processor idle/stall, shader front end
-//                          stalls and draw overlap, shader core occupancy/starvation, wave life, wave cycle split,
-//                          texture latency); 0 = none
+//                          build 72: GPU cycles, state contexts, command processor stall, shader front end stalls and
+//                          draw overlap, shader core occupancy/starvation, wave life, alu/long-sync wave cycles, and
+//                          per unit ahead of and behind the shader cores: primitive control starved by the command
+//                          processor or by draw setup, vertex fetch, triangle setup, rasterizer, render backend, 2D
+//                          engine and depth pre-test busy cycles); 0 = none
 //   FEX_TU_SAMPLE_DRAWS=N  passes with at least N draws are timed and counted (default 100)
 //   FEX_TU_EARLY_PREAMBLE=1  (the D2R default from build 71, driver fex2 and later) push descriptor sets count as written,
 //                          so the lighting shaders' reads of vkd3d's root constant buffers can run in the early
@@ -110,6 +112,13 @@ namespace FEX::Windows {
 //                          copies); bindings not pushed since the push set's layout changed read as empty (null
 //                          descriptors). The driver reads it once at device creation; it is part of the shaders' cache
 //                          key, so shaders are compiled anew once. 0 = stock.
-// The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report both.
+//   FEX_TU_DEPTH_CLEAR=alt (the D2R default in build 72, driver fex3 and later) a depth/stencil attachment cleared at the
+//                          start of a direct (sysmem) pass is cleared by one 3D draw through the depth unit (depth
+//                          test ALWAYS, like vkCmdClearAttachments inside a pass) instead of the 2D engine, in every
+//                          other second, so one run compares both. Build 71's pass meter: each 4096x4096 D16 shadow
+//                          map spends ~1.1 ms in its clear before the first draw (~25 pixels per GPU clock, the same
+//                          rate as the 2D engine's color clears), two maps plus a 2048x2048 one per frame. 1 = always
+//                          the 3D draw, 0 = stock. Without the stats log nothing flips it, so alt stays on.
+// The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

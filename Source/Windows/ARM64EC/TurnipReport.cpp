@@ -2,7 +2,7 @@
 /*
 $info$
 tags: Bin|ARM64EC
-desc: Reads the FEX link of FEX's Turnip build: descriptor fix statistics and GPU counters around big render passes
+desc: Reads the FEX link of FEX's Turnip build: descriptor fix and depth clear statistics, GPU counters around big render passes
 $end_info$
 */
 
@@ -58,6 +58,15 @@ namespace {
     {T::GroupSp, 25, "wave_short_sync"},
     {T::GroupSp, 119, "tex_lat_cyc"},
     {T::GroupSp, 120, "tex_lat_n"},
+    // build 72 additions
+    {T::GroupPc, 13, "pc_starve_cp"},
+    {T::GroupPc, 48, "pc_starve_predraw"},
+    {T::GroupVfd, 0, "vfd_busy"},
+    {T::GroupTse, 0, "tse_busy"},
+    {T::GroupRas, 0, "ras_busy"},
+    {T::GroupRb, 0, "rb_busy"},
+    {T::GroupRb, 23, "rb_2d_busy"},
+    {T::GroupLrz, 0, "lrz_busy"},
     // build 69 list
     {T::GroupSp, 9, "wave_cyc"},
     {T::GroupSp, 14, "fs_cyc"},
@@ -86,7 +95,8 @@ namespace {
   // Slots the driver allocates are 48 bytes + 16 per counter, rounded up to 64.
   constexpr size_t MaxSlotSize = 1024;
 
-  // One kind of render pass: same size, attachments, first format, direct or tiled, and descriptor mode.
+  // One kind of render pass: same size, attachments, first format, direct or tiled, descriptor mode, and for direct
+  // passes that clear depth at their start, how that clear was done.
   struct PassKind {
     uint16_t Width, Height;
     uint8_t Colors, Attachments, Sysmem, Mode;
@@ -103,7 +113,17 @@ namespace {
   };
   constexpr size_t MaxKinds = 16;
   // Kinds printed per second, the ones with the most GPU time.
-  constexpr size_t PrintKinds = 4;
+  constexpr size_t PrintKinds = 5;
+
+  // PassKind::Mode bits: T::ModeChangedOnly, and for direct passes with a depth clear T::SlotDepthClear plus
+  // T::ModeDepthClear3d when the 3D draw did it.
+  uint8_t KindMode(const T::Slot& S) {
+    uint8_t Mode = S.Mode & T::ModeChangedOnly;
+    if (S.Sysmem && (S.Mode & T::SlotDepthClear)) {
+      Mode |= T::SlotDepthClear | (S.Mode & T::ModeDepthClear3d);
+    }
+    return Mode;
+  }
 
   T::Channel* Chan {};
   bool NotedDriver {};
@@ -112,7 +132,7 @@ namespace {
   uint32_t Seconds {};
   uint32_t CurrentMode {};
   uint64_t NextSeq {1};
-  uint64_t Last[6][2] {};
+  uint64_t Last[8][2] {};
 
   bool ReadSlot(uint64_t RingCpu, uint32_t Index, uint32_t SlotSize, uint8_t* Out) {
     SIZE_T Read = 0;
@@ -133,11 +153,17 @@ namespace {
                                 !(Chan->Compile & T::CompilePushSpeculate) ? "off (FEX_TU_EARLY_PREAMBLE=0)" :
                                 Chan->Patch < 2                            ? "NOT available (driver older than fex2)" :
                                                                              "NOT honored";
+    const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
+    const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
+                             Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
+                             !(Status & T::StatusDepthClear3d)        ? "by the 2D engine: 3D draw NOT honored" :
+                             ClearSwitch == 2                         ? "by a 3D draw in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
+                                                                        "by a 3D draw (FEX_TU_DEPTH_CLEAR=1)";
     FEX::Windows::StatsLogNote(fextl::fmt::format(
-      "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, {} of {} "
-      "GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
+      "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
+      "depth clears at the start of direct passes {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, Chan->CountersReserved, Chan->CounterCount,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, DepthClear, Chan->CountersReserved, Chan->CounterCount,
       (Status & T::StatusNotKgsl) ? " (not KGSL)" : "", (Status & T::StatusRingFailed) ? ", ring allocation FAILED" : "",
       Chan->RingCount, Chan->SlotSize, Counters.empty() ? "-" : Counters));
   }
@@ -175,10 +201,11 @@ namespace {
     const auto Ratio = [](double A, double B) {
       return B > 0 ? A / B : 0.0;
     };
-    fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
+    const char* Clear = !(K.Mode & T::SlotDepthClear) ? "" : (K.Mode & T::ModeDepthClear3d) ? " clear 3d" : " clear 2d";
+    fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
                                             K.Width, K.Height, K.Colors, K.Attachments, K.Format0, K.Sysmem ? "direct" : "tiled",
-                                            DescSeen ? (K.Mode ? " desc on" : " desc off") : "", K.Passes, K.Draws, Ms,
-                                            Ms * 1000.0 / Draws);
+                                            DescSeen ? ((K.Mode & T::ModeChangedOnly) ? " desc on" : " desc off") : "", Clear,
+                                            K.Passes, K.Draws, Ms, Ms * 1000.0 / Draws);
     const double Cycles = V(T::GroupCp, 0);
     if (Cycles > 0 && K.Ticks) {
       Line += fextl::fmt::format(" at {:.0f} MHz", Cycles / (K.Ticks / 19.2));
@@ -249,6 +276,28 @@ namespace {
         Line += " | per cycle: " + Parts;
       }
     }
+    // Units ahead of and behind the shader cores, per GPU cycle (build 72): primitive control waiting for the command
+    // processor's next draw or for draw setup, and how busy vertex fetch, triangle setup, rasterizer, depth pre-test,
+    // render backend and 2D engine are. One unit near 1.00 (or above, for units the counter sums over several copies of)
+    // while the others idle is the limit.
+    if (Cycles > 0) {
+      static constexpr struct {
+        uint32_t Group, Countable;
+        const char* Name;
+      } Units[] = {{T::GroupPc, 13, "pc waits for cp"},    {T::GroupPc, 48, "pc waits for draw setup"},
+                   {T::GroupVfd, 0, "vertex fetch"},       {T::GroupTse, 0, "triangle setup"},
+                   {T::GroupRas, 0, "rasterizer"},         {T::GroupLrz, 0, "depth pre-test"},
+                   {T::GroupRb, 0, "render backend"},      {T::GroupRb, 23, "2d engine"}};
+      fextl::string Parts;
+      for (const auto& U : Units) {
+        if (Has(U.Group, U.Countable)) {
+          Parts += fextl::fmt::format("{}{} {:.2f}", Parts.empty() ? "" : ", ", U.Name, V(U.Group, U.Countable) / Cycles);
+        }
+      }
+      if (!Parts.empty()) {
+        Line += " | units per cycle: " + Parts;
+      }
+    }
     if (Has(T::GroupCp, 11)) {
       Line += fextl::fmt::format(" | contexts/draw {:.2f}", V(T::GroupCp, 11) / Draws);
     }
@@ -265,11 +314,22 @@ namespace {
 
   fextl::string Lines() {
     const uint32_t Status = __atomic_load_n(&Chan->Status, __ATOMIC_ACQUIRE);
-    // Pick the mode for the next second first, so the flip happens at a steady pace.
+    // Pick the mode for the next second first, so the flip happens at a steady pace. With both switches on alt the
+    // depth clear flips every two seconds, so each of the four combinations gets seconds of its own.
     const uint32_t ModeThisSecond = CurrentMode;
-    if (FEX::Windows::Turnip::DescSwitch() == 2) {
+    const uint32_t DescSw = FEX::Windows::Turnip::DescSwitch();
+    const uint32_t ClearSw = FEX::Windows::Turnip::DepthClearSwitch();
+    if (DescSw == 2 || ClearSw == 2) {
       ++Seconds;
-      CurrentMode = (Seconds & 1) ? (T::ModeChangedOnly | T::ModePushReuse) : 0;
+      uint32_t Mode = CurrentMode;
+      if (DescSw == 2) {
+        Mode = (Mode & ~(T::ModeChangedOnly | T::ModePushReuse)) | ((Seconds & 1) ? (T::ModeChangedOnly | T::ModePushReuse) : 0);
+      }
+      if (ClearSw == 2) {
+        const bool On = DescSw == 2 ? ((Seconds >> 1) & 1) : (Seconds & 1);
+        Mode = (Mode & ~T::ModeDepthClear3d) | (On ? T::ModeDepthClear3d : 0);
+      }
+      CurrentMode = Mode;
       __atomic_store_n(&Chan->Mode, CurrentMode, __ATOMIC_RELAXED);
     }
     ++Ticks;
@@ -295,6 +355,9 @@ namespace {
     Delta(4, Chan->PushReused, Reused);
     const uint64_t PassNow[2] = {Chan->PassesSampled, Chan->PassesSmall};
     Delta(5, PassNow, Misc);
+    uint64_t Clears[2], ClearPx[2];
+    Delta(6, Chan->DepthClears, Clears);
+    Delta(7, Chan->DepthClearPx, ClearPx);
     const auto PerUpdate = [&](int i) {
       return Emits[i] ? fextl::fmt::format("{:.2f}", static_cast<double>(Flushed[i]) / Emits[i]) : fextl::string("-");
     };
@@ -309,6 +372,13 @@ namespace {
     } else {
       Out += fextl::fmt::format("  turnip: cmdbufs {} | descriptor updates {} | push {} | passes sampled {} small {}\n", CmdBufs[0],
                                 Emits[0], PushAll, Misc[0], Misc[1]);
+    }
+
+    // Depth clears at the start of passes that may run direct, as recorded (fex3 and later): by the 2D engine or a 3D draw.
+    if (Chan->Patch >= 3 && (ClearSw != 0 || Clears[1] != 0)) {
+      Out += fextl::fmt::format("  turnip: depth clear {} this second | depth clears 2d engine {} ({:.1f} Mpx) 3d draw {} ({:.1f} Mpx)\n",
+                                (ModeThisSecond & T::ModeDepthClear3d) ? "3d" : "2d", Clears[0], ClearPx[0] / 1e6, Clears[1],
+                                ClearPx[1] / 1e6);
     }
 
     const uint64_t RingCpu = __atomic_load_n(&Chan->RingCpu, __ATOMIC_ACQUIRE);
@@ -347,7 +417,7 @@ namespace {
         continue;
       }
       ++NextSeq;
-      const uint8_t SlotMode = S.Mode & T::ModeChangedOnly;
+      const uint8_t SlotMode = KindMode(S);
       PassKind* K = nullptr;
       for (size_t i = 0; i < KindCount; ++i) {
         if (Kinds[i].Same(S, SlotMode)) {

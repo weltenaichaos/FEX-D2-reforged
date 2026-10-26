@@ -127,6 +127,13 @@ namespace {
     // FEX's Turnip fex2 treats push sets as written (unpushed slots read as empty), and the preamble shrinks to ~250
     // branch-free instructions that run early (checked on the PC with the game's 4 lighting shaders).
     {"FEX_TU_EARLY_PREAMBLE", "1"},
+    // Build 72: in fights each frame draws two 4096x4096 shadow maps (and one 2048x2048), and each starts with a depth
+    // clear that Turnip does with the GPU's 2D engine: ~1.1 ms per 4096 map at ~25 pixels per clock (the 'last tile
+    // began' times of the pass meter), ~2.6 ms of the ~26 ms GPU frame. FEX's Turnip fex3 can clear them with one 3D draw
+    // through the depth unit instead (what vkCmdClearAttachments does inside a pass), compressed like the game's own depth
+    // writes; alt switches it on in every other second so one run measures both ways ('turnip pass 4096x4096 ... clear
+    // 3d|2d' lines, and the pass meter's 'last tile began').
+    {"FEX_TU_DEPTH_CLEAR", "alt"},
   };
 
   // In the order the stats log lists them.
@@ -187,6 +194,7 @@ namespace {
     "FEX_TU_COUNTERS",
     "FEX_TU_SAMPLE_DRAWS",
     "FEX_TU_EARLY_PREAMBLE",
+    "FEX_TU_DEPTH_CLEAR",
   };
 
   bool UseD2RDefaults {};

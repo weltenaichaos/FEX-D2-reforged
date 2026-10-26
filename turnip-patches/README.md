@@ -30,6 +30,27 @@ GameNative.
     so shaders compile anew.
   - Status bit 0x80 tells FEX it was honored.
 
+- `0003-fex3-depth-clear-3d.patch` (fex3, build 72): mode bit 2 `TU_FEX_MODE_DEPTH_CLEAR_3D`.
+  - In `tu_emit_subpass_begin_sysmem` a depth/stencil attachment cleared at the start of the
+    subpass (the subpass's own single-sampled D16/X8D24/D24S8/D32 attachment, one layer, no
+    multiview, FDM, predication, custom resolve or unresolve) is not cleared by the 2D engine
+    (`clear_sysmem_attachment`, r2d) but left for `tu_fex_clear_depth_3d`, which
+    `tu_emit_subpass_begin` calls once the depth buffer state is emitted: the
+    `vkCmdClearAttachments` sysmem path (`tu_clear_sysmem_attachments`, a RECTLIST draw with
+    depth test ALWAYS and depth/stencil writes) under `CP_COND_REG_EXEC RENDER_MODE|SYSMEM`.
+    Writes go through the depth unit and its cache with UBWC like the app's own depth writes,
+    so the CCU color->depth flush and the wait for idle after the 2D clear are not needed. LRZ
+    is left alone: the pass already cleared it to the same value. Tiled (GMEM) passes clear in
+    GMEM as before. Why: on a740 (a7xx gen2, no `has_generic_clear`) the 2D engine fills ~25
+    pixels per GPU clock, ~1.1 ms for each of D2R's two 4096x4096 D16 shadow maps per frame.
+  - Statistics `depth_clears[2]` / `depth_clear_px[2]` at 0x268 (were reserved), status bit
+    0x100, slot mode bit 0x80 (`TU_FEX_SLOT_DEPTH_CLEAR`: the pass clears depth at its start).
+
+Host check (fex3): `cltest/` records a D16 depth-only pass and a color + D24S8 pass with depth
+clears on the noop drm shim; with mode 0 `cffdump` shows `CP_BLIT` for both depth clears, with
+mode 4 a `DI_PT_RECTLIST` draw after `RB_DEPTH_BUFFER_INFO` (UBWC `LOSSLESSCOMPEN`) with
+`RB_DEPTH_CNTL` Z_WRITE_ENABLE / ZFUNC_ALWAYS, color writes off, stencil untouched.
+
 Host check (fex2): `eptest/` compiles a D2R lighting shader's SPIR-V with
 vkd3d's descriptor buffer layouts on the noop drm shim and prints the pipeline statistics
 ('Early preamble', 'Preamble Instruction Count'), with and without the FEX link.

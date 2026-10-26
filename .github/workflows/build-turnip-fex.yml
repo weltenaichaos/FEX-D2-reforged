@@ -5,8 +5,9 @@
 # Mesa tag MESA_TAG plus this repo's turnip-patches/*.patch, in name order. The patches add
 # the FEX link (TU_FEX_CHANNEL, see Source/Windows/Common/TurnipChannel.h): a descriptor
 # cache fix FEX turns on and off each second, GPU counters around big render passes for
-# FEX's stats log, and (fex2) early preambles for loads through push descriptor sets. Without
-# FEX's link the driver behaves like stock Turnip.
+# FEX's stats log, (fex2) early preambles for loads through push descriptor sets, and (fex3)
+# start-of-pass depth clears as 3D draws in direct passes. Without FEX's link the driver
+# behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
 name: Build Turnip (FEX)
@@ -20,7 +21,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex2
+  FEX_PATCH: fex3
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -125,6 +126,8 @@ jobs:
           strings "$so" | grep -E "^Mesa .* fex%d$|fex pass ring" | head
           strings "$so" | grep -q "fex pass ring"
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
+          grep -q "tu_fex_clear_depth_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "define TU_FEX_PATCH 3" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
 
       - name: Package adrenotools zip
         run: |
@@ -134,7 +137,7 @@ jobs:
           {
             "schemaVersion": 1,
             "name": "Turnip ${MESA_VERSION} FEX ${FEX_PATCH} (build ${{ github.run_number }})",
-            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters and early preambles for push descriptor sets via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
+            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets and 3D depth clears via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
             "author": "FEX-D2-reforged",
             "packageVersion": "${{ github.run_number }}",
             "vendor": "Mesa",
@@ -176,6 +179,11 @@ jobs:
             fex2 (FEX build 71 and later, FEX_TU_EARLY_PREAMBLE=1): push descriptor sets made for descriptor
             buffers count as written (bindings not pushed since a layout change are zeroed), so shader
             reads of vkd3d's root constant buffers can run in the early preamble, ahead of the draw's
-            pixel waves. Without FEX's link it behaves like stock Turnip.
+            pixel waves.
+            fex3 (FEX build 72 and later, FEX_TU_DEPTH_CLEAR=alt|1): a depth/stencil attachment cleared at
+            the start of a direct (sysmem) render pass is cleared by one 3D draw through the depth unit
+            after the pass state is set up (like vkCmdClearAttachments inside a pass) instead of by the 2D
+            engine; FEX can switch it each second and the driver counts both kinds. Without FEX's link it
+            behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -11,9 +11,14 @@
 //     (us/draw) at MHz | shader cores: busy (of 6), waves per busy core, cores stalled, cores starved by the front end
 //     | fs waves and pixels per draw, wave life | wave cycles split | tex latency | per cycle: draw overlap (dual fs)
 //     and front end / command processor stalls | contexts per draw; then every counter per draw
-//     (one line for each of the 4 pass kinds with the most GPU time that second, the rest summed on 'turnip pass
+//     (one line for each of the 5 pass kinds with the most GPU time that second, the rest summed on 'turnip pass
 //      other'; build 70 counters, see EnvironmentVariablesHandling.cpp)
-// With FEX_TU_DESC=alt it also flips the descriptor fix on and off each second.
+//   (build 72, driver fex3: '<direct> clear 3d|2d' after the kind for direct passes that clear depth at their start, and
+//    '| units per cycle: pc waits for cp, pc waits for draw setup, vertex fetch, triangle setup, rasterizer, depth
+//    pre-test, render backend, 2d engine' before the contexts)
+//   turnip: depth clear <3d|2d> this second | depth clears 2d engine n (Mpx) 3d draw m (Mpx)   (driver fex3 and later)
+// With FEX_TU_DESC=alt it also flips the descriptor fix on and off each second, with FEX_TU_DEPTH_CLEAR=alt the depth
+// clear path (every two seconds when both are alt).
 namespace TurnipReport {
 // Call in process init, when the stats log is on.
 void Init();
