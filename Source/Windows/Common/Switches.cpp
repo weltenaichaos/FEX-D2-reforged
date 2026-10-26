@@ -114,6 +114,12 @@ namespace {
     // holds back one hand-out of the credit once it sees the game running ahead of the latency it set (see
     // EnvironmentVariablesHandling.h). That VKD3D build also turns it on by itself while frame start pacing is on.
     {"FEX_VKD3D_LATENCY_RESYNC", "1"},
+    // Build 80 + VKD3D fex17: D2R keeps creating heaps while it is played (GPU memory grew 3.1 -> 3.8 GB in 95 s of the
+    // b79 run), each a new driver allocation the kernel zeroes on the calling thread (~0.15 ms per MB). Twice the main
+    // thread made 96 MB in one frame (~14 ms, the frame came late) and a 256 MB heap on a worker made Android reclaim
+    // memory while the main thread waited. FEX's vkd3d-proton build makes spares on a background thread so the game's
+    // threads take one instead (see EnvironmentVariablesHandling.h).
+    {"FEX_VKD3D_MEMORY_AHEAD", "1"},
     // Build 68: the main pass's time grows ~14.6 us per draw at about the same shaded pixel count (b67: 238 draws 5.4 ms,
     // 963 draws 15.9 ms, ~0.85M pixels each), and a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9).
     // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14
@@ -216,6 +222,7 @@ namespace {
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",
     "FEX_VKD3D_LATENCY_RESYNC",
+    "FEX_VKD3D_MEMORY_AHEAD",
     "FEX_TU_NOPREAMBLE",
     "FEX_TU_CHANNEL",
     "FEX_TU_DESC",

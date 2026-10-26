@@ -1,0 +1,590 @@
+From bf2d32ab154e57fe3ecfd425172f0012bfef5b23 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 17:13:45 +0000
+Subject: [PATCH] FEX: GPU memory made ahead (VKD3D_FEX_MEMORY_AHEAD)
+
+D2R keeps creating heaps while it is played, each with its own
+vkAllocateMemory, which on Turnip/KGSL costs ~0.15 ms per MB of kernel
+zeroing and mapping on the calling thread (14 ms for 96 MB on the main
+thread in one frame, twice in the FEX build 79 run; those frames came
+late). A background thread now makes spares of each kind of request
+seen (memory type, size, allocate flags, priority; 4-64 MB, plain
+chains only) and later requests take one instead of allocating. Each
+kind keeps as many spares as its biggest burst, up to a quarter of the
+cap (VKD3D_FEX_MEMORY_AHEAD_MB, default 256 MB); emptiest kind first,
+idle kinds give up spares when the cap is full. Report flag 0x2000 and
+a 'gpu memory ahead' line with spares taken/not ready/made and the time
+of allocations made when asked.
+---
+ libs/vkd3d/fex_pass_meter.c |  25 +++
+ libs/vkd3d/memory.c         | 386 +++++++++++++++++++++++++++++++++++-
+ libs/vkd3d/resource.c       |   2 +
+ libs/vkd3d/vkd3d_private.h  |  51 +++++
+ 4 files changed, 463 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/fex_pass_meter.c b/libs/vkd3d/fex_pass_meter.c
+index 3b604b5..e25d160 100644
+--- a/libs/vkd3d/fex_pass_meter.c
++++ b/libs/vkd3d/fex_pass_meter.c
+@@ -1733,6 +1733,7 @@ static void fex_gpu_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+     static char text[VKD3D_FEX_REPORT_SIZE];
+     const double ms = meter->ns_per_tick / 1e6;
+     const struct vkd3d_fex_transfer_totals *x = &meter->xfer;
++    struct vkd3d_fex_ahead_counts ahead;
+     struct vkd3d_fex_mem_counts mem;
+     uint32_t top[6], top_count = 0;
+     bool any_mem = false;
+@@ -1764,6 +1765,16 @@ static void fex_gpu_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+                 " CopyTiles/WriteBufferImmediate/AtomicCopy; 'vkd3d' = none of these: vkd3d's own work such as image"
+                 " layout changes); timer results are reset once read (%s)\n",
+                 meter->host_reset ? "on" : "off: the driver can't");
++        /* First few reports only: the report has room for 4 KB. */
++        if (meter->gpu_publishes <= 3)
++            len = vkd3d_fex_report_append(text, sizeof(text), len,
++                "# gpu memory ahead (VKD3D fex17): new memory of 4-64 MB (the game's heaps) comes from spares a"
++                " background thread made before it was asked for (switch %s): 'taken' = requests that got one, 'not"
++                " ready' = requests that allocated themselves, 'made ahead' = spares made (time on that thread), 'freed'"
++                " = spares freed for a kind asked for more recently, 'ready' = spares waiting now; 'made when asked' ="
++                " every allocation of 1 MB or more made right when it was asked for (by the game's threads), with the"
++                " time it took\n",
++                meter->device->memory_info.fex_ahead.on ? "on" : "off");
+     }
+ 
+     vkd3d_fex_memory_take(&mem);
+@@ -1782,6 +1793,20 @@ static void fex_gpu_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+ #undef FEX_MEM
+     }
+ 
++    vkd3d_fex_ahead_take_counts(meter->device, &ahead);
++    if (ahead.taken || ahead.missed || ahead.made || ahead.freed || ahead.failed || ahead.asked)
++    {
++        len = vkd3d_fex_report_append(text, sizeof(text), len,
++                "  gpu memory ahead: %s | taken=%u %.0fMB not ready=%u %.0fMB | made ahead=%u %.0fMB %.1fms max %.1fms"
++                " freed=%u failed=%u | ready %u %.0fMB (of %.0fMB, %u kinds) | made when asked=%u %.0fMB %.1fms max"
++                " %.1fms\n",
++                ahead.on ? "on" : "off", ahead.taken, ahead.taken_bytes / 1048576.0, ahead.missed,
++                ahead.missed_bytes / 1048576.0, ahead.made, ahead.made_bytes / 1048576.0, ahead.made_ns / 1e6,
++                ahead.made_max_ns / 1e6, ahead.freed, ahead.failed, ahead.ready, ahead.ready_bytes / 1048576.0,
++                ahead.cap_bytes / 1048576.0, ahead.kinds, ahead.asked, ahead.asked_bytes / 1048576.0,
++                ahead.asked_ns / 1e6, ahead.asked_max_ns / 1e6);
++    }
++
+     if (x->submits || x->resolved || x->lost)
+     {
+         len = vkd3d_fex_report_append(text, sizeof(text), len,
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 5d1f73f..3ea1517 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -1070,6 +1070,378 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
+         vkd3d_report_memory_budget(device);
+ }
+ 
++/* GPU memory made ahead (VKD3D fex17, VKD3D_FEX_MEMORY_AHEAD=1).
++ * D2R keeps creating heaps while it is played (the GPU memory in use grew from 3.1 to 3.8 GB in 95 s of the FEX build 79
++ * run and was never given back), each with its own vkAllocateMemory. On Turnip that is a KGSL allocation the kernel
++ * zeroes and maps page by page: ~0.15 ms per MB (14 ms for the six heaps of 96 MB together the main thread made in one
++ * frame, twice in that run), and a 256 MB heap on a worker made the kernel reclaim memory (direct reclaim, 220 stalls)
++ * while the main thread waited for it. Those frames came late, and the frame start pacing then held back little for ~8 s each
++ * (frames ~60 ms to the screen instead of ~40).
++ * Each kind of request (memory type, size, allocate flags, priority) seen once gets spares made by a background thread
++ * at a lower priority, which a later request of that kind takes instead of allocating. Each kind keeps as many spares
++ * as the most requests it got in one burst (each within 1 s of the one before), up to a quarter of the cap
++ * (VKD3D_FEX_MEMORY_AHEAD_MB, default 256 MB, for all spares together). The emptiest kind (fewest spares for what it
++ * keeps) is filled first; when the cap is full, spares of kinds not asked for in a while are freed for the kind asked
++ * for now. A spare is memory the driver just allocated and nobody used, so it is what a new allocation would
++ * be: zeroed by the kernel, made with the same flags (the zero-initialize flag included). Requests between 4 and 64 MB
++ * whose pNext chain has only allocate flags and a priority; no dedicated, imported or exported memory. */
++#define FEX_AHEAD_MIN_SIZE (4ull << 20)
++#define FEX_AHEAD_MAX_SIZE (64ull << 20)
++#define FEX_AHEAD_BURST_NS 1000000000ull
++#define FEX_AHEAD_IDLE_NS 2000000000ull     /* a kind not asked for this much longer than another gives up its spares */
++#define FEX_AHEAD_ASKED_MIN_SIZE (1ull << 20) /* allocations made when asked are timed from this size on */
++#define FEX_AHEAD_DEFAULT_MB 256u
++
++static pthread_mutex_t vkd3d_fex_ahead_count_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct vkd3d_fex_ahead_counts vkd3d_fex_ahead_count;
++
++static bool vkd3d_fex_ahead_signature(const VkMemoryAllocateInfo *info, VkMemoryAllocateFlags *flags,
++        bool *has_priority, float *priority)
++{
++    const VkMemoryAllocateFlagsInfo *flags_info;
++    const VkBaseInStructure *next;
++
++    *flags = 0;
++    *has_priority = false;
++    *priority = 0.0f;
++    for (next = info->pNext; next; next = next->pNext)
++    {
++        if (next->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO)
++        {
++            flags_info = (const VkMemoryAllocateFlagsInfo *)next;
++            if (flags_info->deviceMask || (flags_info->flags &
++                    ~(VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT | VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT)))
++                return false;
++            *flags = flags_info->flags;
++        }
++        else if (next->sType == VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT)
++        {
++            *has_priority = true;
++            *priority = ((const VkMemoryPriorityAllocateInfoEXT *)next)->priority;
++        }
++        else
++            return false;
++    }
++    return true;
++}
++
++static uint32_t vkd3d_fex_ahead_max_depth(const struct vkd3d_fex_ahead *ahead, VkDeviceSize size)
++{
++    VkDeviceSize depth = (ahead->cap / 4u) / size;
++    return (uint32_t)max(min(depth, (VkDeviceSize)VKD3D_FEX_AHEAD_SPARES), (VkDeviceSize)1);
++}
++
++/* Takes a spare made for exactly this request, if one is ready, and notes the request either way. */
++static bool vkd3d_fex_ahead_get(struct d3d12_device *device, const VkMemoryAllocateInfo *info, VkDeviceMemory *memory)
++{
++    struct vkd3d_fex_ahead *ahead = &device->memory_info.fex_ahead;
++    struct vkd3d_fex_ahead_kind *kind = NULL;
++    VkMemoryAllocateFlags flags;
++    bool has_priority, took = false, first = false;
++    float priority;
++    uint64_t now_ns;
++    uint32_t i;
++
++    if (!ahead->on || info->allocationSize < FEX_AHEAD_MIN_SIZE || info->allocationSize > FEX_AHEAD_MAX_SIZE)
++        return false;
++    if (!vkd3d_fex_ahead_signature(info, &flags, &has_priority, &priority))
++        return false;
++    if (vkd3d_address_binding_tracker_active(&device->address_binding_tracker))
++        return false;
++
++    now_ns = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&ahead->lock);
++    for (i = 0; i < ahead->kind_count; i++)
++    {
++        if (ahead->kinds[i].type_index == info->memoryTypeIndex && ahead->kinds[i].size == info->allocationSize &&
++                ahead->kinds[i].flags == flags && ahead->kinds[i].has_priority == has_priority &&
++                (!has_priority || ahead->kinds[i].priority == priority))
++        {
++            kind = &ahead->kinds[i];
++            break;
++        }
++    }
++    if (!kind && ahead->kind_count < ARRAY_SIZE(ahead->kinds))
++    {
++        kind = &ahead->kinds[ahead->kind_count++];
++        memset(kind, 0, sizeof(*kind));
++        kind->type_index = info->memoryTypeIndex;
++        kind->size = info->allocationSize;
++        kind->flags = flags;
++        kind->has_priority = has_priority;
++        kind->priority = priority;
++        first = true;
++    }
++
++    if (kind && kind->ready)
++    {
++        *memory = kind->spares[--kind->ready];
++        ahead->held -= kind->size;
++        took = true;
++    }
++    if (kind)
++    {
++        /* Requests in this burst, this one included: the most of them is how many spares the kind keeps. */
++        kind->burst = !first && now_ns - kind->last_ns < FEX_AHEAD_BURST_NS ? kind->burst + 1 : 1;
++        kind->depth = max(kind->depth, min(kind->burst, vkd3d_fex_ahead_max_depth(ahead, kind->size)));
++        kind->last_ns = now_ns;
++        pthread_cond_signal(&ahead->cond);
++    }
++    pthread_mutex_unlock(&ahead->lock);
++
++    pthread_mutex_lock(&vkd3d_fex_ahead_count_lock);
++    if (took)
++    {
++        vkd3d_fex_ahead_count.taken++;
++        vkd3d_fex_ahead_count.taken_bytes += info->allocationSize;
++    }
++    else
++    {
++        vkd3d_fex_ahead_count.missed++;
++        vkd3d_fex_ahead_count.missed_bytes += info->allocationSize;
++    }
++    pthread_mutex_unlock(&vkd3d_fex_ahead_count_lock);
++    return took;
++}
++
++static void vkd3d_fex_ahead_note_asked(VkDeviceSize size, uint64_t ns)
++{
++    if (size < FEX_AHEAD_ASKED_MIN_SIZE)
++        return;
++    pthread_mutex_lock(&vkd3d_fex_ahead_count_lock);
++    vkd3d_fex_ahead_count.asked++;
++    vkd3d_fex_ahead_count.asked_bytes += size;
++    vkd3d_fex_ahead_count.asked_ns += ns;
++    vkd3d_fex_ahead_count.asked_max_ns = max(vkd3d_fex_ahead_count.asked_max_ns, ns);
++    pthread_mutex_unlock(&vkd3d_fex_ahead_count_lock);
++}
++
++static void *vkd3d_fex_ahead_worker(void *userdata)
++{
++    struct d3d12_device *device = userdata;
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_fex_ahead *ahead = &device->memory_info.fex_ahead;
++    struct vkd3d_fex_ahead_kind *kind, *victim;
++    VkMemoryPriorityAllocateInfoEXT priority_info;
++    VkMemoryAllocateFlagsInfo flags_info;
++    VkMemoryAllocateInfo allocate_info;
++    VkDeviceMemory memory;
++    uint64_t start_ns, ns;
++    uint32_t i;
++    VkResult vr;
++
++    vkd3d_set_thread_name("vkd3d-fex-ahead");
++#ifdef _WIN32
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++#endif
++
++    pthread_mutex_lock(&ahead->lock);
++    while (!ahead->stop)
++    {
++        /* The emptiest kind that wants a spare more (fewest spares for what it keeps; the one asked for last of
++         * those). */
++        kind = NULL;
++        for (i = 0; i < ahead->kind_count; i++)
++        {
++            const struct vkd3d_fex_ahead_kind *k = &ahead->kinds[i];
++            uint64_t have, best;
++
++            if (k->failed || k->ready + k->making >= k->depth)
++                continue;
++            if (kind)
++            {
++                /* Compare have/depth without division. */
++                have = (uint64_t)(k->ready + k->making) * kind->depth;
++                best = (uint64_t)(kind->ready + kind->making) * k->depth;
++                if (have > best || (have == best && k->last_ns <= kind->last_ns))
++                    continue;
++            }
++            kind = &ahead->kinds[i];
++        }
++        if (!kind)
++        {
++            pthread_cond_wait(&ahead->cond, &ahead->lock);
++            continue;
++        }
++
++        if (ahead->held + kind->size > ahead->cap)
++        {
++            /* Make room: a spare of the kind not asked for the longest, if that was a while before this one. */
++            victim = NULL;
++            for (i = 0; i < ahead->kind_count; i++)
++            {
++                if (ahead->kinds[i].ready && ahead->kinds[i].last_ns + FEX_AHEAD_IDLE_NS < kind->last_ns &&
++                        (!victim || ahead->kinds[i].last_ns < victim->last_ns))
++                    victim = &ahead->kinds[i];
++            }
++            if (!victim)
++            {
++                pthread_cond_wait(&ahead->cond, &ahead->lock);
++                continue;
++            }
++            memory = victim->spares[--victim->ready];
++            if (victim->depth)
++                victim->depth--;
++            ahead->held -= victim->size;
++            pthread_mutex_unlock(&ahead->lock);
++            VK_CALL(vkFreeMemory(device->vk_device, memory, NULL));
++            pthread_mutex_lock(&vkd3d_fex_ahead_count_lock);
++            vkd3d_fex_ahead_count.freed++;
++            pthread_mutex_unlock(&vkd3d_fex_ahead_count_lock);
++            pthread_mutex_lock(&ahead->lock);
++            continue;
++        }
++
++        kind->making++;
++        ahead->held += kind->size;
++
++        memset(&allocate_info, 0, sizeof(allocate_info));
++        allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        allocate_info.allocationSize = kind->size;
++        allocate_info.memoryTypeIndex = kind->type_index;
++        flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
++        flags_info.pNext = NULL;
++        flags_info.flags = kind->flags;
++        flags_info.deviceMask = 0;
++        if (kind->has_priority)
++        {
++            priority_info.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
++            priority_info.pNext = NULL;
++            priority_info.priority = kind->priority;
++            flags_info.pNext = &priority_info;
++        }
++        /* Same chain as vkd3d_memory_allocation_init: the flags struct is there even when no flag is set. */
++        allocate_info.pNext = &flags_info;
++        pthread_mutex_unlock(&ahead->lock);
++
++        start_ns = vkd3d_get_current_time_ns();
++        vr = VK_CALL(vkAllocateMemory(device->vk_device, &allocate_info, NULL, &memory));
++        ns = vkd3d_get_current_time_ns() - start_ns;
++
++        pthread_mutex_lock(&ahead->lock);
++        kind->making--;
++        if (vr == VK_SUCCESS && kind->ready < ARRAY_SIZE(kind->spares))
++            kind->spares[kind->ready++] = memory;
++        else
++        {
++            ahead->held -= kind->size;
++            if (vr == VK_SUCCESS)
++                VK_CALL(vkFreeMemory(device->vk_device, memory, NULL));
++            else
++            {
++                kind->failed = true;
++                WARN("FEX: making %"PRIu64" MB of memory type %u ahead failed, vr %d.\n",
++                        kind->size >> 20, kind->type_index, vr);
++            }
++        }
++        pthread_mutex_lock(&vkd3d_fex_ahead_count_lock);
++        if (vr == VK_SUCCESS)
++        {
++            vkd3d_fex_ahead_count.made++;
++            vkd3d_fex_ahead_count.made_bytes += allocate_info.allocationSize;
++            vkd3d_fex_ahead_count.made_ns += ns;
++            vkd3d_fex_ahead_count.made_max_ns = max(vkd3d_fex_ahead_count.made_max_ns, ns);
++        }
++        else
++            vkd3d_fex_ahead_count.failed++;
++        pthread_mutex_unlock(&vkd3d_fex_ahead_count_lock);
++    }
++    pthread_mutex_unlock(&ahead->lock);
++    return NULL;
++}
++
++void vkd3d_fex_ahead_init(struct d3d12_device *device)
++{
++    struct vkd3d_fex_ahead *ahead = &device->memory_info.fex_ahead;
++    char env[16];
++    uint32_t mb;
++
++    memset(ahead, 0, sizeof(*ahead));
++    if (!vkd3d_get_env_var("VKD3D_FEX_MEMORY_AHEAD", env, sizeof(env)) || strcmp(env, "1"))
++    {
++        INFO("FEX: GPU memory made ahead off.\n");
++        return;
++    }
++    mb = FEX_AHEAD_DEFAULT_MB;
++    if (vkd3d_get_env_var("VKD3D_FEX_MEMORY_AHEAD_MB", env, sizeof(env)))
++    {
++        mb = strtoul(env, NULL, 0);
++        mb = min(max(mb, 16u), 1024u);
++    }
++    ahead->cap = (VkDeviceSize)mb << 20;
++    if (pthread_mutex_init(&ahead->lock, NULL))
++        return;
++    if (pthread_cond_init(&ahead->cond, NULL))
++    {
++        pthread_mutex_destroy(&ahead->lock);
++        return;
++    }
++    if (pthread_create(&ahead->thread, NULL, vkd3d_fex_ahead_worker, device))
++    {
++        pthread_cond_destroy(&ahead->cond);
++        pthread_mutex_destroy(&ahead->lock);
++        return;
++    }
++    ahead->thread_started = true;
++    ahead->on = true;
++    vkd3d_atomic_uint32_or((uint32_t *)&vkd3d_fex_gpu_report.flags, VKD3D_FEX_REPORT_FLAG_MEMORY_AHEAD,
++            vkd3d_memory_order_release);
++    INFO("FEX: GPU memory made ahead on (up to %u MB).\n", mb);
++}
++
++void vkd3d_fex_ahead_cleanup(struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_fex_ahead *ahead = &device->memory_info.fex_ahead;
++    uint32_t i, j;
++
++    if (!ahead->thread_started)
++        return;
++    pthread_mutex_lock(&ahead->lock);
++    ahead->on = false;
++    ahead->stop = true;
++    pthread_cond_signal(&ahead->cond);
++    pthread_mutex_unlock(&ahead->lock);
++    pthread_join(ahead->thread, NULL);
++    ahead->thread_started = false;
++
++    for (i = 0; i < ahead->kind_count; i++)
++        for (j = 0; j < ahead->kinds[i].ready; j++)
++            VK_CALL(vkFreeMemory(device->vk_device, ahead->kinds[i].spares[j], NULL));
++    ahead->kind_count = 0;
++    ahead->held = 0;
++    pthread_cond_destroy(&ahead->cond);
++    pthread_mutex_destroy(&ahead->lock);
++}
++
++void vkd3d_fex_ahead_take_counts(struct d3d12_device *device, struct vkd3d_fex_ahead_counts *out)
++{
++    struct vkd3d_fex_ahead *ahead = &device->memory_info.fex_ahead;
++    uint32_t i;
++
++    pthread_mutex_lock(&vkd3d_fex_ahead_count_lock);
++    *out = vkd3d_fex_ahead_count;
++    memset(&vkd3d_fex_ahead_count, 0, sizeof(vkd3d_fex_ahead_count));
++    pthread_mutex_unlock(&vkd3d_fex_ahead_count_lock);
++
++    out->on = ahead->on;
++    out->ready = 0;
++    out->ready_bytes = 0;
++    out->kinds = 0;
++    out->cap_bytes = 0;
++    if (!ahead->on)
++        return;
++    pthread_mutex_lock(&ahead->lock);
++    for (i = 0; i < ahead->kind_count; i++)
++    {
++        out->ready += ahead->kinds[i].ready;
++        out->ready_bytes += (uint64_t)ahead->kinds[i].ready * ahead->kinds[i].size;
++    }
++    out->kinds = ahead->kind_count;
++    out->cap_bytes = ahead->cap;
++    pthread_mutex_unlock(&ahead->lock);
++}
++
+ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
+         VkDeviceSize size, VkMemoryPropertyFlags type_flags, const uint32_t base_type_mask,
+         void *pNext, bool respect_budget, struct vkd3d_device_memory_allocation *allocation)
+@@ -1081,6 +1453,7 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
+     VkDeviceSize *type_current, heap_size;
+     VkMemoryAllocateInfo allocate_info;
+     bool rebar_budget;
++    uint64_t start_ns;
+     VkResult vr;
+ 
+     device_local_mask = 0u;
+@@ -1200,7 +1573,18 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
+     /* In case we get address binding callbacks, ensure driver knows it's not a sparse bind that happens async. */
+     vkd3d_address_binding_tracker_mark_user_thread();
+ 
+-    vr = VK_CALL(vkAllocateMemory(device->vk_device, &allocate_info, NULL, &allocation->vk_memory));
++    /* FEX (VKD3D fex17): a spare made ahead for exactly this request, else allocate now (timed). */
++    if (!rebar_budget && vkd3d_fex_ahead_get(device, &allocate_info, &allocation->vk_memory))
++    {
++        vr = VK_SUCCESS;
++    }
++    else
++    {
++        start_ns = vkd3d_get_current_time_ns();
++        vr = VK_CALL(vkAllocateMemory(device->vk_device, &allocate_info, NULL, &allocation->vk_memory));
++        if (vr == VK_SUCCESS)
++            vkd3d_fex_ahead_note_asked(allocate_info.allocationSize, vkd3d_get_current_time_ns() - start_ns);
++    }
+ 
+     if (vr == VK_SUCCESS)
+     {
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index d7a4f82..2711959 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -9575,6 +9575,7 @@ static void vkd3d_memory_info_init_budgets(struct vkd3d_memory_info *info,
+ void vkd3d_memory_info_cleanup(struct vkd3d_memory_info *info,
+         struct d3d12_device *device)
+ {
++    vkd3d_fex_ahead_cleanup(device);
+     pthread_mutex_destroy(&info->budget_lock);
+ }
+ 
+@@ -9756,6 +9757,7 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
+           info->cpu_accessible_domain.sampled_type_mask);
+     TRACE("Device supports CPU visible render targets on memory types 0x%#x.\n",
+           info->cpu_accessible_domain.rt_ds_type_mask);
++    vkd3d_fex_ahead_init(device);
+     return S_OK;
+ }
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 185749a..9fe19a4 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3076,6 +3076,7 @@ struct vkd3d_timestamp_profiler_submitted_work;
+ #define VKD3D_FEX_REPORT_FLAG_SKIP_FRESH_CLEARS 0x400u /* gpu report: zero fills of never-used chunk pages skipped */
+ #define VKD3D_FEX_REPORT_FLAG_PRESENT_DRAWN 0x800u /* present report: frames go to the window system only once drawn */
+ #define VKD3D_FEX_REPORT_FLAG_LATENCY_RESYNC 0x1000u /* present report: frame credit resync is on (VKD3D fex16) */
++#define VKD3D_FEX_REPORT_FLAG_MEMORY_AHEAD 0x2000u /* gpu report: GPU memory made ahead is on (VKD3D fex17) */
+ #define VKD3D_FEX_REPORT_FLAG_DEVICE 0x80000000u /* a D3D12 device was created */
+ struct vkd3d_fex_report
+ {
+@@ -4561,6 +4562,52 @@ struct vkd3d_memory_info_domain
+     uint32_t rt_ds_type_mask;
+ };
+ 
++/* VKD3D fex17: GPU memory made ahead (memory.c). Each kind is one exact vkAllocateMemory request (memory type, size,
++ * allocate flags, priority) the game's heaps asked for; its spares are made on a background thread and handed out
++ * instead of a new allocation. */
++#define VKD3D_FEX_AHEAD_KINDS 24u
++#define VKD3D_FEX_AHEAD_SPARES 24u
++struct vkd3d_fex_ahead_kind
++{
++    uint32_t type_index;
++    VkMemoryAllocateFlags flags;
++    bool has_priority;
++    float priority;
++    VkDeviceSize size;
++    uint32_t depth;   /* spares to keep ready */
++    uint32_t burst;   /* requests in the current burst */
++    uint32_t ready;   /* spares made */
++    uint32_t making;  /* spares being made */
++    bool failed;      /* making one failed: no more for this kind */
++    uint64_t last_ns; /* last request */
++    VkDeviceMemory spares[VKD3D_FEX_AHEAD_SPARES];
++};
++struct vkd3d_fex_ahead
++{
++    bool on;
++    bool thread_started;
++    bool stop;
++    pthread_t thread;
++    pthread_mutex_t lock;
++    pthread_cond_t cond;
++    VkDeviceSize cap;  /* most bytes of spares made or being made */
++    VkDeviceSize held; /* bytes of spares made or being made */
++    uint32_t kind_count;
++    struct vkd3d_fex_ahead_kind kinds[VKD3D_FEX_AHEAD_KINDS];
++};
++/* Counted since the last take (the 'gpu memory ahead' line). */
++struct vkd3d_fex_ahead_counts
++{
++    uint32_t taken, missed, made, freed, failed, asked;
++    uint64_t taken_bytes, missed_bytes, made_bytes, asked_bytes;
++    uint64_t made_ns, made_max_ns, asked_ns, asked_max_ns;
++    /* now */
++    bool on;
++    uint32_t ready, kinds;
++    uint64_t ready_bytes, cap_bytes;
++};
++void vkd3d_fex_ahead_take_counts(struct d3d12_device *device, struct vkd3d_fex_ahead_counts *out);
++
+ struct vkd3d_memory_info
+ {
+     /* Includes normal system memory, but also resizable BAR memory.
+@@ -4591,12 +4638,16 @@ struct vkd3d_memory_info
+ 
+     pthread_mutex_t budget_lock;
+     uint32_t has_used_gpu_upload_heap;
++
++    struct vkd3d_fex_ahead fex_ahead; /* VKD3D fex17 */
+ };
+ 
+ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
+         struct d3d12_device *device);
+ void vkd3d_memory_info_cleanup(struct vkd3d_memory_info *info,
+         struct d3d12_device *device);
++void vkd3d_fex_ahead_init(struct d3d12_device *device);
++void vkd3d_fex_ahead_cleanup(struct d3d12_device *device);
+ 
+ /* meta operations */
+ struct vkd3d_clear_uav_args
+-- 
+2.43.0
+

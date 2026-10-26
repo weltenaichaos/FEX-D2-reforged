@@ -46,6 +46,7 @@ namespace {
   constexpr uint32_t FlagSkipFreshClears = 0x400; // gpu report (VKD3D fex11): zero fills of never-used block pages skipped
   constexpr uint32_t FlagPresentDrawn = 0x800;    // present report (VKD3D fex12): frames go to the window system only once drawn
   constexpr uint32_t FlagLatencyResync = 0x1000;  // present report (VKD3D fex16): frame credit resync is on
+  constexpr uint32_t FlagMemoryAhead = 0x2000;    // gpu report (VKD3D fex17): GPU memory made ahead is on
   constexpr uint32_t FlagDevice = 0x80000000u;
 
   struct Source {
@@ -450,16 +451,17 @@ namespace {
       // fex11 and older don't know the flag, so off there can also mean an older VKD3D component.
       const char* DrawnState = PresentFlags & FlagPresentDrawn ? "on" : "off (or VKD3D older than fex12)";
       const char* ResyncState = PresentFlags & FlagLatencyResync ? "on" : "off (or VKD3D older than fex16)";
+      const char* AheadState = GpuFlags & FlagMemoryAhead ? "on" : "off (or VKD3D older than fex17)";
       CopyHeader CopyH {};
       const bool HasCopy = Copy.Address && ReadMemory(Copy.Address, &CopyH, sizeof(CopyH)) && CopyH.Magic == CopyMagic;
       const char* CopyState = !HasCopy ? "missing (VKD3D older than fex13)" : CopyH.Flags & FlagOn ? "on" : "off";
       Out.insert(0, fextl::fmt::format("# vkd3d: FEX's VKD3D build is loaded (d3d12core.dll at {:X}): clear folding {}, "
                                        "GPU pass meter {}, present timeline {}, cap pre-sleep {}, zero fills of never-used memory "
                                        "skipped {}, frames to the screen only once drawn {}, shader copy {}, frame credit resync {}, "
-                                       "frame start pacing {}\n",
+                                       "GPU memory made ahead {}, frame start pacing {}\n",
                                        ModuleAddress, PassFlags & FlagFoldClears ? "on" : "off", PassFlags & FlagOn ? "on" : "off",
                                        PresentState, PresentFlags & FlagCapPresleep ? "on" : "off", FreshState, DrawnState, CopyState,
-                                       ResyncState,
+                                       ResyncState, AheadState,
                                        !(PresentFlags & FlagFrameStart) ? "off" :
                                        PresentFlags & FlagMarginCaused ? "on (gradual, margin only from frames it made late: VKD3D fex4 or "
                                                                          "later)" :

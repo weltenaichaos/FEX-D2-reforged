@@ -415,6 +415,10 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "that many hand-outs of the credit, so the game is back at 2 frames in flight (VKD3D fex16 and later; "
                       "'frame credits (resync)' line)",
                       true);
+  SetupVkd3dFexSwitch("FEX_VKD3D_MEMORY_AHEAD", L"VKD3D_FEX_MEMORY_AHEAD",
+                      "new GPU memory of 4-64 MB for the game's heaps comes from spares a background thread made before "
+                      "the game asked, instead of the kernel zeroing it on the game's thread (VKD3D fex17 and later; 'gpu "
+                      "memory ahead' line)");
   SetupVkd3dShaderCopy();
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");

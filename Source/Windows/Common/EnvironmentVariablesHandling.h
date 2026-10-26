@@ -80,6 +80,18 @@ namespace FEX::Windows {
 //                            many hand-outs (the next frame starts one frame later, once). 8 such actions within 60 s
 //                            stop it. A 'frame credits (resync)' line shows how far ahead the game was (-1 or 0 = as
 //                            set, 0 or 1 = one ahead) and the hand-outs held back.
+//   FEX_VKD3D_MEMORY_AHEAD=1 VKD3D_FEX_MEMORY_AHEAD=1 (the D2R default, build 80, VKD3D fex17). D2R keeps creating
+//                            D3D12 heaps while it is played (in the b79 log GPU memory grew from 3.1 to 3.8 GB in 95 s
+//                            and was never given back), each with its own vkAllocateMemory, which on Turnip/KGSL is
+//                            kernel zeroing and mapping on the calling thread: ~0.15 ms per MB. Twice the main thread
+//                            made 96 MB of heaps in one frame (~14 ms in ID3D12Device::CreateHeap, the frame came late,
+//                            and the frame start pacing then held back little for ~8 s), and a 256 MB heap on a worker
+//                            made Android reclaim memory while the main thread waited for its jobs. vkd3d now makes
+//                            spares of each kind of request it saw (memory type, size, flags; 4-64 MB) on a background
+//                            thread and hands one out instead of allocating; each kind keeps as many as its biggest
+//                            burst, up to a quarter of VKD3D_FEX_MEMORY_AHEAD_MB (default 256 MB) for all together. A
+//                            'gpu memory ahead' line shows spares taken, requests that found none, the spares made and
+//                            how long the allocations made when asked took.
 //
 // Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
 // same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader
