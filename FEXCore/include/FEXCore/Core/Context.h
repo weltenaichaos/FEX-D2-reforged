@@ -140,6 +140,15 @@ public:
   virtual void FlushAndCloseCodeMap() = 0;
 
   FEX_DEFAULT_VISIBILITY virtual void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) = 0;
+  // Code buffer policy, for frontends. All threads share one buffer of translated code; when it is full, a new one is
+  // started and every thread translates or loads its code again (from 16 MB doubling up to 128 MB, each step the same).
+  //   UseMaximalCodeBuffer: start at the largest size. Call after InitCore, before any code is translated.
+  //   RequestCodeBufferRenewal: the next code allocation of any thread within ValidMs starts a fresh buffer when the
+  //   current one is at least MinUsedPercent used, so the frontend can put that reload where it is hidden (a loading
+  //   screen) rather than let the buffer run full in the middle of play. A later request replaces an earlier one.
+  // Each new buffer is reported through HLE::SyscallHandler::OnCodeBufferStarted.
+  FEX_DEFAULT_VISIBILITY virtual void UseMaximalCodeBuffer() = 0;
+  FEX_DEFAULT_VISIBILITY virtual void RequestCodeBufferRenewal(uint32_t MinUsedPercent, uint32_t ValidMs) = 0;
   FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual void
   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;

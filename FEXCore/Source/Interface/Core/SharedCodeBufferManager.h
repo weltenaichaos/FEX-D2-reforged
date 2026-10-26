@@ -31,6 +31,10 @@ struct CodeBuffer {
 
   ~CodeBuffer();
 
+  // Blocks placed in this buffer, and how many of them were loaded from the disk cache (for the frontend's notes).
+  std::atomic<uint32_t> Blocks {};
+  std::atomic<uint32_t> CachedBlocks {};
+
   // Atomically allocate a fixed size buffer out of the current allocated codebuffer.
   // Lockless because it's just a linear allocator.
   struct CodeBufferAllocation {
@@ -126,12 +130,42 @@ public:
   // Subsequent calls to GetLatest will point to the returned buffer.
   fextl::shared_ptr<CodeBuffer> StartMaximalCodeBuffer();
 
-  virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
+  // Why a buffer was started: the first one, the latest one was full, a renewal the frontend asked for (see
+  // RequestRenewal), or the start size changed before any code was placed (UseMaximal).
+  enum class StartReason : uint8_t { First, Full, Renewed, Resized };
+  struct StartInfo {
+    StartReason Reason;
+    uint32_t Number;         // buffers started so far, this one included
+    uint64_t Size;           // this buffer's usable size
+    uint64_t PrevSize;       // the buffer it replaced: usable size, bytes used and blocks placed (0 for the first)
+    uint64_t PrevUsed;
+    uint32_t PrevBlocks;
+    uint32_t PrevCachedBlocks;
+  };
+  virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&, const StartInfo&) {};
+
+  // Start at the largest size instead of growing to it: every growth step starts a new buffer, which drops all code.
+  void UseMaximal();
+
+  // The next code allocation of any thread within ValidMs starts a fresh buffer when the current one is at least
+  // MinUsedPercent used (TakeRenewal says so). A frontend asks at a moment where reloading code is hidden, such as a
+  // loading screen, so the buffer doesn't run full (and drop everything) in the middle of play. A later request replaces
+  // an earlier one.
+  void RequestRenewal(uint32_t MinUsedPercent, uint32_t ValidMs);
+  // Called by a thread about to place code in Current, its reference to the latest buffer: whether to start a fresh one
+  // instead. Only one thread takes a request.
+  bool TakeRenewal(const CodeBuffer& Current);
 
 private:
   fextl::shared_ptr<CodeBuffer> Latest;
 
-  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);
+  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size, StartReason Reason);
+
+  // MinUsedPercent << 56 | the cycle counter it expires at (low 56 bits); 0 = no request.
+  std::atomic<uint64_t> RenewRequest {};
+  // Set by TakeRenewal, read by the AllocateNew that follows it.
+  std::atomic<bool> RenewTaken {};
+  std::atomic<uint32_t> Started {};
 
   bool NameJITBuffers {true};
 };

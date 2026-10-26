@@ -27,6 +27,7 @@ $end_info$
 // version had it (the frame wait loop's call). Anything that isn't found stays emulated.
 
 #include "NativeRedirect.h"
+#include "CodeBuffer.h"
 #include "FrameLatency.h"
 #include "NativeStats.h"
 #include "NativeUnpackCache.h"
@@ -855,7 +856,7 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
   }
   // FrameLatency.cpp counts frames too.
   if (const char* FrameTimes = FEX::Windows::Switch("FEX_FRAMETIMES");
-      (StatsLog || FrameLatency::WantsFrameMarks()) && !(FrameTimes && FrameTimes[0] == '0')) {
+      (StatsLog || FrameLatency::WantsFrameMarks() || CodeBufferPolicy::WantsFrameMarks()) && !(FrameTimes && FrameTimes[0] == '0')) {
     FrameClock::Enabled = true;
   }
   if (FrameClock::Enabled) {

@@ -52,6 +52,21 @@ public:
   // Called after a block was installed from the disk cache, only while per-thread stats are being collected.
   virtual void OnDiskCacheHit(uint64_t GuestRIP) {}
 
+  // A new buffer for translated code was started (see Context::RequestCodeBufferRenewal); the code in the one it replaced
+  // is no longer used, so each thread translates or loads what it runs again. Called on the thread that started it, while
+  // it holds code locks: record, don't block. Reason: 0 first buffer, 1 the last one was full, 2 a renewal the frontend
+  // asked for, 3 the start size changed before any code was placed.
+  struct CodeBufferStart {
+    uint8_t Reason;
+    uint32_t Number;
+    uint64_t Size;
+    uint64_t PrevSize;
+    uint64_t PrevUsed;
+    uint32_t PrevBlocks;
+    uint32_t PrevCachedBlocks;
+  };
+  virtual void OnCodeBufferStarted(const CodeBufferStart& Info) {}
+
   // Lets the frontend run its own host code in place of the guest code at GuestRIP. Called on every block lookup that
   // reaches the compiler, before the code caches are consulted; a non-zero result is jumped to instead of a compiled
   // block, with the same register state a compiled block would get. The result is not cached, but direct branches to it

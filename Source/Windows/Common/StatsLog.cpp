@@ -149,6 +149,10 @@ namespace {
     uint64_t DiskCacheFileReadCount;
     uint64_t DiskCacheRelocTime;
     uint64_t DiskCacheInstallTime;
+    uint64_t DiskCacheDecodeTime;
+    uint64_t DiskCacheRangeTime;
+    uint64_t DiskCacheRangeReuseCount;
+    uint64_t DiskCacheCopyTime;
     uint64_t SuspendCount;
     // Longest single events of the last second (cycles) and when they ended (cycle counter), see ThreadStats.
     uint64_t MaxJITTime;
@@ -3527,6 +3531,10 @@ namespace {
           .DiskCacheFileReadCount = Slot.AccumulatedDiskCacheFileReadCount,
           .DiskCacheRelocTime = Slot.AccumulatedDiskCacheRelocTime,
           .DiskCacheInstallTime = Slot.AccumulatedDiskCacheInstallTime,
+          .DiskCacheDecodeTime = Slot.AccumulatedDiskCacheDecodeTime,
+          .DiskCacheRangeTime = Slot.AccumulatedDiskCacheRangeTime,
+          .DiskCacheRangeReuseCount = Slot.AccumulatedDiskCacheRangeReuseCount,
+          .DiskCacheCopyTime = Slot.AccumulatedDiskCacheCopyTime,
           .SuspendCount = Slot.AccumulatedSuspendCount,
         });
         // Take the longest single events and reset them for the next second.
@@ -3602,6 +3610,10 @@ namespace {
               .DiskCacheFileReadCount = Diff(Cur.DiskCacheFileReadCount, Old->DiskCacheFileReadCount),
               .DiskCacheRelocTime = Diff(Cur.DiskCacheRelocTime, Old->DiskCacheRelocTime),
               .DiskCacheInstallTime = Diff(Cur.DiskCacheInstallTime, Old->DiskCacheInstallTime),
+              .DiskCacheDecodeTime = Diff(Cur.DiskCacheDecodeTime, Old->DiskCacheDecodeTime),
+              .DiskCacheRangeTime = Diff(Cur.DiskCacheRangeTime, Old->DiskCacheRangeTime),
+              .DiskCacheRangeReuseCount = Diff(Cur.DiskCacheRangeReuseCount, Old->DiskCacheRangeReuseCount),
+              .DiskCacheCopyTime = Diff(Cur.DiskCacheCopyTime, Old->DiskCacheCopyTime),
               .SuspendCount = Diff(Cur.SuspendCount, Old->SuspendCount),
               .MaxJITTime = Cur.MaxJITTime,
               .MaxJITAt = Cur.MaxJITAt,
@@ -3696,12 +3708,17 @@ namespace {
           Line += fextl::fmt::format("    max{}\n", Max);
         }
         // Disk cache lookup breakdown (dcl = whole lookup incl. misses; key = lookup key/anon decode; read = entry reads, file
-        // = how many came from the cache file; rel = relocations; inst = putting a hit into the code buffer).
+        // = how many came from the cache file; rel = relocations; inst = putting a hit into the code buffer). Build 84: key
+        // splits into dec (decoding the first bytes of code outside any file) and rq (asking Wine for the executable range;
+        // reuse = lookups that took the decoder's answer instead), inst into copy (into the code buffer, cache flush) and the
+        // rest (lookup tables, page protection).
         if (D.DiskCacheHitCount || D.DiskCacheMissCount) {
-          Line += fextl::fmt::format("    dc hit={} miss={} dcl={:.1f}ms key={:.1f}ms read={:.1f}ms file={} rel={:.1f}ms inst={:.1f}ms\n",
+          Line += fextl::fmt::format("    dc hit={} miss={} dcl={:.1f}ms key={:.1f}ms (dec={:.1f} rq={:.1f} reuse={}) read={:.1f}ms file={} "
+                                     "rel={:.1f}ms inst={:.1f}ms (copy={:.1f})\n",
                                      D.DiskCacheHitCount, D.DiskCacheMissCount, D.DiskCacheLookupTime * MsPerTick,
-                                     D.DiskCacheKeyTime * MsPerTick, D.DiskCacheReadTime * MsPerTick, D.DiskCacheFileReadCount,
-                                     D.DiskCacheRelocTime * MsPerTick, D.DiskCacheInstallTime * MsPerTick);
+                                     D.DiskCacheKeyTime * MsPerTick, D.DiskCacheDecodeTime * MsPerTick, D.DiskCacheRangeTime * MsPerTick,
+                                     D.DiskCacheRangeReuseCount, D.DiskCacheReadTime * MsPerTick, D.DiskCacheFileReadCount,
+                                     D.DiskCacheRelocTime * MsPerTick, D.DiskCacheInstallTime * MsPerTick, D.DiskCacheCopyTime * MsPerTick);
         }
         if (State->Profile) {
           if (const auto* T = FindSampled(State, D.TID)) {
@@ -3977,7 +3994,10 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "main thread waited on this second (kind, /latency = a swapchain frame latency handle, +N = released N more "
                        "times, calls, ms sampled waiting @caller, timeout ms); '# latency' = what FEX_FRAMELATENCY found and did; '# smc' "
                        "= a page whose own code kept writing to it, "
-                       "so it stays writable and its code checks itself (FEX_SMC_HOTPAGE); sched queue = what "
+                       "so it stays writable and its code checks itself (FEX_SMC_HOTPAGE); '# code buffer' = a new buffer for translated "
+                       "code was started (why, how full the old one was and how many blocks it held, all dropped) or a loading screen "
+                       "was seen (FEX_CODE_BUFFER_START, FEX_CODE_BUFFER_RENEW); dc key splits into dec (decode) and rq (range query, "
+                       "reuse = taken from the decode), inst into copy and the rest; sched queue = what "
                        "vkd3d's queue thread (it hands the game's GPU work and each present to the driver) was doing, sampled every "
                        "10ms: running, or the Linux call it waited in (ioctl(request) = a GPU driver call, ppoll/futex = waiting "
                        "for another thread, a fence or the display server); gpu = GPU clock (average, lowest and highest of 50ms "

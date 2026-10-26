@@ -1,4 +1,5 @@
 add_library(arm64ecfex SHARED
+  CodeBuffer.cpp
   FrameLatency.cpp
   GameFiles.cpp
   LoaderWatch.cpp

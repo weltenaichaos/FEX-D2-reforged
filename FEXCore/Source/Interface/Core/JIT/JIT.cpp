@@ -855,24 +855,39 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
   LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
                                                                                                "doesn't match up!\n");
   // Bring CodeBuffer up to date
-  if (auto Prev = CheckCodeBufferUpdate()) {
-    Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
-    auto lk = ThreadState->LookupCache->AcquireWriteLock();
-    ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
-  }
+  const auto MoveToLatest = [this] {
+    if (auto Prev = CheckCodeBufferUpdate()) {
+      Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+      auto lk = ThreadState->LookupCache->AcquireWriteLock();
+      ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+      return true;
+    }
+    return false;
+  };
+  MoveToLatest();
 
   // Attempt to allocate a buffer from the SharedCodeBuffers.
   while (AllocatedInfo.BufferAllocationOffset == nullptr) {
-    AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
-
-    if (AllocatedInfo.BufferAllocationOffset == nullptr) {
-      // If it didn't fit then clear the buffer and try again.
-      // This has the possibility of migrating the SharedCodeBuffer. See above in `Arm64JITCore::ClearCache()`
-      CTX->ClearCodeCache(ThreadState);
-      continue;
+    // A renewal the frontend asked for (at a loading screen): start a fresh buffer now, as if this one were full.
+    const bool Renew = CTX->TakeRenewal(*CurrentCodeBuffer);
+    if (!Renew) {
+      AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
+      if (AllocatedInfo.BufferAllocationOffset != nullptr) {
+        break;
+      }
+      // Another thread may have started a new buffer since this thread last looked: use it rather than start one more,
+      // since every start drops all translated code again.
+      if (MoveToLatest()) {
+        continue;
+      }
     }
+
+    // If it didn't fit then clear the buffer and try again.
+    // This has the possibility of migrating the SharedCodeBuffer. See above in `Arm64JITCore::ClearCache()`
+    CTX->ClearCodeCache(ThreadState);
   }
 
+  CurrentCodeBuffer->Blocks.fetch_add(1, std::memory_order_relaxed);
   return AllocatedInfo;
 }
 
@@ -1203,6 +1218,7 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
   // we stored it aligned, better still be?
   LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
   auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
+  CurrentCodeBuffer->CachedBlocks.fetch_add(1, std::memory_order_relaxed);
 
   uint8_t* Dest = AllocatedInfo.BufferAllocationOffset;
   memcpy(Dest, HostBytes.data(), HostBytes.size());

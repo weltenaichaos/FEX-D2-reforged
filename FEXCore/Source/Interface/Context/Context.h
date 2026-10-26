@@ -221,8 +221,14 @@ public:
     }
   }
 
-  void OnCodeBufferAllocated(const std::shared_ptr<CPU::CodeBuffer>&) override;
+  void OnCodeBufferAllocated(const std::shared_ptr<CPU::CodeBuffer>&, const StartInfo& Info) override;
   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
+  void UseMaximalCodeBuffer() override {
+    UseMaximal();
+  }
+  void RequestCodeBufferRenewal(uint32_t MinUsedPercent, uint32_t ValidMs) override {
+    RequestRenewal(MinUsedPercent, ValidMs);
+  }
   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {

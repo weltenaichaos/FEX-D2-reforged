@@ -7,6 +7,9 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 
+#include <algorithm>
+#include <chrono>
+
 #ifndef _WIN32
 #include <FEXCore/Utils/PrctlUtils.h>
 #endif
@@ -56,7 +59,7 @@ SharedCodeBufferManager::SharedCodeBufferManager() {
   NameJITBuffers = !(GlobalJITNaming || LibraryJITNaming || BlockJITNaming);
 }
 
-fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) {
+fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size, StartReason Reason) {
 #ifndef _WIN32
   // MDWE (Memory-Deny-Write-Execute) is a new Linux 6.3 feature.
   // It's equivalent to systemd's `MemoryDenyWriteExecute` but implemented entirely in the kernel.
@@ -81,16 +84,28 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
 
   auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers);
 
+  StartInfo Info {
+    .Reason = Reason,
+    .Number = Started.fetch_add(1, std::memory_order_relaxed) + 1,
+    .Size = Buffer->UsableSize(),
+  };
+  if (Latest) {
+    Info.PrevSize = Latest->UsableSize();
+    Info.PrevUsed = Latest->AllocatedSpaceUsed();
+    Info.PrevBlocks = Latest->Blocks.load(std::memory_order_relaxed);
+    Info.PrevCachedBlocks = Latest->CachedBlocks.load(std::memory_order_relaxed);
+  }
+
   Latest = Buffer;
 
-  OnCodeBufferAllocated(Buffer);
+  OnCodeBufferAllocated(Buffer, Info);
 
   return Buffer;
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
   if (!Latest) {
-    AllocateNew(INITIAL_CODE_SIZE);
+    AllocateNew(INITIAL_CODE_SIZE, StartReason::First);
   }
   return Latest;
 }
@@ -103,10 +118,42 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
 
   auto NewCodeBufferSize = GetLatest()->TotalAllocationSize();
   NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
-  return AllocateNew(NewCodeBufferSize);
+  return AllocateNew(NewCodeBufferSize, RenewTaken.exchange(false, std::memory_order_relaxed) ? StartReason::Renewed : StartReason::Full);
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartMaximalCodeBuffer() {
-  return AllocateNew(MAX_CODE_SIZE);
+  return AllocateNew(MAX_CODE_SIZE, Latest ? StartReason::Resized : StartReason::First);
+}
+
+void SharedCodeBufferManager::UseMaximal() {
+  if (!Latest || Latest->TotalAllocationSize() < MAX_CODE_SIZE) {
+    StartMaximalCodeBuffer();
+  }
+}
+
+static uint64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void SharedCodeBufferManager::RequestRenewal(uint32_t MinUsedPercent, uint32_t ValidMs) {
+  constexpr uint64_t DeadlineMask = (1ULL << 56) - 1;
+  const uint64_t Deadline = (NowMs() + ValidMs) & DeadlineMask;
+  RenewRequest.store((uint64_t {std::min(MinUsedPercent, 100U)} << 56) | Deadline, std::memory_order_release);
+}
+
+bool SharedCodeBufferManager::TakeRenewal(const CodeBuffer& Current) {
+  uint64_t Request = RenewRequest.load(std::memory_order_relaxed);
+  if (!Request || !RenewRequest.compare_exchange_strong(Request, 0, std::memory_order_acq_rel)) {
+    return false;
+  }
+  constexpr uint64_t DeadlineMask = (1ULL << 56) - 1;
+  if (NowMs() > (Request & DeadlineMask)) {
+    return false;
+  }
+  if (Current.AllocatedSpaceUsed() * 100 < Current.UsableSize() * (Request >> 56)) {
+    return false;
+  }
+  RenewTaken.store(true, std::memory_order_relaxed);
+  return true;
 }
 } // namespace FEXCore::CPU

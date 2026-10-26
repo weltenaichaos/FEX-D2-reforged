@@ -54,6 +54,7 @@ $end_info$
 #include "Windows/Common/PriorityGuard.h"
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/Switches.h"
+#include "CodeBuffer.h"
 #include "FrameLatency.h"
 #include "Rumble.h"
 #include "LoaderWatch.h"
@@ -837,6 +838,10 @@ public:
     FEX::Windows::StatsLogDiskCacheHit(GuestRIP);
   }
 
+  void OnCodeBufferStarted(const CodeBufferStart& Info) override {
+    CodeBufferPolicy::NoteStarted(Info);
+  }
+
   uintptr_t RedirectBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) override {
     return NativeRedirect::Lookup(GuestRIP);
   }
@@ -908,6 +913,7 @@ NTSTATUS ProcessInit() {
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
   CTX->InitCore();
+  CodeBufferPolicy::Init(CTX.get(), FEX::Windows::StatsLogRequested(AppConfigName));
   // FEX_CODELOCK_POLITE=<ms>: writers of the code invalidation lock (memory protection changes, code invalidation) wait
   // this long for compiles in progress to finish before queueing, so one slow compile and a queued writer can't stop
   // every other thread's compiles. 0 queues them at once, like upstream.

@@ -571,7 +571,10 @@ namespace DiskCache {
       if (!AnonCaching) {
         return Miss(FEXCore::SHMStats::DC_MISS_ANON_OFF);
       }
-      Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(GuestRIP), AnonPrefixGuestBytes);
+      {
+        FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheDecodeTime);
+        Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(GuestRIP), AnonPrefixGuestBytes);
+      }
       const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
 
       XXH3_state_t HashState;
@@ -598,7 +601,17 @@ namespace DiskCache {
       // LogMan::Msg::IFmt("anon lookup! length {:d} {}", GuestCodeKey, TotalSize);
     }
 
-    auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
+    // The anonymous key's decode above just asked the frontend for this range (Decoder::CheckRangeExecutable): use that
+    // answer instead of asking again (a VirtualQuery in Wine, ~1 per code load; the main thread loads up to 5,000 blocks a
+    // second when it enters new code).
+    FEXCore::HLE::ExecutableRangeInfo RangeInfo;
+    if (auto Cached = (Region && Region->FileStartVA) ? std::nullopt : Thread->FrontendDecoder->CachedExecutableRange(GuestRIP)) {
+      RangeInfo = *Cached;
+      FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheRangeReuseCount, 1);
+    } else {
+      FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheRangeTime);
+      RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
+    }
     if (RangeInfo.Size == 0 || RangeInfo.Base > GuestRIP) {
       return Miss(FEXCore::SHMStats::DC_MISS_RANGE);
     }

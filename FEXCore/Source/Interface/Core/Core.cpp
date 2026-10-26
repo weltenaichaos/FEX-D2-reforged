@@ -481,7 +481,7 @@ void ContextImpl::LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {
 }
 #endif
 
-void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>& Buffer) {
+void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>& Buffer, const StartInfo& Info) {
   if (Config.GlobalJITNaming()) {
     Symbols.RegisterJITSpace(Buffer->GetBufferBase(), Buffer->TotalAllocationSize());
   }
@@ -489,6 +489,18 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
   {
     std::scoped_lock lk {CodeBufferListLock};
     CodeBufferList.emplace_back(Buffer);
+  }
+
+  if (SyscallHandler) {
+    SyscallHandler->OnCodeBufferStarted({
+      .Reason = static_cast<uint8_t>(Info.Reason),
+      .Number = Info.Number,
+      .Size = Info.Size,
+      .PrevSize = Info.PrevSize,
+      .PrevUsed = Info.PrevUsed,
+      .PrevBlocks = Info.PrevBlocks,
+      .PrevCachedBlocks = Info.PrevCachedBlocks,
+    });
   }
 }
 
@@ -939,7 +951,10 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
     if (Hit && !DiskCache.IsValidating() && !HitTouchesFullSMC) {
       FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheInstallTime);
-      auto LoadedCode = Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
+      auto LoadedCode = [&] {
+        FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheCopyTime);
+        return Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
+      }();
       if (LoadedCode.BlockBegin) {
         for (auto& CodePage : Hit->GuestPages) {
           if (Thread->LookupCache->AddBlockExecutableRange(Thread, Hit->EntryPointRIPs, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {

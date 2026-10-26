@@ -6,6 +6,7 @@
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/CodeCache.h>
+#include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/ThreadPoolAllocator.h>
 #include <FEXCore/fextl/set.h>
 #include <FEXCore/fextl/vector.h>
@@ -13,6 +14,7 @@
 
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <cstdint>
 #include <optional>
 
@@ -87,6 +89,15 @@ public:
 
   void ResetExecutableRangeCache() {
     ExecutableRangeBase = ExecutableRangeEnd = 0;
+  }
+
+  // The executable range the decoder's last query found, if it holds Address: the same answer a query would give within
+  // this compile (CheckRangeExecutable asked the same frontend function for it, under the same code lock).
+  std::optional<FEXCore::HLE::ExecutableRangeInfo> CachedExecutableRange(uint64_t Address) const {
+    if (Address >= ExecutableRangeBase && Address < ExecutableRangeEnd) {
+      return FEXCore::HLE::ExecutableRangeInfo {ExecutableRangeBase, ExecutableRangeEnd - ExecutableRangeBase, ExecutableRangeWritable};
+    }
+    return std::nullopt;
   }
 
 private:
