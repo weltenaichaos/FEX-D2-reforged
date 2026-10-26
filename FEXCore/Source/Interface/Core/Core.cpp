@@ -951,9 +951,18 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
     if (Hit && !DiskCache.IsValidating() && !HitTouchesFullSMC) {
       FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheInstallTime);
+      // What this code was loaded for: if the same is still in the code buffer (its blocks were dropped since, but the
+      // guest code came back the same), that copy is mapped again instead of placing another (FEX_CODE_REUSE).
+      const CPU::PlacedCodeKey ReuseKey {
+        .GuestRIP = GuestRIP,
+        .HashLow = Hit->GuestHashLow,
+        .HashHigh = Hit->GuestHashHigh,
+        .GuestSize = Hit->GuestSize,
+        .HostSize = static_cast<uint32_t>(Hit->HostCode.size()),
+      };
       auto LoadedCode = [&] {
         FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheCopyTime);
-        return Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
+        return Thread->CPUBackend->LoadCachedCode(Hit->HostCode, ReusePlacedCode() ? &ReuseKey : nullptr);
       }();
       if (LoadedCode.BlockBegin) {
         for (auto& CodePage : Hit->GuestPages) {
@@ -1140,7 +1149,7 @@ void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
   auto it = CodeBufferList.begin();
   while (it != CodeBufferList.end()) {
     if (auto Strong = it->lock()) {
-      Strong->LookupCache->InvalidateRange(Start, Length);
+      NoteDropped(Strong->LookupCache->InvalidateRange(Start, Length));
       it++;
     } else {
       it = CodeBufferList.erase(it);

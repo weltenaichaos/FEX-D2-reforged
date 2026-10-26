@@ -229,6 +229,13 @@ public:
   void RequestCodeBufferRenewal(uint32_t MinUsedPercent, uint32_t ValidMs) override {
     RequestRenewal(MinUsedPercent, ValidMs);
   }
+  void SetPlacedCodeReuse(bool Enable) override {
+    SetReusePlaced(Enable);
+  }
+  CodeBufferUse GetCodeBufferUse() const override {
+    const auto U = GetUse();
+    return {U.Number, U.Size, U.Used, U.Translated, U.Loaded, U.Reused, U.ReusedBytes, U.Dropped};
+  }
   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {

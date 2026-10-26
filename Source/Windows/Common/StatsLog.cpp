@@ -153,6 +153,7 @@ namespace {
     uint64_t DiskCacheRangeTime;
     uint64_t DiskCacheRangeReuseCount;
     uint64_t DiskCacheCopyTime;
+    uint64_t DiskCachePlacedBeforeCount;
     uint64_t SuspendCount;
     // Longest single events of the last second (cycles) and when they ended (cycle counter), see ThreadStats.
     uint64_t MaxJITTime;
@@ -3535,6 +3536,7 @@ namespace {
           .DiskCacheRangeTime = Slot.AccumulatedDiskCacheRangeTime,
           .DiskCacheRangeReuseCount = Slot.AccumulatedDiskCacheRangeReuseCount,
           .DiskCacheCopyTime = Slot.AccumulatedDiskCacheCopyTime,
+          .DiskCachePlacedBeforeCount = Slot.AccumulatedDiskCachePlacedBeforeCount,
           .SuspendCount = Slot.AccumulatedSuspendCount,
         });
         // Take the longest single events and reset them for the next second.
@@ -3614,6 +3616,7 @@ namespace {
               .DiskCacheRangeTime = Diff(Cur.DiskCacheRangeTime, Old->DiskCacheRangeTime),
               .DiskCacheRangeReuseCount = Diff(Cur.DiskCacheRangeReuseCount, Old->DiskCacheRangeReuseCount),
               .DiskCacheCopyTime = Diff(Cur.DiskCacheCopyTime, Old->DiskCacheCopyTime),
+              .DiskCachePlacedBeforeCount = Diff(Cur.DiskCachePlacedBeforeCount, Old->DiskCachePlacedBeforeCount),
               .SuspendCount = Diff(Cur.SuspendCount, Old->SuspendCount),
               .MaxJITTime = Cur.MaxJITTime,
               .MaxJITAt = Cur.MaxJITAt,
@@ -3711,14 +3714,15 @@ namespace {
         // = how many came from the cache file; rel = relocations; inst = putting a hit into the code buffer). Build 84: key
         // splits into dec (decoding the first bytes of code outside any file) and rq (asking Wine for the executable range;
         // reuse = lookups that took the decoder's answer instead), inst into copy (into the code buffer, cache flush) and the
-        // rest (lookup tables, page protection).
+        // rest (lookup tables, page protection). Build 85: in buffer = hits served by the copy already in the code buffer.
         if (D.DiskCacheHitCount || D.DiskCacheMissCount) {
           Line += fextl::fmt::format("    dc hit={} miss={} dcl={:.1f}ms key={:.1f}ms (dec={:.1f} rq={:.1f} reuse={}) read={:.1f}ms file={} "
-                                     "rel={:.1f}ms inst={:.1f}ms (copy={:.1f})\n",
+                                     "rel={:.1f}ms inst={:.1f}ms (copy={:.1f}, in buffer={})\n",
                                      D.DiskCacheHitCount, D.DiskCacheMissCount, D.DiskCacheLookupTime * MsPerTick,
                                      D.DiskCacheKeyTime * MsPerTick, D.DiskCacheDecodeTime * MsPerTick, D.DiskCacheRangeTime * MsPerTick,
                                      D.DiskCacheRangeReuseCount, D.DiskCacheReadTime * MsPerTick, D.DiskCacheFileReadCount,
-                                     D.DiskCacheRelocTime * MsPerTick, D.DiskCacheInstallTime * MsPerTick, D.DiskCacheCopyTime * MsPerTick);
+                                     D.DiskCacheRelocTime * MsPerTick, D.DiskCacheInstallTime * MsPerTick, D.DiskCacheCopyTime * MsPerTick,
+                                     D.DiskCachePlacedBeforeCount);
         }
         if (State->Profile) {
           if (const auto* T = FindSampled(State, D.TID)) {
@@ -3995,9 +3999,12 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "times, calls, ms sampled waiting @caller, timeout ms); '# latency' = what FEX_FRAMELATENCY found and did; '# smc' "
                        "= a page whose own code kept writing to it, "
                        "so it stays writable and its code checks itself (FEX_SMC_HOTPAGE); '# code buffer' = a new buffer for translated "
-                       "code was started (why, how full the old one was and how many blocks it held, all dropped) or a loading screen "
-                       "was seen (FEX_CODE_BUFFER_START, FEX_CODE_BUFFER_RENEW); dc key splits into dec (decode) and rq (range query, "
-                       "reuse = taken from the decode), inst into copy and the rest; sched queue = what "
+                       "code was started (why, how full the old one was and how many blocks it held, all dropped), a loading screen "
+                       "was seen (FEX_CODE_BUFFER_START, FEX_CODE_BUFFER_RENEW), or every 10 s: how full the buffer is, blocks placed "
+                       "and served by the copy already in it (FEX_CODE_REUSE), blocks dropped and why (the guest's protection "
+                       "changes, writes to code, frees); dc key splits into dec (decode) and rq (range query, "
+                       "reuse = taken from the decode), inst into copy and the rest, in buffer = hits served by the copy already in "
+                       "the code buffer; sched queue = what "
                        "vkd3d's queue thread (it hands the game's GPU work and each present to the driver) was doing, sampled every "
                        "10ms: running, or the Linux call it waited in (ioctl(request) = a GPU driver call, ppoll/futex = waiting "
                        "for another thread, a fence or the display server); gpu = GPU clock (average, lowest and highest of 50ms "

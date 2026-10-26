@@ -24,6 +24,32 @@ namespace FEX::Windows {
  */
 class InvalidationTracker {
 public:
+  // Why translated code was dropped, for the stats log (build 85): every invalidation is counted by its cause, with the
+  // blocks it dropped from the code buffers' lookup maps.
+  enum class DropReason : uint8_t {
+    ProtectExecToExec,  // a protection change on executable pages that leaves them executable
+    ProtectExecRemoved, // executable pages made non-executable
+    ProtectToExec,      // non-executable pages made executable
+    WriteFault,         // a write to write-protected code
+    Free,               // memory freed
+    Unmap,              // a view unmapped
+    FlushICache,        // the guest flushed the instruction cache
+    Dirty,              // Wine reported memory written behind FEX's back
+    ReadFile,           // a file read into memory
+    Other,              // FEX itself (compile restarts, redirects, DEP changes, image maps)
+    Count
+  };
+  struct DropCounts {
+    uint64_t Calls[size_t(DropReason::Count)];
+    uint64_t Pages[size_t(DropReason::Count)];
+    uint64_t Blocks[size_t(DropReason::Count)];
+    // The new protections of the protection changes that dropped code, by the lowest PAGE_* bit set (0x01 NOACCESS,
+    // 0x02 READONLY, 0x04 READWRITE, 0x08 WRITECOPY, 0x10 EXECUTE, 0x20 EXECUTE_READ, 0x40 EXECUTE_READWRITE,
+    // 0x80 EXECUTE_WRITECOPY): [0] exec to exec, [1] exec removed.
+    uint64_t ProtBits[2][8];
+  };
+  static DropCounts GetDropCounts();
+
   InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads);
   void HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot);
   void HandleProcessExecuteFlagsChange(ULONG Flags);
@@ -32,8 +58,8 @@ public:
     uint64_t SectionStart;
     uint64_t SectionSize;
   };
-  InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
-  void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
+  InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free, DropReason Reason = DropReason::Unmap);
+  void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free, DropReason Reason = DropReason::Other);
   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
   bool HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t FaultAddress);
 
@@ -62,9 +88,16 @@ public:
 private:
   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
   void DisableSMCDetection();
-  void InvalidateIntervalInternal(uint64_t Address, uint64_t Size);
+  void InvalidateIntervalInternal(uint64_t Address, uint64_t Size, DropReason Reason);
   // NOTE: This assumed CodeInvalidationMutex is locked by the caller
-  void InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size);
+  void InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size, DropReason Reason);
+  // The same, returning how many blocks were dropped (and counting them for GetDropCounts).
+  uint64_t InvalidateAndCountLocked(uint64_t Address, uint64_t Size, DropReason Reason);
+
+  static inline std::atomic<uint64_t> DropCalls[size_t(DropReason::Count)] {};
+  static inline std::atomic<uint64_t> DropPages[size_t(DropReason::Count)] {};
+  static inline std::atomic<uint64_t> DropBlocks[size_t(DropReason::Count)] {};
+  static inline std::atomic<uint64_t> DropProtBits[2][8] {};
 
   // NOTE: If ForWriteLocked is true then this assumes CodeInvalidationMutex is locked by the caller,
   // and any code in the range will be invalidated before protection as RWX, otherwise protects as RX if false.

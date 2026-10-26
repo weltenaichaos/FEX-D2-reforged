@@ -63,10 +63,12 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
 
+  DropReason Reason = DropReason::ProtectToExec;
   const bool NeedsInvalidate = [&]() {
     std::unique_lock Lock(IntervalsLock);
 
     FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
+    const bool WasExec = XIntervals.Intersect(ProtInterval);
 
     const bool HasExec = ProtHasExec(Prot);
     const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
@@ -77,6 +79,7 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
     }
 
     if (EffectiveExec) {
+      Reason = WasExec ? DropReason::ProtectExecToExec : DropReason::ProtectToExec;
       XIntervals.Insert(ProtInterval);
       if (EffectiveRWX) {
         LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
@@ -86,7 +89,8 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
         DEPPromotedIntervals.Insert(ProtInterval);
       }
       return true;
-    } else if (XIntervals.Intersect(ProtInterval)) {
+    } else if (WasExec) {
+      Reason = DropReason::ProtectExecRemoved;
       XIntervals.Remove(ProtInterval);
       RWXIntervals.Remove(ProtInterval);
       if (DEPDisabled) {
@@ -100,7 +104,12 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
 
   if (NeedsInvalidate) {
     // IntervalsLock cannot be held during invalidation
-    InvalidateIntervalInternal(AlignedBase, AlignedSize);
+    std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
+    const uint64_t Dropped = InvalidateAndCountLocked(AlignedBase, AlignedSize, Reason);
+    if (Dropped && Reason != DropReason::ProtectToExec) {
+      const int Bit = (Prot & 0xFF) ? __builtin_ctz(Prot & 0xFF) : 0;
+      DropProtBits[Reason == DropReason::ProtectExecToExec ? 0 : 1][Bit].fetch_add(1, std::memory_order_relaxed);
+    }
   }
 }
 
@@ -148,7 +157,7 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
 
   // Invalidate all cached code: previously-compiled blocks may contain NoExec stubs for addresses
   // that are now executable (or reference regions whose executability just changed).
-  InvalidateIntervalInternalLocked(0, std::numeric_limits<uint64_t>::max());
+  InvalidateIntervalInternalLocked(0, std::numeric_limits<uint64_t>::max(), DropReason::Other);
 }
 
 void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address) {
@@ -188,7 +197,8 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
   }
 }
 
-InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::InvalidateContainingSection(uint64_t Address, bool Free) {
+InvalidationTracker::InvalidateContainingSectionResult
+InvalidationTracker::InvalidateContainingSection(uint64_t Address, bool Free, DropReason Reason) {
   MEMORY_BASIC_INFORMATION Info;
   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
     return {Address, 0};
@@ -203,7 +213,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     SectionSize += Info.RegionSize;
   }
 
-  InvalidateIntervalInternal(SectionBase, SectionSize);
+  InvalidateIntervalInternal(SectionBase, SectionSize, Reason);
 
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
@@ -215,7 +225,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
   return {SectionBase, SectionSize};
 }
 
-void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
+void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free, DropReason Reason) {
   if (!Address) {
     // Match the Windows behaviour when passed a NULL base address.
     Size = std::numeric_limits<uint64_t>::max();
@@ -224,7 +234,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
 
-  InvalidateIntervalInternal(AlignedBase, AlignedSize);
+  InvalidateIntervalInternal(AlignedBase, AlignedSize, Free && Reason == DropReason::Other ? DropReason::Free : Reason);
 
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
@@ -252,7 +262,7 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
     {
       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
 
-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE, DropReason::WriteFault);
       // A page that keeps faulting stays writable from now on (ProtectRWXIntervalsInternal skips it), and its code is
       // compiled to check itself. Done under the exclusive lock, so no compile sees the page change state mid-way.
       NoteWriteFaultLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK);
@@ -448,17 +458,44 @@ ULONG InvalidationTracker::GetUntrapProt(uint64_t Address) const {
   return PAGE_EXECUTE_READWRITE;
 }
 
-void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t Size) {
+void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t Size, DropReason Reason) {
   std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
-  InvalidateIntervalInternalLocked(Address, Size);
+  InvalidateIntervalInternalLocked(Address, Size, Reason);
 }
 
-void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
-  // NOTE: This assumes CodeInvalidationMutex is locked by the caller
+void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size, DropReason Reason) {
+  InvalidateAndCountLocked(Address, Size, Reason);
+}
+
+uint64_t InvalidationTracker::InvalidateAndCountLocked(uint64_t Address, uint64_t Size, DropReason Reason) {
+  // NOTE: This assumes CodeInvalidationMutex is locked by the caller. Invalidations are serialized by it, so the change
+  // of the dropped count belongs to this one.
+  const uint64_t Before = CTX.GetCodeBufferUse().Dropped;
   CTX.InvalidateCodeBuffersCodeRange(Address, Size);
   for (auto Thread : Threads) {
     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);
   }
+  const uint64_t Dropped = CTX.GetCodeBufferUse().Dropped - Before;
+  const auto Index = static_cast<size_t>(Reason);
+  DropCalls[Index].fetch_add(1, std::memory_order_relaxed);
+  DropPages[Index].fetch_add(Size >= (uint64_t {1} << 40) ? 0 : Size >> 12, std::memory_order_relaxed);
+  DropBlocks[Index].fetch_add(Dropped, std::memory_order_relaxed);
+  return Dropped;
+}
+
+InvalidationTracker::DropCounts InvalidationTracker::GetDropCounts() {
+  DropCounts Out {};
+  for (size_t i = 0; i < size_t(DropReason::Count); ++i) {
+    Out.Calls[i] = DropCalls[i].load(std::memory_order_relaxed);
+    Out.Pages[i] = DropPages[i].load(std::memory_order_relaxed);
+    Out.Blocks[i] = DropBlocks[i].load(std::memory_order_relaxed);
+  }
+  for (size_t k = 0; k < 2; ++k) {
+    for (size_t b = 0; b < 8; ++b) {
+      Out.ProtBits[k][b] = DropProtBits[k][b].load(std::memory_order_relaxed);
+    }
+  }
+  return Out;
 }
 
 bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
@@ -479,7 +516,7 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
           // applied and the invalidation mutex must be locked throughout.
           // Do this lazily only when an RWX region is actually hit.
           // NOTE: This assumes CodeInvalidationMutex is locked by the caller
-          InvalidateIntervalInternalLocked(Address, Size);
+          InvalidateIntervalInternalLocked(Address, Size, DropReason::ReadFile);
         }
         HitRWXInterval = true;
       }

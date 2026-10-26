@@ -97,6 +97,9 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size, 
   }
 
   Latest = Buffer;
+  LatestSize.store(Buffer->UsableSize(), std::memory_order_relaxed);
+  LatestUsed.store(0, std::memory_order_relaxed);
+  LatestRaw.store(Buffer.get(), std::memory_order_release);
 
   OnCodeBufferAllocated(Buffer, Info);
 
@@ -129,6 +132,26 @@ void SharedCodeBufferManager::UseMaximal() {
   if (!Latest || Latest->TotalAllocationSize() < MAX_CODE_SIZE) {
     StartMaximalCodeBuffer();
   }
+}
+
+void SharedCodeBufferManager::NotePlaced(const CodeBuffer* Buffer, bool Loaded) {
+  if (Buffer == LatestRaw.load(std::memory_order_acquire)) {
+    LatestUsed.store(Buffer->AllocatedSpaceUsed(), std::memory_order_relaxed);
+  }
+  (Loaded ? LoadedTotal : TranslatedTotal).fetch_add(1, std::memory_order_relaxed);
+}
+
+SharedCodeBufferManager::Use SharedCodeBufferManager::GetUse() const {
+  return {
+    .Number = Started.load(std::memory_order_relaxed),
+    .Size = LatestSize.load(std::memory_order_relaxed),
+    .Used = LatestUsed.load(std::memory_order_relaxed),
+    .Translated = TranslatedTotal.load(std::memory_order_relaxed),
+    .Loaded = LoadedTotal.load(std::memory_order_relaxed),
+    .Reused = ReusedTotal.load(std::memory_order_relaxed),
+    .ReusedBytes = ReusedBytesTotal.load(std::memory_order_relaxed),
+    .Dropped = DroppedTotal.load(std::memory_order_relaxed),
+  };
 }
 
 static uint64_t NowMs() {

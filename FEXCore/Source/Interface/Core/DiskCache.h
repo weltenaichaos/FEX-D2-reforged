@@ -119,6 +119,10 @@ namespace DiskCache {
     std::span<const uint64_t> GuestPages;
     std::span<uint64_t> EntryPointRIPs;
     std::span<const uint32_t> EntryPointHostOffsets;
+    // The guest code's hash (over the entry's guest extents) and size, checked against the live guest bytes by Lookup.
+    uint64_t GuestHashLow {};
+    uint64_t GuestHashHigh {};
+    uint32_t GuestSize {};
 
     // the spans above point to memory owned by the Blob vec, so it's important this can't be copied
     CodeHitData() = default;

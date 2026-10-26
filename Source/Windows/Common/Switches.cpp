@@ -102,6 +102,11 @@ namespace {
     {"FEX_CODE_BUFFER_START", "max"},
     {"FEX_CODE_BUFFER_RENEW", "50"},
     {"FEX_CODE_BUFFER_RENEW_EARLY", "10"},
+    // Build 85: in calm play of the build 84 run FEX placed ~78 blocks a second in the code buffer, ~8% of the 128 MB a
+    // minute, more than D2R's whole working set (~13,000 blocks) every 3 minutes, nearly all loaded from the disk cache:
+    // code that was dropped and runs again (D2R's protection decrypts its code pages on demand). Code that comes back the
+    // same is now mapped again from the copy already in the buffer instead of placing another.
+    {"FEX_CODE_REUSE", "1"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
@@ -203,6 +208,7 @@ namespace {
     "FEX_CODE_BUFFER_RENEW",
     "FEX_CODE_BUFFER_RENEW_EARLY",
     "FEX_CODE_BUFFER_LOAD_MS",
+    "FEX_CODE_REUSE",
     "FEX_GAME_FILES_UNCACHED",
     "FEX_GAME_FILES_MS",
     "FEX_GAME_FILES_KEEP_MB",

@@ -1261,7 +1261,8 @@ void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
   }
 
   std::scoped_lock Lock(ThreadCreationMutex);
-  InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+  InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false,
+      FEX::Windows::InvalidationTracker::DropReason::FlushICache);
 }
 
 void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
@@ -1270,7 +1271,8 @@ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
   }
 
   std::scoped_lock Lock(ThreadCreationMutex);
-  InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+  InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false,
+      FEX::Windows::InvalidationTracker::DropReason::FlushICache);
 }
 
 void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
@@ -1279,7 +1281,8 @@ void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
   }
 
   std::scoped_lock Lock(ThreadCreationMutex);
-  InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+  InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false,
+      FEX::Windows::InvalidationTracker::DropReason::Dirty);
 }
 
 void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After, NTSTATUS Status) {
@@ -1331,7 +1334,8 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
 
   if (After && Status == STATUS_SUCCESS) {
     std::scoped_lock Lock(ThreadCreationMutex);
-    InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+    InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false,
+        FEX::Windows::InvalidationTracker::DropReason::ReadFile);
   }
 }
 

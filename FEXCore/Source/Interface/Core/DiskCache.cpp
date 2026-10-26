@@ -892,6 +892,9 @@ namespace DiskCache {
     BlobOffset += Header.ThunkRelocCount * sizeof(BlobThunkRelocation);
 
     HitData.GuestPages = {reinterpret_cast<uint64_t*>(HitData.Blob.data()), GuestPages.size()};
+    HitData.GuestHashLow = Header.GuestHash.low64;
+    HitData.GuestHashHigh = Header.GuestHash.high64;
+    HitData.GuestSize = Header.GuestSize;
 
     for (auto& EntryPointRip : HitData.EntryPointRIPs) {
       EntryPointRip += GuestRIP;

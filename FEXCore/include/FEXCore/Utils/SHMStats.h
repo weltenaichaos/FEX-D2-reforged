@@ -114,6 +114,9 @@ struct ThreadStats {
   uint64_t AccumulatedDiskCacheRangeTime;
   uint64_t AccumulatedDiskCacheRangeReuseCount;
   uint64_t AccumulatedDiskCacheCopyTime;
+  // Disk cache hits served by the copy of that code already in the code buffer (build 85, FEX_CODE_REUSE).
+  uint64_t AccumulatedDiskCachePlacedBeforeCount;
+  uint64_t Reserved85; // keeps the struct a multiple of 16 bytes
 };
 
 enum DiskCacheMissReason : uint8_t {

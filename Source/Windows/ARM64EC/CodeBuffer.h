@@ -31,9 +31,16 @@ class Context;
 //                               seamless (no loading screen), so with 50% alone it would still have filled in play.
 //   FEX_CODE_BUFFER_LOAD_MS=N   how long without a frame counts as a loading screen (default 250; play frames stay
 //                               under 100 ms)
+//   FEX_CODE_REUSE=1            (D2R default) code loaded from the disk cache whose blocks were dropped since (the guest
+//                               changed or rewrote its pages) and that comes back byte for byte the same is mapped again
+//                               from the copy already in the buffer, instead of placing another copy. In the build 84 run
+//                               calm play placed ~78 blocks a second (~8% of the buffer a minute), nearly all from the
+//                               disk cache, more than D2R's whole working set every 3 minutes. 0 = upstream.
 //
 // With the stats log on, a "# code buffer" line names every new buffer (why, how full the old one was, how many blocks
-// it held and how many of those came from the disk cache) and every loading screen seen.
+// it held and how many of those came from the disk cache) and every loading screen seen, and every 10 s says how full the
+// buffer is, what was placed in it and served again from it, and how many blocks were dropped by what (protection
+// changes by their new protection, write faults, frees, unmaps, instruction cache flushes, file reads).
 namespace CodeBufferPolicy {
 // Call on the process's first thread, in process init, right after InitCore and before any code is translated.
 void Init(FEXCore::Context::Context* CTX, bool StatsLog);

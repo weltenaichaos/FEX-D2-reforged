@@ -125,18 +125,44 @@ struct GuestToHostMap {
     return BlockList.erase(Address) != 0;
   }
 
-  void InvalidateRange(uint64_t Start, uint64_t Length) {
+  // Returns how many blocks were dropped.
+  size_t InvalidateRange(uint64_t Start, uint64_t Length) {
     auto lk = AcquireWriteLock();
 
     auto lower = CodePages.lower_bound(Start >> 12);
     auto upper = CodePages.upper_bound((Start + Length - 1) >> 12);
 
+    size_t Dropped = 0;
     for (auto it = lower; it != upper; it++) {
       for (const auto& Entry : it->second) {
-        Erase(Entry, lk);
+        Dropped += Erase(Entry, lk);
       }
     }
     CodePages.erase(lower, upper);
+    return Dropped;
+  }
+
+  // Disk cache code placed in this buffer, by what it was loaded for (CPU::PlacedCodeKey). Code here is never moved or
+  // freed while the buffer lives, and dropping a block (Erase) only unlinks the blocks that jump to it: its own exits
+  // stay linked to blocks that are still mapped, and those links stay recorded in BlockLinks, so they are cut if their
+  // target is dropped later. A block found here can therefore be mapped again as it is. Cleared with the maps
+  // (ClearCache), as BlockLinks is.
+  struct PlacedCode {
+    CPU::PlacedCodeKey Key;
+    uint8_t* HostCode;
+  };
+  fextl::robin_map<uint64_t, PlacedCode> Placed;
+
+  uint8_t* FindPlaced(const CPU::PlacedCodeKey& Key, const LookupCacheBaseLockToken&) const {
+    auto It = Placed.find(Key.Hash());
+    if (It == Placed.end() || !(It->second.Key == Key)) {
+      return nullptr;
+    }
+    return It->second.HostCode;
+  }
+
+  void RememberPlaced(const CPU::PlacedCodeKey& Key, uint8_t* HostCode, const LookupCacheWriteLockToken&) {
+    Placed.insert_or_assign(Key.Hash(), PlacedCode {Key, HostCode});
   }
 
   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,

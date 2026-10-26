@@ -149,6 +149,23 @@ public:
   // Each new buffer is reported through HLE::SyscallHandler::OnCodeBufferStarted.
   FEX_DEFAULT_VISIBILITY virtual void UseMaximalCodeBuffer() = 0;
   FEX_DEFAULT_VISIBILITY virtual void RequestCodeBufferRenewal(uint32_t MinUsedPercent, uint32_t ValidMs) = 0;
+  //   SetPlacedCodeReuse: when code loaded from the disk cache was placed in the current buffer before (its blocks were
+  //   dropped since, but the guest code came back the same), map that copy again instead of placing another.
+  //   GetCodeBufferUse: the latest buffer's number, usable size and bytes used, and counts since the start: blocks
+  //   placed after translating them or loading them from the disk cache, disk cache blocks served by code already in the
+  //   buffer (and the bytes that were not copied), blocks dropped by invalidations.
+  struct CodeBufferUse {
+    uint32_t Number;
+    uint64_t Size;
+    uint64_t Used;
+    uint64_t Translated;
+    uint64_t Loaded;
+    uint64_t Reused;
+    uint64_t ReusedBytes;
+    uint64_t Dropped;
+  };
+  FEX_DEFAULT_VISIBILITY virtual void SetPlacedCodeReuse(bool Enable) = 0;
+  FEX_DEFAULT_VISIBILITY virtual CodeBufferUse GetCodeBufferUse() const = 0;
   FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual void
   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;

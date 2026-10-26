@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "CodeBuffer.h"
+#include "Windows/Common/InvalidationTracker.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/Switches.h"
 
@@ -18,6 +19,7 @@ $end_info$
 
 #include <algorithm>
 #include <atomic>
+#include <iterator>
 #include <cstdlib>
 #include <ntstatus.h>
 #include <windef.h>
@@ -90,6 +92,71 @@ namespace {
     }
   }
 
+  // Every 10 s: how full the buffer is, what was placed in it, what was served by code already in it, and what was
+  // dropped and why.
+  constexpr uint64_t UseEverySeconds = 10;
+  uint64_t UseLastAt {};
+  FEXCore::Context::Context::CodeBufferUse UseLast {};
+  FEX::Windows::InvalidationTracker::DropCounts DropsLast {};
+
+  fextl::string UseLine(uint64_t Now, uint64_t Freq) {
+    using Tracker = FEX::Windows::InvalidationTracker;
+    using R = Tracker::DropReason;
+    const auto U = Ctx->GetCodeBufferUse();
+    const auto D = Tracker::GetDropCounts();
+    const double Seconds = UseLastAt ? static_cast<double>(Now - UseLastAt) / static_cast<double>(Freq) : 0.0;
+    constexpr double MB = 1024.0 * 1024.0;
+
+    fextl::string Out = fextl::fmt::format("# code buffer: #{} {:.0f}% used ({:.1f} of {:.0f} MB", U.Number,
+                                           U.Size ? static_cast<double>(U.Used) * 100.0 / static_cast<double>(U.Size) : 0.0,
+                                           static_cast<double>(U.Used) / MB, static_cast<double>(U.Size) / MB);
+    if (UseLastAt && U.Number == UseLast.Number) {
+      Out += fextl::fmt::format(", +{:.2f} MB", static_cast<double>(U.Used - std::min(U.Used, UseLast.Used)) / MB);
+    }
+    Out += fextl::fmt::format(") | in the last {:.0f} s: placed {} blocks ({} loaded from the disk cache, {} translated), {} disk cache "
+                              "hits served by the copy already in the buffer ({:.2f} MB not copied)",
+                              Seconds, (U.Loaded - UseLast.Loaded) + (U.Translated - UseLast.Translated), U.Loaded - UseLast.Loaded,
+                              U.Translated - UseLast.Translated, U.Reused - UseLast.Reused,
+                              static_cast<double>(U.ReusedBytes - UseLast.ReusedBytes) / MB);
+    Out += fextl::fmt::format(", dropped {} blocks:", U.Dropped - UseLast.Dropped);
+
+    static constexpr const char* ReasonNames[] = {"protection exec->exec", "protection exec removed", "protection made exec",
+                                                  "write faults", "frees", "unmaps", "icache flushes", "dirty", "file reads", "other"};
+    static_assert(std::size(ReasonNames) == size_t(R::Count));
+    static constexpr const char* ProtNames[] = {"NOACCESS", "R", "RW", "WC", "X", "RX", "RWX", "XWC"};
+    bool Any = false;
+    for (size_t i = 0; i < size_t(R::Count); ++i) {
+      const uint64_t Calls = D.Calls[i] - DropsLast.Calls[i];
+      if (!Calls) {
+        continue;
+      }
+      Out += fextl::fmt::format("{} {} {}x {} pages {} blocks", Any ? "," : "", ReasonNames[i], Calls, D.Pages[i] - DropsLast.Pages[i],
+                                D.Blocks[i] - DropsLast.Blocks[i]);
+      if (i == size_t(R::ProtectExecToExec) || i == size_t(R::ProtectExecRemoved)) {
+        const size_t K = i == size_t(R::ProtectExecToExec) ? 0 : 1;
+        fextl::string To;
+        for (size_t b = 0; b < 8; ++b) {
+          if (const uint64_t N = D.ProtBits[K][b] - DropsLast.ProtBits[K][b]) {
+            To += fextl::fmt::format("{}{} {}", To.empty() ? "" : " ", ProtNames[b], N);
+          }
+        }
+        if (!To.empty()) {
+          Out += fextl::fmt::format(" (those that dropped code, by new protection: {})", To);
+        }
+      }
+      Any = true;
+    }
+    if (!Any) {
+      Out += " none";
+    }
+    Out += "\n";
+
+    UseLastAt = Now;
+    UseLast = U;
+    DropsLast = D;
+    return Out;
+  }
+
   fextl::string Lines() {
     fextl::string Out;
     const uint64_t Now = Counter();
@@ -131,6 +198,12 @@ namespace {
         Out += fextl::fmt::format("# code buffer: #{} started ({}), {:.0f} MB\n", I.Number, ReasonText(I.Reason),
                                   static_cast<double>(I.Size) / MB);
       }
+    }
+
+    if (!UseLastAt) {
+      UseLine(Now, Freq); // the baseline for the first line
+    } else if (Now - UseLastAt >= UseEverySeconds * Freq - Freq / 4) {
+      Out += UseLine(Now, Freq);
     }
     return Out;
   }
@@ -203,17 +276,26 @@ void Init(FEXCore::Context::Context* CTX, bool StatsLog) {
   RenewEarlyPercent = EarlySwitch && EarlySwitch[0] >= '0' && EarlySwitch[0] <= '9' ?
                         std::min<uint32_t>(strtoul(EarlySwitch, nullptr, 10), 100) :
                         RenewPercent;
+  // FEX_CODE_REUSE=1 (the D2R default): disk cache code that comes back the same is mapped again from the copy already in
+  // the buffer instead of placing another.
+  const char* ReuseSwitch = FEX::Windows::Switch("FEX_CODE_REUSE");
+  const bool Reuse = ReuseSwitch && ReuseSwitch[0] == '1';
+  CTX->SetPlacedCodeReuse(Reuse);
+
   const char* LoadSwitch = FEX::Windows::Switch("FEX_CODE_BUFFER_LOAD_MS");
   LoadMs = LoadSwitch && LoadSwitch[0] >= '0' && LoadSwitch[0] <= '9' ? std::clamp<uint32_t>(strtoul(LoadSwitch, nullptr, 10), 100, 5000) : 250;
 
   if (StatsLog) {
     FEX::Windows::StatsLogNote(fextl::fmt::format(
-      "code buffer: {}; {} (FEX_CODE_BUFFER_START=max|grow, FEX_CODE_BUFFER_RENEW=N|off, FEX_CODE_BUFFER_RENEW_EARLY=N, "
-      "FEX_CODE_BUFFER_LOAD_MS={})",
+      "code buffer: {}; {}; {} (FEX_CODE_BUFFER_START=max|grow, FEX_CODE_BUFFER_RENEW=N|off, FEX_CODE_BUFFER_RENEW_EARLY=N, "
+      "FEX_CODE_BUFFER_LOAD_MS={}, FEX_CODE_REUSE=1|0)",
       StartMax ? "starts at 128 MB" : "starts at 16 MB and doubles up to 128 MB (upstream)",
       RenewPercent ? fextl::fmt::format("renewed at a loading screen when {}% used or more ({}% at the first {})", RenewPercent,
                                         std::min(RenewEarlyPercent, RenewPercent), EarlyLoads) :
                      fextl::string("never renewed early"),
+      Reuse ? "disk cache code that comes back the same after its blocks were dropped is mapped again from the copy already in the "
+              "buffer" :
+              "dropped code is always placed again (upstream)",
       LoadMs));
     FEX::Windows::StatsLogSetLineProvider(Lines);
   }

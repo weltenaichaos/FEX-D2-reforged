@@ -118,7 +118,9 @@ namespace CPU {
     virtual CompiledCode CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
                                      FEXCore::Core::DebugData* DebugData, bool CheckTF) = 0;
 
-    virtual CompiledCode LoadCachedCode(std::span<const uint8_t> HostBytes) {
+    // Places code loaded from the disk cache. With a Key, code placed for the same key earlier and still in the current
+    // buffer is returned instead of placing another copy (see GuestToHostMap::Placed).
+    virtual CompiledCode LoadCachedCode(std::span<const uint8_t> HostBytes, const PlacedCodeKey* Key = nullptr) {
       return {};
     }
 

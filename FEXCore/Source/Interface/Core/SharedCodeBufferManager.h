@@ -12,6 +12,7 @@ $end_info$
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -20,6 +21,26 @@ struct GuestToHostMap;
 }
 
 namespace FEXCore::CPU {
+// What a block of code from the disk cache was loaded for: the guest code's address, the hash and size of the guest
+// bytes it translates, and its host size. Equal keys mean the same translation of the same bytes at the same address,
+// so code placed for one key can serve it again (GuestToHostMap::FindPlaced).
+struct PlacedCodeKey {
+  uint64_t GuestRIP;
+  uint64_t HashLow;
+  uint64_t HashHigh;
+  uint32_t GuestSize;
+  uint32_t HostSize;
+
+  bool operator==(const PlacedCodeKey&) const = default;
+  uint64_t Hash() const {
+    uint64_t H = GuestRIP * 0x9E3779B97F4A7C15ULL;
+    H ^= HashLow + 0x632BE59BD9B4E019ULL + (H << 6) + (H >> 2);
+    H ^= HashHigh + 0x85EBCA77C2B2AE63ULL + (H << 6) + (H >> 2);
+    H ^= (uint64_t {GuestSize} << 32 | HostSize) + (H << 6) + (H >> 2);
+    return H;
+  }
+};
+
 struct CodeBuffer {
   fextl::unique_ptr<GuestToHostMap> LookupCache;
 
@@ -144,6 +165,40 @@ public:
   };
   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&, const StartInfo&) {};
 
+  // Placing disk cache code again that is still in the buffer. A guest that changes the protection of its code pages
+  // (or rewrites them with the same bytes) makes FEX drop the blocks there; when the same code runs again it is found
+  // in the disk cache and, without this, copied into the buffer once more while the old copy stays as waste.
+  void SetReusePlaced(bool Enable) {
+    ReusePlaced.store(Enable, std::memory_order_relaxed);
+  }
+  bool ReusePlacedCode() const {
+    return ReusePlaced.load(std::memory_order_relaxed);
+  }
+
+  // For the frontend's log: the latest buffer's number, usable size and bytes used, and counts since the process
+  // started: blocks placed after translating them and after loading them from the disk cache, disk cache blocks served by
+  // code already in the buffer (and the bytes not copied), and blocks dropped from the lookup maps by invalidations.
+  struct Use {
+    uint32_t Number;
+    uint64_t Size;
+    uint64_t Used;
+    uint64_t Translated;
+    uint64_t Loaded;
+    uint64_t Reused;
+    uint64_t ReusedBytes;
+    uint64_t Dropped;
+  };
+  Use GetUse() const;
+  // A thread placed code in Buffer (Loaded: from the disk cache, else just translated).
+  void NotePlaced(const CodeBuffer* Buffer, bool Loaded);
+  void NoteReused(size_t Bytes) {
+    ReusedTotal.fetch_add(1, std::memory_order_relaxed);
+    ReusedBytesTotal.fetch_add(Bytes, std::memory_order_relaxed);
+  }
+  void NoteDropped(size_t Blocks) {
+    DroppedTotal.fetch_add(Blocks, std::memory_order_relaxed);
+  }
+
   // Start at the largest size instead of growing to it: every growth step starts a new buffer, which drops all code.
   void UseMaximal();
 
@@ -166,6 +221,17 @@ private:
   // Set by TakeRenewal, read by the AllocateNew that follows it.
   std::atomic<bool> RenewTaken {};
   std::atomic<uint32_t> Started {};
+
+  std::atomic<bool> ReusePlaced {};
+  // The latest buffer, only compared against (never followed: the log thread reads these without the buffer's lock).
+  std::atomic<const CodeBuffer*> LatestRaw {};
+  std::atomic<uint64_t> LatestSize {};
+  std::atomic<uint64_t> LatestUsed {};
+  std::atomic<uint64_t> TranslatedTotal {};
+  std::atomic<uint64_t> LoadedTotal {};
+  std::atomic<uint64_t> ReusedTotal {};
+  std::atomic<uint64_t> ReusedBytesTotal {};
+  std::atomic<uint64_t> DroppedTotal {};
 
   bool NameJITBuffers {true};
 };

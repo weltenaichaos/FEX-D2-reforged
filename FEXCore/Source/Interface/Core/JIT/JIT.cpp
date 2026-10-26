@@ -850,19 +850,23 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
 }
 
 
-CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(size_t Size) {
+bool Arm64JITCore::MoveToLatestCodeBuffer() {
+  if (auto Prev = CheckCodeBufferUpdate()) {
+    Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    auto lk = ThreadState->LookupCache->AcquireWriteLock();
+    ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+    return true;
+  }
+  return false;
+}
+
+CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(size_t Size, bool Loaded) {
   CodeBuffer::CodeBufferAllocation AllocatedInfo {};
   LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
                                                                                                "doesn't match up!\n");
   // Bring CodeBuffer up to date
   const auto MoveToLatest = [this] {
-    if (auto Prev = CheckCodeBufferUpdate()) {
-      Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
-      auto lk = ThreadState->LookupCache->AcquireWriteLock();
-      ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
-      return true;
-    }
-    return false;
+    return MoveToLatestCodeBuffer();
   };
   MoveToLatest();
 
@@ -888,6 +892,10 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
   }
 
   CurrentCodeBuffer->Blocks.fetch_add(1, std::memory_order_relaxed);
+  if (Loaded) {
+    CurrentCodeBuffer->CachedBlocks.fetch_add(1, std::memory_order_relaxed);
+  }
+  CTX->NotePlaced(CurrentCodeBuffer.get(), Loaded);
   return AllocatedInfo;
 }
 
@@ -1214,15 +1222,40 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   return std::move(CodeData);
 }
 
-CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes) {
+CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes, const PlacedCodeKey* Key) {
   // we stored it aligned, better still be?
   LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
-  auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
-  CurrentCodeBuffer->CachedBlocks.fetch_add(1, std::memory_order_relaxed);
+
+  if (Key) {
+    // Look in the buffer this code would be placed in.
+    MoveToLatestCodeBuffer();
+    uint8_t* Found {};
+    {
+      auto lk = CurrentCodeBuffer->LookupCache->AcquireReadLock();
+      Found = CurrentCodeBuffer->LookupCache->FindPlaced(*Key, lk);
+    }
+    if (Found) {
+      CTX->NoteReused(HostBytes.size());
+      FEXCORE_PROFILE_INSTANT_INCREMENT(ThreadState, AccumulatedDiskCachePlacedBeforeCount, 1);
+      CPUBackend::CompiledCode Result;
+      Result.BlockBegin = Found;
+      Result.Size = HostBytes.size();
+      Result.HostCodeOffset = Found - CurrentCodeBuffer->GetBufferBase();
+      return Result;
+    }
+  }
+
+  auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size(), true);
 
   uint8_t* Dest = AllocatedInfo.BufferAllocationOffset;
   memcpy(Dest, HostBytes.data(), HostBytes.size());
   ClearICache(Dest, HostBytes.size());
+
+  if (Key) {
+    // The allocation may have moved this thread to a new buffer: remember the code in the one it went to.
+    auto lk = CurrentCodeBuffer->LookupCache->AcquireWriteLock();
+    CurrentCodeBuffer->LookupCache->RememberPlaced(*Key, Dest, lk);
+  }
 
   CPUBackend::CompiledCode Result;
   Result.BlockBegin = Dest;

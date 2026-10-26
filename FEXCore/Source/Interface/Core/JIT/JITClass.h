@@ -55,7 +55,7 @@ public:
                                        FEXCore::Core::DebugData* DebugData, bool CheckTF) override;
 
   [[nodiscard]]
-  CPUBackend::CompiledCode LoadCachedCode(std::span<const uint8_t> HostBytes) override;
+  CPUBackend::CompiledCode LoadCachedCode(std::span<const uint8_t> HostBytes, const PlacedCodeKey* Key = nullptr) override;
 
   void ClearCache() override;
 
@@ -638,7 +638,9 @@ private:
 
   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
 
-  [[nodiscard]] CodeBuffer::CodeBufferAllocation AllocateCodeBufferInSharedCache(size_t Size);
+  // Moves this thread to the latest code buffer if another thread started one; returns whether it moved.
+  bool MoveToLatestCodeBuffer();
+  [[nodiscard]] CodeBuffer::CodeBufferAllocation AllocateCodeBufferInSharedCache(size_t Size, bool Loaded = false);
 
 #define DEF_OP(x) void Op_##x(IR::IROp_Header const* IROp, IR::Ref Node)
 
