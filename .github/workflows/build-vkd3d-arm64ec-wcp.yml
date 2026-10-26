@@ -22,8 +22,8 @@ on:
 env:
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
   VKD3D_TAG: v3.0b
-  WCP_VERSION: 3.0b-arm64ec-fex17
-  WCP_VERSION_CODE: 18
+  WCP_VERSION: 3.0b-arm64ec-fex18
+  WCP_VERSION_CODE: 19
 
 jobs:
   build:
@@ -124,7 +124,7 @@ jobs:
             "type": "VKD3D",
             "versionName": "${WCP_VERSION}",
             "versionCode": ${WCP_VERSION_CODE},
-            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline, cap pre-sleep, gradual frame start pacing whose margin only grows for frames the hold-back made late, read-only depth-stencil planes not written back after a render pass, frame start pacing that counts a busy GPU as spare time, pass shape measurements, frame done signalled from the CPU after the swapchain copy's fence instead of an empty queue submit, that fence watched from the copy's submit so pacing sees the real GPU finish, a 30 ms hold-back ceiling (50 ms from fex14), spare times of the last 256 frames instead of 64 outside GPU-bound pacing (fex15), frame credits held back when the game runs frames ahead of the frame latency it set (fex16), GPU memory for the game's heaps made ahead on a background thread (fex17), the cap's grid measured from every held present, a frame start margin that recovers 1 ms per 60 frames, per-draw GPU timing with the driver's shader statistics, GPU-bound frame start pacing, GPU timers in 1 frame in 8, zero fills of never-used memory skipped, a gpu report of new memory, vkd3d's transfers and the GPU time between render passes, frames to the window system only once drawn, a copy of chosen shaders and the driver's compiled code for FEX's stats log). Build from ${GITHUB_SHA}.",
+            "description": "vkd3d-proton ${VKD3D_TAG} built as ARM64EC (system32, runs without FEX) and i686 (syswow64), with FEX-D2-reforged's vkd3d-patches (clear folding, GPU pass meter, present timeline, cap pre-sleep, gradual frame start pacing whose margin only grows for frames the hold-back made late, read-only depth-stencil planes not written back after a render pass, frame start pacing that counts a busy GPU as spare time, pass shape measurements, frame done signalled from the CPU after the swapchain copy's fence instead of an empty queue submit, that fence watched from the copy's submit so pacing sees the real GPU finish, a 30 ms hold-back ceiling (50 ms from fex14), spare times of the last 256 frames instead of 64 outside GPU-bound pacing (fex15), frame credits held back when the game runs frames ahead of the frame latency it set (fex16), GPU memory for the game's heaps made ahead on a background thread (fex17), a frame start margin of at least 6 ms outside GPU-bound pacing (fex18), the cap's grid measured from every held present, a frame start margin that recovers 1 ms per 60 frames, per-draw GPU timing with the driver's shader statistics, GPU-bound frame start pacing, GPU timers in 1 frame in 8, zero fills of never-used memory skipped, a gpu report of new memory, vkd3d's transfers and the GPU time between render passes, frames to the window system only once drawn, a copy of chosen shaders and the driver's compiled code for FEX's stats log). Build from ${GITHUB_SHA}.",
             "files": [
               {"source": "system32/d3d12.dll",     "target": "\${system32}/d3d12.dll"},
               {"source": "system32/d3d12core.dll", "target": "\${system32}/d3d12core.dll"},
@@ -209,6 +209,10 @@ jobs:
             MB of kernel zeroing (14 ms for 96 MB on the main thread in one frame). Each kind of
             request keeps as many spares as its biggest burst, all together up to
             VKD3D_FEX_MEMORY_AHEAD_MB (default 256 MB). 'gpu memory ahead' line in FEX's log.
+            From fex18 on, frame start pacing keeps at least 6 ms below the smallest spare time of
+            the last frames outside GPU-bound pacing (was 3 ms; VKD3D_FEX_START_MARGIN_MS, 1-20): in
+            the FEX build 79-81 runs the hold-back made a frame late every 15-20 s, and more than
+            half of those were only 2-5 ms past their time.
             Install in GameNative as a VKD3D
             content profile; it appears as `${{ env.WCP_VERSION }}`.
         env:

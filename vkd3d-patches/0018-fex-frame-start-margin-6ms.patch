@@ -1,0 +1,131 @@
+From 5107162971ab0e2bd874914641e9b8aaf0413174 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 18:02:57 +0000
+Subject: [PATCH] FEX: frame start margin at least 6 ms outside GPU-bound
+ pacing (VKD3D_FEX_START_MARGIN_MS)
+
+---
+ libs/vkd3d/fex_timeline.c  | 12 ++++++++++--
+ libs/vkd3d/swapchain.c     | 24 +++++++++++++++++++-----
+ libs/vkd3d/vkd3d_private.h |  3 +++
+ 3 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index bff630c..813e43c 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -32,6 +32,7 @@ bool vkd3d_fex_present_drawn_on;
+ bool vkd3d_fex_latency_resync_on;
+ uint32_t vkd3d_fex_frame_start_max_ms = 50;
+ uint32_t vkd3d_fex_frame_start_window = 256;
++uint32_t vkd3d_fex_frame_start_margin_ms = 6;
+ 
+ struct fex_timeline_stat
+ {
+@@ -165,6 +166,13 @@ void vkd3d_fex_timeline_init(void)
+         if (frames >= 64 && frames <= 1024)
+             vkd3d_fex_frame_start_window = frames;
+     }
++    /* Smallest margin outside GPU-bound pacing in ms (VKD3D fex18: 6 unless set; 1-20 taken, 3 = fex9 to fex17). */
++    if (vkd3d_get_env_var("VKD3D_FEX_START_MARGIN_MS", env, sizeof(env)))
++    {
++        unsigned long ms = strtoul(env, NULL, 10);
++        if (ms >= 1 && ms <= 20)
++            vkd3d_fex_frame_start_margin_ms = ms;
++    }
+     vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_present_report.flags, VKD3D_FEX_REPORT_FLAG_DEVICE |
+             (vkd3d_fex_timeline_on ? VKD3D_FEX_REPORT_FLAG_ON : 0) |
+             (vkd3d_fex_frame_start_on ? VKD3D_FEX_REPORT_FLAG_FRAME_START | VKD3D_FEX_REPORT_FLAG_GRADUAL_START |
+@@ -178,8 +186,8 @@ void vkd3d_fex_timeline_init(void)
+     if (vkd3d_fex_timeline_on)
+         INFO("FEX timeline on.\n");
+     if (vkd3d_fex_frame_start_on)
+-        INFO("FEX frame start pacing on, up to %u ms, spare times of the last %u frames.\n",
+-                vkd3d_fex_frame_start_max_ms, vkd3d_fex_frame_start_window);
++        INFO("FEX frame start pacing on, up to %u ms, spare times of the last %u frames, margin at least %u ms.\n",
++                vkd3d_fex_frame_start_max_ms, vkd3d_fex_frame_start_window, vkd3d_fex_frame_start_margin_ms);
+     if (vkd3d_fex_present_presleep_on)
+         INFO("FEX cap pre-sleep on.\n");
+     if (vkd3d_fex_host_frame_done_on)
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 8a14f34..a7a6ba1 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -2187,8 +2187,9 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+     else if (chain->fex_done.enable)
+         snprintf(pacing, sizeof(pacing), "on (up to %u ms: VKD3D fex14, spare times of the last %u frames outside GPU-bound"
+                 " pacing: VKD3D fex15, a busy GPU counts as spare time, GPU finish seen as it happens, margin 1 ms smaller"
+-                " per 60 frames without a late one, GPU-bound pacing when 48 of the last 64 frames had a busy GPU:"
+-                " VKD3D fex10)", vkd3d_fex_frame_start_max_ms, vkd3d_fex_frame_start_window);
++                " per 60 frames without a late one down to %u ms outside GPU-bound pacing: VKD3D fex18, GPU-bound pacing"
++                " when 48 of the last 64 frames had a busy GPU: VKD3D fex10)", vkd3d_fex_frame_start_max_ms,
++                vkd3d_fex_frame_start_window, vkd3d_fex_frame_start_margin_ms);
+     else
+         snprintf(pacing, sizeof(pacing), "on (up to %u ms: VKD3D fex14, spare times of the last %u frames: VKD3D fex15,"
+                 " a busy GPU counts as spare time: VKD3D fex6)", vkd3d_fex_frame_start_max_ms,
+@@ -3831,7 +3832,17 @@ static void *dxgi_vk_swap_chain_fex_done_worker(void *chain_)
+     return NULL;
+ }
+ 
+-#define FEX_START_MARGIN_MIN_NS 3000000ll
++#define FEX_START_MARGIN_MIN_NS 3000000ll   /* GPU-bound pacing */
++/* Outside GPU-bound pacing (VKD3D fex18): 6 ms unless VKD3D_FEX_START_MARGIN_MS says otherwise (1-20; was 3). In the
++ * FEX build 78-81 runs (calm play, 30 FPS held) the margin sat at 3 ms and the hold-back made a frame late every 15-20 s
++ * in builds 79-81 (1 every 39 s in 78). Of the 34 such frames in their play, 18 were 2-5 ms past their time, which the
++ * 3 ms more a 6 ms margin holds back would have covered: the game's own work for that frame took longer than for any of
++ * the last 256 (~20-27 ms against a median of 14-15). The rest were 6-19 ms past it, from hitches no margin covers (the
++ * game reading its files on the main thread, the main thread waiting 15-50 ms for its core). Replayed per frame on
++ * those runs' spare times, 6 ms
++ * makes ~60% fewer of them for ~2 ms less hold-back on average; each one also halves the hold-back, which then takes
++ * ~5-8 s to grow back (frames 5-15 ms longer from start to screen meanwhile). */
++#define FEX_START_CALM_MARGIN_MIN_NS ((int64_t)vkd3d_fex_frame_start_margin_ms * 1000000ll)
+ #define FEX_START_MARGIN_FIRST_NS 6000000ll
+ #define FEX_START_MARGIN_MAX_NS 30000000ll
+ #define FEX_START_MARGIN_UP_NS 3000000ll   /* margin added for each frame the hold-back made late */
+@@ -3895,7 +3906,7 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+         const struct fex_frame_times *fex)
+ {
+     int64_t queue_wait, held, gpu_ahead, spare = 0, natural, lowest, target = 0, aim = 0, delay, step, margin, gpu_busy;
+-    int64_t present_room, max_step, low[FEX_START_BUSY_RANK], v, lowest_recent = 0, memory_less = 0;
++    int64_t present_room, max_step, low[FEX_START_BUSY_RANK], v, lowest_recent = 0, memory_less = 0, margin_min;
+     uint64_t gpu_done_ns = 0, release_ns, now_ns, base_ns, hold_start_ns, gpu_frame_ns = 0, qp_end_ns;
+     bool late = false, caused = false, measured = false, held_back, gpu_noted = false, busy = false, unseen = false;
+     bool gpu_bound = false;
+@@ -4004,6 +4015,7 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+             late = true;
+             caused = natural >= -FEX_START_LATE_NS;
+         }
++        margin_min = gpu_bound ? FEX_START_MARGIN_MIN_NS : FEX_START_CALM_MARGIN_MIN_NS;
+         if (caused)
+         {
+             margin = min(margin + (gpu_bound ? FEX_START_BUSY_MARGIN_UP_NS : FEX_START_MARGIN_UP_NS),
+@@ -4012,9 +4024,11 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+         }
+         else if (++chain->fex_start.quiet_frames >= FEX_START_MARGIN_DOWN_FRAMES)
+         {
+-            margin = max(margin - 1000000ll, FEX_START_MARGIN_MIN_NS);
++            margin = max(margin - 1000000ll, margin_min);
+             chain->fex_start.quiet_frames = 0;
+         }
++        /* Back from GPU-bound pacing (smaller margin there). */
++        margin = max(margin, margin_min);
+ 
+         if (gpu_bound)
+         {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 9fe19a4..c7e2bdc 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3176,6 +3176,9 @@ extern uint32_t vkd3d_fex_frame_start_max_ms;
+ /* Frames whose spare times frame start pacing remembers outside GPU-bound pacing (VKD3D_FEX_START_WINDOW, 64-1024;
+  * VKD3D fex15: 256 unless set, was 64). */
+ extern uint32_t vkd3d_fex_frame_start_window;
++/* Smallest margin of frame start pacing outside GPU-bound pacing in ms (VKD3D_FEX_START_MARGIN_MS, 1-20; VKD3D fex18: 6
++ * unless set, was 3). */
++extern uint32_t vkd3d_fex_frame_start_margin_ms;
+ /* Cap pre-sleep (VKD3D_FEX_PRESENT_PRESLEEP=1, swapchain.c): sleep out a frame cap's wait before vkQueuePresentKHR,
+  * without holding the VkQueue the game's other queues share. */
+ extern bool vkd3d_fex_present_presleep_on;
+-- 
+2.43.0
+
