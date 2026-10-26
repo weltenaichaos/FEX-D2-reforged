@@ -264,10 +264,11 @@ namespace {
     // stats log nothing flips it, so it stays on).
     const char* Desc = Switch("FEX_TU_DESC");
     TurnipDesc = SwitchOff(Desc) ? 0 : (Desc[0] == 'a' || Desc[0] == 'A') ? 2 : 1;
-    // FEX_TU_DEPTH_CLEAR: 0 stock (2D engine), 1 3D draw, fastz = 3D draw with the fragment shader disabled (driver fex4),
-    // alt (D2R default since build 74) = 3D draw always, fast Z in every other second. Build 73 measured the 3D draw
-    // against the 2D engine (alt then flipped those): ~0.55 ms less per 4096x4096 shadow map. Like FEX_TU_DESC, only
-    // TurnipReport flips it, so without the stats log alt stays on (with fast Z).
+    // FEX_TU_DEPTH_CLEAR: 0 stock (2D engine), 1 3D draw (D2R default from build 75), fastz = 3D draw with the fragment
+    // shader disabled (driver fex4), alt (D2R default in build 74) = 3D draw always, fast Z in every other second. Build 73
+    // measured the 3D draw against the 2D engine (alt then flipped those): ~0.55 ms less per 4096x4096 shadow map; build 74
+    // measured fast Z: no gain. Like FEX_TU_DESC, only TurnipReport flips it, so without the stats log alt stays on (with
+    // fast Z).
     const char* DepthClear = Switch("FEX_TU_DEPTH_CLEAR");
     TurnipDepthClear = SwitchOff(DepthClear)                              ? 0 :
                        (DepthClear[0] == 'a' || DepthClear[0] == 'A') ? 2 :
@@ -377,9 +378,10 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "a frame cap that sleeps inside vkQueuePresentKHR gets its wait slept out before the present, without "
                       "holding the VkQueue the game's compute and copy queues share ('cap' line)");
   SetupVkd3dFexSwitch("FEX_VKD3D_FRAME_START", L"VKD3D_FEX_FRAME_START",
-                      "the game's next frame starts as late as the measured waiting allows (up to 20 ms, changing by at most "
-                      "0.2 ms per frame up and 1 ms down, from VKD3D fex3 on), so it reads input closer to when the frame is "
-                      "shown ('frame start' line)");
+                      "the game's next frame starts as late as the measured waiting allows (VKD3D sets the most it holds back: "
+                      "20 ms up to fex7, 30 ms from fex8, 50 ms from fex14, VKD3D_FEX_START_MAX_MS; from fex15 below the "
+                      "shortest spare time of the last 256 frames, VKD3D_FEX_START_WINDOW; changing by at most 0.2 ms per "
+                      "frame up and 1 ms down), so it reads input closer to when the frame is shown ('frame start' line)");
   SetupVkd3dFexSwitch("FEX_VKD3D_SKIP_FRESH_CLEARS", L"VKD3D_FEX_SKIP_FRESH_CLEARS",
                       "new GPU memory that vkd3d places in block pages never used since the driver zeroed them skips its "
                       "zero fill (VKD3D fex11 and later; 'gpu memory' line)");

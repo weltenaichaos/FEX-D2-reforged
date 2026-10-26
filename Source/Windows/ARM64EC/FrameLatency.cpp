@@ -374,17 +374,29 @@ namespace {
     fextl::unordered_map<uint64_t, uint32_t> WaitSamples;
     fextl::unordered_map<uint64_t, Tally> Calls;
     fextl::unordered_map<uint64_t, fextl::string> Kinds;
+    fextl::unordered_map<uint64_t, bool> Latency; // handle -> is a frame latency handle, for the sample hook's answer
   };
   LineState* Line {};
 
-  void SampleHook(uint64_t Target) {
+  // 1 = the main thread waits on a frame latency handle, 2 = on another handle, 0 = not in a watched wait.
+  uint8_t SampleHook(uint64_t Target) {
     ++Line->Samples;
     if (Target && (Target == FEXWaitWatchTargets[0] || Target == FEXWaitWatchTargets[1])) {
       const uint64_t Count = CallCount();
       if (Count) {
-        ++Line->WaitSamples[ReadCall(Count - 1).Handle];
+        const uint64_t Handle = ReadCall(Count - 1).Handle;
+        ++Line->WaitSamples[Handle];
+        auto It = Line->Latency.find(Handle);
+        if (It == Line->Latency.end()) {
+          if (Line->Latency.size() > 256) {
+            Line->Latency.clear();
+          }
+          It = Line->Latency.emplace(Handle, Describe(Handle).LatencyHandle()).first;
+        }
+        return It->second ? 1 : 2;
       }
     }
+    return 0;
   }
 
   fextl::string WaitsLine() {

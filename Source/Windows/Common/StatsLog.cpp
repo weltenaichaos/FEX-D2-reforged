@@ -86,6 +86,29 @@ namespace {
   constexpr size_t MaxSlowFrameLines = 1500;
   constexpr uint64_t FrameSummarySeconds = 10;
 
+  // Busy frames (build 75, with FEX_STATSLOG_PROFILE=1): a "# busy frame" line for every frame whose game part (the frame
+  // less the main thread's wait on the swapchain frame latency handle) took at least BusyFrameMinMs and BusyFrameFactor
+  // times the median of the last BusyFrameHistory frames. In the build 74 + VKD3D fex14 run the game's own frame (vkd3d's
+  // release to Present()) took 15-30 ms instead of ~9 ms in 78 of 459 seconds of standing still, and the frame start
+  // pacing's hold-back made those frames late; per second, those seconds had 3x the main thread's lookup cache misses,
+  // ~2x its compiles, more code writes by the game thread and ~16 ms more waiting for a CPU, which a second's totals
+  // can't tie to the slow frame. The line has the main thread's time on a CPU and waiting for one in that frame (Linux
+  // schedstat, read every 2ms), its compiles, lookup misses, disk cache lookups, exception handling and code lock waits,
+  // all threads' code writes, the other threads' compile time, and where the samples found it.
+  constexpr double BusyFrameMinMs = 16.0;
+  constexpr double BusyFrameFactor = 1.4;
+  constexpr size_t BusyFrameHistory = 64;
+  constexpr size_t MaxBusyFrameLines = 1500;
+  constexpr size_t BusyFrameLinesPerSecond = 4;
+  constexpr size_t MaxMainTicks = 1024;
+  enum MainTickKind : uint8_t {
+    TickFex = 0,     // outside emulated code with no native function known: FEX itself (compiling, dispatching, signals)
+    TickGame = 1,    // emulated code
+    TickNative = 2,  // in (or last in) a native function: Wine, VKD3D, the driver
+    TickWait = 3,    // in a watched wait on a handle other than a frame latency handle
+    TickLatency = 4, // in a watched wait on a frame latency handle
+  };
+
   // Native-call sampler (with FEX_STATSLOG_PROFILE=1): ExitFunctionEC (ARM64EC/Module.S) stores the native function it
   // enters in the thread's CHPE CPU area (EmulatorDataInline). Samples of a thread outside emulated code count against the
   // last native function it entered from x86 code: a Wine/Windows API (named by the module's exports), one of FEX's own
@@ -302,6 +325,7 @@ namespace {
     bool On;
     int Pid;           // Linux pid = the main thread's Linux tid
     int MainFd = -1;   // /proc/self/task/<pid>/stat
+    int MainSchedFd = -1; // /proc/self/task/<pid>/schedstat, read every 2ms for "# busy frame" lines
     int ServerPid;
     int ServerFd = -1; // /proc/<wineserver>/stat
     uint32_t MainSamples, MainRunnable, MainCores[Linux::MaxCPUs];
@@ -1194,6 +1218,7 @@ namespace {
     }
     Sched.Pid = Linux::GetPid();
     Sched.MainFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/stat", Sched.Pid).c_str());
+    Sched.MainSchedFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/schedstat", Sched.Pid).c_str());
     SchedOpenServer();
     CoreLoadInit();
     SystemInit();
@@ -1767,13 +1792,37 @@ namespace {
     // Stall probe events of 2ms or more from this and the previous second, for "# frame" lines.
     uint64_t ProbeRead;
     fextl::vector<ProbeEvent> ProbeEvents;
+
+    // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
+    struct MainTick {
+      uint32_t At;      // counter ticks since SecondStart
+      uint8_t Kind;     // MainTickKind
+      bool HaveSched;   // RunNs/WaitNs read
+      uint64_t RunNs;   // Linux schedstat: time on a CPU
+      uint64_t WaitNs;  // ... and time runnable without one
+      uint64_t Jit;     // main thread's compile time (counter ticks), compiles, lookup cache misses, exception handling
+      uint64_t JitCount; // time, code lock wait time and disk cache lookup time (counter ticks), all running totals
+      uint64_t Misses;
+      uint64_t Sig;
+      uint64_t CodeLock;
+      uint64_t DiskCache;
+      uint64_t Smc;      // code writes of all threads
+      uint64_t OtherJit; // compile time of all other threads (counter ticks)
+    };
+    MainTick MainTicks[MaxMainTicks];
+    size_t MainTickCount;
+    MainTick PrevMainTicks[MaxMainTicks];
+    size_t PrevMainTickCount;
+    float BusyHistory[BusyFrameHistory]; // game parts (ms) of the last frames, a ring
+    size_t BusyHistoryCount;
+    size_t BusyFrameLines;
   };
 
   // Up to twelve, see StatsLogSetLineProvider.
   constexpr size_t MaxLineProviders = 12;
   std::atomic<fextl::string (*)()> LineProviders[MaxLineProviders] {};
   // Called with every sample of the main thread, see StatsLogSetMainSampleHook.
-  std::atomic<void (*)(uint64_t)> MainSampleHook {};
+  std::atomic<uint8_t (*)(uint64_t)> MainSampleHook {};
 
   uint64_t GetCounter() {
     uint64_t Result {};
@@ -2630,7 +2679,7 @@ namespace {
 
   // A "# frame" line: what Main was sampled doing from frame start Begin to the next frame start End, from this and the
   // previous second's samples (an older start is noted as such).
-  fextl::string FormatSlowFrame(LogState* State, uint64_t Seconds, uint64_t Begin, uint64_t End, double Ms) {
+  LogState::Run CollectFrameRun(LogState* State, uint64_t Begin, uint64_t End) {
     LogState::Run R {};
     auto Add = [&](const LogState::MainSample* Main, size_t MainCount, const LogState::OtherSample* Other, size_t OtherCount, uint64_t Start) {
       for (size_t i = 0; i < MainCount; ++i) {
@@ -2656,7 +2705,11 @@ namespace {
       Add(State->PrevMainSamples, State->PrevMainSampleCount, State->PrevOtherSamples, State->PrevOtherSampleCount, State->PrevSecondStart);
     }
     Add(State->MainSamples, State->MainSampleCount, State->OtherSamples, State->OtherSampleCount, State->SecondStart);
+    return R;
+  }
 
+  fextl::string FormatSlowFrame(LogState* State, uint64_t Seconds, uint64_t Begin, uint64_t End, double Ms) {
+    const LogState::Run R = CollectFrameRun(State, Begin, End);
     fextl::vector<std::pair<uint32_t, uint64_t>> Blocks, Natives;
     SplitCounts(R.Counts, Blocks, Natives);
     uint32_t Emulated {};
@@ -2668,6 +2721,97 @@ namespace {
       fextl::fmt::format("# frame t={} {:.0f}ms{} main samples={} emu={}%{}:", Older ? fextl::string("<") : FrameTime(State, Seconds, Begin),
                          Ms, Older ? " (began before the samples kept)" : "", R.Samples, R.Samples ? Emulated * 100 / R.Samples : 0,
                          ProbeDuring(State, Begin, End));
+    return Text + RunBody(State, R, Blocks, Natives);
+  }
+
+  // A "# busy frame" line for the frame from Begin to End when its game part was long, see BusyFrameMinMs; empty otherwise.
+  // Every frame's game part goes into the history the median comes from.
+  fextl::string BusyFrame(LogState* State, uint64_t Seconds, uint64_t Begin, uint64_t End, double Ms, size_t& LinesThisSecond) {
+    // The ticks of this and the previous second in time order, as (absolute counter, tick).
+    const LogState::MainTick* Before {}; // last tick before Begin
+    const LogState::MainTick* First {};
+    const LogState::MainTick* Last {};   // last tick before End
+    uint64_t PrevAt {};
+    const LogState::MainTick* Prev {};
+    uint32_t Kinds[5] {};
+    uint64_t LatencyTicks {}, WaitTicks {}; // counter ticks blocked in the frame latency wait / in another watched wait
+    size_t Count {};
+    bool AllSched = true;
+    auto Walk = [&](const LogState::MainTick* Ticks, size_t N, uint64_t Base) {
+      for (size_t i = 0; i < N; ++i) {
+        const auto& K = Ticks[i];
+        const uint64_t At = Base + K.At;
+        if (At < Begin) {
+          Before = &K;
+        } else if (At < End) {
+          if (!First) {
+            First = &K;
+          }
+          Last = &K;
+          ++Count;
+          Kinds[std::min<uint8_t>(K.Kind, 4)]++;
+          AllSched = AllSched && K.HaveSched;
+          // A tick in a watched wait counts as blocked there for the time since the tick before, unless the thread was
+          // on a CPU for half of it (the wait returned and it is running again, e.g. compiling, before the next call).
+          if (Prev && (K.Kind == TickLatency || K.Kind == TickWait) && At > PrevAt) {
+            const uint64_t Span = At - PrevAt;
+            const double SpanNs = static_cast<double>(Span) * 1e9 / static_cast<double>(State->CounterFreq);
+            const bool Ran = K.HaveSched && Prev->HaveSched && static_cast<double>(K.RunNs - Prev->RunNs) >= SpanNs * 0.5;
+            if (!Ran) {
+              (K.Kind == TickLatency ? LatencyTicks : WaitTicks) += Span;
+            }
+          }
+        }
+        Prev = &K;
+        PrevAt = At;
+      }
+    };
+    if (State->PrevSecondStart) {
+      Walk(State->PrevMainTicks, State->PrevMainTickCount, State->PrevSecondStart);
+    }
+    Walk(State->MainTicks, State->MainTickCount, State->SecondStart);
+    if (Count < 3 || !First || !Last || !MainSampleHook.load(std::memory_order_relaxed)) {
+      return {};
+    }
+    const auto* From = Before ? Before : First;
+    const double MsPerTick = 1000.0 / static_cast<double>(State->CounterFreq);
+    const double GameMs = std::max(0.0, Ms - static_cast<double>(LatencyTicks) * MsPerTick);
+
+    // Median of the history, then add this frame.
+    float Sorted[BusyFrameHistory];
+    const size_t HistoryN = std::min(State->BusyHistoryCount, BusyFrameHistory);
+    std::copy_n(State->BusyHistory, HistoryN, Sorted);
+    std::sort(Sorted, Sorted + HistoryN);
+    const double Usual = HistoryN ? Sorted[HistoryN / 2] : 0.0;
+    State->BusyHistory[State->BusyHistoryCount++ % BusyFrameHistory] = static_cast<float>(GameMs);
+    if (HistoryN < BusyFrameHistory / 2 || GameMs < BusyFrameMinMs || GameMs < Usual * BusyFrameFactor ||
+        LinesThisSecond >= BusyFrameLinesPerSecond || State->BusyFrameLines >= MaxBusyFrameLines) {
+      return {};
+    }
+    ++LinesThisSecond;
+    ++State->BusyFrameLines;
+
+    auto Delta = [](uint64_t A, uint64_t B) {
+      return A > B ? A - B : 0;
+    };
+    const fextl::string SchedText =
+      AllSched && From->HaveSched ?
+        fextl::fmt::format("main thread on a CPU {:.1f}ms, waiting for one {:.1f}ms", static_cast<double>(Delta(Last->RunNs, From->RunNs)) / 1e6,
+                           static_cast<double>(Delta(Last->WaitNs, From->WaitNs)) / 1e6) :
+        fextl::string("main thread's CPU time unknown");
+    const LogState::Run R = CollectFrameRun(State, Begin, End);
+    fextl::vector<std::pair<uint32_t, uint64_t>> Blocks, Natives;
+    SplitCounts(R.Counts, Blocks, Natives);
+    auto Text = fextl::fmt::format(
+      "# busy frame t={} {:.0f}ms, game part {:.1f}ms (median {:.1f}) | {}, blocked in other waits {:.1f}ms | compiled {} blocks in "
+      "{:.1f}ms, other threads compiled {:.1f}ms, lookup misses {}, disk cache lookups {:.1f}ms, exception handling {:.1f}ms, code "
+      "lock waits {:.1f}ms, code writes (all threads) {} | ticks game {} fex {} native {} other waits {} latency wait {}{}:",
+      FrameTime(State, Seconds, Begin), Ms, GameMs, Usual, SchedText, static_cast<double>(WaitTicks) * MsPerTick,
+      Delta(Last->JitCount, From->JitCount), static_cast<double>(Delta(Last->Jit, From->Jit)) * MsPerTick,
+      static_cast<double>(Delta(Last->OtherJit, From->OtherJit)) * MsPerTick, Delta(Last->Misses, From->Misses),
+      static_cast<double>(Delta(Last->DiskCache, From->DiskCache)) * MsPerTick, static_cast<double>(Delta(Last->Sig, From->Sig)) * MsPerTick,
+      static_cast<double>(Delta(Last->CodeLock, From->CodeLock)) * MsPerTick, Delta(Last->Smc, From->Smc), Kinds[TickGame],
+      Kinds[TickFex], Kinds[TickNative], Kinds[TickWait], Kinds[TickLatency], ProbeDuring(State, Begin, End));
     return Text + RunBody(State, R, Blocks, Natives);
   }
 
@@ -2685,6 +2829,7 @@ namespace {
     const double MsPerTick = 1000.0 / static_cast<double>(State->CounterFreq);
     fextl::vector<float> Frames;
     fextl::string Slow;
+    size_t BusyLines {};
     while (State->FramesRead < Count) {
       const uint64_t Start = __atomic_load_n(&Marks[1 + (State->FramesRead & (FrameMarkRingSize - 1))], __ATOMIC_RELAXED);
       if (Start > WindowEnd) {
@@ -2698,6 +2843,9 @@ namespace {
           ++State->SlowFrameLines;
           Slow += FormatSlowFrame(State, Seconds, State->LastFrameStart, Start, Ms);
         }
+        if (State->Profile) {
+          Slow += BusyFrame(State, Seconds, State->LastFrameStart, Start, Ms, BusyLines);
+        }
       }
       State->LastFrameStart = Start;
     }
@@ -2707,6 +2855,8 @@ namespace {
     State->PrevMainSampleCount = State->MainSampleCount;
     std::copy_n(State->OtherSamples, State->OtherSampleCount, State->PrevOtherSamples);
     State->PrevOtherSampleCount = State->OtherSampleCount;
+    std::copy_n(State->MainTicks, State->MainTickCount, State->PrevMainTicks);
+    State->PrevMainTickCount = State->MainTickCount;
     State->PrevSecondStart = State->SecondStart;
     State->PrevSeconds = Seconds;
 
@@ -2740,11 +2890,42 @@ namespace {
     return Out + Slow;
   }
 
+  // Busy frames, see BusyFrameMinMs: notes what the main thread is in and its running totals at this sample tick.
+  void RecordMainTick(LogState* State, const SampledThread& T, uint32_t At, bool In, uint64_t NativeTarget, uint8_t Wait) {
+    if (!State->Profile || State->MainTickCount >= MaxMainTicks) {
+      return;
+    }
+    auto& K = State->MainTicks[State->MainTickCount++];
+    K.At = At;
+    K.Kind = In ? TickGame : Wait == 1 ? TickLatency : Wait == 2 ? TickWait : NativeTarget ? TickNative : TickFex;
+    const auto& M = *T.Slot;
+    K.Jit = M.AccumulatedJITTime;
+    K.JitCount = M.AccumulatedJITCount;
+    K.Misses = M.AccumulatedCacheMissCount;
+    K.Sig = M.AccumulatedSignalTime;
+    K.CodeLock = M.AccumulatedCodeLockWaitTime;
+    K.DiskCache = M.AccumulatedDiskCacheLookupTime;
+    uint64_t Smc {}, OtherJit {};
+    State->Stats->ForEachSlot([&](const FEXCore::SHMStats::ThreadStats& Slot) {
+      Smc += Slot.AccumulatedSMCCount;
+      if (&Slot != T.Slot) {
+        OtherJit += Slot.AccumulatedJITTime;
+      }
+    });
+    K.Smc = Smc;
+    K.OtherJit = OtherJit;
+    Linux::SchedStat S {};
+    K.HaveSched = Linux::PreadSchedStat(Sched.MainSchedFd, S);
+    K.RunNs = S.RunNs;
+    K.WaitNs = S.WaitNs;
+  }
+
   // Waits one second, polling the sampled threads' InSimulation flag every few milliseconds.
   void SampleFor1s(LogState* State) {
     const uint64_t Start = GetCounter();
     const uint64_t End = Start + State->CounterFreq;
     State->SecondStart = Start;
+    State->MainTickCount = 0; // FrameLines kept the last second's ticks
     for (size_t i = 0; i < State->SampledCount; ++i) {
       memset(State->Sampled[i].BinSamples, 0, sizeof(State->Sampled[i].BinSamples));
       memset(State->Sampled[i].BinInSimulation, 0, sizeof(State->Sampled[i].BinInSimulation));
@@ -2782,9 +2963,11 @@ namespace {
           }
         }
         if (T.IsMain) {
+          uint8_t Wait {};
           if (const auto Hook = MainSampleHook.load(std::memory_order_relaxed)) {
-            Hook(NativeTarget);
+            Wait = Hook(NativeTarget);
           }
+          RecordMainTick(State, T, static_cast<uint32_t>(Now - Start), In, NativeTarget, Wait);
         }
         if (State->Profile && !T.IsMain && State->OtherSampleCount < MaxOtherSamples) {
           const uint64_t Value = In ? (T.BlockHeader ? *T.BlockHeader : 0) : (NativeTarget ? NativeTarget | NativeSampleFlag : 0);
@@ -3457,7 +3640,12 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "one game frame "
                        "start to the next (count, average, median, 90th/99th percentile, longest, how many took 40/50/67/100ms "
                        "or more), frames10s = the same over 10 seconds; '# frame' = a frame of 50ms or more with what Main and "
-                       "the busy threads were doing in it; codelock = FEX's code invalidation lock: exclusive locks taken, how "
+                       "the busy threads were doing in it; '# busy frame' = a frame whose game part (the frame less Main's wait on "
+                       "the frame latency handle) took 16ms and 1.4x the median of the last 64 or more: Main's time on a CPU and "
+                       "waiting for one (Linux), time blocked in other waits, its compiles, lookup cache misses, disk cache "
+                       "lookups, exception handling and code lock waits, all threads' code writes, the other threads' compile "
+                       "time, the 2ms ticks by where Main was (emulated code, FEX itself, a native function, other waits, the "
+                       "latency wait), the stall probe's waits and the sampled blocks; codelock = FEX's code invalidation lock: exclusive locks taken, how "
                        "many waited 1ms "
                        "or more, polite waits that ran out, longest wait and hold (max codelock = a compile's longest wait "
                        "for it); logger work = the log thread's own work between two sampled seconds; susp = times threads stopped "
@@ -3575,7 +3763,7 @@ void StatsLogSetLineProvider(fextl::string (*Provider)()) {
   }
 }
 
-void StatsLogSetMainSampleHook(void (*Hook)(uint64_t NativeTarget)) {
+void StatsLogSetMainSampleHook(uint8_t (*Hook)(uint64_t NativeTarget)) {
   MainSampleHook.store(Hook, std::memory_order_release);
 }
 

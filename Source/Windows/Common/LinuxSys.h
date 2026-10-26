@@ -74,6 +74,8 @@ struct SchedStat {
   uint64_t Slices;
 };
 bool ReadSchedStat(const char* Path, SchedStat& Out);
+// The same from a schedstat file kept open (read again from its start).
+bool PreadSchedStat(int Fd, SchedStat& Out);
 
 // The pid of a process of this user named Name (its comm, or the file name of one of its first three arguments), other
 // than this one; 0 when there is none.

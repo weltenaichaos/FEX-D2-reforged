@@ -124,7 +124,8 @@ namespace FEX::Windows {
 //                          cores busy for ~0.5 ms. From build 74 alt keeps the 3D draw always and runs it without
 //                          fragment shader ('fast Z', driver fex4 and later: FS_DISABLE as for depth-only pipelines,
 //                          the depth from the vertex shader) in every other second; fastz = always without fragment
-//                          shader.
+//                          shader. Build 74 measured fast Z: no gain (1.19 vs 1.19 ms per 4096 map), so from build 75
+//                          the D2R default is 1 (the 3D draw always, no alternation).
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

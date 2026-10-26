@@ -137,7 +137,9 @@ namespace {
     // its empty fragment shader on all 16.8 million pixels (every shader core busy ~0.5 ms). Turnip fex4 can run it with
     // the fragment shader disabled (the GPU's depth-only 'fast Z' mode, as Turnip does for depth-only pipelines); alt
     // now switches that on in every other second ('clear fastz|3d' lines).
-    {"FEX_TU_DEPTH_CLEAR", "alt"},
+    // Build 75: build 74 measured no gain from fast Z (1.19 vs 1.19 ms per 4096 map at the same load; the clear is
+    // limited by writing depth to memory), so it is the 3D draw always, without the alternation.
+    {"FEX_TU_DEPTH_CLEAR", "1"},
   };
 
   // In the order the stats log lists them.

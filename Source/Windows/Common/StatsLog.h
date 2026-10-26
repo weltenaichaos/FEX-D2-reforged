@@ -42,8 +42,9 @@ void StatsLogWatchImage(uint64_t Base);
 void StatsLogSetLineProvider(fextl::string (*Provider)());
 
 // Hook gets every sample (one per 2ms) of the main thread on the log thread: the native function it is in, or 0 while it
-// runs emulated code or nothing is known.
-void StatsLogSetMainSampleHook(void (*Hook)(uint64_t NativeTarget));
+// runs emulated code or nothing is known. It returns 1 when that is a wait on a swapchain frame latency handle, 2 for
+// another wait it watches, 0 otherwise (for the '# busy frame' lines).
+void StatsLogSetMainSampleHook(uint8_t (*Hook)(uint64_t NativeTarget));
 
 // Names a native function that isn't exported (FEX's own native redirects) for the native-call sampler's "native" lines.
 void StatsLogNameNative(uint64_t Address, std::string_view Name);

@@ -341,6 +341,17 @@ bool ReadSchedStat(const char* Path, SchedStat& Out) {
   return ParseU64(P, Out.RunNs) && ParseU64(P, Out.WaitNs) && ParseU64(P, Out.Slices);
 }
 
+bool PreadSchedStat(int Fd, SchedStat& Out) {
+  char Buffer[128];
+  const int64_t Len = Fd >= 0 ? Pread(Fd, Buffer, sizeof(Buffer) - 1, 0) : -9;
+  if (Len <= 0) {
+    return false;
+  }
+  Buffer[Len] = 0;
+  const char* P = Buffer;
+  return ParseU64(P, Out.RunNs) && ParseU64(P, Out.WaitNs) && ParseU64(P, Out.Slices);
+}
+
 namespace {
   struct FindArgs {
     const char* Name;
