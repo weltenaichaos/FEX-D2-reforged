@@ -20,6 +20,7 @@ namespace {
   constexpr int64_t NR_setpriority = 140;
   constexpr int64_t NR_getpriority = 141;
   constexpr int64_t NR_getpid = 172;
+  constexpr int64_t NR_getuid = 174;
   constexpr int64_t NR_gettid = 178;
   constexpr int64_t NR_fadvise64 = 223;
 
@@ -135,7 +136,7 @@ int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size) {
 }
 
 bool Stat(const char* Path, FileInfo& Out) {
-  // struct stat of arm64 Linux (asm-generic): st_mode at byte 16, st_size at byte 48, 128 bytes in all.
+  // struct stat of arm64 Linux (asm-generic): st_mode at byte 16, st_uid at 24, st_size at 48, 128 bytes in all.
   alignas(8) uint8_t Buffer[128];
   if (Syscall(NR_newfstatat, AT_FDCWD, reinterpret_cast<intptr_t>(Path), reinterpret_cast<intptr_t>(Buffer), 0) != 0) {
     return false;
@@ -143,6 +144,7 @@ bool Stat(const char* Path, FileInfo& Out) {
   uint32_t Mode {};
   int64_t Size {};
   memcpy(&Mode, Buffer + 16, sizeof(Mode));
+  memcpy(&Out.Uid, Buffer + 24, sizeof(Out.Uid));
   memcpy(&Size, Buffer + 48, sizeof(Size));
   Out.Size = Size > 0 ? static_cast<uint64_t>(Size) : 0;
   Out.Regular = (Mode & 0170000) == 0100000;
@@ -188,6 +190,10 @@ int64_t ReadSmallFile(const char* Path, char* Buffer, size_t Size) {
 
 int GetPid() {
   return static_cast<int>(Syscall(NR_getpid));
+}
+
+uint32_t GetUid() {
+  return static_cast<uint32_t>(Syscall(NR_getuid));
 }
 
 int GetTid() {

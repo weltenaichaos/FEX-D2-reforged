@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <iterator>
 #include <mutex>
@@ -89,6 +90,7 @@ namespace {
   enum class PrioMode { Keep, Clamp, Normal };
   enum class CoreMode { Off, Big, Fast };
   enum class LoaderMode { Off, Find, Little };
+  enum class OthersMode { Off, Process, User };
 
   struct Config {
     PrioMode Prio;
@@ -105,6 +107,7 @@ namespace {
     uint64_t ExeBase;    // the main exe's image range as loaded, before any protection remaps it
     uint64_t ExeEnd;
     uint32_t GameExcPerRound; // FEX_LOADER_GAME_EXCEPTIONS, 0 = off
+    OthersMode Others;        // FEX_MAINCORE_OTHERS
   };
 
   // Loader threads, see FEX_LOADER_CORES in PriorityGuard.h.
@@ -440,6 +443,175 @@ namespace {
         }
       },
       &A);
+  }
+
+  // Keeps every other thread of this Linux user off the main thread's core (FEX_MAINCORE_OTHERS, see PriorityGuard.h):
+  // threads of this process that Wine doesn't list (the guard's round above only reaches the threads Wine knows) and, with
+  // "user", every thread of the user's other processes (Wine's other programs such as steam.exe, the launcher's own
+  // process). The wineserver has KeepServerOff. A thread loses only the main thread's core; one that could run nowhere else
+  // gets the game's other cores.
+  constexpr uint32_t MaxOthersNotes = 80;
+
+  struct OthersKeeper {
+    struct Proc {
+      fextl::string Name;
+      uint32_t SeenAt;
+      uint32_t Moved;  // threads moved off the core, all rounds
+      uint32_t Rounds; // rounds in which some had to be moved
+      bool FailNoted;
+    };
+    fextl::unordered_map<int, Proc> Procs;
+    int SelfPid;
+    uint32_t Uid;
+    uint32_t Notes;
+    uint32_t MovedMinute; // threads moved since the last summary
+    uint32_t TotalMoved;
+  };
+
+  struct OthersSweep {
+    OthersKeeper* K;
+    int MainTid;
+    uint64_t Fast;
+    uint64_t Fallback;
+    int ServerPid;
+    uint32_t Round;
+  };
+
+  struct OthersTasks {
+    const OthersSweep* S;
+    int Pid;
+    bool Self;
+    uint32_t Threads;
+    uint32_t Moved;
+    uint32_t Failed;
+    int Error;
+    uint64_t Before;
+    uint64_t After;
+  };
+
+  void OthersTask(const char* Name, void* Arg) {
+    auto* T = static_cast<OthersTasks*>(Arg);
+    const int Tid = atoi(Name);
+    if (Tid <= 0 || (T->Self && Tid == T->S->MainTid)) {
+      return;
+    }
+    ++T->Threads;
+    const uint64_t Usable = Linux::GetAffinity(Tid);
+    if (!(Usable & T->S->Fast)) {
+      return;
+    }
+    // GetAffinity leaves out CPUs the kernel has paused at the moment; the status file has the mask as set, so a thread
+    // keeps those.
+    char Path[96];
+    snprintf(Path, sizeof(Path), "/proc/%d/task/%d/status", T->Pid, Tid);
+    uint64_t Mask = Linux::ReadAllowedMask(Path);
+    if (!(Mask & T->S->Fast)) {
+      Mask = Usable;
+    }
+    uint64_t Want = Mask & ~T->S->Fast;
+    if (!Want) {
+      Want = T->S->Fallback;
+    }
+    if (!Want || Want == Mask) {
+      return;
+    }
+    const int Result = Linux::SetAffinity(Tid, Want);
+    if (Result == 0) {
+      if (!T->Moved) {
+        T->Before = Mask;
+        T->After = Want;
+      }
+      ++T->Moved;
+    } else {
+      ++T->Failed;
+      T->Error = Result;
+    }
+  }
+
+  void OthersProcess(const OthersSweep& S, int Pid, bool Self) {
+    char Path[64];
+    snprintf(Path, sizeof(Path), "/proc/%d/task", Pid);
+    OthersTasks T {.S = &S, .Pid = Pid, .Self = Self};
+    if (!Linux::ForEachEntry(Path, OthersTask, &T)) {
+      return;
+    }
+    auto& K = *S.K;
+    auto [It, New] = K.Procs.try_emplace(Pid);
+    auto& P = It->second;
+    P.SeenAt = S.Round;
+    if (New) {
+      if (Self) {
+        P.Name = "this process";
+      } else {
+        char Comm[64];
+        snprintf(Path, sizeof(Path), "/proc/%d/comm", Pid);
+        const int64_t Len = Linux::ReadSmallFile(Path, Comm, sizeof(Comm));
+        P.Name = Len > 0 ? fextl::string(Comm, static_cast<size_t>(Comm[Len - 1] == '\n' ? Len - 1 : Len)) : fextl::string("?");
+      }
+    }
+    if (T.Moved) {
+      ++P.Rounds;
+      P.Moved += T.Moved;
+      K.MovedMinute += T.Moved;
+      K.TotalMoved += T.Moved;
+      // The first two rounds that moved any of a process's threads, then every 50th: a program that keeps putting its
+      // threads back shows as a count.
+      if ((P.Rounds <= 2 || P.Rounds % 50 == 0) && K.Notes < MaxOthersNotes) {
+        ++K.Notes;
+        StatsLogNote(fextl::fmt::format("cores: {} (pid {}): {} of {} threads off the main thread's core, {:#x} -> {:#x}{} "
+                                        "(FEX_MAINCORE_OTHERS)",
+                                        P.Name, Pid, T.Moved, T.Threads, T.Before, T.After,
+                                        P.Rounds > 1 ? fextl::fmt::format(", again (#{}, {} threads in all)", P.Rounds, P.Moved) : fextl::string {}));
+      }
+    }
+    if (T.Failed && !P.FailNoted && K.Notes < MaxOthersNotes) {
+      P.FailNoted = true;
+      ++K.Notes;
+      StatsLogNote(fextl::fmt::format("cores: {} (pid {}): {} threads can't be moved off the main thread's core, errno {}", P.Name, Pid,
+                                      T.Failed, -T.Error));
+    }
+  }
+
+  void OthersEntry(const char* Name, void* Arg) {
+    const auto* S = static_cast<const OthersSweep*>(Arg);
+    if (Name[0] < '1' || Name[0] > '9') {
+      return;
+    }
+    const int Pid = atoi(Name);
+    if (Pid <= 0 || Pid == S->K->SelfPid || Pid == S->ServerPid) {
+      return;
+    }
+    char Path[64];
+    snprintf(Path, sizeof(Path), "/proc/%d", Pid);
+    Linux::FileInfo Info {};
+    if (!Linux::Stat(Path, Info) || Info.Uid != S->K->Uid) {
+      return;
+    }
+    OthersProcess(*S, Pid, false);
+  }
+
+  void KeepOthersOff(OthersKeeper& K, const Config& C, uint64_t Fallback, int ServerPid, uint32_t Round) {
+    OthersSweep S {.K = &K, .MainTid = C.MainLinuxTid, .Fast = C.FastMask, .Fallback = Fallback, .ServerPid = ServerPid, .Round = Round};
+    OthersProcess(S, K.SelfPid, true);
+    if (C.Others == OthersMode::User) {
+      Linux::ForEachEntry("/proc", OthersEntry, &S);
+    }
+    for (auto It = K.Procs.begin(); It != K.Procs.end();) {
+      It = It->second.SeenAt == Round ? std::next(It) : K.Procs.erase(It);
+    }
+    // Once a minute, when anything had to be moved: which programs keep starting threads there.
+    if (Round % 30 == 0 && K.MovedMinute) {
+      fextl::string Text;
+      for (const auto& [Pid, P] : K.Procs) {
+        if (P.Moved) {
+          Text += fextl::fmt::format(" {}/{} {}", P.Name, Pid, P.Moved);
+        }
+      }
+      StatsLogNote(fextl::fmt::format("cores: s={} other threads moved off the main thread's core: {} this minute, {} in all; by process "
+                                      "(name/pid threads in all):{}",
+                                      Round * 2, K.MovedMinute, K.TotalMoved, Text.empty() ? " -" : Text));
+      K.MovedMinute = 0;
+    }
   }
 
   // Lifts every thread of the wineserver to nice C.ServerNice. Returns the pid (0 if not found).
@@ -973,6 +1145,9 @@ namespace {
     Keeper.StatusPath = fextl::fmt::format("/proc/self/task/{}/status", Keeper.Tid);
     uint64_t KeepFast {}, KeepWide {};
     LoaderFinder Finder {.C = C};
+    OthersKeeper Others {};
+    Others.SelfPid = Linux::GetPid();
+    Others.Uid = Linux::GetUid();
 
     for (;;) {
       const LONG Base = C->Prio != PrioMode::Keep ? CheckClass(Round == 0) : 8;
@@ -1050,6 +1225,9 @@ namespace {
       const bool FastUsable = C->FastMask && GameMask && (GameMask & C->FastMask) == C->FastMask && GameMask != C->FastMask;
       if (ServerPid && C->Cores == CoreMode::Fast && FastUsable) {
         KeepServerOff(ServerPid, GameMask & ~C->FastMask, ServerCoreReports);
+      }
+      if (C->Others != OthersMode::Off && C->Cores == CoreMode::Fast && FastUsable) {
+        KeepOthersOff(Others, *C, GameMask & ~C->FastMask, ServerPid, Round);
       }
       // What the main thread's Linux cores should be until the next round: the fast core, or with it the game's big cores
       // (never the slowest ones) while it waits too long for the fast one.
@@ -1176,6 +1354,9 @@ void StartPriorityGuard(std::string_view AppName) {
   const char* Wait = Switch("FEX_MAINCORE_WAIT");
   C->EaseWaitMs = !Wait ? 40 : (Wait[0] >= '0' && Wait[0] <= '9') ? static_cast<uint32_t>(std::clamp(atoi(Wait), 0, 1000)) : 0;
 
+  const char* Others = Switch("FEX_MAINCORE_OTHERS");
+  C->Others = !Others || Others[0] == 'o' || Others[0] == '0' ? OthersMode::Off : Others[0] == 'p' ? OthersMode::Process : OthersMode::User;
+
   const char* Helpers = Switch("FEX_HELPER_CORES");
   C->HelpersLittle = Helpers && Helpers[0] == 'l';
 
@@ -1213,6 +1394,14 @@ void StartPriorityGuard(std::string_view AppName) {
                                                     "waits {} ms or more a second for its own (FEX_MAINCORE_WAIT=off keeps it there)",
                                                     C->EaseWaitMs) :
                                  fextl::string("cores: main thread's Linux cores checked every 250 ms; it stays on its core however long it waits"));
+    StatsLogNote(C->Others == OthersMode::User ?
+                   "cores: every other thread of this Linux user (Wine's other programs such as steam.exe, the launcher's process, and "
+                   "this process's threads Wine doesn't list) kept off the main thread's core, checked every 2 s "
+                   "(FEX_MAINCORE_OTHERS=process only this process's, =off leaves them)" :
+                 C->Others == OthersMode::Process ?
+                   "cores: this process's threads Wine doesn't list kept off the main thread's core, other programs left alone "
+                   "(FEX_MAINCORE_OTHERS=process; =user moves steam.exe and the rest of this user's threads too)" :
+                   "cores: other programs' threads left alone, they may run on the main thread's core (FEX_MAINCORE_OTHERS=off)");
   }
   StatsLogNote(C->ServerNiceOn ? fextl::fmt::format("server: wineserver to nice {} (FEX_SERVER_NICE=off leaves it alone)", C->ServerNice) :
                                  fextl::string("server: wineserver nice left alone"));

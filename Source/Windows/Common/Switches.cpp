@@ -41,6 +41,10 @@ namespace {
     {"FEX_SERVER_NICE", "-10"},
     // Build 51: the main thread may leave its core while it waits 40 ms a second or more for it (see PriorityGuard.h).
     {"FEX_MAINCORE_WAIT", "40"},
+    // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
+    // PriorityGuard.h). In the build 75 log the main thread waited for its core 7 ms per slow frame, nearly always inside
+    // SetEvent, and steam.exe's CPU use tracked those waits in four runs.
+    {"FEX_MAINCORE_OTHERS", "user"},
     // Build 50 tried one more frame in flight on the swapchain's frame latency handle (FEX_FRAMELATENCY=2). Heavy scenes
     // were no faster: the wait moved into vkd3d-proton's Present, the GPU or present path being the limit there. It only
     // added input lag, so build 51 leaves the handle as the game set it (see ARM64EC/FrameLatency.h).
@@ -99,8 +103,11 @@ namespace {
     // FEX's vkd3d-proton build (fex13) copies these shaders (by D3D bytecode hash, costliest first), their PSOs and
     // the driver's compiled code into the stats log, so their cost can be taken apart off the device (see
     // EnvironmentVariablesHandling.h, ARM64EC/Vkd3dReport.cpp).
-    {"FEX_VKD3D_SHADER_COPY", "5ff3d3024d2fe860,5b7fecfba4c4c6b0,fb5d9d516da6de30,0e155e00b71ab675,2d370003cb44c8a1,"
-                              "2f7464fc8033e6be,1071ee16e09ed9f2,ef0fa3aad756de0d,d04262aee603ba0a"},
+    // Build 76: off. The copies did their job (builds 67-71 took the lighting shaders apart from them); they were 37% of a
+    // log and kept the driver compiling 4 pipelines with its internal representations while the game loads. The hashes:
+    // 5ff3d3024d2fe860,5b7fecfba4c4c6b0,fb5d9d516da6de30,0e155e00b71ab675,2d370003cb44c8a1,2f7464fc8033e6be,
+    // 1071ee16e09ed9f2,ef0fa3aad756de0d,d04262aee603ba0a.
+    {"FEX_VKD3D_SHADER_COPY", "0"},
     // Build 68: the main pass's time grows ~14.6 us per draw at about the same shaded pixel count (b67: 238 draws 5.4 ms,
     // 963 draws 15.9 ms, ~0.85M pixels each), and a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9).
     // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14
@@ -118,8 +125,10 @@ namespace {
     // texture and cache events around the big passes.
     {"FEX_TU_CHANNEL", "1"},
     {"FEX_TU_DESC", "0"},
-    {"FEX_TU_COUNTERS", "1"},
-    {"FEX_TU_SAMPLE_DRAWS", "100"},
+    // Build 76: off. The counter study is done (builds 70-74); each pass of 100 draws or more paid two GPU waits for idle
+    // (and ~50 register reads) to be timed and counted, and the 'turnip pass' lines were 14% of a log.
+    {"FEX_TU_COUNTERS", "0"},
+    {"FEX_TU_SAMPLE_DRAWS", "0"},
     // Build 71: build 70 found the main pass's lighting draws each wait for their setup step (the shader preamble: ~730
     // instructions, ~108 memory reads, 47 branches) inside the draw's first pixel wave. Qualcomm's own driver and stock
     // Turnip run it ahead of the draw ('early preamble'), but Turnip refuses here: with vkd3d's descriptor buffers it
@@ -174,6 +183,7 @@ namespace {
     "FEX_STALLPROBE",
     "FEX_MAINCORE",
     "FEX_MAINCORE_WAIT",
+    "FEX_MAINCORE_OTHERS",
     "FEX_HELPER_CORES",
     "FEX_SERVER_NICE",
     "FEX_LOADER_CORES",

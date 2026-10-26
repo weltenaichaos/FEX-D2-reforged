@@ -22,6 +22,7 @@ int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size);
 // What a path names (following symbolic links), from fstatat. False when it can't be looked at.
 struct FileInfo {
   uint64_t Size;
+  uint32_t Uid; // the owner
   bool Regular;
   bool Directory;
 };
@@ -33,6 +34,8 @@ int64_t ReadLink(const char* Path, char* Buffer, size_t Size);
 // Reads a small file into Buffer, NUL-terminated. Returns its length, or a negative errno.
 int64_t ReadSmallFile(const char* Path, char* Buffer, size_t Size);
 int GetPid();
+// The Linux user id this process runs as (on Android, the app's user).
+uint32_t GetUid();
 // The calling thread's Linux tid.
 int GetTid();
 // Reads Size bytes of this process's memory at Address through /proc/self/mem. False where any of it isn't mapped

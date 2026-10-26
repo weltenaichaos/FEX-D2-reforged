@@ -66,7 +66,8 @@ namespace FEX::Windows {
 //                            compiled code and statistics (the driver compiles those four pipelines once with its
 //                            internal representations kept). The stats log writes the copies out as 'shader copy'
 //                            blocks (see ARM64EC/Vkd3dReport.cpp) so the cost can be taken apart off the device.
-//                            FEX_VKD3D_SHADER_COPY=0 turns it off.
+//                            FEX_VKD3D_SHADER_COPY=0 turns it off (the D2R default from build 76: the shader study is
+//                            done, and the copies were 37% of a log).
 //
 // Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
 // same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader
@@ -94,13 +95,15 @@ namespace FEX::Windows {
 //                          1 = in direct (sysmem) passes invalidate only the sets whose address changed since the
 //                          pass began, and an identical push keeps its old copy; alt = on in every other second, so
 //                          one run compares both ways (needs the stats log, without it alt stays on)
-//   FEX_TU_COUNTERS=1      reserve 24 GPU counters through KGSL and record them around big passes (the D2R default;
+//   FEX_TU_COUNTERS=1      reserve 24 GPU counters through KGSL and record them around big passes (the D2R default up
+//                          to build 75, 0 from build 76: the study is done;
 //                          build 74: GPU cycles, state contexts, and where the command processor's time per draw goes
 //                          (busy, register writes and bunches, state loads, draw packets, waits for command or draw
 //                          state data, syncs, waits for idle, packets and dwords read), shader front end stalls and
 //                          draw overlap, shader core occupancy/starvation and pixels, primitive control starved by
 //                          the command processor, render backend busy and depth writes waiting for memory); 0 = none
-//   FEX_TU_SAMPLE_DRAWS=N  passes with at least N draws are timed and counted (default 100)
+//   FEX_TU_SAMPLE_DRAWS=N  passes with at least N draws are timed and counted (default 100; the D2R default 0 from build
+//                          76: each sampled pass paid two GPU waits for idle)
 //   FEX_TU_EARLY_PREAMBLE=1  (the D2R default from build 71, driver fex2 and later) push descriptor sets count as written,
 //                          so the lighting shaders' reads of vkd3d's root constant buffers can run in the early
 //                          preamble, ahead of the draw's pixel waves, as Qualcomm's driver does for D3D11 games. Build

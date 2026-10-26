@@ -37,6 +37,21 @@ namespace FEX::Windows {
 //                      loading, where the wineserver and other threads share that core), it may also use the game's
 //                      other big cores until it waits under 10 ms a second for 5 seconds (longer if it keeps bouncing).
 //                      D2R default 40; "off" or 0 keeps it on its core at all times.
+//   FEX_MAINCORE_OTHERS=user  with "fast": every other thread of the app's Linux user stays off the main thread's core
+//                      too, checked every 2 seconds at the Linux level: Wine's other programs (steam.exe, winedevice.exe,
+//                      explorer.exe ...), the launcher's own process and this process's threads Wine doesn't list (the D2R
+//                      default, build 76). A thread loses only that core; one that could run nowhere else gets the game's
+//                      other cores. "# cores: <name> (pid N): ..." lines name what moved.
+//                      Build 75 timed each slow game frame: in play the main thread waited for its core 7 ms per slow frame
+//                      (up to 28 ms), nearly always inside SetEvent (7.5 of the frame's 2 ms samples where it waited 10 ms or
+//                      more, 0.2 elsewhere), while threads other than it and the game's used ~25% of that core. Of the
+//                      user's other programs only steam.exe's CPU use followed those waits (correlation 0.75-0.97 over 5 s
+//                      windows in the build 74, fex14, fex15 and build 75 runs; winedevice, pulseaudio and the wineserver
+//                      0.6 or less). Each frame the game calls the Steam client, a round trip to steam.exe through shared
+//                      memory and events; the event wakes a steam.exe thread, Linux may start it on the waking thread's core,
+//                      and the main thread then waits there until Steam is done with that core.
+//   FEX_MAINCORE_OTHERS=process  only this process's threads Wine doesn't list
+//   FEX_MAINCORE_OTHERS=off  other programs may run on the main thread's core (build 75 and earlier)
 //   FEX_HELPER_CORES=little  the stats log thread (a 2ms sampler), this guard, the rumble sender (FEXRumble) and the
 //                      file cache dropper (FEXFileCache) on the slowest cores, off the game's (the D2R default), when the
 //                      process may use them. The stall probe, disk cache and unpack cache threads stay on the game's cores.

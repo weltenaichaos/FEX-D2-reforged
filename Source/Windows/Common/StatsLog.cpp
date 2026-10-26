@@ -388,7 +388,9 @@ namespace {
     uint64_t PrevIdle[Linux::MaxCPUs];  // /proc/stat: idle+iowait ticks; cpuidle: us
     uint64_t PrevTotal[Linux::MaxCPUs]; // /proc/stat: all ticks
     uint64_t PrevUsage[Linux::MaxCPUs]; // cpuidle: idle states entered
+    uint64_t PrevIrq[Linux::MaxCPUs];   // /proc/stat: irq+softirq ticks
     bool PrevOk[Linux::MaxCPUs];
+    int FastCpu = -1; // the one CPU with the highest maximum clock (the main thread's, FEX_MAINCORE=fast), -1 if none
     uint64_t PrevCounter;
     bool Have;
     int LogTid;
@@ -406,7 +408,7 @@ namespace {
   CoreLoadState Core;
 
   // Reads one CPU's counters; false when they can't be read (offline CPU, or no access).
-  bool CoreRead(int Cpu, const char* ProcStat, uint64_t& Idle, uint64_t& Total, uint64_t& Usage) {
+  bool CoreRead(int Cpu, const char* ProcStat, uint64_t& Idle, uint64_t& Total, uint64_t& Usage, uint64_t& Irq) {
     if (Core.ProcStat) {
       // "cpuN user nice system idle iowait irq softirq steal ..." in ticks.
       const auto Name = fextl::fmt::format("\ncpu{} ", Cpu);
@@ -420,6 +422,7 @@ namespace {
         F = strtoull(P, &P, 10);
       }
       Idle = Fields[3] + Fields[4];
+      Irq = Fields[5] + Fields[6];
       Total = 0;
       for (const auto F : Fields) {
         Total += F;
@@ -456,6 +459,16 @@ namespace {
     Linux::ReadMaxClocks(KHz);
     while (Core.Cpus < Linux::MaxCPUs && KHz[Core.Cpus]) {
       ++Core.Cpus;
+    }
+    for (int Cpu = 0; Cpu < Core.Cpus; ++Cpu) {
+      if (Core.FastCpu < 0 || KHz[Cpu] > KHz[Core.FastCpu]) {
+        Core.FastCpu = Cpu;
+      }
+    }
+    for (int Cpu = 0; Core.FastCpu >= 0 && Cpu < Core.Cpus; ++Cpu) {
+      if (Cpu != Core.FastCpu && KHz[Cpu] == KHz[Core.FastCpu]) {
+        Core.FastCpu = -1; // no single fastest CPU
+      }
     }
     char Probe[256];
     Core.StatFd = Linux::Open("/proc/stat");
@@ -513,7 +526,8 @@ namespace {
     }
   }
 
-  fextl::string CoreLine(double GameRunMs, double ServerRunMs) {
+  // MainOnFastMs: the main thread's run time on the fastest CPU this second (< 0 when unknown).
+  fextl::string CoreLine(double GameRunMs, double ServerRunMs, double MainOnFastMs) {
     if (!Core.On || !Core.Cpus) {
       return {};
     }
@@ -526,10 +540,10 @@ namespace {
       StatBuffer[Len > 0 ? Len + 1 : 1] = 0;
       StatText = StatBuffer;
     }
-    uint64_t Idle[Linux::MaxCPUs] {}, Total[Linux::MaxCPUs] {}, Usage[Linux::MaxCPUs] {};
+    uint64_t Idle[Linux::MaxCPUs] {}, Total[Linux::MaxCPUs] {}, Usage[Linux::MaxCPUs] {}, Irq[Linux::MaxCPUs] {};
     bool Ok[Linux::MaxCPUs] {};
     for (int Cpu = 0; Cpu < Core.Cpus; ++Cpu) {
-      Ok[Cpu] = CoreRead(Cpu, StatText, Idle[Cpu], Total[Cpu], Usage[Cpu]);
+      Ok[Cpu] = CoreRead(Cpu, StatText, Idle[Cpu], Total[Cpu], Usage[Cpu], Irq[Cpu]);
     }
     fextl::string Out;
     if (Core.Have) {
@@ -580,6 +594,17 @@ namespace {
       if (!PausedText.empty()) {
         Out += fextl::fmt::format(" | paused{}", PausedText);
       }
+      // Build 76: the main thread's core. Busy time there that is neither the main thread's nor interrupts is other
+      // threads (build 75: ~25% of it in play, while the main thread waited ~35 ms a second for it).
+      const int F = Core.FastCpu;
+      if (F >= 0 && Core.ProcStat && Ok[F] && Core.PrevOk[F] && Total[F] > Core.PrevTotal[F] && MainOnFastMs >= 0.0) {
+        const double Dt = static_cast<double>(Total[F] - Core.PrevTotal[F]);
+        const double Busy = std::clamp(1.0 - static_cast<double>(Idle[F] - Core.PrevIdle[F]) / Dt, 0.0, 1.0);
+        const double Irqs = std::clamp(static_cast<double>(Irq[F] - Core.PrevIrq[F]) / Dt, 0.0, 1.0);
+        const double MainShare = std::clamp(MainOnFastMs / 1000.0 / Wall, 0.0, 1.0);
+        Out += fextl::fmt::format(" | main core {}: busy {:.0f}%, main thread ~{:.0f}%, interrupts {:.0f}%, other threads ~{:.0f}%", F, Busy * 100.0,
+                                  MainShare * 100.0, Irqs * 100.0, std::max(Busy - MainShare - Irqs, 0.0) * 100.0);
+      }
     }
     if (Core.LoadavgFd >= 0) {
       char Buffer[128];
@@ -618,6 +643,7 @@ namespace {
       Core.PrevIdle[Cpu] = Idle[Cpu];
       Core.PrevTotal[Cpu] = Total[Cpu];
       Core.PrevUsage[Cpu] = Usage[Cpu];
+      Core.PrevIrq[Cpu] = Irq[Cpu];
       Core.PrevOk[Cpu] = Ok[Cpu];
     }
     Core.PrevCounter = Counter;
@@ -1510,7 +1536,7 @@ namespace {
     }
     Sched.Second = Seconds;
     fextl::string Out;
-    double GameRunMs {}, ServerRunMs {};
+    double GameRunMs {}, ServerRunMs {}, MainOnFastMs = -1.0;
 
     // The main thread.
     {
@@ -1524,6 +1550,10 @@ namespace {
                                 Have ? fextl::fmt::format("{:.1f}ms", WaitMs) : fextl::string("-"), HaveStat ? S.Nice : 0,
                                 Linux::GetAffinity(Sched.Pid), SchedCores(Sched.MainRunnable, Sched.MainCores), Sched.MainRunnable,
                                 Sched.MainSamples);
+      // Its time on the fastest CPU: run time split by where the 10 ms samples found it runnable.
+      if (Have && Core.FastCpu >= 0 && Sched.MainRunnable) {
+        MainOnFastMs = RunMs * Sched.MainCores[Core.FastCpu] / Sched.MainRunnable;
+      }
     }
 
     // The wineserver.
@@ -1703,7 +1733,7 @@ namespace {
       Out += fextl::fmt::format("  sched procs 5s (name/pid % of a core):{}\n", Text.empty() ? " -" : Text.c_str());
     }
 
-    Out += CoreLine(GameRunMs, ServerRunMs);
+    Out += CoreLine(GameRunMs, ServerRunMs, MainOnFastMs);
     Out += SystemLine(ServerRunMs);
     CgroupCheck();
 
@@ -3652,7 +3682,7 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "for a suspend request in emulated code (time suspended shows as fex:suspended); probe = the stall "
                        "probe's longest waits this second, stalls[...] on a '# frame' line = its waits of 2ms or more during "
                        "that frame; '# prio' = thread priority changes (FEX_PRIO); '# cores' = thread core changes (FEX_MAINCORE, "
-                       "FEX_HELPER_CORES); '# server' = wineserver nice (FEX_SERVER_NICE); sched main/server = Linux view of "
+                       "FEX_HELPER_CORES, FEX_MAINCORE_OTHERS: other programs' threads moved off the main thread's core); '# server' = wineserver nice (FEX_SERVER_NICE); sched main/server = Linux view of "
                        "the main thread and the wineserver: CPU time (run), time ready but without a CPU (wait), nice, allowed "
                        "CPUs, and which CPU it was on while runnable (sampled every 10ms); sched threads = the busiest threads "
                        "(Linux name/tid run+wait ms @last CPU); sched procs 5s = other processes of this user by CPU use; waits main = "
@@ -3668,7 +3698,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "the power levels allowed (0 = fastest; a launcher's power control or heat raises the first), temperature; "
                        "cores busy% = how busy each CPU was, whoever ran there (? = can't tell), the game's CPUs' busy time split "
                        "into this process, the wineserver and others (other apps, Android, the launcher, the kernel), paused = "
-                       "share of the second the kernel had a CPU out of use, runnable = runnable tasks of the whole system, cpu "
+                       "share of the second the kernel had a CPU out of use, main core N = the main thread's core: busy, the main "
+                       "thread's share, interrupts, other threads, runnable = runnable tasks of the whole system, cpu "
                        "pressure = share of the second some task waited for a CPU; system busy = the whole device's busy CPU "
                        "time in cores by kind (user, low prio = user at lowered priority, kernel, irq), this process, the "
                        "wineserver, app group = this app's Android group (the launcher's own process and Wine's processes), "
