@@ -68,6 +68,18 @@ namespace FEX::Windows {
 //                            blocks (see ARM64EC/Vkd3dReport.cpp) so the cost can be taken apart off the device.
 //                            FEX_VKD3D_SHADER_COPY=0 turns it off (the D2R default from build 76: the shader study is
 //                            done, and the copies were 37% of a log).
+//   FEX_VKD3D_LATENCY_RESYNC=1 VKD3D_FEX_LATENCY_RESYNC=1 (the D2R default, VKD3D fex16; =0 sets it to 0, since that
+//                            VKD3D build also turns it on by itself while frame start pacing is on). D2R's frame latency
+//                            handle holds 2 credits: the game takes one before each frame (WaitForSingleObjectEx with a
+//                            1 s timeout) and vkd3d hands one back once that frame's present is done. In the b74 and b77
+//                            logs that wait timed out during a 1.6 s hitch at startup; the frame the game then ran
+//                            without a credit left one too many for the whole session, so 3 frames were in flight (only
+//                            vkd3d's own latency of 3 in Present() held the game) and frames took ~100 ms from start to
+//                            screen with no hold-back instead of ~67, ~50 at best. Each hand-out now compares the game's
+//                            Present() calls with the credits it took; once the game runs ahead, vkd3d holds back that
+//                            many hand-outs (the next frame starts one frame later, once). 8 such actions within 60 s
+//                            stop it. A 'frame credits (resync)' line shows how far ahead the game was (-1 or 0 = as
+//                            set, 0 or 1 = one ahead) and the hand-outs held back.
 //
 // Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
 // same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader

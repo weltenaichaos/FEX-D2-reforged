@@ -1,0 +1,395 @@
+From b6289e509f3188eabc82f2d6e25e3c253c159ebc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 12:12:25 +0000
+Subject: [PATCH] FEX: frame credit resync (VKD3D_FEX_LATENCY_RESYNC)
+
+The game's frame latency handle holds the credits for frames it may
+start: SetMaximumFrameLatency(2) makes two, the game takes one before
+each frame and vkd3d hands one back once that frame's present is done.
+A frame started without taking one leaves a credit too many for good.
+In the D2R logs of FEX builds 74 and 77 the game's wait on the handle
+timed out after 1 s during a 1.6 s hitch at startup: from then on the
+game ran a frame further ahead than it asked for, only vkd3d's own
+latency of 3 in Present() held it, and frames took ~100 ms from start
+to screen with no hold-back (~67 with two frames), ~50 at best.
+
+Each hand-out now compares the game's Present() calls (read before the
+hand-out) with the credits it took (handed out minus the count the
+hand-out returns) and the hand-outs held back so far: a game exactly at
+its latency is at -1 or 0, one a frame ahead at 0 or 1. When a window
+of 32 hand-outs saw it ahead (all looks within one of each other, and
+the game took a credit for at least 24 of them), the next hand-outs
+are held back by as many: the game's next frame starts one frame later
+once, then it is back at the latency it set. More than 8 such actions
+in 60 s stop it for the swapchain (the game doesn't take one credit
+per frame).
+
+On unless VKD3D_FEX_LATENCY_RESYNC=0 while frame start pacing is on
+(FEX sets that for D2R); 1 turns it on without. Windows builds only:
+it needs ReleaseSemaphore's previous count. With the FEX timeline on,
+a 'frame credits (resync)' line shows how far ahead the game was and
+the hand-outs held back; the present note says whether it is on.
+---
+ libs/vkd3d/fex_timeline.c  |  61 ++++++++++++++++-
+ libs/vkd3d/swapchain.c     | 130 ++++++++++++++++++++++++++++++++++++-
+ libs/vkd3d/vkd3d_private.h |   8 +++
+ 3 files changed, 196 insertions(+), 3 deletions(-)
+
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index 9945a50..bff630c 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -29,6 +29,7 @@ bool vkd3d_fex_frame_start_on;
+ bool vkd3d_fex_present_presleep_on;
+ bool vkd3d_fex_host_frame_done_on;
+ bool vkd3d_fex_present_drawn_on;
++bool vkd3d_fex_latency_resync_on;
+ uint32_t vkd3d_fex_frame_start_max_ms = 50;
+ uint32_t vkd3d_fex_frame_start_window = 256;
+ 
+@@ -75,6 +76,10 @@ static struct
+     /* handoff to the window system (VKD3D fex12) */
+     uint32_t handoff_presents, handoff_unfinished, handoff_waited, handoff_gave_up;
+     struct fex_timeline_stat handoff_wait;
++    /* frame credit resync (VKD3D fex16) */
++    uint32_t resync_windows, resync_held, resync_taken_back;
++    int64_t resync_ahead_min, resync_ahead_max;
++    bool resync_stopped;
+ } fex_timeline;
+ 
+ static UINT64 fex_timeline_last_publish_ns;
+@@ -136,6 +141,15 @@ void vkd3d_fex_timeline_init(void)
+     vkd3d_fex_host_frame_done_on = !(vkd3d_get_env_var("VKD3D_FEX_HOST_FRAME_DONE", env, sizeof(env)) &&
+             !strcmp(env, "0"));
+     vkd3d_fex_present_drawn_on = vkd3d_get_env_var("VKD3D_FEX_PRESENT_DRAWN", env, sizeof(env)) && !strcmp(env, "1");
++    /* VKD3D fex16: on with frame start pacing (FEX builds up to 77 don't set it) unless 0; 1 turns it on without. */
++    if (vkd3d_get_env_var("VKD3D_FEX_LATENCY_RESYNC", env, sizeof(env)))
++        vkd3d_fex_latency_resync_on = !strcmp(env, "1");
++    else
++        vkd3d_fex_latency_resync_on = vkd3d_fex_frame_start_on;
++#ifndef _WIN32
++    /* Needs the count a hand-out leaves (ReleaseSemaphore's previous count), which an eventfd doesn't give. */
++    vkd3d_fex_latency_resync_on = false;
++#endif
+     /* Most hold-back in ms (VKD3D fex14: 50 unless set; 1-90 taken, 30 = fex8 to fex13). */
+     if (vkd3d_get_env_var("VKD3D_FEX_START_MAX_MS", env, sizeof(env)))
+     {
+@@ -157,7 +171,8 @@ void vkd3d_fex_timeline_init(void)
+                     VKD3D_FEX_REPORT_FLAG_MARGIN_CAUSED | VKD3D_FEX_REPORT_FLAG_BUSY_GPU_SPARE : 0) |
+             (vkd3d_fex_present_presleep_on ? VKD3D_FEX_REPORT_FLAG_PRESLEEP : 0) |
+             (vkd3d_fex_host_frame_done_on ? VKD3D_FEX_REPORT_FLAG_HOST_FRAME_DONE : 0) |
+-            (vkd3d_fex_present_drawn_on ? VKD3D_FEX_REPORT_FLAG_PRESENT_DRAWN : 0), vkd3d_memory_order_release);
++            (vkd3d_fex_present_drawn_on ? VKD3D_FEX_REPORT_FLAG_PRESENT_DRAWN : 0) |
++            (vkd3d_fex_latency_resync_on ? VKD3D_FEX_REPORT_FLAG_LATENCY_RESYNC : 0), vkd3d_memory_order_release);
+     vkd3d_atomic_uint64_store_explicit(&fex_timeline_last_publish_ns, vkd3d_get_current_time_ns(),
+             vkd3d_memory_order_relaxed);
+     if (vkd3d_fex_timeline_on)
+@@ -171,6 +186,8 @@ void vkd3d_fex_timeline_init(void)
+         INFO("FEX frame done signal from the CPU on.\n");
+     if (vkd3d_fex_present_drawn_on)
+         INFO("FEX drawn frames only on.\n");
++    if (vkd3d_fex_latency_resync_on)
++        INFO("FEX frame credit resync on.\n");
+ }
+ 
+ uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type)
+@@ -285,6 +302,26 @@ void vkd3d_fex_timeline_handoff(bool unfinished, bool waited, uint64_t wait_ns,
+     spinlock_release(&fex_timeline.lock);
+ }
+ 
++void vkd3d_fex_timeline_resync(int64_t ahead_min, int64_t ahead_max, bool held, uint32_t taken_back, bool stopped)
++{
++    if (!vkd3d_fex_timeline_on)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    if (held)
++        fex_timeline.resync_held++;
++    else
++    {
++        if (!fex_timeline.resync_windows || ahead_min < fex_timeline.resync_ahead_min)
++            fex_timeline.resync_ahead_min = ahead_min;
++        if (!fex_timeline.resync_windows || ahead_max > fex_timeline.resync_ahead_max)
++            fex_timeline.resync_ahead_max = ahead_max;
++        fex_timeline.resync_windows++;
++    }
++    fex_timeline.resync_taken_back = taken_back;
++    fex_timeline.resync_stopped = stopped;
++    spinlock_release(&fex_timeline.lock);
++}
++
+ void vkd3d_fex_timeline_gpu_frame(uint64_t ns, uint32_t pass_frame)
+ {
+     if (!vkd3d_fex_timeline_on || pass_frame >= ARRAY_SIZE(fex_timeline.gpu_frame))
+@@ -398,6 +435,9 @@ static void fex_timeline_publish(double seconds)
+     uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored;
+     uint32_t handoff_presents, handoff_unfinished, handoff_waited, handoff_gave_up;
+     struct fex_timeline_stat handoff_wait;
++    uint32_t resync_windows, resync_held, resync_taken_back;
++    int64_t resync_ahead_min, resync_ahead_max;
++    bool resync_stopped;
+     uint64_t pacing_delay_ns, pacing_margin_ns, cap_step_ns, cap_guard_ns;
+     int64_t pacing_spare_min_ns, pacing_aim_ns;
+     uint32_t pacing_ceiling, pacing_gpu_bound, pacing_memory;
+@@ -476,6 +516,14 @@ static void fex_timeline_publish(double seconds)
+     fex_timeline.handoff_waited = 0;
+     fex_timeline.handoff_gave_up = 0;
+     memset(&fex_timeline.handoff_wait, 0, sizeof(fex_timeline.handoff_wait));
++    resync_windows = fex_timeline.resync_windows;
++    resync_held = fex_timeline.resync_held;
++    resync_taken_back = fex_timeline.resync_taken_back;
++    resync_ahead_min = fex_timeline.resync_ahead_min;
++    resync_ahead_max = fex_timeline.resync_ahead_max;
++    resync_stopped = fex_timeline.resync_stopped;
++    fex_timeline.resync_windows = 0;
++    fex_timeline.resync_held = 0;
+     spinlock_release(&fex_timeline.lock);
+ 
+     if (config[0])
+@@ -539,6 +587,17 @@ static void fex_timeline_publish(double seconds)
+                     " | handed over anyway (drawn frames only is off): the screen may show an older image for those\n");
+     }
+ 
++    if (vkd3d_fex_latency_resync_on && (resync_windows || resync_held || resync_taken_back))
++    {
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "  frame credits (resync) |");
++        if (resync_windows)
++            len = vkd3d_fex_report_append(text, sizeof(text), len,
++                    " game frames ahead of its latency %"PRId64" to %"PRId64" (-1 or 0 = as set, 0 or 1 = one ahead) |",
++                    resync_ahead_min, resync_ahead_max);
++        len = vkd3d_fex_report_append(text, sizeof(text), len, " hand-outs held back %u this second, %u in all%s\n",
++                resync_held, resync_taken_back, resync_stopped ? " | stopped: held back 8 times in 60 s" : "");
++    }
++
+     for (i = 0; i < FEX_TIMELINE_MAX_QUEUES; i++)
+     {
+         const struct fex_timeline_queue *q = &queues[i];
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 682c280..8a14f34 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -392,6 +392,30 @@ struct dxgi_vk_swap_chain
+         uint32_t unpushed;         /* copies added since the last present was handed over */
+         uint64_t tracked_blit_value; /* highest fenced blit value added */
+     } fex_done;
++
++    /* FEX frame credit resync (VKD3D_FEX_LATENCY_RESYNC; VKD3D fex16). The game's frame latency handle is a semaphore
++     * holding the credits for frames the game may start: SetMaximumFrameLatency(N) makes N, the game takes one before
++     * each frame and vkd3d gives one back once that frame's present is done. A frame the game starts without taking one
++     * (its wait timed out, or it presented before it began to wait) leaves one credit too many for good: the game then
++     * runs a frame further ahead than it asked for, each frame takes a frame longer from input to screen, and only
++     * vkd3d's own latency limit in Present() holds it (D2R logs b74 and b77: a 1 s timeout of the wait at startup, then
++     * ~100 ms from frame start to screen where 2 frames give ~67). Each hand-out compares the game's Present() calls
++     * with the credits it took (handed out minus the count left), and once frames ran without one, the next hand-outs
++     * are held back by as many. */
++    struct
++    {
++        pthread_mutex_t lock;
++        bool lock_initialized;
++        uint64_t given;            /* credits put on the handle: its first count, SetMaximumFrameLatency, hand-outs */
++        uint32_t taken_back;       /* hand-outs held back in all */
++        uint32_t owed;             /* hand-outs still to hold back */
++        uint32_t window;           /* hand-outs looked at in this window */
++        int64_t ahead_min, ahead_max; /* frames the game was ahead of its latency at the hand-outs of this window */
++        uint64_t window_acquired;  /* credits the game had taken at the window's start */
++        uint32_t actions;          /* times hand-outs were held back */
++        uint64_t action_ns[8];     /* when the last 8 of them were decided */
++        bool stopped;              /* held back 8 times in 60 s: the game doesn't take one credit per frame */
++    } fex_resync;
+ };
+ 
+ static void dxgi_vk_swap_chain_drain_internal_blit_semaphore(struct dxgi_vk_swap_chain *chain, uint64_t value);
+@@ -759,6 +783,11 @@ static void dxgi_vk_swap_chain_cleanup_surface(struct dxgi_vk_swap_chain *chain)
+ 
+ static void dxgi_vk_swap_chain_cleanup_sync_objects(struct dxgi_vk_swap_chain *chain)
+ {
++    if (chain->fex_resync.lock_initialized)
++    {
++        pthread_mutex_destroy(&chain->fex_resync.lock);
++        chain->fex_resync.lock_initialized = false;
++    }
+     vkd3d_native_sync_handle_destroy(chain->frame_latency_event);
+     vkd3d_native_sync_handle_destroy(chain->frame_latency_event_internal);
+ 
+@@ -1148,7 +1177,12 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetFrameLatency(IDXGIVkSwapC
+      * the application's responsibility to reduce the semaphore value
+      * in case the latency gets reduced. */
+     if (MaxLatency > chain->frame_latency)
+-        vkd3d_native_sync_handle_release(chain->frame_latency_event, MaxLatency - chain->frame_latency);
++    {
++        pthread_mutex_lock(&chain->fex_resync.lock);
++        if (vkd3d_native_sync_handle_release(chain->frame_latency_event, MaxLatency - chain->frame_latency) >= 0)
++            chain->fex_resync.given += MaxLatency - chain->frame_latency;
++        pthread_mutex_unlock(&chain->fex_resync.lock);
++    }
+ 
+     chain->frame_latency = MaxLatency;
+     return S_OK;
+@@ -1695,10 +1729,14 @@ static HRESULT dxgi_vk_swap_chain_init_sync_objects(struct dxgi_vk_swap_chain *c
+     char env[8];
+     HRESULT hr;
+ 
++    pthread_mutex_init(&chain->fex_resync.lock, NULL);
++    chain->fex_resync.lock_initialized = true;
++
+     if (chain->desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
+     {
+         INFO("Enabling frame latency handles.\n");
+         chain->frame_latency = 1;
++        chain->fex_resync.given = chain->frame_latency;
+ 
+         if (FAILED(hr = vkd3d_native_sync_handle_create(chain->frame_latency,
+                 VKD3D_NATIVE_SYNC_HANDLE_TYPE_SEMAPHORE, &chain->frame_latency_event)))
+@@ -2159,6 +2197,7 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+     snprintf(text, sizeof(text), "swapchain %ux%u, %u images (asked %u, game BufferCount %u), mode %s%s%s,"
+             " SyncInterval %u, present wait %s, game latency handle %s (max latency %u), internal latency %u,"
+             " vkd3d limiter %.1f fps, frame start pacing %s, cap pre-sleep %s, frame done signal %s, drawn frames only %s,"
++            " frame credit resync %s,"
+             " VkQueues: graphics family %u x%u,"
+             " compute family %u x%u,"
+             " copy family %u x%u",
+@@ -2178,6 +2217,8 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+             !vkd3d_fex_present_drawn_on ? "off" : chain->fex_done.enable ?
+                     "on (vkQueuePresentKHR only once the GPU finished the frame's copy: VKD3D fex12)" :
+                     "off (needs the frame done thread)",
++            vkd3d_fex_latency_resync_on ? "on (hand-outs held back when the game runs frames ahead of its latency:"
++                    " VKD3D fex16)" : "off",
+             families[VKD3D_QUEUE_FAMILY_GRAPHICS]->vk_family_index, families[VKD3D_QUEUE_FAMILY_GRAPHICS]->queue_count,
+             families[VKD3D_QUEUE_FAMILY_COMPUTE]->vk_family_index, families[VKD3D_QUEUE_FAMILY_COMPUTE]->queue_count,
+             families[VKD3D_QUEUE_FAMILY_TRANSFER]->vk_family_index, families[VKD3D_QUEUE_FAMILY_TRANSFER]->queue_count);
+@@ -3455,14 +3496,99 @@ static void dxgi_vk_swap_chain_delay_next_frame(struct dxgi_vk_swap_chain *chain
+     vkd3d_fex_timeline_step(VKD3D_FEX_STEP_LIMITER, current_time_ns - fex_sleep_start_ns);
+ }
+ 
++#define FEX_RESYNC_WINDOW 32u
++
++/* FEX frame credit resync, under fex_resync.lock: one hand-out's look at the game. ahead = the game's Present() calls
++ * (read before the hand-out) minus the credits it took minus the hand-outs held back so far. A frame between its credit
++ * and its Present() counts one less, so a game exactly at its latency shows -1 or 0 and one a frame ahead 0 or 1. */
++static void dxgi_vk_swap_chain_fex_resync_note(struct dxgi_vk_swap_chain *chain, int64_t ahead, uint64_t acquired)
++{
++    uint64_t now_ns, oldest_ns;
++    uint32_t owe;
++
++    if (!chain->fex_resync.window)
++    {
++        chain->fex_resync.window_acquired = acquired;
++        chain->fex_resync.ahead_min = ahead;
++        chain->fex_resync.ahead_max = ahead;
++    }
++    else
++    {
++        chain->fex_resync.ahead_min = min(chain->fex_resync.ahead_min, ahead);
++        chain->fex_resync.ahead_max = max(chain->fex_resync.ahead_max, ahead);
++    }
++    if (++chain->fex_resync.window < FEX_RESYNC_WINDOW)
++        return;
++    chain->fex_resync.window = 0;
++    vkd3d_fex_timeline_resync(chain->fex_resync.ahead_min, chain->fex_resync.ahead_max, false,
++            chain->fex_resync.taken_back, chain->fex_resync.stopped);
++
++    /* Act only on a game that took a credit for (nearly) every frame in the window, and whose looks agree with taking
++     * exactly one before each frame (all within one of each other). */
++    if (chain->fex_resync.stopped || chain->fex_resync.ahead_max < 1 ||
++            chain->fex_resync.ahead_min < chain->fex_resync.ahead_max - 1 ||
++            acquired - chain->fex_resync.window_acquired < FEX_RESYNC_WINDOW * 3 / 4)
++        return;
++
++    now_ns = vkd3d_get_current_time_ns();
++    oldest_ns = chain->fex_resync.action_ns[chain->fex_resync.actions % ARRAY_SIZE(chain->fex_resync.action_ns)];
++    if (chain->fex_resync.actions >= ARRAY_SIZE(chain->fex_resync.action_ns) && now_ns - oldest_ns < 60000000000ull)
++    {
++        chain->fex_resync.stopped = true;
++        INFO("FEX frame credit resync: held back hand-outs %u times in the last 60 s, the game doesn't take one credit "
++                "per frame; stopped.\n", (unsigned int)ARRAY_SIZE(chain->fex_resync.action_ns));
++        vkd3d_fex_timeline_resync(chain->fex_resync.ahead_min, chain->fex_resync.ahead_max, false,
++                chain->fex_resync.taken_back, true);
++        return;
++    }
++    chain->fex_resync.action_ns[chain->fex_resync.actions % ARRAY_SIZE(chain->fex_resync.action_ns)] = now_ns;
++    chain->fex_resync.actions++;
++    owe = (uint32_t)min(chain->fex_resync.ahead_max, (int64_t)DXGI_MAX_SWAP_CHAIN_BUFFERS);
++    chain->fex_resync.owed = owe;
++    INFO("FEX frame credit resync: the game is %u frame%s ahead of its frame latency %u (seen %"PRId64" to %"PRId64
++            " in the last %u hand-outs); holding back the next %u.\n", owe, owe == 1 ? "" : "s", chain->frame_latency,
++            chain->fex_resync.ahead_min, chain->fex_resync.ahead_max, FEX_RESYNC_WINDOW, owe);
++}
++
+ static void dxgi_vk_swap_chain_release_frame_latency_event(struct dxgi_vk_swap_chain *chain)
+ {
++    uint64_t presents = 0, acquired;
+     int previous_semaphore;
+ 
+     if (!vkd3d_native_sync_handle_is_valid(chain->frame_latency_event))
+         return;
+ 
+-    if ((previous_semaphore = vkd3d_native_sync_handle_release(chain->frame_latency_event, 1)) >= 0)
++    if (vkd3d_fex_latency_resync_on)
++    {
++        pthread_mutex_lock(&chain->fex_resync.lock);
++        if (chain->fex_resync.owed)
++        {
++            chain->fex_resync.owed--;
++            chain->fex_resync.taken_back++;
++            vkd3d_fex_timeline_resync(0, 0, true, chain->fex_resync.taken_back, chain->fex_resync.stopped);
++            pthread_mutex_unlock(&chain->fex_resync.lock);
++            return;
++        }
++        /* Read before the hand-out: the game takes a frame's credit before that frame's Present(), so every Present()
++         * counted here has its credit in the count the hand-out returns. */
++        presents = vkd3d_atomic_uint64_load_explicit(&chain->user.present_count, vkd3d_memory_order_acquire);
++    }
++
++    previous_semaphore = vkd3d_native_sync_handle_release(chain->frame_latency_event, 1);
++
++    if (vkd3d_fex_latency_resync_on)
++    {
++        if (previous_semaphore >= 0)
++        {
++            acquired = chain->fex_resync.given - (uint64_t)previous_semaphore;
++            chain->fex_resync.given++;
++            dxgi_vk_swap_chain_fex_resync_note(chain,
++                    (int64_t)presents - (int64_t)acquired - (int64_t)chain->fex_resync.taken_back, acquired);
++        }
++        pthread_mutex_unlock(&chain->fex_resync.lock);
++    }
++
++    if (previous_semaphore >= 0)
+     {
+         /* Some applications can keep using MaxLatency of 1,
+          * but just avoid acquiring the semaphore a few times to achieve higher latency.
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 1e3299c..185749a 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3075,6 +3075,7 @@ struct vkd3d_timestamp_profiler_submitted_work;
+ #define VKD3D_FEX_REPORT_FLAG_HOST_FRAME_DONE 0x200u /* present report: frame done signalled from the CPU after a fence */
+ #define VKD3D_FEX_REPORT_FLAG_SKIP_FRESH_CLEARS 0x400u /* gpu report: zero fills of never-used chunk pages skipped */
+ #define VKD3D_FEX_REPORT_FLAG_PRESENT_DRAWN 0x800u /* present report: frames go to the window system only once drawn */
++#define VKD3D_FEX_REPORT_FLAG_LATENCY_RESYNC 0x1000u /* present report: frame credit resync is on (VKD3D fex16) */
+ #define VKD3D_FEX_REPORT_FLAG_DEVICE 0x80000000u /* a D3D12 device was created */
+ struct vkd3d_fex_report
+ {
+@@ -3184,6 +3185,10 @@ extern bool vkd3d_fex_host_frame_done_on;
+  * GPU has finished the frame's copy into the swapchain image. GameNative's window system shows an image from the moment
+  * its present arrives, without waiting for the GPU, so an image handed over earlier showed what it held before. */
+ extern bool vkd3d_fex_present_drawn_on;
++/* Frame credit resync (VKD3D_FEX_LATENCY_RESYNC, VKD3D fex16, swapchain.c; on unless 0 while frame start pacing is on,
++ * else only with 1): when the game runs frames ahead of the frame latency it set (a frame started without taking a
++ * credit from its frame latency handle), hold back that many of vkd3d's hand-outs on the handle. */
++extern bool vkd3d_fex_latency_resync_on;
+ void vkd3d_fex_timeline_init(void);
+ uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type);
+ void vkd3d_fex_timeline_queue_free_slot(uint32_t slot);
+@@ -3207,6 +3212,9 @@ void vkd3d_fex_timeline_config(const char *text);
+  * thread was ready to call vkQueuePresentKHR, and how long it then waited for it (gave_up: stopped waiting at the
+  * ceiling). */
+ void vkd3d_fex_timeline_handoff(bool unfinished, bool waited, uint64_t wait_ns, bool gave_up);
++/* Frame credit resync (VKD3D fex16): a window of hand-outs looked at (ahead_min/max: frames the game was ahead of its
++ * latency), or a hand-out held back (held). taken_back: hand-outs held back in all; stopped: resync gave up. */
++void vkd3d_fex_timeline_resync(int64_t ahead_min, int64_t ahead_max, bool held, uint32_t taken_back, bool stopped);
+ void vkd3d_fex_timeline_tick(uint64_t now_ns);
+ 
+ /* FEX pass meter (fex_pass_meter.c): GPU time per render pass and command list, reported to FEX's stats log. */
+-- 
+2.43.0
+

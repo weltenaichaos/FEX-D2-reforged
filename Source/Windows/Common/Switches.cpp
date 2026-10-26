@@ -108,6 +108,12 @@ namespace {
     // 5ff3d3024d2fe860,5b7fecfba4c4c6b0,fb5d9d516da6de30,0e155e00b71ab675,2d370003cb44c8a1,2f7464fc8033e6be,
     // 1071ee16e09ed9f2,ef0fa3aad756de0d,d04262aee603ba0a.
     {"FEX_VKD3D_SHADER_COPY", "0"},
+    // VKD3D fex16: in the b74 and b77 logs the game's 1 s wait for its frame latency credit timed out during a hitch at
+    // startup, and the frame it then ran without one left a credit too many for the whole session: one frame more in
+    // flight, ~100 ms from frame start to screen with no hold-back (~67 with two frames). FEX's vkd3d-proton build
+    // holds back one hand-out of the credit once it sees the game running ahead of the latency it set (see
+    // EnvironmentVariablesHandling.h). That VKD3D build also turns it on by itself while frame start pacing is on.
+    {"FEX_VKD3D_LATENCY_RESYNC", "1"},
     // Build 68: the main pass's time grows ~14.6 us per draw at about the same shaded pixel count (b67: 238 draws 5.4 ms,
     // 963 draws 15.9 ms, ~0.85M pixels each), and a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9).
     // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14
@@ -209,6 +215,7 @@ namespace {
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",
+    "FEX_VKD3D_LATENCY_RESYNC",
     "FEX_TU_NOPREAMBLE",
     "FEX_TU_CHANNEL",
     "FEX_TU_DESC",

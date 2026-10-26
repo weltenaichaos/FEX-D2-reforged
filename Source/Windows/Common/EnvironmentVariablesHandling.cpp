@@ -98,7 +98,9 @@ namespace {
   // See EnvironmentVariablesHandling.h: turns on a feature of FEX's vkd3d-proton build by setting Var=1, unless the
   // variable is already set.
   template<size_t N>
-  void SetupVkd3dFexSwitch(const char* SwitchName, const wchar_t (&VarText)[N], const char* What) {
+  // ZeroWhenOff: with the switch off, set the variable to 0 instead of leaving it unset (for a VKD3D feature that is on
+  // unless 0).
+  void SetupVkd3dFexSwitch(const char* SwitchName, const wchar_t (&VarText)[N], const char* What, bool ZeroWhenOff = false) {
     const char* Value = Switch(SwitchName);
     const bool On = Value && !(Value[0] == '0' && !Value[1]);
     const auto Var = Narrow(VarText, N - 1);
@@ -110,6 +112,14 @@ namespace {
     if (QueryStatus != StatusVariableNotFound) {
       StatsLogNote(fextl::fmt::format("vkd3d: {}={} was already set, left alone ({})", Var,
                                       QueryStatus == 0 ? Narrow(Old, OldValue.Length / sizeof(wchar_t)) : fextl::string("?"), What));
+      return;
+    }
+    if (!On && ZeroWhenOff) {
+      static constexpr wchar_t ZeroText[] = L"0";
+      UNICODE_STRING Zero {sizeof(wchar_t), sizeof(ZeroText), const_cast<wchar_t*>(ZeroText)};
+      const NTSTATUS SetStatus = RtlSetEnvironmentVariable(nullptr, &Name, &Zero);
+      StatsLogNote(fextl::fmt::format("vkd3d: {}=0 (status {:#x}, {} off): {} stays off", Var, static_cast<uint32_t>(SetStatus),
+                                      SwitchName, What));
       return;
     }
     if (!On) {
@@ -398,6 +408,12 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "each frame goes to the window system only once the GPU has drawn it, because GameNative's X server "
                       "shows an image as soon as it gets it and one handed over earlier showed an older frame (VKD3D fex12 "
                       "and later; 'screen handoff' line)");
+  SetupVkd3dFexSwitch("FEX_VKD3D_LATENCY_RESYNC", L"VKD3D_FEX_LATENCY_RESYNC",
+                      "when the game runs frames ahead of the frame latency it set (it started a frame without taking a "
+                      "credit from its frame latency handle, e.g. after its wait timed out in a hitch), vkd3d holds back "
+                      "that many hand-outs of the credit, so the game is back at 2 frames in flight (VKD3D fex16 and later; "
+                      "'frame credits (resync)' line)",
+                      true);
   SetupVkd3dShaderCopy();
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
