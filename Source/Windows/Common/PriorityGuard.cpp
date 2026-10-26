@@ -118,6 +118,12 @@ namespace {
   constexpr uint32_t LoaderMaxRounds = 4;            // busy rounds counted before a thread that didn't qualify isn't sampled for a while
   constexpr uint64_t LoaderBusyNs = 500'000'000;     // run time in a 2 s round: 25% of a core
   constexpr uint32_t LoaderSkipRounds = 30;          // 1 minute
+  // Build 81: D2R's loader thread spends most of its samples in Wine calls, and over 4 busy rounds gave 3 to 7 samples in
+  // protection code in every log from build 73 to 80, never one in the game's code; the game's workers gave 0-1 in
+  // protection code and 6-25 in the game's. With 6 needed it was a coin toss: in build 80 (4 at 0:17) it stayed on the
+  // game's big cores until 1:29, in build 76 (3, then 5) until 2:51.
+  constexpr uint32_t LoaderMinProtectionNoGame = 3;  // samples in protection code over all LoaderMaxRounds busy rounds, with no game sample
+  constexpr uint32_t LoaderSoonRounds = 5;           // 10 s: a thread with protection samples and none of the game's is checked again soon
   constexpr size_t MaxModuleKinds = 64;              // cached image kinds, see ModuleKinds
   constexpr size_t MaxLoaderThreads = 4;
   constexpr size_t MaxGameThreads = 4; // game threads found by their exceptions, on the "loader" line
@@ -1217,7 +1223,9 @@ namespace {
       ++T.BusyRounds;
       ++T.Checks;
       const double Busy = static_cast<double>(RunNs) / 2e7; // % of a core over the 2 s round
-      const bool IsLoader = T.InProtection >= LoaderMinProtection && T.InProtection >= 3 * T.InGame;
+      const bool ByShare = T.InProtection >= LoaderMinProtection && T.InProtection >= 3 * T.InGame;
+      const bool ByNoGame = T.BusyRounds >= LoaderMaxRounds && T.InGame == 0 && T.InProtection >= LoaderMinProtectionNoGame;
+      const bool IsLoader = ByShare || ByNoGame;
       if (!IsLoader && T.BusyRounds < LoaderMaxRounds) {
         continue;
       }
@@ -1234,14 +1242,14 @@ namespace {
                            "code, {} in Wine's or other native DLLs (waiting or in a Wine call), {} unreadable{}",
                            T.BusyRounds, T.InProtection + T.InGame + T.InNative + T.Unread, T.InProtection, T.InGame, T.InNative, T.Unread, Where);
       if (!IsLoader) {
+        const bool Soon = T.InProtection && !T.InGame;
         if (F.CheckNotes < MaxCheckNotes) {
           ++F.CheckNotes;
-          StatsLogNote(fextl::fmt::format("loader: checked tid={} {} (Linux {}) at {:.0f}% of a core {}; not a loader thread, checked again in a "
-                                          "minute",
-                                          TID, T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Counts));
+          StatsLogNote(fextl::fmt::format("loader: checked tid={} {} (Linux {}) at {:.0f}% of a core {}; not a loader thread, checked again in {}",
+                                          TID, T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Counts, Soon ? "10 s" : "a minute"));
         }
         T.InProtection = T.InGame = T.InNative = T.Unread = T.BusyRounds = 0;
-        T.SkipUntil = Round + LoaderSkipRounds;
+        T.SkipUntil = Round + (Soon ? LoaderSoonRounds : LoaderSkipRounds);
         continue;
       }
 
@@ -1264,7 +1272,8 @@ namespace {
         L.RetryAt = F.Tick + 40;
       }
       StatsLogNote(fextl::fmt::format(
-        "loader: tid={} {} (Linux {}) at {:.0f}% of a core {}: a loader thread; {}", TID, T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Counts,
+        "loader: tid={} {} (Linux {}) at {:.0f}% of a core {}: a loader thread{}; {}", TID, T.Name.empty() ? "-" : T.Name, T.LinuxTid, Busy, Counts,
+        ByShare ? "" : " (no game code sample in its 4 busy rounds: build 81)",
         Want                                     ? fextl::fmt::format("Linux cores {:#x} -> {:#x} (the slowest), result {} (FEX_LOADER_CORES=off leaves it)",
                                                                       Before, Want, Result) :
         F.C->Loader == LoaderMode::Little ? fextl::string("left where it is: the slowest cores aren't known") :
@@ -1604,8 +1613,9 @@ void StartPriorityGuard(std::string_view AppName) {
   const fextl::string Exe = fextl::fmt::format("main exe {:X}-{:X}", C->ExeBase, C->ExeEnd);
   StatsLogNote(C->Loader == LoaderMode::Little ?
                  fextl::fmt::format("loader: threads running at 25% of a core or more whose own code is mostly protection code (not in the {} "
-                                    "or another x64 DLL; Wine's DLLs don't count either way) go to the slowest cores at the Linux level, checked "
-                                    "every 250 ms (FEX_LOADER_CORES=off leaves them, =find only finds them)",
+                                    "or another x64 DLL; Wine's DLLs don't count either way), or from build 81 that ran 3 or more protection "
+                                    "code samples and none of the game's code in 4 busy rounds, go to the slowest cores at the Linux level, "
+                                    "checked every 250 ms (FEX_LOADER_CORES=off leaves them, =find only finds them)",
                                     Exe) :
                C->Loader == LoaderMode::Find ?
                  fextl::fmt::format("loader: threads running mostly protection code (not in the {} or another x64 DLL) are found and logged, "

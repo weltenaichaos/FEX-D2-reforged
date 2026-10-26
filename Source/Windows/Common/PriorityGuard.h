@@ -88,7 +88,9 @@ namespace FEX::Windows {
 //
 //   FEX_LOADER_CORES=little  every thread that runs at 25% of a core or more (over 2 second rounds), with at least 6
 //                      protection code samples and 3 times as many as game code samples over its busy rounds (up to 4,
-//                      then it isn't looked at for a minute), goes to the slowest cores (0-2 on the Thor) for good, at the
+//                      then it isn't looked at for a minute), or (build 81) with at least 3 protection code samples and
+//                      none in the game's code over 4 busy rounds (a thread with some protection samples and none of the
+//                      game's is looked at again after 10 s), goes to the slowest cores (0-2 on the Thor) for good, at the
 //                      Linux level: GameNative's container lets Wine use cores 3-7 only, but Linux lets the process use
 //                      all 8. Its Linux cores are checked 4 times a second and set back when something changed them (the
 //                      D2R default).
@@ -105,6 +107,13 @@ namespace FEX::Windows {
 //   FEX_LOADER_GAME_EXCEPTIONS=N  a thread that raises N or more exceptions in the main exe's code within a 2 second
 //                      round is a game thread: it is never moved to the slowest cores, and moved back if it was (the D2R
 //                      default 400; 0 turns this off)
+//
+// Build 81: the loader thread gives few samples of its own code, since most of its time is in Wine calls. Over 4 busy
+// rounds it had 3-7 protection samples and no game samples in every log from build 73 to 80; the game's workers had 0-1
+// protection samples and 6-25 game samples. With 6 required, build 80 found it only at 1:29 (4 at 0:17), build 76 at
+// 2:51 (3, then 5). Until then it ran at ~0.3-0.4 of a big core next to the game's workers: other tasks on the game's
+// cores 0.75 of a core against 0.22-0.26 once it was moved, the main thread waited 34-44 ms a second for a CPU (24-26
+// after), and build 80 had 13 frames of 40 ms or more in those 45 s of play against 2 in the next 139 s.
 //
 // Each loader thread found gets a "# loader: ..." line, and every second a "loader" line with how long it ran and how
 // long it waited for a CPU; game threads found this way are on it too, with their exceptions in the game's code a
