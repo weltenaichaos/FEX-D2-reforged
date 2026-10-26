@@ -97,9 +97,10 @@ namespace {
 
   // See EnvironmentVariablesHandling.h: turns on a feature of FEX's vkd3d-proton build by setting Var=1, unless the
   // variable is already set.
+  // ZeroWhenOff: with the switch set to 0 (by the user, or by the app's defaults), set the variable to 0 instead of leaving
+  // it unset (for a VKD3D feature that is on unless 0). A program without the switch (no default for it, e.g. Steam)
+  // leaves the variable alone: build 78 set 0 there too, and D2R, started from it, inherited the 0 and left it as it was.
   template<size_t N>
-  // ZeroWhenOff: with the switch off, set the variable to 0 instead of leaving it unset (for a VKD3D feature that is on
-  // unless 0).
   void SetupVkd3dFexSwitch(const char* SwitchName, const wchar_t (&VarText)[N], const char* What, bool ZeroWhenOff = false) {
     const char* Value = Switch(SwitchName);
     const bool On = Value && !(Value[0] == '0' && !Value[1]);
@@ -114,7 +115,7 @@ namespace {
                                       QueryStatus == 0 ? Narrow(Old, OldValue.Length / sizeof(wchar_t)) : fextl::string("?"), What));
       return;
     }
-    if (!On && ZeroWhenOff) {
+    if (!On && ZeroWhenOff && Value) {
       static constexpr wchar_t ZeroText[] = L"0";
       UNICODE_STRING Zero {sizeof(wchar_t), sizeof(ZeroText), const_cast<wchar_t*>(ZeroText)};
       const NTSTATUS SetStatus = RtlSetEnvironmentVariable(nullptr, &Name, &Zero);
