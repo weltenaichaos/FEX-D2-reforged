@@ -89,6 +89,27 @@ rumble_hit:
   add x9, x9, #:lo12:NativeRumbleTarget
 rumble_done:
 
+  // A call from x64 code into ReadFile (one of FEXReadWatch[0..2], all 0 until GameFiles.cpp finds kernelbase's) runs
+  // FEX's wrapper (NativeReadFileTarget, see GameFiles.h), which notes what was read and calls the entry the game called,
+  // stored in FEXReadWatch[3]. Only x16 and x17, as above.
+  adrp x16, FEXReadWatch
+  add x16, x16, #:lo12:FEXReadWatch
+  ldr x17, [x16]
+  cbz x17, read_watch_done
+  cmp x17, x9
+  b.eq read_watch_hit
+  ldr x17, [x16, #8]
+  cmp x17, x9
+  b.eq read_watch_hit
+  ldr x17, [x16, #16]
+  cmp x17, x9
+  b.ne read_watch_done
+read_watch_hit:
+  str x9, [x16, #24]
+  adrp x9, NativeReadFileTarget
+  add x9, x9, #:lo12:NativeReadFileTarget
+read_watch_done:
+
   // A call from one of the game's loader threads (its TEB in FEXLoaderWatch[1..4], see LoaderWatch.h) into CreateEventW,
   // CloseHandle, WaitForMultipleObjects or WaitForSingleObject runs FEX's counting wrapper instead, which calls the one it
   // was going to. Only x16 and x17, as above; [0] stays 0 until a loader thread is found.
@@ -400,3 +421,6 @@ NATIVE_REDIRECT NativeLoaderCreateEvent, #FEXNativeLoaderCreateEventW, "mov x4, 
 NATIVE_REDIRECT NativeLoaderCloseHandle, #FEXNativeLoaderCloseHandle, "mov x1, x30; mov x2, sp"
 NATIVE_REDIRECT NativeLoaderWait, #FEXNativeLoaderWaitForMultiple, "mov x4, x30; mov x5, sp"
 NATIVE_REDIRECT NativeLoaderWaitOne, #FEXNativeLoaderWaitForSingle, "mov x2, x30; mov x3, sp"
+  // The game files' ReadFile wrapper (GameFiles.cpp), entered from ExitFunctionEC above, also with lr and sp after its four
+  // register arguments: the fifth (the OVERLAPPED) is on the x64 caller's stack.
+NATIVE_REDIRECT NativeReadFile, #FEXNativeReadFile, "mov x4, x30; mov x5, sp"

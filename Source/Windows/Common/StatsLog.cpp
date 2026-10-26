@@ -355,6 +355,18 @@ namespace {
     fextl::unordered_map<int, SchedPrev> Tasks;
     fextl::unordered_map<int, SchedPrev> Procs;
     fextl::unordered_map<int, fextl::string> ProcNames;
+    // Build 82: CPU clocks (cpufreq scaling_cur_freq, the clock the kernel last set for that CPU's group), sampled every
+    // 10 ms: the CPU the main thread is on while it is runnable, the fastest CPU always, every CPU every 100 ms. The
+    // running totals go into the '# busy frame' lines.
+    struct ClockSamples {
+      uint64_t SumKHz;
+      uint32_t N;
+      uint32_t Top; // samples at the CPU's highest clock
+      uint32_t MinKHz, MaxKHz;
+    };
+    ClockSamples MainClock, FastClock, CoreClock[Linux::MaxCPUs];
+    uint32_t ClockTick;
+    uint64_t MainClockTotalKHz, MainClockTotalN, FastClockTotalKHz, FastClockTotalN;
   };
   SchedState Sched;
 
@@ -414,8 +426,57 @@ namespace {
     bool HavePsi;
     fextl::string MainCgroup, ServerCgroup;
     uint32_t CgroupNotes;
+    // Build 82: each CPU's scaling_cur_freq (-1 when unreadable), its highest clock, and the fastest CPU's limits and
+    // governor.
+    int FreqFds[Linux::MaxCPUs];
+    uint32_t TopKHz[Linux::MaxCPUs];
+    bool FreqOn;
+    int FastMinFd = -1, FastMaxFd = -1, FastGovernorFd = -1;
   };
   CoreLoadState Core;
+
+  // A number of kHz from a sysfs file kept open, 0 when unreadable.
+  uint32_t ReadKHz(int Fd) {
+    if (Fd < 0) {
+      return 0;
+    }
+    char Buffer[32];
+    const int64_t Len = Linux::Pread(Fd, Buffer, sizeof(Buffer) - 1, 0);
+    if (Len <= 0) {
+      return 0;
+    }
+    Buffer[Len] = 0;
+    return static_cast<uint32_t>(strtoul(Buffer, nullptr, 10));
+  }
+
+  void ClockInit(const uint32_t (&KHz)[Linux::MaxCPUs]) {
+    int Readable {};
+    for (int Cpu = 0; Cpu < Linux::MaxCPUs; ++Cpu) {
+      Core.FreqFds[Cpu] = -1;
+      Core.TopKHz[Cpu] = KHz[Cpu];
+      if (Cpu >= Core.Cpus) {
+        continue;
+      }
+      const int Fd = Linux::Open(fextl::fmt::format("/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq", Cpu).c_str());
+      if (Fd >= 0 && !ReadKHz(Fd)) {
+        Linux::Close(Fd);
+      } else if (Fd >= 0) {
+        Core.FreqFds[Cpu] = Fd;
+        ++Readable;
+      }
+    }
+    Core.FreqOn = Readable > 0;
+    if (Core.FastCpu >= 0) {
+      const auto Dir = fextl::fmt::format("/sys/devices/system/cpu/cpu{}/cpufreq/", Core.FastCpu);
+      Core.FastMinFd = Linux::Open((Dir + "scaling_min_freq").c_str());
+      Core.FastMaxFd = Linux::Open((Dir + "scaling_max_freq").c_str());
+      Core.FastGovernorFd = Linux::Open((Dir + "scaling_governor").c_str());
+    }
+    StatsLogNote(Core.FreqOn ? fextl::fmt::format("cpu clock: {} of {} CPUs' clocks readable (scaling_cur_freq), sampled every 10 ms "
+                                                  "('cpu clock' line, clocks on '# busy frame' lines)",
+                                                  Readable, Core.Cpus) :
+                               fextl::string("cpu clock: no CPU's scaling_cur_freq readable; no clock lines"));
+  }
 
   // Reads one CPU's counters; false when they can't be read (offline CPU, or no access).
   bool CoreRead(int Cpu, const char* ProcStat, uint64_t& Idle, uint64_t& Total, uint64_t& Usage, uint64_t& Irq) {
@@ -480,6 +541,7 @@ namespace {
         Core.FastCpu = -1; // no single fastest CPU
       }
     }
+    ClockInit(KHz);
     if (Core.FastCpu >= 0) {
       char Probe[64];
       Core.SchedStatFd = Linux::Open("/proc/schedstat");
@@ -1324,7 +1386,10 @@ namespace {
     SystemInit();
   }
 
-  void SchedSampleOne(int Fd, uint32_t& Samples, uint32_t& Runnable, uint32_t (&Cores)[Linux::MaxCPUs]) {
+  void SchedSampleOne(int Fd, uint32_t& Samples, uint32_t& Runnable, uint32_t (&Cores)[Linux::MaxCPUs], int* RunningOn = nullptr) {
+    if (RunningOn) {
+      *RunningOn = -1;
+    }
     if (Fd < 0) {
       return;
     }
@@ -1343,8 +1408,96 @@ namespace {
       ++Runnable;
       if (S.Processor >= 0 && S.Processor < Linux::MaxCPUs) {
         ++Cores[S.Processor];
+        if (RunningOn) {
+          *RunningOn = S.Processor;
+        }
       }
     }
+  }
+
+  void ClockAdd(SchedState::ClockSamples& C, uint32_t KHz, uint32_t TopKHz) {
+    C.MinKHz = C.N ? std::min(C.MinKHz, KHz) : KHz;
+    C.MaxKHz = C.N ? std::max(C.MaxKHz, KHz) : KHz;
+    C.SumKHz += KHz;
+    C.Top += TopKHz && KHz >= TopKHz ? 1 : 0;
+    ++C.N;
+  }
+
+  // Every 10 ms, see SchedState::ClockSamples. MainCpu: the main thread's CPU if it is runnable, else -1.
+  void ClockSampleTick(int MainCpu) {
+    if (!Core.FreqOn) {
+      return;
+    }
+    uint32_t Read[Linux::MaxCPUs] {};
+    auto Get = [&](int Cpu) -> uint32_t {
+      if (Cpu < 0 || Cpu >= Core.Cpus || Core.FreqFds[Cpu] < 0) {
+        return 0;
+      }
+      if (!Read[Cpu]) {
+        Read[Cpu] = ReadKHz(Core.FreqFds[Cpu]);
+      }
+      return Read[Cpu];
+    };
+    if (const uint32_t KHz = Get(MainCpu)) {
+      ClockAdd(Sched.MainClock, KHz, Core.TopKHz[MainCpu]);
+      Sched.MainClockTotalKHz += KHz;
+      ++Sched.MainClockTotalN;
+    }
+    if (const uint32_t KHz = Get(Core.FastCpu)) {
+      ClockAdd(Sched.FastClock, KHz, Core.TopKHz[Core.FastCpu]);
+      Sched.FastClockTotalKHz += KHz;
+      ++Sched.FastClockTotalN;
+    }
+    if (++Sched.ClockTick % 10 == 0) {
+      for (int Cpu = 0; Cpu < Core.Cpus; ++Cpu) {
+        if (const uint32_t KHz = Get(Cpu)) {
+          ClockAdd(Sched.CoreClock[Cpu], KHz, Core.TopKHz[Cpu]);
+        }
+      }
+    }
+  }
+
+  // The "cpu clock" line for the last second's samples.
+  fextl::string ClockLine() {
+    if (!Core.FreqOn) {
+      return {};
+    }
+    auto Mhz = [](const SchedState::ClockSamples& C) {
+      return C.N ? C.SumKHz / C.N / 1000 : 0;
+    };
+    auto TopShare = [](const SchedState::ClockSamples& C) {
+      return C.N ? (C.Top * 100 + C.N / 2) / C.N : 0;
+    };
+    fextl::string Out = "  cpu clock:";
+    const auto& M = Sched.MainClock;
+    Out += M.N ? fextl::fmt::format(" main thread {} MHz while runnable (lowest {}, highest {}, at its CPU's top {}% of {} samples)", Mhz(M),
+                                    M.MinKHz / 1000, M.MaxKHz / 1000, TopShare(M), M.N) :
+                 fextl::string(" main thread not runnable at any sample");
+    if (Core.FastCpu >= 0) {
+      const auto& F = Sched.FastClock;
+      char Governor[32] {};
+      if (Core.FastGovernorFd >= 0) {
+        const int64_t Len = Linux::Pread(Core.FastGovernorFd, Governor, sizeof(Governor) - 1, 0);
+        Governor[Len > 0 ? Len : 0] = 0;
+        if (char* End = strchr(Governor, '\n')) {
+          *End = 0;
+        }
+      }
+      Out += fextl::fmt::format(" | core {} {} MHz (lowest {}, at top {}%), top {} MHz, allowed {}-{} MHz, governor {}", Core.FastCpu, Mhz(F),
+                                F.N ? F.MinKHz / 1000 : 0, TopShare(F), Core.TopKHz[Core.FastCpu] / 1000, ReadKHz(Core.FastMinFd) / 1000,
+                                ReadKHz(Core.FastMaxFd) / 1000, Governor[0] ? Governor : "?");
+    }
+    Out += " | cores MHz";
+    for (int Cpu = 0; Cpu < Core.Cpus; ++Cpu) {
+      const auto& C = Sched.CoreClock[Cpu];
+      Out += C.N ? fextl::fmt::format(" {}", Mhz(C)) : fextl::string(" -");
+    }
+    Sched.MainClock = {};
+    Sched.FastClock = {};
+    for (auto& C : Sched.CoreClock) {
+      C = {};
+    }
+    return Out + "\n";
   }
 
   constexpr uint64_t RunningKey = ~0ull;
@@ -1461,10 +1614,12 @@ namespace {
     if (!Sched.On || ++Sched.Tick % 5) {
       return;
     }
-    SchedSampleOne(Sched.MainFd, Sched.MainSamples, Sched.MainRunnable, Sched.MainCores);
+    int MainCpu = -1;
+    SchedSampleOne(Sched.MainFd, Sched.MainSamples, Sched.MainRunnable, Sched.MainCores, &MainCpu);
     SchedSampleOne(Sched.ServerFd, Sched.ServerSamples, Sched.ServerRunnable, Sched.ServerCores);
     SchedSampleQueue();
     CorePauseSample();
+    ClockSampleTick(MainCpu);
   }
 
   fextl::string SchedCores(uint32_t Runnable, const uint32_t (&Cores)[Linux::MaxCPUs]) {
@@ -1666,6 +1821,7 @@ namespace {
         const double Share = static_cast<double>(Sched.MainCores[Core.FastCpu]) / static_cast<double>(Sched.MainRunnable);
         MainFast = {.RunMs = RunMs * Share, .WaitMs = WaitMs * Share, .Slices = static_cast<double>(Slices) * Share};
       }
+      Out += ClockLine();
     }
 
     // The wineserver.
@@ -1950,6 +2106,7 @@ namespace {
       uint64_t DiskCache;
       uint64_t Smc;      // code writes of all threads
       uint64_t OtherJit; // compile time of all other threads (counter ticks)
+      uint64_t MainClockKHz, MainClockN, FastClockKHz, FastClockN; // build 82: running totals of the clock samples
     };
     MainTick MainTicks[MaxMainTicks];
     size_t MainTickCount;
@@ -2941,6 +3098,16 @@ namespace {
         fextl::fmt::format("main thread on a CPU {:.1f}ms, waiting for one {:.1f}ms", static_cast<double>(Delta(Last->RunNs, From->RunNs)) / 1e6,
                            static_cast<double>(Delta(Last->WaitNs, From->WaitNs)) / 1e6) :
         fextl::string("main thread's CPU time unknown");
+    // Build 82: the CPU clock over the frame: of the main thread's CPU while it was runnable, and of the fastest CPU.
+    fextl::string ClockText;
+    if (Core.FreqOn) {
+      const uint64_t MainN = Delta(Last->MainClockN, From->MainClockN);
+      const uint64_t FastN = Delta(Last->FastClockN, From->FastClockN);
+      ClockText = fextl::fmt::format(", clock {} MHz running ({} samples), core {} {} MHz",
+                                     MainN ? fextl::fmt::format("{}", Delta(Last->MainClockKHz, From->MainClockKHz) / MainN / 1000) : fextl::string("-"),
+                                     MainN, Core.FastCpu,
+                                     FastN ? fextl::fmt::format("{}", Delta(Last->FastClockKHz, From->FastClockKHz) / FastN / 1000) : fextl::string("-"));
+    }
     const LogState::Run R = CollectFrameRun(State, Begin, End);
     fextl::vector<std::pair<uint32_t, uint64_t>> Blocks, Natives;
     SplitCounts(R.Counts, Blocks, Natives);
@@ -2948,7 +3115,7 @@ namespace {
       "# busy frame t={} {:.0f}ms, game part {:.1f}ms (median {:.1f}) | {}, blocked in other waits {:.1f}ms | compiled {} blocks in "
       "{:.1f}ms, other threads compiled {:.1f}ms, lookup misses {}, disk cache lookups {:.1f}ms, exception handling {:.1f}ms, code "
       "lock waits {:.1f}ms, code writes (all threads) {} | ticks game {} fex {} native {} other waits {} latency wait {}{}:",
-      FrameTime(State, Seconds, Begin), Ms, GameMs, Usual, SchedText, static_cast<double>(WaitTicks) * MsPerTick,
+      FrameTime(State, Seconds, Begin), Ms, GameMs, Usual, SchedText + ClockText, static_cast<double>(WaitTicks) * MsPerTick,
       Delta(Last->JitCount, From->JitCount), static_cast<double>(Delta(Last->Jit, From->Jit)) * MsPerTick,
       static_cast<double>(Delta(Last->OtherJit, From->OtherJit)) * MsPerTick, Delta(Last->Misses, From->Misses),
       static_cast<double>(Delta(Last->DiskCache, From->DiskCache)) * MsPerTick, static_cast<double>(Delta(Last->Sig, From->Sig)) * MsPerTick,
@@ -3056,6 +3223,10 @@ namespace {
     });
     K.Smc = Smc;
     K.OtherJit = OtherJit;
+    K.MainClockKHz = Sched.MainClockTotalKHz;
+    K.MainClockN = Sched.MainClockTotalN;
+    K.FastClockKHz = Sched.FastClockTotalKHz;
+    K.FastClockN = Sched.FastClockTotalN;
     Linux::SchedStat S {};
     K.HaveSched = Linux::PreadSchedStat(Sched.MainSchedFd, S);
     K.RunNs = S.RunNs;
@@ -3834,7 +4005,16 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "thread and the wineserver are in; rumble = the game's XInputSetState calls (FEX_RUMBLE): calls, changes "
                        "of strength, changes sent to the controller and how long Wine took for each; game files = the game's big "
                        "files (in its folder, or open) that FEXFileCache drops from the file cache, and how much the file cache "
-                       "shrank at the drops (FEX_GAME_FILES_UNCACHED)\n",
+                       "shrank at the drops (FEX_GAME_FILES_UNCACHED), kept = what the drops leave out (read lately by anyone, by the main "
+                       "thread, readahead; FEX_GAME_FILES_KEEP_MB), memory guard = passes that dropped everything for low memory; game "
+                       "reads = the game's reads of those files (FEX_GAME_FILES_READ_WATCH): queued = overlapped reads still going on "
+                       "when ReadFile returned, the main thread's and the other threads' reads with their wait, kept = reads whose "
+                       "data was kept, MB by read since its last read = how much of the files was read between two reads of the same "
+                       "MB (the budget that would have kept it; first = never read before), other files = reads of other files, slow "
+                       "main = the main thread's reads of 8ms or more (file@offset, size, wait, distance, kept); cpu clock = CPU "
+                       "clocks the kernel set (scaling_cur_freq, sampled every 10ms): the main thread's CPU while runnable, the "
+                       "fastest core with its limits and governor, each core's average; '# busy frame' clock = the same over the "
+                       "frame\n",
                        AppName, GetCurrentProcessId());
   // No fflush: FEX's CRT fwrite goes straight to WriteFile, and its fflush is an UNIMPLEMENTED() stub that
   // terminates the process.
