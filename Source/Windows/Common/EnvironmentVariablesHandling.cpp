@@ -264,55 +264,63 @@ namespace {
     // stats log nothing flips it, so it stays on).
     const char* Desc = Switch("FEX_TU_DESC");
     TurnipDesc = SwitchOff(Desc) ? 0 : (Desc[0] == 'a' || Desc[0] == 'A') ? 2 : 1;
-    // FEX_TU_DEPTH_CLEAR: 0 stock (2D engine), 1 3D draw, alt (D2R default in build 72) = 3D draw in every other second.
-    // Like FEX_TU_DESC, only TurnipReport flips it, so without the stats log alt stays on.
+    // FEX_TU_DEPTH_CLEAR: 0 stock (2D engine), 1 3D draw, fastz = 3D draw with the fragment shader disabled (driver fex4),
+    // alt (D2R default since build 74) = 3D draw always, fast Z in every other second. Build 73 measured the 3D draw
+    // against the 2D engine (alt then flipped those): ~0.55 ms less per 4096x4096 shadow map. Like FEX_TU_DESC, only
+    // TurnipReport flips it, so without the stats log alt stays on (with fast Z).
     const char* DepthClear = Switch("FEX_TU_DEPTH_CLEAR");
-    TurnipDepthClear = SwitchOff(DepthClear) ? 0 : (DepthClear[0] == 'a' || DepthClear[0] == 'A') ? 2 : 1;
+    TurnipDepthClear = SwitchOff(DepthClear)                              ? 0 :
+                       (DepthClear[0] == 'a' || DepthClear[0] == 'A') ? 2 :
+                       (DepthClear[0] == 'f' || DepthClear[0] == 'F') ? 3 :
+                                                                          1;
     Chan->Mode = (TurnipDesc ? (Turnip::ModeChangedOnly | Turnip::ModePushReuse) : 0) |
-                 (TurnipDepthClear ? Turnip::ModeDepthClear3d : 0);
+                 (TurnipDepthClear ? Turnip::ModeDepthClear3d : 0) |
+                 (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0);
 
     // FEX_TU_COUNTERS: 1 (default) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at least this many
     // draws get timed and counted (default 100: the main pass, the depth prepass and the shadow maps in towns and
-    // fights). Build 72's list: build 71 left a fixed cost per draw in every big pass (prepass ~2,200 GPU cycles per draw
-    // for ~390 cycle waves, shadow maps ~1,650) with the shader cores mostly idle; the new counters say which unit ahead
-    // of the shader cores is busy or waiting per draw (primitive control starved by the command processor or by draw
-    // setup, vertex fetch, triangle setup, rasterizer, render backend, depth pre-test), and how long the 2D engine runs
-    // (the start-of-pass clears FEX_TU_DEPTH_CLEAR moves to the 3D path). Dropped from build 70's list: counters that
-    // read the same in every pass (command processor idle, shader state stall, idle/short-sync/wait wave cycles,
-    // texture latency).
+    // fights). Build 74's list: build 73 found primitive control waiting for the command processor's next draw ~43% of
+    // the main pass and the command processor's output stalled ~42%, with every draw taking a new state context, so the
+    // fixed cost per draw (~6,000 GPU cycles in the main pass, ~2,000 in the shadow maps) sits in the command processor.
+    // The command processor counters say where its time per draw goes: executing register writes, state loads
+    // (constants, descriptors), draw packets, waiting for its command or draw state data to arrive from memory, or for
+    // syncs, and how many packets and dwords a draw takes. Dropped from build 73's list: units that read ~0.8-0.9 busy
+    // per cycle in every pass (vertex fetch, triangle setup, rasterizer, depth pre-test), the 2D engine (depth clears
+    // are 3D draws now), draw setup starve (always 0) and the wave life/kind/alu/long-sync counters (known).
     if (!SwitchOff(Switch("FEX_TU_COUNTERS"))) {
       static constexpr struct {
         uint32_t Group, Countable;
       } List[] = {
-        // Clock and command processor: GPU cycles, how many state contexts the draws used, and whether the command
-        // processor waits on the GPU (pipe out stall).
+        // Clock and command processor: GPU cycles, how many state contexts the draws used, whether the command
+        // processor waits on the GPU (pipe out stall), and (build 74) where its own time goes. A7xx has 14 command
+        // processor counters, counter 0 shared with KGSL's always-on count: this list takes the other 13.
         {Turnip::GroupCp, 0},  // CP_ALWAYS_COUNT (GPU cycles, shared with KGSL)
         {Turnip::GroupCp, 11}, // CP_CONTEXT_DONE
         {Turnip::GroupCp, 22}, // CP_SQE_PIPE_OUT_STALL
+        {Turnip::GroupCp, 2},  // CP_BUSY_CYCLES
+        {Turnip::GroupCp, 16}, // CP_SQE_PM4_STARVE_RB_IB (waiting for command buffer data from memory)
+        {Turnip::GroupCp, 17}, // CP_SQE_PM4_STARVE_SDS (waiting for draw state data from memory)
+        {Turnip::GroupCp, 23}, // CP_SQE_SYNC_STALL
+        {Turnip::GroupCp, 24}, // CP_SQE_PM4_WFI_STALL (wait for idle)
+        {Turnip::GroupCp, 26}, // CP_SQE_T4_EXEC (register writes)
+        {Turnip::GroupCp, 27}, // CP_SQE_LOAD_STATE_EXEC (constant/descriptor/shader loads)
+        {Turnip::GroupCp, 29}, // CP_SQE_DRAW_EXEC (draw packets)
+        {Turnip::GroupCp, 30}, // CP_SQE_CTXT_REG_BUNCH_EXEC (register bunches)
+        {Turnip::GroupCp, 45}, // CP_PM4_DATA (dwords)
+        {Turnip::GroupCp, 46}, // CP_PM4_HEADERS (packets)
         // Shader front end: two pixel shader states active at once (draw overlap), waits.
         {Turnip::GroupHlsq, 11}, // HLSQ_FS_DATA_WAIT_PROGRAMMING
         {Turnip::GroupHlsq, 12}, // HLSQ_DUAL_FS_PROG_ACTIVE
         {Turnip::GroupHlsq, 22}, // HLSQ_FS_STALL_CYCLES
-        // Shader cores: occupancy, starvation, wave life, and what waves spend their cycles on.
+        // Shader cores: occupancy, starvation, pixels (fast Z depth clears run no pixels through them).
         {Turnip::GroupSp, 0},   // SP_BUSY_CYCLES
         {Turnip::GroupSp, 8},   // SP_WAVE_CONTEXTS
         {Turnip::GroupSp, 69},  // SP_STARVE_CYCLES_HLSQ
-        {Turnip::GroupSp, 10},  // SP_STAGE_WAVE_CYCLES
-        {Turnip::GroupSp, 11},  // SP_STAGE_WAVE_SAMPLES
-        {Turnip::GroupSp, 97},  // SP_FS_STAGE_1X_WAVES
-        {Turnip::GroupSp, 98},  // SP_FS_STAGE_2X_WAVES
         {Turnip::GroupSp, 101}, // SP_PIXELS
-        {Turnip::GroupSp, 89},  // SP_WAVE_ALU_CYCLES
-        {Turnip::GroupSp, 24},  // SP_WAVE_LONG_SYNC_CYCLES
-        // Geometry front end and back end (build 72): which unit holds a draw up.
+        // Geometry front end and back end: primitive control waiting for the next draw, render backend.
         {Turnip::GroupPc, 13},  // PC_STARVE_CYCLES_DI (waiting for the command processor's next draw)
-        {Turnip::GroupPc, 48},  // PC_STARVE_CYCLES_PREDRAW (waiting for draw setup)
-        {Turnip::GroupVfd, 0},  // VFD_BUSY_CYCLES (vertex fetch)
-        {Turnip::GroupTse, 0},  // TSE_BUSY_CYCLES (triangle setup)
-        {Turnip::GroupRas, 0},  // RAS_BUSY_CYCLES (rasterizer)
         {Turnip::GroupRb, 0},   // RB_BUSY_CYCLES (render backend)
-        {Turnip::GroupRb, 23},  // RB_2D_ALIVE_CYCLES (2D engine)
-        {Turnip::GroupLrz, 0},  // LRZ_BUSY_CYCLES (depth pre-test)
+        {Turnip::GroupRb, 37},  // RB_STALL_CYCLES_CCU_DEPTH_WRITE (depth writes waiting for the cache/memory)
       };
       static_assert(std::size(List) <= Turnip::MaxCounters);
       for (const auto& C : List) {
@@ -345,8 +353,10 @@ namespace {
                                     "note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
                                     Chan->Compile ? "asked for (FEX_TU_EARLY_PREAMBLE=1, driver fex2 and later)" : "off (FEX_TU_EARLY_PREAMBLE=0)",
-                                    TurnipDepthClear == 2 ? "by a 3D draw in every other second, the 2D engine in the others "
-                                                            "(FEX_TU_DEPTH_CLEAR=alt, driver fex3 and later)" :
+                                    TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
+                                                            "in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
+                                    TurnipDepthClear == 3 ? "by a 3D draw without fragment shader (fast Z, FEX_TU_DEPTH_CLEAR=fastz, "
+                                                            "driver fex4 and later)" :
                                     TurnipDepthClear      ? "by a 3D draw (FEX_TU_DEPTH_CLEAR=1, driver fex3 and later)" :
                                                             "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)",
                                     Chan->CounterCount, Chan->SampleMinDraws));

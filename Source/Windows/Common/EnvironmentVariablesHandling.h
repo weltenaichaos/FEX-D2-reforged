@@ -95,11 +95,11 @@ namespace FEX::Windows {
 //                          pass began, and an identical push keeps its old copy; alt = on in every other second, so
 //                          one run compares both ways (needs the stats log, without it alt stays on)
 //   FEX_TU_COUNTERS=1      reserve 24 GPU counters through KGSL and record them around big passes (the D2R default;
-//                          build 72: GPU cycles, state contexts, command processor stall, shader front end stalls and
-//                          draw overlap, shader core occupancy/starvation, wave life, alu/long-sync wave cycles, and
-//                          per unit ahead of and behind the shader cores: primitive control starved by the command
-//                          processor or by draw setup, vertex fetch, triangle setup, rasterizer, render backend, 2D
-//                          engine and depth pre-test busy cycles); 0 = none
+//                          build 74: GPU cycles, state contexts, and where the command processor's time per draw goes
+//                          (busy, register writes and bunches, state loads, draw packets, waits for command or draw
+//                          state data, syncs, waits for idle, packets and dwords read), shader front end stalls and
+//                          draw overlap, shader core occupancy/starvation and pixels, primitive control starved by
+//                          the command processor, render backend busy and depth writes waiting for memory); 0 = none
 //   FEX_TU_SAMPLE_DRAWS=N  passes with at least N draws are timed and counted (default 100)
 //   FEX_TU_EARLY_PREAMBLE=1  (the D2R default from build 71, driver fex2 and later) push descriptor sets count as written,
 //                          so the lighting shaders' reads of vkd3d's root constant buffers can run in the early
@@ -119,6 +119,12 @@ namespace FEX::Windows {
 //                          map spends ~1.1 ms in its clear before the first draw (~25 pixels per GPU clock, the same
 //                          rate as the 2D engine's color clears), two maps plus a 2048x2048 one per frame. 1 = always
 //                          the 3D draw, 0 = stock. Without the stats log nothing flips it, so alt stays on.
+//                          Build 73 measured it: ~0.55 ms less per 4096x4096 map (2.25 -> 1.69 ms at the same load),
+//                          but the 3D clear still ran the (empty) clear fragment shader on every pixel, all shader
+//                          cores busy for ~0.5 ms. From build 74 alt keeps the 3D draw always and runs it without
+//                          fragment shader ('fast Z', driver fex4 and later: FS_DISABLE as for depth-only pipelines,
+//                          the depth from the vertex shader) in every other second; fastz = always without fragment
+//                          shader.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

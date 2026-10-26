@@ -14,6 +14,7 @@
 //    descriptor sets (vkd3d's root constant buffers) run in the shader's early preamble, ahead of the draw's waves.
 //  - (fex3 and later) with ModeDepthClear3d in 'Mode', clears a depth/stencil attachment at the start of a direct
 //    (sysmem) pass with a 3D draw through the depth unit instead of the 2D engine, and counts both kinds.
+//  - (fex4 and later) with ModeDepthClearFastZ too, runs that 3D draw with the fragment shader disabled (fast Z).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -27,6 +28,7 @@ constexpr uint32_t MaxCounters = 24;
 constexpr uint32_t ModeChangedOnly = 0x1;
 constexpr uint32_t ModePushReuse = 0x2;
 constexpr uint32_t ModeDepthClear3d = 0x4; // fex3 and later
+constexpr uint32_t ModeDepthClearFastZ = 0x8; // fex4 and later: the 3D depth clear draw runs without fragment shader
 // Slot::Mode bit (fex3 and later): the pass clears a depth/stencil attachment at its start.
 constexpr uint8_t SlotDepthClear = 0x80;
 
@@ -41,6 +43,7 @@ constexpr uint32_t StatusRingFailed = 0x20;
 constexpr uint32_t StatusNotA7xx = 0x40;
 constexpr uint32_t StatusPushSpeculate = 0x80; // fex2 and later: CompilePushSpeculate honored
 constexpr uint32_t StatusDepthClear3d = 0x100;  // fex3 and later: ModeDepthClear3d honored (a7xx)
+constexpr uint32_t StatusDepthClearFastZ = 0x200; // fex4 and later: ModeDepthClearFastZ honored (a7xx)
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -97,7 +100,10 @@ struct Channel {
   // [0] = 2D engine, [1] = 3D draw (ModeDepthClear3d), and the pixels of their render areas
   volatile uint64_t DepthClears[2];
   volatile uint64_t DepthClearPx[2];
-  uint64_t Reserved2[4];
+  // 0x288 (fex4 and later): of the 3D draw clears, the ones without fragment shader (ModeDepthClearFastZ)
+  volatile uint64_t DepthClearsFastZ;
+  volatile uint64_t DepthClearPxFastZ;
+  uint64_t Reserved2[2];
 };
 
 struct Slot {
@@ -125,6 +131,7 @@ static_assert(offsetof(Channel, RingCpu) == 0x1f0);
 static_assert(offsetof(Channel, RingNext) == 0x200);
 static_assert(offsetof(Channel, CmdBufs) == 0x208);
 static_assert(offsetof(Channel, DepthClears) == 0x268);
+static_assert(offsetof(Channel, DepthClearsFastZ) == 0x288);
 static_assert(sizeof(Channel) == 0x2a8);
 static_assert(sizeof(Slot) == 48);
 
@@ -132,6 +139,7 @@ static_assert(sizeof(Slot) == 48);
 Channel* GetChannel();
 // FEX_TU_DESC: 0 stock, 1 changed-only + push reuse always, 2 alternate every second (needs the stats log).
 uint32_t DescSwitch();
-// FEX_TU_DEPTH_CLEAR: 0 stock (2D engine), 1 3D draw always, 2 alternate every second (needs the stats log).
+// FEX_TU_DEPTH_CLEAR: 0 stock (2D engine), 1 3D draw always, 2 3D draw always with fast Z in every other second
+// (needs the stats log), 3 3D draw with fast Z always.
 uint32_t DepthClearSwitch();
 } // namespace FEX::Windows::Turnip

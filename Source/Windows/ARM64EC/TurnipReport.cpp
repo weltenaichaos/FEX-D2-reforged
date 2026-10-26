@@ -67,6 +67,19 @@ namespace {
     {T::GroupRb, 0, "rb_busy"},
     {T::GroupRb, 23, "rb_2d_busy"},
     {T::GroupLrz, 0, "lrz_busy"},
+    // build 74 additions
+    {T::GroupCp, 2, "cp_busy"},
+    {T::GroupCp, 16, "cp_starve_cmd"},
+    {T::GroupCp, 17, "cp_starve_state"},
+    {T::GroupCp, 23, "cp_sync_stall"},
+    {T::GroupCp, 24, "cp_wfi_stall"},
+    {T::GroupCp, 26, "cp_reg_writes"},
+    {T::GroupCp, 27, "cp_state_loads"},
+    {T::GroupCp, 29, "cp_draws"},
+    {T::GroupCp, 30, "cp_reg_bunches"},
+    {T::GroupCp, 45, "cp_dwords"},
+    {T::GroupCp, 46, "cp_packets"},
+    {T::GroupRb, 37, "rb_depth_write_stall"},
     // build 69 list
     {T::GroupSp, 9, "wave_cyc"},
     {T::GroupSp, 14, "fs_cyc"},
@@ -116,11 +129,14 @@ namespace {
   constexpr size_t PrintKinds = 5;
 
   // PassKind::Mode bits: T::ModeChangedOnly, and for direct passes with a depth clear T::SlotDepthClear plus
-  // T::ModeDepthClear3d when the 3D draw did it.
+  // T::ModeDepthClear3d when the 3D draw did it and T::ModeDepthClearFastZ when that draw ran without fragment shader.
   uint8_t KindMode(const T::Slot& S) {
     uint8_t Mode = S.Mode & T::ModeChangedOnly;
     if (S.Sysmem && (S.Mode & T::SlotDepthClear)) {
       Mode |= T::SlotDepthClear | (S.Mode & T::ModeDepthClear3d);
+      if (S.Mode & T::ModeDepthClear3d) {
+        Mode |= S.Mode & T::ModeDepthClearFastZ;
+      }
     }
     return Mode;
   }
@@ -132,7 +148,7 @@ namespace {
   uint32_t Seconds {};
   uint32_t CurrentMode {};
   uint64_t NextSeq {1};
-  uint64_t Last[8][2] {};
+  uint64_t Last[9][2] {};
 
   bool ReadSlot(uint64_t RingCpu, uint32_t Index, uint32_t SlotSize, uint8_t* Out) {
     SIZE_T Read = 0;
@@ -157,8 +173,13 @@ namespace {
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
                              Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
                              !(Status & T::StatusDepthClear3d)        ? "by the 2D engine: 3D draw NOT honored" :
-                             ClearSwitch == 2                         ? "by a 3D draw in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
-                                                                        "by a 3D draw (FEX_TU_DEPTH_CLEAR=1)";
+                             ClearSwitch == 1                         ? "by a 3D draw (FEX_TU_DEPTH_CLEAR=1)" :
+                             Chan->Patch < 4                          ? "by a 3D draw, fast Z NOT available (driver older than fex4)" :
+                             !(Status & T::StatusDepthClearFastZ)     ? "by a 3D draw, fast Z NOT honored" :
+                             ClearSwitch == 2                         ? "by a 3D draw, without fragment shader (fast Z) in every other "
+                                                                        "second (FEX_TU_DEPTH_CLEAR=alt)" :
+                                                                        "by a 3D draw without fragment shader (fast Z, "
+                                                                        "FEX_TU_DEPTH_CLEAR=fastz)";
     FEX::Windows::StatsLogNote(fextl::fmt::format(
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
       "depth clears at the start of direct passes {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
@@ -201,7 +222,10 @@ namespace {
     const auto Ratio = [](double A, double B) {
       return B > 0 ? A / B : 0.0;
     };
-    const char* Clear = !(K.Mode & T::SlotDepthClear) ? "" : (K.Mode & T::ModeDepthClear3d) ? " clear 3d" : " clear 2d";
+    const char* Clear = !(K.Mode & T::SlotDepthClear)        ? "" :
+                        !(K.Mode & T::ModeDepthClear3d)      ? " clear 2d" :
+                        (K.Mode & T::ModeDepthClearFastZ)    ? " clear fastz" :
+                                                               " clear 3d";
     fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
                                             K.Width, K.Height, K.Colors, K.Attachments, K.Format0, K.Sysmem ? "direct" : "tiled",
                                             DescSeen ? ((K.Mode & T::ModeChangedOnly) ? " desc on" : " desc off") : "", Clear,
@@ -287,7 +311,8 @@ namespace {
       } Units[] = {{T::GroupPc, 13, "pc waits for cp"},    {T::GroupPc, 48, "pc waits for draw setup"},
                    {T::GroupVfd, 0, "vertex fetch"},       {T::GroupTse, 0, "triangle setup"},
                    {T::GroupRas, 0, "rasterizer"},         {T::GroupLrz, 0, "depth pre-test"},
-                   {T::GroupRb, 0, "render backend"},      {T::GroupRb, 23, "2d engine"}};
+                   {T::GroupRb, 0, "render backend"},      {T::GroupRb, 23, "2d engine"},
+                   {T::GroupRb, 37, "depth writes wait for memory"}};
       fextl::string Parts;
       for (const auto& U : Units) {
         if (Has(U.Group, U.Countable)) {
@@ -296,6 +321,33 @@ namespace {
       }
       if (!Parts.empty()) {
         Line += " | units per cycle: " + Parts;
+      }
+    }
+    // Command processor per draw (build 74), in GPU cycles: busy, then what it executed (register writes, register
+    // bunches, state loads = constants/descriptors/shaders, draw packets) and what it waited for (command buffer data
+    // or draw state data from memory, syncs, wait for idle); packets and dwords it read. Busy close to the pass's
+    // cycles per draw with primitive control waiting for it means the command processor is the limit.
+    if (Has(T::GroupCp, 2) || Has(T::GroupCp, 46)) {
+      static constexpr struct {
+        uint32_t Countable;
+        const char* Name;
+      } CpParts[] = {{2, "busy"},           {26, "register writes"},      {30, "register bunches"},
+                     {27, "state loads"},   {29, "draw packets"},         {16, "waits for command data"},
+                     {17, "waits for draw state data"}, {23, "sync waits"}, {24, "waits for idle"}};
+      fextl::string Parts;
+      for (const auto& P : CpParts) {
+        if (Has(T::GroupCp, P.Countable)) {
+          Parts += fextl::fmt::format("{}{} {:.0f}", Parts.empty() ? "" : ", ", P.Name, V(T::GroupCp, P.Countable) / Draws);
+        }
+      }
+      if (Has(T::GroupCp, 46)) {
+        Parts += fextl::fmt::format("{}packets {:.1f}", Parts.empty() ? "" : " | ", V(T::GroupCp, 46) / Draws);
+      }
+      if (Has(T::GroupCp, 45)) {
+        Parts += fextl::fmt::format(", dwords {:.0f}", V(T::GroupCp, 45) / Draws);
+      }
+      if (!Parts.empty()) {
+        Line += " | command processor per draw: " + Parts;
       }
     }
     if (Has(T::GroupCp, 11)) {
@@ -326,8 +378,9 @@ namespace {
         Mode = (Mode & ~(T::ModeChangedOnly | T::ModePushReuse)) | ((Seconds & 1) ? (T::ModeChangedOnly | T::ModePushReuse) : 0);
       }
       if (ClearSw == 2) {
+        // Build 74: the 3D draw stays on, its fast Z (no fragment shader) flips.
         const bool On = DescSw == 2 ? ((Seconds >> 1) & 1) : (Seconds & 1);
-        Mode = (Mode & ~T::ModeDepthClear3d) | (On ? T::ModeDepthClear3d : 0);
+        Mode = (Mode & ~T::ModeDepthClearFastZ) | T::ModeDepthClear3d | (On ? T::ModeDepthClearFastZ : 0);
       }
       CurrentMode = Mode;
       __atomic_store_n(&Chan->Mode, CurrentMode, __ATOMIC_RELAXED);
@@ -355,9 +408,11 @@ namespace {
     Delta(4, Chan->PushReused, Reused);
     const uint64_t PassNow[2] = {Chan->PassesSampled, Chan->PassesSmall};
     Delta(5, PassNow, Misc);
-    uint64_t Clears[2], ClearPx[2];
+    uint64_t Clears[2], ClearPx[2], FastZ[2];
     Delta(6, Chan->DepthClears, Clears);
     Delta(7, Chan->DepthClearPx, ClearPx);
+    const uint64_t FastZNow[2] = {Chan->DepthClearsFastZ, Chan->DepthClearPxFastZ};
+    Delta(8, FastZNow, FastZ);
     const auto PerUpdate = [&](int i) {
       return Emits[i] ? fextl::fmt::format("{:.2f}", static_cast<double>(Flushed[i]) / Emits[i]) : fextl::string("-");
     };
@@ -374,11 +429,15 @@ namespace {
                                 Emits[0], PushAll, Misc[0], Misc[1]);
     }
 
-    // Depth clears at the start of passes that may run direct, as recorded (fex3 and later): by the 2D engine or a 3D draw.
+    // Depth clears at the start of passes that may run direct, as recorded (fex3 and later): by the 2D engine or a 3D draw,
+    // and of the 3D draws the ones without fragment shader (fast Z, fex4 and later).
     if (Chan->Patch >= 3 && (ClearSw != 0 || Clears[1] != 0)) {
-      Out += fextl::fmt::format("  turnip: depth clear {} this second | depth clears 2d engine {} ({:.1f} Mpx) 3d draw {} ({:.1f} Mpx)\n",
-                                (ModeThisSecond & T::ModeDepthClear3d) ? "3d" : "2d", Clears[0], ClearPx[0] / 1e6, Clears[1],
-                                ClearPx[1] / 1e6);
+      const char* Now = !(ModeThisSecond & T::ModeDepthClear3d)                         ? "2d" :
+                        (ModeThisSecond & T::ModeDepthClearFastZ) && Chan->Patch >= 4 ? "fastz" :
+                                                                                          "3d";
+      Out += fextl::fmt::format("  turnip: depth clear {} this second | depth clears 2d engine {} ({:.1f} Mpx) 3d draw {} ({:.1f} Mpx), "
+                                "of them fast z {} ({:.1f} Mpx)\n",
+                                Now, Clears[0], ClearPx[0] / 1e6, Clears[1], ClearPx[1] / 1e6, FastZ[0], FastZ[1] / 1e6);
     }
 
     const uint64_t RingCpu = __atomic_load_n(&Chan->RingCpu, __ATOMIC_ACQUIRE);

@@ -133,6 +133,10 @@ namespace {
     // through the depth unit instead (what vkCmdClearAttachments does inside a pass), compressed like the game's own depth
     // writes; alt switches it on in every other second so one run measures both ways ('turnip pass 4096x4096 ... clear
     // 3d|2d' lines, and the pass meter's 'last tile began').
+    // Build 74: build 73 measured the 3D clear ~0.55 ms faster per 4096 map, so it stays on; the clear draw still ran
+    // its empty fragment shader on all 16.8 million pixels (every shader core busy ~0.5 ms). Turnip fex4 can run it with
+    // the fragment shader disabled (the GPU's depth-only 'fast Z' mode, as Turnip does for depth-only pipelines); alt
+    // now switches that on in every other second ('clear fastz|3d' lines).
     {"FEX_TU_DEPTH_CLEAR", "alt"},
   };
 

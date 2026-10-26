@@ -46,6 +46,22 @@ GameNative.
   - Statistics `depth_clears[2]` / `depth_clear_px[2]` at 0x268 (were reserved), status bit
     0x100, slot mode bit 0x80 (`TU_FEX_SLOT_DEPTH_CLEAR`: the pass clears depth at its start).
 
+- `0004-fex4-depth-clear-fastz.patch` (fex4, build 74): mode bit 3 `TU_FEX_MODE_DEPTH_CLEAR_FASTZ`.
+  - `tu_fex_clear_depth_3d` sets `cmd->state.fex.clear_fs_disable` around its
+    `tu_clear_sysmem_attachments` call; there, a clear without color (`clear_rts == 0`) on a7xx
+    writes `RB_RENDER_CNTL`, `GRAS_SU_RENDER_CNTL` and `SP_RENDER_CNTL` with `FS_DISABLE` after
+    `r3d_common`, as `tu_calc_disable_fs` does for depth-only pipelines: no fragment shader waves,
+    the depth comes from the clear vertex shader's position, and the depth unit can use its Z-only
+    rate. The next draw re-emits those registers with its draw states (the clear disabled them all).
+    Why: build 73 counted 16.8 million fragment shader pixels per 4096x4096 shadow map clear, every
+    shader core busy for its ~0.5 ms.
+  - Statistics `depth_clears_fastz` / `depth_clear_px_fastz` at 0x288 (were reserved), status bit
+    0x200; the slot mode carries bit 3.
+
+Host check (fex4): `cltest` mode 12 shows `FS_DISABLE` in all three registers before the clear's
+`DI_PT_RECTLIST` draw, and the app's color draw after it re-emits them without it; mode 4 keeps
+`FS_DISABLE` off for the clear.
+
 Host check (fex3): `cltest/` records a D16 depth-only pass and a color + D24S8 pass with depth
 clears on the noop drm shim; with mode 0 `cffdump` shows `CP_BLIT` for both depth clears, with
 mode 4 a `DI_PT_RECTLIST` draw after `RB_DEPTH_BUFFER_INFO` (UBWC `LOSSLESSCOMPEN`) with

@@ -1,17 +1,18 @@
-// Host test for Turnip fex3 (TU_FEX_MODE_DEPTH_CLEAR_3D) on the freedreno noop drm shim.
+// Host test for Turnip fex3/fex4 (TU_FEX_MODE_DEPTH_CLEAR_3D, _FASTZ) on the freedreno noop drm shim.
 // Case A: depth-only D16 WxH dynamic rendering pass, depth CLEAR + STORE, one VS-only draw.
 // Case B: RGBA8 color CLEAR + D24S8 with depth CLEAR and stencil LOAD, one draw.
 // Prints the channel's depth clear statistics and the sampled slots (mode 0x80 = the pass clears depth); the
 // command stream is checked with FD_RD_DUMP + cffdump: mode 0 clears both depth attachments with CP_BLIT (2D
 // engine), mode 4 with a DI_PT_RECTLIST draw (RB_DEPTH_CNTL Z_WRITE_ENABLE, ZFUNC ALWAYS) inside
-// CP_COND_REG_EXEC RENDER_MODE|SYSMEM, after RB_DEPTH_BUFFER_INFO is set.
+// CP_COND_REG_EXEC RENDER_MODE|SYSMEM, after RB_DEPTH_BUFFER_INFO is set; mode 12 (fex4) the same draw with
+// RB_RENDER_CNTL / GRAS_SU_RENDER_CNTL / SP_RENDER_CNTL FS_DISABLE set before it.
 // Build (tu_fex.h from a Mesa tree with the patches):
 //   glslangValidator -V --vn tri_vert_spv -o tri_vert_spv.h tri.vert
 //   glslangValidator -V --vn col_frag_spv -o col_frag_spv.h col.frag
 //   cc -O1 -I<mesa>/src/freedreno/vulkan -o cltest cltest.c -lvulkan
 // Run: VK_ICD_FILENAMES=<freedreno_icd.json of a host Mesa build>
 //   LD_PRELOAD=<build>/src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so FD_GPU_ID=740 TU_DEBUG=sysmem
-//   FD_RD_DUMP=full FD_RD_DUMP_PATH=<dir> ./cltest <mode 0|4> [size, default 256]
+//   FD_RD_DUMP=full FD_RD_DUMP_PATH=<dir> ./cltest <mode 0|4|12> [size, default 256]
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,9 +143,10 @@ int main(int argc, char **argv) {
    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
    CK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
    CK(vkQueueWaitIdle(q));
-   printf("mode %u: depth clears 2d %llu (%llu px) 3d %llu (%llu px), cmdbufs %llu\n", mode,
+   printf("mode %u: depth clears 2d %llu (%llu px) 3d %llu (%llu px) of them fast z %llu (%llu px), cmdbufs %llu\n", mode,
           (unsigned long long)chan->depth_clears[0], (unsigned long long)chan->depth_clear_px[0],
           (unsigned long long)chan->depth_clears[1], (unsigned long long)chan->depth_clear_px[1],
+          (unsigned long long)chan->depth_clears_fastz, (unsigned long long)chan->depth_clear_px_fastz,
           (unsigned long long)(chan->cmdbufs[0] + chan->cmdbufs[1]));
    for (int i = 1; i <= 2 && chan->ring_cpu; i++) {
       struct tu_fex_slot *sl = (struct tu_fex_slot *)(uintptr_t)(chan->ring_cpu + i * chan->slot_size);

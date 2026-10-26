@@ -14,11 +14,15 @@
 //     (one line for each of the 5 pass kinds with the most GPU time that second, the rest summed on 'turnip pass
 //      other'; build 70 counters, see EnvironmentVariablesHandling.cpp)
 //   (build 72, driver fex3: '<direct> clear 3d|2d' after the kind for direct passes that clear depth at their start, and
-//    '| units per cycle: pc waits for cp, pc waits for draw setup, vertex fetch, triangle setup, rasterizer, depth
-//    pre-test, render backend, 2d engine' before the contexts)
-//   turnip: depth clear <3d|2d> this second | depth clears 2d engine n (Mpx) 3d draw m (Mpx)   (driver fex3 and later)
+//    '| units per cycle: ...' before the contexts; build 74, driver fex4: 'clear fastz' = the 3D clear ran without
+//    fragment shader, and '| command processor per draw: busy, register writes, register bunches, state loads, draw
+//    packets, waits for command data, waits for draw state data, sync waits, waits for idle (GPU cycles) | packets,
+//    dwords' before the contexts; units per cycle are only the ones still counted: pc waits for cp, render backend,
+//    depth writes wait for memory)
+//   turnip: depth clear <fastz|3d|2d> this second | depth clears 2d engine n (Mpx) 3d draw m (Mpx), of them fast z k
+//     (Mpx)   (driver fex3 and later; fast z fex4 and later)
 // With FEX_TU_DESC=alt it also flips the descriptor fix on and off each second, with FEX_TU_DEPTH_CLEAR=alt the depth
-// clear path (every two seconds when both are alt).
+// clear's fast Z (build 74; build 72/73: 3D draw against 2D engine), every two seconds when both are alt.
 namespace TurnipReport {
 // Call in process init, when the stats log is on.
 void Init();
