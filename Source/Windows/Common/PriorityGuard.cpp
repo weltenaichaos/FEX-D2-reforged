@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <ntstatus.h>
@@ -100,6 +101,7 @@ namespace {
     int ServerNice;
     uint64_t FastMask;   // the CPU(s) with the highest maximum clock, 0 when all are alike or unknown
     uint64_t LittleMask; // the CPU(s) with the lowest maximum clock, 0 when all are alike or unknown
+    uint64_t AllMask;    // every CPU with a known clock, 0 when Windows numbers them differently
     uint32_t MainTID;    // the thread that started the process (FEX's process init runs on it)
     int MainLinuxTid;    // its Linux tid
     uint32_t EaseWaitMs; // FEX_MAINCORE_WAIT, 0 = never let the main thread off its core
@@ -360,6 +362,7 @@ namespace {
     fextl::string Text;
     for (int i = 0; i < Linux::MaxCPUs; ++i) {
       if (KHz[i]) {
+        C.AllMask |= 1ull << i;
         Text += fextl::fmt::format(" {}:{}", i, KHz[i] / 1000);
         if (KHz[i] == Max && Max != Min) {
           C.FastMask |= 1ull << i;
@@ -378,7 +381,7 @@ namespace {
     const bool SameNumbers = NtQuerySystemInformation(SystemBasicInformation, &Info, sizeof(Info), nullptr) == STATUS_SUCCESS &&
                              Info.NumberOfProcessors == LinuxCount;
     if (!SameNumbers) {
-      C.FastMask = C.LittleMask = 0;
+      C.FastMask = C.LittleMask = C.AllMask = 0;
     }
     StatsLogNote(fextl::fmt::format("cores: max MHz{}; Windows sees {} CPUs; fastest {:#x}, slowest {:#x}{}",
                                     Text.empty() ? " unreadable" : Text.c_str(), static_cast<int>(Info.NumberOfProcessors), C.FastMask,
@@ -460,12 +463,19 @@ namespace {
       uint32_t Rounds; // rounds in which some had to be moved
       bool FailNoted;
     };
+    // Processes by pid; threads hidden from /proc (see OthersHidden) by the negated number of their cgroup (pid_N).
     fextl::unordered_map<int, Proc> Procs;
     int SelfPid;
     uint32_t Uid;
     uint32_t Notes;
     uint32_t MovedMinute; // threads moved since the last summary
     uint32_t TotalMoved;
+    // Build 77: the user's cgroup v2 directory ("/sys/fs/cgroup/uid_<user>"), empty when unknown, and a buffer for its
+    // groups' thread lists.
+    fextl::string UidCgroup;
+    fextl::vector<char> Buffer;
+    bool HiddenOff;    // the groups can't be listed
+    bool HiddenNoted;  // a group's thread list couldn't be read (noted once)
   };
 
   struct OthersSweep {
@@ -473,6 +483,7 @@ namespace {
     int MainTid;
     uint64_t Fast;
     uint64_t Fallback;
+    uint64_t All; // every CPU, 0 if unknown
     int ServerPid;
     uint32_t Round;
   };
@@ -528,6 +539,37 @@ namespace {
     }
   }
 
+  // "pid N", or for threads hidden from /proc (Key < 0) "group pid_N".
+  fextl::string OthersKeyText(int Key) {
+    return Key < 0 ? fextl::fmt::format("group pid_{}", -Key) : fextl::fmt::format("pid {}", Key);
+  }
+
+  // Counts and notes what one sweep of a process (or of a group's hidden threads) moved.
+  void OthersReport(const OthersSweep& S, int Key, OthersKeeper::Proc& P, const OthersTasks& T) {
+    auto& K = *S.K;
+    if (T.Moved) {
+      ++P.Rounds;
+      P.Moved += T.Moved;
+      K.MovedMinute += T.Moved;
+      K.TotalMoved += T.Moved;
+      // The first two rounds that moved any of a process's threads, then every 50th: a program that keeps putting its
+      // threads back shows as a count.
+      if ((P.Rounds <= 2 || P.Rounds % 50 == 0) && K.Notes < MaxOthersNotes) {
+        ++K.Notes;
+        StatsLogNote(fextl::fmt::format("cores: {} ({}): {} of {} threads off the main thread's core, {:#x} -> {:#x}{} "
+                                        "(FEX_MAINCORE_OTHERS)",
+                                        P.Name, OthersKeyText(Key), T.Moved, T.Threads, T.Before, T.After,
+                                        P.Rounds > 1 ? fextl::fmt::format(", again (#{}, {} threads in all)", P.Rounds, P.Moved) : fextl::string {}));
+      }
+    }
+    if (T.Failed && !P.FailNoted && K.Notes < MaxOthersNotes) {
+      P.FailNoted = true;
+      ++K.Notes;
+      StatsLogNote(fextl::fmt::format("cores: {} ({}): {} threads can't be moved off the main thread's core, errno {}", P.Name,
+                                      OthersKeyText(Key), T.Failed, -T.Error));
+    }
+  }
+
   void OthersProcess(const OthersSweep& S, int Pid, bool Self) {
     char Path[64];
     snprintf(Path, sizeof(Path), "/proc/%d/task", Pid);
@@ -549,26 +591,162 @@ namespace {
         P.Name = Len > 0 ? fextl::string(Comm, static_cast<size_t>(Comm[Len - 1] == '\n' ? Len - 1 : Len)) : fextl::string("?");
       }
     }
-    if (T.Moved) {
-      ++P.Rounds;
-      P.Moved += T.Moved;
-      K.MovedMinute += T.Moved;
-      K.TotalMoved += T.Moved;
-      // The first two rounds that moved any of a process's threads, then every 50th: a program that keeps putting its
-      // threads back shows as a count.
-      if ((P.Rounds <= 2 || P.Rounds % 50 == 0) && K.Notes < MaxOthersNotes) {
-        ++K.Notes;
-        StatsLogNote(fextl::fmt::format("cores: {} (pid {}): {} of {} threads off the main thread's core, {:#x} -> {:#x}{} "
-                                        "(FEX_MAINCORE_OTHERS)",
-                                        P.Name, Pid, T.Moved, T.Threads, T.Before, T.After,
-                                        P.Rounds > 1 ? fextl::fmt::format(", again (#{}, {} threads in all)", P.Rounds, P.Moved) : fextl::string {}));
+    OthersReport(S, Pid, P, T);
+  }
+
+  // Reads a whole cgroup file (its lines come in pieces) into K.Buffer, NUL-terminated. Its length or a negative errno.
+  int64_t ReadGroupFile(OthersKeeper& K, const char* Path) {
+    const int Fd = Linux::Open(Path);
+    if (Fd < 0) {
+      K.Buffer[0] = 0;
+      return Fd;
+    }
+    size_t Len = 0;
+    while (Len + 1 < K.Buffer.size()) {
+      const int64_t N = Linux::Pread(Fd, K.Buffer.data() + Len, K.Buffer.size() - 1 - Len, Len);
+      if (N <= 0) {
+        if (N < 0 && !Len) {
+          Linux::Close(Fd);
+          K.Buffer[0] = 0;
+          return N;
+        }
+        break;
+      }
+      Len += static_cast<size_t>(N);
+    }
+    Linux::Close(Fd);
+    K.Buffer[Len] = 0;
+    return static_cast<int64_t>(Len);
+  }
+
+  // A thread or process /proc doesn't show this user (Android's /proc hides processes that aren't dumpable from everyone
+  // without the right to trace them, their own user included), or shows as someone else's.
+  bool HiddenFromProc(const OthersKeeper& K, long Id) {
+    char Path[32];
+    snprintf(Path, sizeof(Path), "/proc/%ld", Id);
+    Linux::FileInfo Info {};
+    return !Linux::Stat(Path, Info) || Info.Uid != K.Uid;
+  }
+
+  void CollectGroups(const char* Name, void* Arg) {
+    if (strncmp(Name, "pid_", 4) != 0 || Name[4] < '0' || Name[4] > '9') {
+      return;
+    }
+    static_cast<fextl::vector<int>*>(Arg)->push_back(atoi(Name + 4));
+  }
+
+  // What a group's hidden threads belong to, for the notes: its processes /proc doesn't show.
+  fextl::string HiddenName(OthersKeeper& K, int Group) {
+    char Path[128];
+    snprintf(Path, sizeof(Path), "%s/pid_%d/cgroup.procs", K.UidCgroup.c_str(), Group);
+    fextl::string Pids;
+    uint32_t Count {};
+    if (ReadGroupFile(K, Path) > 0) {
+      for (char* P = K.Buffer.data(); *P;) {
+        char* End {};
+        const long Pid = strtol(P, &End, 10);
+        if (End == P) {
+          break;
+        }
+        P = End;
+        while (*P == '\n' || *P == ' ') {
+          ++P;
+        }
+        if (Pid > 0 && HiddenFromProc(K, Pid) && Count++ < 4) {
+          Pids += fextl::fmt::format("{}{}", Pids.empty() ? "" : ", ", Pid);
+        }
       }
     }
-    if (T.Failed && !P.FailNoted && K.Notes < MaxOthersNotes) {
-      P.FailNoted = true;
-      ++K.Notes;
-      StatsLogNote(fextl::fmt::format("cores: {} (pid {}): {} threads can't be moved off the main thread's core, errno {}", P.Name, Pid,
-                                      T.Failed, -T.Error));
+    return Count == 1 ? fextl::fmt::format("a process hidden from /proc (pid {}; in the launcher's group: its own app process)", Pids) :
+           Count     ? fextl::fmt::format("{} processes hidden from /proc (pids {}{})", Count, Pids, Count > 4 ? ", ..." : "") :
+                       fextl::string("threads hidden from /proc");
+  }
+
+  // Build 77: threads of this user that /proc doesn't show, above all the launcher's own app process (GameNative's Java
+  // process: it renders the game's frames to the screen and reads the controller). Android groups every process of an
+  // app's user in cgroup v2 (/sys/fs/cgroup/uid_<user>/pid_<process>, Wine's processes in the launcher's group), and a
+  // group's cgroup.threads lists every thread in it. Build 76 moved every thread /proc shows off the main thread's core,
+  // yet ~17% of that core stayed busy with other threads while the main thread waited ~40 ms a second for it, and the
+  // user's CPU use that no /proc process accounts for was ~0.14 of a core. Such a thread's own mask can't be read either,
+  // so it gets every core but the main thread's.
+  void OthersHidden(const OthersSweep& S) {
+    auto& K = *S.K;
+    if (K.UidCgroup.empty() || K.HiddenOff) {
+      return;
+    }
+    fextl::vector<int> Groups;
+    if (!Linux::ForEachEntry(K.UidCgroup.c_str(), CollectGroups, &Groups)) {
+      K.HiddenOff = true;
+      if (K.Notes < MaxOthersNotes) {
+        ++K.Notes;
+        StatsLogNote(fextl::fmt::format("cores: {} can't be listed, threads hidden from /proc (the launcher's own process) stay where "
+                                        "they are",
+                                        K.UidCgroup));
+      }
+      return;
+    }
+    if (K.Buffer.empty()) {
+      K.Buffer.resize(128 * 1024);
+    }
+    for (const int G : Groups) {
+      char Path[128];
+      snprintf(Path, sizeof(Path), "%s/pid_%d/cgroup.threads", K.UidCgroup.c_str(), G);
+      const int64_t Len = ReadGroupFile(K, Path);
+      if (Len < 0) {
+        if (!K.HiddenNoted && K.Notes < MaxOthersNotes) {
+          K.HiddenNoted = true;
+          ++K.Notes;
+          StatsLogNote(fextl::fmt::format("cores: {} can't be read (errno {}): threads hidden from /proc there stay where they are",
+                                          Path, -Len));
+        }
+        continue;
+      }
+      OthersTasks T {.S = &S};
+      for (char* P = K.Buffer.data(); *P;) {
+        char* End {};
+        const long Tid = strtol(P, &End, 10);
+        if (End == P) {
+          break;
+        }
+        P = End;
+        while (*P == '\n' || *P == ' ') {
+          ++P;
+        }
+        // Threads /proc shows were handled above (the wineserver's by KeepServerOff).
+        if (Tid <= 0 || Tid == S.MainTid || !HiddenFromProc(K, Tid)) {
+          continue;
+        }
+        ++T.Threads;
+        const uint64_t Usable = Linux::GetAffinity(static_cast<int>(Tid));
+        if (!(Usable & S.Fast)) {
+          continue;
+        }
+        const uint64_t Want = (S.All ? S.All : Usable) & ~S.Fast;
+        if (!Want) {
+          continue;
+        }
+        const int Result = Linux::SetAffinity(static_cast<int>(Tid), Want);
+        if (Result == 0) {
+          if (!T.Moved) {
+            T.Before = Usable;
+            T.After = Want;
+          }
+          ++T.Moved;
+        } else {
+          ++T.Failed;
+          T.Error = Result;
+        }
+      }
+      if (!T.Threads) {
+        continue;
+      }
+      auto [It, New] = K.Procs.try_emplace(-G);
+      auto& Proc = It->second;
+      Proc.SeenAt = S.Round;
+      if (New) {
+        Proc.Name = HiddenName(K, G);
+      }
+      OthersReport(S, -G, Proc, T);
     }
   }
 
@@ -591,10 +769,12 @@ namespace {
   }
 
   void KeepOthersOff(OthersKeeper& K, const Config& C, uint64_t Fallback, int ServerPid, uint32_t Round) {
-    OthersSweep S {.K = &K, .MainTid = C.MainLinuxTid, .Fast = C.FastMask, .Fallback = Fallback, .ServerPid = ServerPid, .Round = Round};
+    OthersSweep S {
+      .K = &K, .MainTid = C.MainLinuxTid, .Fast = C.FastMask, .Fallback = Fallback, .All = C.AllMask, .ServerPid = ServerPid, .Round = Round};
     OthersProcess(S, K.SelfPid, true);
     if (C.Others == OthersMode::User) {
       Linux::ForEachEntry("/proc", OthersEntry, &S);
+      OthersHidden(S);
     }
     for (auto It = K.Procs.begin(); It != K.Procs.end();) {
       It = It->second.SeenAt == Round ? std::next(It) : K.Procs.erase(It);
@@ -602,9 +782,9 @@ namespace {
     // Once a minute, when anything had to be moved: which programs keep starting threads there.
     if (Round % 30 == 0 && K.MovedMinute) {
       fextl::string Text;
-      for (const auto& [Pid, P] : K.Procs) {
+      for (const auto& [Key, P] : K.Procs) {
         if (P.Moved) {
-          Text += fextl::fmt::format(" {}/{} {}", P.Name, Pid, P.Moved);
+          Text += Key < 0 ? fextl::fmt::format(" [{}]/pid_{} {}", P.Name, -Key, P.Moved) : fextl::fmt::format(" {}/{} {}", P.Name, Key, P.Moved);
         }
       }
       StatsLogNote(fextl::fmt::format("cores: s={} other threads moved off the main thread's core: {} this minute, {} in all; by process "
@@ -1148,6 +1328,20 @@ namespace {
     OthersKeeper Others {};
     Others.SelfPid = Linux::GetPid();
     Others.Uid = Linux::GetUid();
+    {
+      // "0::/uid_10121/pid_1716": this process's cgroup v2 group; its parent holds the user's groups.
+      char Group[512];
+      if (Linux::ReadSmallFile("/proc/self/cgroup", Group, sizeof(Group)) > 0) {
+        if (const char* P = strstr(Group, "0::/uid_")) {
+          const char* Start = P + 3;
+          const char* End = Start + 5;
+          while (*End >= '0' && *End <= '9') {
+            ++End;
+          }
+          Others.UidCgroup = fextl::fmt::format("/sys/fs/cgroup{}", fextl::string(Start, static_cast<size_t>(End - Start)));
+        }
+      }
+    }
 
     for (;;) {
       const LONG Base = C->Prio != PrioMode::Keep ? CheckClass(Round == 0) : 8;
@@ -1395,9 +1589,10 @@ void StartPriorityGuard(std::string_view AppName) {
                                                     C->EaseWaitMs) :
                                  fextl::string("cores: main thread's Linux cores checked every 250 ms; it stays on its core however long it waits"));
     StatsLogNote(C->Others == OthersMode::User ?
-                   "cores: every other thread of this Linux user (Wine's other programs such as steam.exe, the launcher's process, and "
-                   "this process's threads Wine doesn't list) kept off the main thread's core, checked every 2 s "
-                   "(FEX_MAINCORE_OTHERS=process only this process's, =off leaves them)" :
+                   "cores: every other thread of this Linux user (Wine's other programs such as steam.exe, this process's threads Wine "
+                   "doesn't list, and from build 77 the threads /proc hides, found through the user's cgroup groups: the launcher's "
+                   "own app process) kept off the main thread's core, checked every 2 s (FEX_MAINCORE_OTHERS=process only this "
+                   "process's, =off leaves them)" :
                  C->Others == OthersMode::Process ?
                    "cores: this process's threads Wine doesn't list kept off the main thread's core, other programs left alone "
                    "(FEX_MAINCORE_OTHERS=process; =user moves steam.exe and the rest of this user's threads too)" :

@@ -50,6 +50,14 @@ namespace FEX::Windows {
 //                      0.6 or less). Each frame the game calls the Steam client, a round trip to steam.exe through shared
 //                      memory and events; the event wakes a steam.exe thread, Linux may start it on the waking thread's core,
 //                      and the main thread then waits there until Steam is done with that core.
+//                      Build 77: also the threads /proc doesn't show. Android hides processes that aren't dumpable, such as
+//                      the launcher's own app process (GameNative's Java process: it puts the game's frames on the screen
+//                      and reads the controller), even from their own user, so build 76's sweep never saw them. Android
+//                      groups every process of the app's user in cgroup v2 (/sys/fs/cgroup/uid_<user>/pid_<process>), and a
+//                      group's cgroup.threads lists all its threads; those /proc doesn't show get every core but the main
+//                      thread's ("# cores: a process hidden from /proc (pid N; ...) (group pid_N): ..."). In build 76 the
+//                      main thread still waited ~40 ms a second for its core while ~17% of that core went to other threads,
+//                      and the user's CPU use that no /proc process accounts for was ~0.14 of a core.
 //   FEX_MAINCORE_OTHERS=process  only this process's threads Wine doesn't list
 //   FEX_MAINCORE_OTHERS=off  other programs may run on the main thread's core (build 75 and earlier)
 //   FEX_HELPER_CORES=little  the stats log thread (a 2ms sampler), this guard, the rumble sender (FEXRumble) and the

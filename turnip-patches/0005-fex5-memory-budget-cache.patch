@@ -1,0 +1,212 @@
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 9475e58..e5c5a4d 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2151,9 +2151,21 @@ tu_get_budget_memory(struct tu_physical_device *physical_device, uint64_t heap_u
+     */
+    const float percent = 0.9f;
+ 
+-   return vk_physical_device_heap_budget_from_system(&physical_device->vk,
+-                                                     percent, heap_size,
+-                                                     heap_used);
++   /* fex5: tu_fex_available_memory reads /proc/meminfo at most every 250 ms
++    * when FEX asks for it (vk_physical_device_heap_budget_from_system reads
++    * it on every call). */
++   uint64_t available_memory;
++   if (!tu_fex_available_memory(&available_memory)) {
++      const void *log_objs[] = { (const void *)&physical_device->vk };
++      __vk_log(VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
++               VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT,
++               1, log_objs, __FILE__, __LINE__,
++               "Failed to query available system memory");
++      return 0;
++   }
++
++   return vk_physical_device_heap_budget(available_memory, percent, heap_size,
++                                         heap_used);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index 6975f33..b0bb344 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -21,6 +21,9 @@
+ #include "msm_kgsl.h"
+ #endif
+ 
++#include "util/os_misc.h"
++#include "util/os_time.h"
++
+ #include "tu_cmd_buffer.h"
+ #include "tu_cs.h"
+ #include "tu_device.h"
+@@ -97,6 +100,8 @@ tu_fex_device_init(struct tu_device *dev)
+    } else {
+       status |= TU_FEX_STATUS_NOT_A7XX;
+    }
++   /* fex5: on every GPU (tu_fex_available_memory). */
++   status |= TU_FEX_STATUS_BUDGET_CACHE;
+ 
+    /* Read once: it changes compiled shaders (part of the layout hash). */
+    fex->compile = chan->compile & TU_FEX_COMPILE_MASK;
+@@ -228,6 +233,67 @@ tu_fex_device_finish(struct tu_device *dev)
+    dev->fex = NULL;
+ }
+ 
++/* fex5: the channel for the memory budget query, which runs on a physical
++ * device, maybe before any device exists: looked up once. */
++static struct tu_fex_channel *
++tu_fex_budget_channel(void)
++{
++   static int state; /* 0 not looked up yet, 1 none, 2 found */
++   static struct tu_fex_channel *found;
++   const int s = __atomic_load_n(&state, __ATOMIC_ACQUIRE);
++   if (s == 2)
++      return __atomic_load_n(&found, __ATOMIC_RELAXED);
++   if (s == 1)
++      return NULL;
++   struct tu_fex_channel *chan = tu_fex_find_channel();
++   if (chan)
++      __atomic_fetch_or(&chan->status, TU_FEX_STATUS_BUDGET_CACHE, __ATOMIC_RELEASE);
++   __atomic_store_n(&found, chan, __ATOMIC_RELAXED);
++   __atomic_store_n(&state, chan ? 2 : 1, __ATOMIC_RELEASE);
++   return chan;
++}
++
++bool
++tu_fex_available_memory(uint64_t *available)
++{
++   struct tu_fex_channel *chan = tu_fex_budget_channel();
++   if (!chan)
++      return os_get_available_system_memory(available);
++
++   /* MemAvailable moves with the file cache and other apps, a budget is a
++    * rough estimate anyway: one read every 250 ms is plenty. */
++   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
++   static uint64_t cached;
++   static int64_t cached_at;
++   static bool have;
++
++   const int64_t start = os_time_get_nano();
++   const bool cache = __atomic_load_n(&chan->mode, __ATOMIC_RELAXED) & TU_FEX_MODE_BUDGET_CACHE;
++   bool ok;
++   simple_mtx_lock(&lock);
++   if (cache && have && start - cached_at < 250000000ll) {
++      *available = cached;
++      ok = true;
++   } else {
++      uint64_t value = 0;
++      ok = os_get_available_system_memory(&value);
++      __atomic_fetch_add(&chan->budget_reads, 1, __ATOMIC_RELAXED);
++      if (ok) {
++         cached = value;
++         cached_at = start;
++         have = true;
++         *available = value;
++      } else if (cache && have) {
++         *available = cached;
++         ok = true;
++      }
++   }
++   simple_mtx_unlock(&lock);
++   __atomic_fetch_add(&chan->budget_queries, 1, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&chan->budget_ns, (uint64_t)(os_time_get_nano() - start), __ATOMIC_RELAXED);
++   return ok;
++}
++
+ uint32_t
+ tu_fex_begin_cmdbuf(struct tu_device *dev)
+ {
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 04cea1e..f8d179e 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -17,6 +17,11 @@
+  *    passes are done (tu_fex_channel::mode, fex3): the 2D engine (stock) or a
+  *    3D draw through the depth unit, and (fex4) whether that draw runs with
+  *    the fragment shader disabled ("fast Z").
++ *  - (fex5) lets the memory budget query (vkGetPhysicalDeviceMemoryProperties2
++ *    with VkPhysicalDeviceMemoryBudgetPropertiesEXT) reuse the available
++ *    system memory it read from /proc/meminfo for 250 ms instead of reading
++ *    the file on every call (tu_fex_channel::mode, read at every query), and
++ *    counts the queries, the file reads and the time they took.
+  * Without the variable (or with a block that fails the checks) the driver
+  * behaves like stock Turnip.
+  *
+@@ -32,7 +37,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 4
++#define TU_FEX_PATCH 5
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -56,7 +61,14 @@
+  * the (empty) clear fragment shader and kept all shader cores busy. Only
+  * for clears without color (always so for TU_FEX_MODE_DEPTH_CLEAR_3D). */
+ #define TU_FEX_MODE_DEPTH_CLEAR_FASTZ 0x8u
++/* Mode bits for command buffers (tu_fex_begin_cmdbuf). */
+ #define TU_FEX_MODE_MASK 0xfu
++/* fex5: the memory budget query reads /proc/meminfo at most every 250 ms and
++ * reuses the last MemAvailable in between (stock: on every call). D3D12 games
++ * ask DXGI for the video memory budget every frame (QueryVideoMemoryInfo); FEX's
++ * logs of D2R show its main thread in vkGetPhysicalDeviceMemoryProperties2 for
++ * ~1 ms of every frame. Read at every query, not per command buffer. */
++#define TU_FEX_MODE_BUDGET_CACHE 0x10u
+ 
+ /* tu_fex_channel::compile bits (FEX, before the driver loads) */
+ /* Push descriptor sets made with VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT
+@@ -79,6 +91,7 @@
+ #define TU_FEX_STATUS_PUSH_SPECULATE 0x80u /* TU_FEX_COMPILE_PUSH_SPECULATE honored */
+ #define TU_FEX_STATUS_DEPTH_CLEAR_3D 0x100u /* TU_FEX_MODE_DEPTH_CLEAR_3D honored (fex3, a7xx) */
+ #define TU_FEX_STATUS_DEPTH_CLEAR_FASTZ 0x200u /* TU_FEX_MODE_DEPTH_CLEAR_FASTZ honored (fex4, a7xx) */
++#define TU_FEX_STATUS_BUDGET_CACHE 0x400u /* TU_FEX_MODE_BUDGET_CACHE honored (fex5) */
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -101,7 +114,9 @@ struct tu_fex_channel {
+    struct tu_fex_counter counters[TU_FEX_MAX_COUNTERS];
+    /* 0x1a0: written by FEX while the game runs */
+    volatile uint32_t mode; /* TU_FEX_MODE_* for command buffers begun from now on */
+-   uint32_t reserved1[3];
++   /* 0x1a4 (fex5, driver): /proc/meminfo reads by the memory budget query */
++   volatile uint32_t budget_reads;
++   uint32_t reserved1[2];
+    /* 0x1b0: written by the driver */
+    volatile uint32_t status; /* TU_FEX_STATUS_* */
+    uint32_t patch;           /* TU_FEX_PATCH */
+@@ -131,7 +146,10 @@ struct tu_fex_channel {
+     * disabled (TU_FEX_MODE_DEPTH_CLEAR_FASTZ), and their pixels */
+    volatile uint64_t depth_clears_fastz;
+    volatile uint64_t depth_clear_px_fastz;
+-   uint64_t reserved2[2];
++   /* 0x298 (fex5): memory budget queries, and the nanoseconds they spent
++    * getting the available system memory (file reads included) */
++   volatile uint64_t budget_queries;
++   volatile uint64_t budget_ns;
+ };
+ 
+ /* tu_fex_slot::mode bit (fex3): the pass clears a depth/stencil attachment
+@@ -167,6 +185,8 @@ static_assert(__builtin_offsetof(struct tu_fex_channel, ring_next) == 0x200, "la
+ static_assert(__builtin_offsetof(struct tu_fex_channel, cmdbufs) == 0x208, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, depth_clears) == 0x268, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, depth_clears_fastz) == 0x288, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, budget_reads) == 0x1a4, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, budget_queries) == 0x298, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_channel) == 0x2a8, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
+ 
+@@ -228,6 +248,11 @@ void tu_fex_count_desc(struct tu_device *dev, uint32_t mode, uint32_t sets_flush
+ void tu_fex_count_push(struct tu_device *dev, uint32_t mode, bool reused);
+ void tu_fex_count_depth_clear(struct tu_device *dev, bool draw, bool fastz, uint64_t pixels);
+ 
++/* fex5: the available system memory for the memory budget (bytes), as
++ * os_get_available_system_memory, but read at most every 250 ms while FEX's
++ * mode has TU_FEX_MODE_BUDGET_CACHE; counted in the channel when there is one. */
++bool tu_fex_available_memory(uint64_t *available);
++
+ /* Render pass sampling: begin returns a slot sequence number (0 = not
+  * sampled) to pass to end. Both emit into cs (outside the draw IB). */
+ uint64_t tu_fex_pass_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool sysmem);

@@ -6,8 +6,9 @@
 # the FEX link (TU_FEX_CHANNEL, see Source/Windows/Common/TurnipChannel.h): a descriptor
 # cache fix FEX turns on and off each second, GPU counters around big render passes for
 # FEX's stats log, (fex2) early preambles for loads through push descriptor sets, (fex3)
-# start-of-pass depth clears as 3D draws in direct passes and (fex4) those draws without
-# fragment shader (fast Z). Without FEX's link the driver behaves like stock Turnip.
+# start-of-pass depth clears as 3D draws in direct passes, (fex4) those draws without
+# fragment shader (fast Z) and (fex5) a memory budget query that reads /proc/meminfo at most
+# every 250 ms. Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
 name: Build Turnip (FEX)
@@ -21,7 +22,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex4
+  FEX_PATCH: fex5
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -127,7 +128,8 @@ jobs:
           strings "$so" | grep -q "fex pass ring"
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_depth_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 4" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 5" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "tu_fex_available_memory" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_device.cc"
           grep -q "clear_fs_disable" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_clear_blit.cc"
 
       - name: Package adrenotools zip
@@ -138,7 +140,7 @@ jobs:
           {
             "schemaVersion": 1,
             "name": "Turnip ${MESA_VERSION} FEX ${FEX_PATCH} (build ${{ github.run_number }})",
-            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets and 3D (fast Z) depth clears via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
+            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets, 3D (fast Z) depth clears and a cached memory budget via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
             "author": "FEX-D2-reforged",
             "packageVersion": "${{ github.run_number }}",
             "vendor": "Mesa",
@@ -187,6 +189,11 @@ jobs:
             engine; FEX can switch it each second and the driver counts both kinds.
             fex4 (FEX build 74 and later, FEX_TU_DEPTH_CLEAR=alt|fastz): that 3D clear draw can run with the
             fragment shader disabled (fast Z, as Turnip does for depth-only pipelines), so its pixels don't
-            go through the shader cores. Without FEX's link it behaves like stock Turnip.
+            go through the shader cores.
+            fex5 (FEX build 77 and later, FEX_TU_BUDGET_CACHE=1): the memory budget query
+            (vkGetPhysicalDeviceMemoryProperties2 with VK_EXT_memory_budget, which DXGI's
+            QueryVideoMemoryInfo asks every frame) reads /proc/meminfo at most every 250 ms instead of on
+            every call; the driver counts the queries, the file reads and their time for FEX's stats log.
+            Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

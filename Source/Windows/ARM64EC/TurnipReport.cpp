@@ -149,6 +149,8 @@ namespace {
   uint32_t CurrentMode {};
   uint64_t NextSeq {1};
   uint64_t Last[9][2] {};
+  uint64_t BudgetLast[2] {}; // BudgetQueries, BudgetNs at the last report
+  uint32_t BudgetLastReads {};
 
   bool ReadSlot(uint64_t RingCpu, uint32_t Index, uint32_t SlotSize, uint8_t* Out) {
     SIZE_T Read = 0;
@@ -180,11 +182,16 @@ namespace {
                                                                         "second (FEX_TU_DEPTH_CLEAR=alt)" :
                                                                         "by a 3D draw without fragment shader (fast Z, "
                                                                         "FEX_TU_DEPTH_CLEAR=fastz)";
+    const char* Budget = !FEX::Windows::Turnip::BudgetCacheSwitch() ? "read on every query as stock (FEX_TU_BUDGET_CACHE=0)" :
+                         Chan->Patch < 5                           ? "read on every query: the cache is NOT available (driver older than fex5)" :
+                         !(Status & T::StatusBudgetCache)          ? "read on every query: the cache is NOT honored" :
+                                                                     "read at most every 250 ms (FEX_TU_BUDGET_CACHE=1)";
     FEX::Windows::StatsLogNote(fextl::fmt::format(
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
-      "depth clears at the start of direct passes {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
+      "depth clears at the start of direct passes {}, available memory for the memory budget {}, {} of {} GPU counters "
+      "reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, DepthClear, Chan->CountersReserved, Chan->CounterCount,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, DepthClear, Budget, Chan->CountersReserved, Chan->CounterCount,
       (Status & T::StatusNotKgsl) ? " (not KGSL)" : "", (Status & T::StatusRingFailed) ? ", ring allocation FAILED" : "",
       Chan->RingCount, Chan->SlotSize, Counters.empty() ? "-" : Counters));
   }
@@ -438,6 +445,23 @@ namespace {
       Out += fextl::fmt::format("  turnip: depth clear {} this second | depth clears 2d engine {} ({:.1f} Mpx) 3d draw {} ({:.1f} Mpx), "
                                 "of them fast z {} ({:.1f} Mpx)\n",
                                 Now, Clears[0], ClearPx[0] / 1e6, Clears[1], ClearPx[1] / 1e6, FastZ[0], FastZ[1] / 1e6);
+    }
+
+    // The memory budget query (fex5 and later): how often the game asks, how often the driver read /proc/meminfo, and the
+    // time it took (build 76: D2R's main thread in vkGetPhysicalDeviceMemoryProperties2 ~3% of every second).
+    if (Chan->Patch >= 5) {
+      const uint64_t Queries = Chan->BudgetQueries, Ns = Chan->BudgetNs;
+      const uint32_t Reads = Chan->BudgetReads;
+      const uint64_t DQueries = Queries - BudgetLast[0], DNs = Ns - BudgetLast[1];
+      const uint32_t DReads = Reads - BudgetLastReads;
+      BudgetLast[0] = Queries;
+      BudgetLast[1] = Ns;
+      BudgetLastReads = Reads;
+      if (DQueries) {
+        Out += fextl::fmt::format("  turnip: memory budget queries {} | /proc/meminfo reads {} | {:.1f} us a query, {:.2f} ms this second\n",
+                                  DQueries, DReads, static_cast<double>(DNs) / 1e3 / static_cast<double>(DQueries),
+                                  static_cast<double>(DNs) / 1e6);
+      }
     }
 
     const uint64_t RingCpu = __atomic_load_n(&Chan->RingCpu, __ATOMIC_ACQUIRE);

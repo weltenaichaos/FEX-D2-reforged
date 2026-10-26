@@ -15,6 +15,9 @@
 //  - (fex3 and later) with ModeDepthClear3d in 'Mode', clears a depth/stencil attachment at the start of a direct
 //    (sysmem) pass with a 3D draw through the depth unit instead of the 2D engine, and counts both kinds.
 //  - (fex4 and later) with ModeDepthClearFastZ too, runs that 3D draw with the fragment shader disabled (fast Z).
+//  - (fex5 and later) with ModeBudgetCache, the memory budget query (vkGetPhysicalDeviceMemoryProperties2 with
+//    VK_EXT_memory_budget) reads /proc/meminfo at most every 250 ms instead of on every call, and counts the queries,
+//    the file reads and their time.
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -29,6 +32,7 @@ constexpr uint32_t ModeChangedOnly = 0x1;
 constexpr uint32_t ModePushReuse = 0x2;
 constexpr uint32_t ModeDepthClear3d = 0x4; // fex3 and later
 constexpr uint32_t ModeDepthClearFastZ = 0x8; // fex4 and later: the 3D depth clear draw runs without fragment shader
+constexpr uint32_t ModeBudgetCache = 0x10;    // fex5 and later: /proc/meminfo read at most every 250 ms by the budget query
 // Slot::Mode bit (fex3 and later): the pass clears a depth/stencil attachment at its start.
 constexpr uint8_t SlotDepthClear = 0x80;
 
@@ -44,6 +48,7 @@ constexpr uint32_t StatusNotA7xx = 0x40;
 constexpr uint32_t StatusPushSpeculate = 0x80; // fex2 and later: CompilePushSpeculate honored
 constexpr uint32_t StatusDepthClear3d = 0x100;  // fex3 and later: ModeDepthClear3d honored (a7xx)
 constexpr uint32_t StatusDepthClearFastZ = 0x200; // fex4 and later: ModeDepthClearFastZ honored (a7xx)
+constexpr uint32_t StatusBudgetCache = 0x400;     // fex5 and later: ModeBudgetCache honored
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -77,7 +82,8 @@ struct Channel {
   Counter Counters[MaxCounters]; // 0x020
   // 0x1a0: written by FEX while the game runs
   volatile uint32_t Mode;
-  uint32_t Reserved1[3];
+  volatile uint32_t BudgetReads; // 0x1a4 (fex5 and later, driver): /proc/meminfo reads by the memory budget query
+  uint32_t Reserved1[2];
   // 0x1b0: written by the driver
   volatile uint32_t Status;
   uint32_t Patch;
@@ -103,7 +109,9 @@ struct Channel {
   // 0x288 (fex4 and later): of the 3D draw clears, the ones without fragment shader (ModeDepthClearFastZ)
   volatile uint64_t DepthClearsFastZ;
   volatile uint64_t DepthClearPxFastZ;
-  uint64_t Reserved2[2];
+  // 0x298 (fex5 and later): memory budget queries, and the nanoseconds they spent getting the available system memory
+  volatile uint64_t BudgetQueries;
+  volatile uint64_t BudgetNs;
 };
 
 struct Slot {
@@ -132,6 +140,8 @@ static_assert(offsetof(Channel, RingNext) == 0x200);
 static_assert(offsetof(Channel, CmdBufs) == 0x208);
 static_assert(offsetof(Channel, DepthClears) == 0x268);
 static_assert(offsetof(Channel, DepthClearsFastZ) == 0x288);
+static_assert(offsetof(Channel, BudgetReads) == 0x1a4);
+static_assert(offsetof(Channel, BudgetQueries) == 0x298);
 static_assert(sizeof(Channel) == 0x2a8);
 static_assert(sizeof(Slot) == 48);
 
@@ -142,4 +152,6 @@ uint32_t DescSwitch();
 // FEX_TU_DEPTH_CLEAR: 0 stock (2D engine), 1 3D draw always, 2 3D draw always with fast Z in every other second
 // (needs the stats log), 3 3D draw with fast Z always.
 uint32_t DepthClearSwitch();
+// FEX_TU_BUDGET_CACHE: true = ModeBudgetCache asked for.
+bool BudgetCacheSwitch();
 } // namespace FEX::Windows::Turnip

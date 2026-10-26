@@ -74,3 +74,16 @@ vkd3d's descriptor buffer layouts on the noop drm shim and prints the pipeline s
 Host check: build with `-Dfreedreno-kmds=msm,kgsl -Dtools=freedreno,drm-shim`, run a small
 Vulkan program on `libfreedreno_noop_drm_shim.so` (`FD_GPU_ID=740`) with `FD_RD_DUMP=full`, and
 decode the dump with `cffdump`.
+
+- `0005-fex5-memory-budget-cache.patch` (fex5, build 77): mode bit 4 `TU_FEX_MODE_BUDGET_CACHE`.
+  - `tu_get_budget_memory` (the `VK_EXT_memory_budget` part of
+    `vkGetPhysicalDeviceMemoryProperties2`) gets the available system memory from
+    `tu_fex_available_memory`: with the mode bit, `/proc/meminfo` is read at most every 250 ms
+    and the last `MemAvailable` reused in between (stock reads the file on every call). The
+    channel is looked up once on the first query (it runs on a physical device, maybe before any
+    device exists). Why: D3D12 games ask DXGI for the video memory budget every frame
+    (`QueryVideoMemoryInfo`); build 76's log has D2R's main thread inside
+    `vkGetPhysicalDeviceMemoryProperties2` for 3% of every second of play (~1 ms of every frame).
+  - Statistics: `budget_reads` at 0x1a4 (was `reserved1[0]`), `budget_queries` and `budget_ns`
+    (time spent getting the available memory, file reads included) at 0x298 (were `reserved2`);
+    status bit 0x400. Host check (noop drm shim): 10 us per query reading the file, 0.05 us cached.

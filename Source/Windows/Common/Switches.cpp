@@ -149,6 +149,11 @@ namespace {
     // Build 75: build 74 measured no gain from fast Z (1.19 vs 1.19 ms per 4096 map at the same load; the clear is
     // limited by writing depth to memory), so it is the 3D draw always, without the alternation.
     {"FEX_TU_DEPTH_CLEAR", "1"},
+    // Build 77: build 76 found D2R's main thread in vkGetPhysicalDeviceMemoryProperties2 for 3% of every second of play
+    // (~1 ms of every frame): DXGI's QueryVideoMemoryInfo asks it for the memory budget each frame, and Turnip reads all
+    // of /proc/meminfo for every query. FEX's Turnip fex5 reads it at most every 250 ms and reuses the last value in
+    // between (the budget is a rough estimate anyway); the 'turnip: memory budget' line counts queries, reads and time.
+    {"FEX_TU_BUDGET_CACHE", "1"},
   };
 
   // In the order the stats log lists them.
@@ -211,6 +216,7 @@ namespace {
     "FEX_TU_SAMPLE_DRAWS",
     "FEX_TU_EARLY_PREAMBLE",
     "FEX_TU_DEPTH_CLEAR",
+    "FEX_TU_BUDGET_CACHE",
   };
 
   bool UseD2RDefaults {};

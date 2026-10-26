@@ -129,6 +129,12 @@ namespace FEX::Windows {
 //                          the depth from the vertex shader) in every other second; fastz = always without fragment
 //                          shader. Build 74 measured fast Z: no gain (1.19 vs 1.19 ms per 4096 map), so from build 75
 //                          the D2R default is 1 (the 3D draw always, no alternation).
+//   FEX_TU_BUDGET_CACHE=1  (the D2R default from build 77, driver fex5 and later) the memory budget query
+//                          (vkGetPhysicalDeviceMemoryProperties2 with VK_EXT_memory_budget) reads /proc/meminfo at most
+//                          every 250 ms and reuses the last available memory in between; stock Turnip reads the whole
+//                          file on every query. Build 76: D2R's main thread in that call for 3% of every second of play
+//                          (~1 ms of every frame), as DXGI's QueryVideoMemoryInfo asks for the budget each frame.
+//                          0 = stock. Works without the stats log too (it is part of the mode set before the game).
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

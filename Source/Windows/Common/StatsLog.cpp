@@ -320,6 +320,7 @@ namespace {
     uint64_t WaitNs;
     uint64_t Ticks;
     uint64_t Seen;
+    uint64_t Slices; // times it got a CPU (schedstat's third field)
   };
   struct SchedState {
     bool On;
@@ -333,6 +334,10 @@ namespace {
     uint32_t Tick;
     uint64_t Second;
     SchedPrev Main, Server;
+    // Build 77: the main thread's context switches from its status file: it went to sleep (voluntary) or something else
+    // took its CPU while it could run (nonvoluntary).
+    uint64_t MainVoluntary, MainPreempted;
+    bool HaveMainSwitches;
     // vkd3d-proton's busiest queue thread: it hands the game's GPU work and each frame's present to the driver, so what it
     // waits in tells the GPU apart from the present path. Its /proc syscall file is read every 10ms: "running", or the
     // Linux call it is blocked in with that call's arguments.
@@ -391,6 +396,11 @@ namespace {
     uint64_t PrevIrq[Linux::MaxCPUs];   // /proc/stat: irq+softirq ticks
     bool PrevOk[Linux::MaxCPUs];
     int FastCpu = -1; // the one CPU with the highest maximum clock (the main thread's, FEX_MAINCORE=fast), -1 if none
+    // Build 77: /proc/schedstat's line for FastCpu: all tasks' time on it, their time waiting in its run queue, and how
+    // many times one got it. Less the main thread's own, that is everyone else there.
+    int SchedStatFd = -1;
+    uint64_t PrevCpuRunNs, PrevCpuWaitNs, PrevCpuSlices;
+    bool HavePrevCpu;
     uint64_t PrevCounter;
     bool Have;
     int LogTid;
@@ -470,6 +480,17 @@ namespace {
         Core.FastCpu = -1; // no single fastest CPU
       }
     }
+    if (Core.FastCpu >= 0) {
+      char Probe[64];
+      Core.SchedStatFd = Linux::Open("/proc/schedstat");
+      if (Core.SchedStatFd >= 0 && Linux::Pread(Core.SchedStatFd, Probe, sizeof(Probe) - 1, 0) <= 0) {
+        Linux::Close(Core.SchedStatFd);
+        Core.SchedStatFd = -1;
+      }
+      StatsLogNote(Core.SchedStatFd >= 0 ? "cores: /proc/schedstat readable: the main thread's core gets its other tasks' runs and run queue "
+                                           "waits ('main core' segment)" :
+                                           "cores: /proc/schedstat not readable: no count of other tasks on the main thread's core");
+    }
     char Probe[256];
     Core.StatFd = Linux::Open("/proc/stat");
     const int64_t StatLen = Core.StatFd >= 0 ? Linux::Pread(Core.StatFd, Probe, sizeof(Probe) - 1, 0) : Core.StatFd;
@@ -526,8 +547,41 @@ namespace {
     }
   }
 
-  // MainOnFastMs: the main thread's run time on the fastest CPU this second (< 0 when unknown).
-  fextl::string CoreLine(double GameRunMs, double ServerRunMs, double MainOnFastMs) {
+  // The main thread's run time, run queue wait and runs on the fastest CPU this second (RunMs < 0 when unknown).
+  struct MainOnFast {
+    double RunMs = -1.0;
+    double WaitMs {};
+    double Slices {};
+  };
+
+  // FastCpu's line of /proc/schedstat ("cpuN yld_count 0 sched_count sched_goidle ttwu_count ttwu_local rq_cpu_time
+  // run_delay pcount"): all tasks' run time and run queue wait there (ns) and their runs.
+  bool ReadCpuSchedStat(uint64_t& RunNs, uint64_t& WaitNs, uint64_t& Slices) {
+    static char Buffer[32768]; // the log thread's only
+    const int64_t Len = Core.SchedStatFd >= 0 ? Linux::Pread(Core.SchedStatFd, Buffer + 1, sizeof(Buffer) - 2, 0) : -9;
+    if (Len <= 0) {
+      return false;
+    }
+    Buffer[0] = '\n';
+    Buffer[Len + 1] = 0;
+    const auto Name = fextl::fmt::format("\ncpu{} ", Core.FastCpu);
+    const char* Line = strstr(Buffer, Name.c_str());
+    if (!Line) {
+      return false;
+    }
+    char* P = const_cast<char*>(Line + Name.size());
+    uint64_t Fields[9] {};
+    for (auto& F : Fields) {
+      F = strtoull(P, &P, 10);
+    }
+    RunNs = Fields[6];
+    WaitNs = Fields[7];
+    Slices = Fields[8];
+    return true;
+  }
+
+  fextl::string CoreLine(double GameRunMs, double ServerRunMs, const MainOnFast& Main) {
+    const double MainOnFastMs = Main.RunMs;
     if (!Core.On || !Core.Cpus) {
       return {};
     }
@@ -604,6 +658,26 @@ namespace {
         const double MainShare = std::clamp(MainOnFastMs / 1000.0 / Wall, 0.0, 1.0);
         Out += fextl::fmt::format(" | main core {}: busy {:.0f}%, main thread ~{:.0f}%, interrupts {:.0f}%, other threads ~{:.0f}%", F, Busy * 100.0,
                                   MainShare * 100.0, Irqs * 100.0, std::max(Busy - MainShare - Irqs, 0.0) * 100.0);
+        // Build 77: who else got that core, from the kernel's own count: how many runs, how long, and how long tasks
+        // waited in its run queue (the main thread's own runs and waits taken out).
+        uint64_t RunNs {}, WaitNs {}, Slices {};
+        if (ReadCpuSchedStat(RunNs, WaitNs, Slices)) {
+          if (Core.HavePrevCpu) {
+            const double AllRunMs = static_cast<double>(RunNs - Core.PrevCpuRunNs) / 1e6;
+            const double AllWaitMs = static_cast<double>(WaitNs - Core.PrevCpuWaitNs) / 1e6;
+            const double AllSlices = static_cast<double>(Slices - Core.PrevCpuSlices);
+            const double OtherRuns = std::max(AllSlices - Main.Slices, 0.0);
+            const double OtherMs = std::max(AllRunMs - MainOnFastMs, 0.0);
+            Out += fextl::fmt::format(", others ran {:.0f} times for {:.1f} ms ({:.2f} ms a run) and waited {:.1f} ms there, the main "
+                                      "thread ran {:.0f} times",
+                                      OtherRuns, OtherMs, OtherRuns > 0 ? OtherMs / OtherRuns : 0.0, std::max(AllWaitMs - Main.WaitMs, 0.0),
+                                      Main.Slices);
+          }
+          Core.PrevCpuRunNs = RunNs;
+          Core.PrevCpuWaitNs = WaitNs;
+          Core.PrevCpuSlices = Slices;
+          Core.HavePrevCpu = true;
+        }
       }
     }
     if (Core.LoadavgFd >= 0) {
@@ -1404,7 +1478,7 @@ namespace {
   }
 
   // Run and wait time of a task since the last call, in ms; false when its schedstat can't be read.
-  bool SchedDelta(const fextl::string& Dir, SchedPrev& Prev, double& RunMs, double& WaitMs, uint64_t Second) {
+  bool SchedDelta(const fextl::string& Dir, SchedPrev& Prev, double& RunMs, double& WaitMs, uint64_t Second, uint64_t* Slices = nullptr) {
     Linux::SchedStat S {};
     if (!Linux::ReadSchedStat((Dir + "/schedstat").c_str(), S)) {
       return false;
@@ -1412,10 +1486,30 @@ namespace {
     const bool Fresh = Prev.Seen == 0 || Prev.Seen + 1 != Second;
     RunMs = Fresh ? 0.0 : static_cast<double>(S.RunNs - Prev.RunNs) / 1e6;
     WaitMs = Fresh ? 0.0 : static_cast<double>(S.WaitNs - Prev.WaitNs) / 1e6;
+    if (Slices) {
+      *Slices = Fresh ? 0 : S.Slices - Prev.Slices;
+    }
     Prev.RunNs = S.RunNs;
     Prev.WaitNs = S.WaitNs;
+    Prev.Slices = S.Slices;
     Prev.Seen = Second;
     return !Fresh;
+  }
+
+  // "voluntary_ctxt_switches:\t12" and "nonvoluntary_ctxt_switches:\t3" from a thread's status file.
+  bool ReadSwitches(const fextl::string& StatusPath, uint64_t& Voluntary, uint64_t& Preempted) {
+    char Buffer[2048];
+    if (Linux::ReadSmallFile(StatusPath.c_str(), Buffer, sizeof(Buffer)) <= 0) {
+      return false;
+    }
+    const char* V = strstr(Buffer, "\nvoluntary_ctxt_switches:");
+    const char* N = strstr(Buffer, "\nnonvoluntary_ctxt_switches:");
+    if (!V || !N) {
+      return false;
+    }
+    Voluntary = strtoull(V + 25, nullptr, 10);
+    Preempted = strtoull(N + 28, nullptr, 10);
+    return true;
   }
 
   // GPU view (on with the stats log; FEX_GPULOG=0 turns it off), from the Adreno driver's sysfs files, read with direct
@@ -1536,23 +1630,41 @@ namespace {
     }
     Sched.Second = Seconds;
     fextl::string Out;
-    double GameRunMs {}, ServerRunMs {}, MainOnFastMs = -1.0;
+    double GameRunMs {}, ServerRunMs {};
+    MainOnFast MainFast;
 
     // The main thread.
     {
       const auto Dir = fextl::fmt::format("/proc/self/task/{}", Sched.Pid);
       double RunMs {}, WaitMs {};
-      const bool Have = SchedDelta(Dir, Sched.Main, RunMs, WaitMs, Seconds);
+      uint64_t Slices {};
+      const bool Have = SchedDelta(Dir, Sched.Main, RunMs, WaitMs, Seconds, &Slices);
       Linux::TaskStat S {};
       const bool HaveStat = Linux::ReadTaskStat((Dir + "/stat").c_str(), S);
-      Out += fextl::fmt::format("  sched main {} run={} wait={} nice={} allowed={:#x} on{} (runnable {}/{} samples)\n",
+      // Build 77: how many times it got a CPU (and its average wait for one), went to sleep, and lost its CPU while it
+      // could still run (preempted: something else took the core).
+      fextl::string Runs;
+      if (Have) {
+        Runs = fextl::fmt::format(" | ran {} times, waited {:.2f} ms a time", Slices, Slices ? WaitMs / static_cast<double>(Slices) : 0.0);
+      }
+      uint64_t Voluntary {}, Preempted {};
+      if (ReadSwitches(Dir + "/status", Voluntary, Preempted)) {
+        if (Sched.HaveMainSwitches) {
+          Runs += fextl::fmt::format(", slept {} times, preempted {} times", Voluntary - Sched.MainVoluntary, Preempted - Sched.MainPreempted);
+        }
+        Sched.MainVoluntary = Voluntary;
+        Sched.MainPreempted = Preempted;
+        Sched.HaveMainSwitches = true;
+      }
+      Out += fextl::fmt::format("  sched main {} run={} wait={} nice={} allowed={:#x} on{} (runnable {}/{} samples){}\n",
                                 HaveStat ? S.Comm : "?", Have ? fextl::fmt::format("{:.0f}ms", RunMs) : fextl::string("-"),
                                 Have ? fextl::fmt::format("{:.1f}ms", WaitMs) : fextl::string("-"), HaveStat ? S.Nice : 0,
                                 Linux::GetAffinity(Sched.Pid), SchedCores(Sched.MainRunnable, Sched.MainCores), Sched.MainRunnable,
-                                Sched.MainSamples);
-      // Its time on the fastest CPU: run time split by where the 10 ms samples found it runnable.
+                                Sched.MainSamples, Runs);
+      // Its time on the fastest CPU: run time (and waits and runs) split by where the 10 ms samples found it runnable.
       if (Have && Core.FastCpu >= 0 && Sched.MainRunnable) {
-        MainOnFastMs = RunMs * Sched.MainCores[Core.FastCpu] / Sched.MainRunnable;
+        const double Share = static_cast<double>(Sched.MainCores[Core.FastCpu]) / static_cast<double>(Sched.MainRunnable);
+        MainFast = {.RunMs = RunMs * Share, .WaitMs = WaitMs * Share, .Slices = static_cast<double>(Slices) * Share};
       }
     }
 
@@ -1733,7 +1845,7 @@ namespace {
       Out += fextl::fmt::format("  sched procs 5s (name/pid % of a core):{}\n", Text.empty() ? " -" : Text.c_str());
     }
 
-    Out += CoreLine(GameRunMs, ServerRunMs, MainOnFastMs);
+    Out += CoreLine(GameRunMs, ServerRunMs, MainFast);
     Out += SystemLine(ServerRunMs);
     CgroupCheck();
 
@@ -3682,9 +3794,13 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "for a suspend request in emulated code (time suspended shows as fex:suspended); probe = the stall "
                        "probe's longest waits this second, stalls[...] on a '# frame' line = its waits of 2ms or more during "
                        "that frame; '# prio' = thread priority changes (FEX_PRIO); '# cores' = thread core changes (FEX_MAINCORE, "
-                       "FEX_HELPER_CORES, FEX_MAINCORE_OTHERS: other programs' threads moved off the main thread's core); '# server' = wineserver nice (FEX_SERVER_NICE); sched main/server = Linux view of "
+                       "FEX_HELPER_CORES, FEX_MAINCORE_OTHERS: other programs' threads moved off the main thread's core, threads hidden from "
+                       "/proc such as the launcher's own process by their cgroup group pid_N); '# server' = wineserver nice (FEX_SERVER_NICE); "
+                       "sched main/server = Linux view of "
                        "the main thread and the wineserver: CPU time (run), time ready but without a CPU (wait), nice, allowed "
-                       "CPUs, and which CPU it was on while runnable (sampled every 10ms); sched threads = the busiest threads "
+                       "CPUs, and which CPU it was on while runnable (sampled every 10ms), for the main thread how many times it got "
+                       "a CPU and its average wait for one, how many times it went to sleep and how many times something else took "
+                       "its CPU while it could run (preempted); sched threads = the busiest threads "
                        "(Linux name/tid run+wait ms @last CPU); sched procs 5s = other processes of this user by CPU use; waits main = "
                        "handles the "
                        "main thread waited on this second (kind, /latency = a swapchain frame latency handle, +N = released N more "
@@ -3699,7 +3815,9 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "cores busy% = how busy each CPU was, whoever ran there (? = can't tell), the game's CPUs' busy time split "
                        "into this process, the wineserver and others (other apps, Android, the launcher, the kernel), paused = "
                        "share of the second the kernel had a CPU out of use, main core N = the main thread's core: busy, the main "
-                       "thread's share, interrupts, other threads, runnable = runnable tasks of the whole system, cpu "
+                       "thread's share, interrupts, other threads, and from the kernel's count (/proc/schedstat) how many times "
+                       "other tasks ran there, for how long, how long tasks other than the main thread waited in its run queue "
+                       "and how many times the main thread ran there; runnable = runnable tasks of the whole system, cpu "
                        "pressure = share of the second some task waited for a CPU; system busy = the whole device's busy CPU "
                        "time in cores by kind (user, low prio = user at lowered priority, kernel, irq), this process, the "
                        "wineserver, app group = this app's Android group (the launcher's own process and Wine's processes), "

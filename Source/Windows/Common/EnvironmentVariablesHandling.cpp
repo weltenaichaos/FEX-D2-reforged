@@ -231,6 +231,7 @@ namespace {
   Turnip::Channel* TurnipChannelPtr {};
   uint32_t TurnipDesc {};
   uint32_t TurnipDepthClear {};
+  bool TurnipBudgetCache {};
 
   bool SwitchOff(const char* Value) {
     return !Value || (Value[0] == '0' && !Value[1]);
@@ -274,9 +275,14 @@ namespace {
                        (DepthClear[0] == 'a' || DepthClear[0] == 'A') ? 2 :
                        (DepthClear[0] == 'f' || DepthClear[0] == 'F') ? 3 :
                                                                           1;
+    // FEX_TU_BUDGET_CACHE: 1 (default) = the driver's memory budget query reads /proc/meminfo at most every 250 ms (driver
+    // fex5 and later); 0 = on every call, as stock. Build 76: D2R's main thread spent 3% of every second of play (~1 ms of
+    // every frame) in vkGetPhysicalDeviceMemoryProperties2, which DXGI's QueryVideoMemoryInfo calls each frame for the
+    // budget, and stock Turnip reads the whole of /proc/meminfo for every call.
+    TurnipBudgetCache = !SwitchOff(Switch("FEX_TU_BUDGET_CACHE"));
     Chan->Mode = (TurnipDesc ? (Turnip::ModeChangedOnly | Turnip::ModePushReuse) : 0) |
                  (TurnipDepthClear ? Turnip::ModeDepthClear3d : 0) |
-                 (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0);
+                 (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0) | (TurnipBudgetCache ? Turnip::ModeBudgetCache : 0);
 
     // FEX_TU_COUNTERS: 1 (default) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at least this many
     // draws get timed and counted (default 100: the main pass, the depth prepass and the shadow maps in towns and
@@ -349,9 +355,9 @@ namespace {
     }
     TurnipChannelPtr = Chan;
     StatsLogNote(fextl::fmt::format("turnip: FEX link TU_FEX_CHANNEL={} set: descriptor fix {}, early preamble for root constant "
-                                    "buffers {}, depth clears at pass start {}, {} GPU counters asked for, passes with {}+ draws "
-                                    "timed and counted; only FEX's Turnip build (fex1 and later) answers, a '# turnip: driver' "
-                                    "note follows once it did",
+                                    "buffers {}, depth clears at pass start {}, memory budget {}, {} GPU counters asked for, passes "
+                                    "with {}+ draws timed and counted; only FEX's Turnip build (fex1 and later) answers, a '# turnip: "
+                                    "driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
                                     Chan->Compile ? "asked for (FEX_TU_EARLY_PREAMBLE=1, driver fex2 and later)" : "off (FEX_TU_EARLY_PREAMBLE=0)",
                                     TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
@@ -360,6 +366,9 @@ namespace {
                                                             "driver fex4 and later)" :
                                     TurnipDepthClear      ? "by a 3D draw (FEX_TU_DEPTH_CLEAR=1, driver fex3 and later)" :
                                                             "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)",
+                                    TurnipBudgetCache ? "reads /proc/meminfo at most every 250 ms (FEX_TU_BUDGET_CACHE=1, driver fex5 "
+                                                        "and later)" :
+                                                        "reads /proc/meminfo on every query as stock (FEX_TU_BUDGET_CACHE=0)",
                                     Chan->CounterCount, Chan->SampleMinDraws));
   }
 } // namespace
@@ -426,6 +435,9 @@ namespace Turnip {
   }
   uint32_t DepthClearSwitch() {
     return TurnipDepthClear;
+  }
+  bool BudgetCacheSwitch() {
+    return TurnipBudgetCache;
   }
 } // namespace Turnip
 } // namespace FEX::Windows
