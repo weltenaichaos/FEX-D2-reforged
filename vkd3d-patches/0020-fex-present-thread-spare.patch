@@ -1,0 +1,50 @@
+From bf3927c3e65042f5475b1ab78ebed0f87d13e4c8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 19:26:42 +0000
+Subject: [PATCH] FEX: spare time with the present thread is the smaller of the
+ present's and the GPU's room
+
+With the present thread (fex19) the frame's command lists no longer wait
+behind the queue thread, so the queue thread's wait no longer adds to the
+GPU's time ahead. Up to fex19 it did: busy seconds showed 48-56 ms spare
+where the GPU was 30 ms ahead, and the hold-back made a frame late every
+20 s (26-29 s in the fex18 runs).
+---
+ libs/vkd3d/swapchain.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index a36c792..e74ad3b 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -2302,7 +2302,8 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+             vkd3d_fex_latency_resync_on ? "on (hand-outs held back when the game runs frames ahead of its latency:"
+                     " VKD3D fex16)" : "off",
+             chain->fex_present.enable ? "on (pre-sleep, drawn frame wait and vkQueuePresentKHR off the queue thread, the"
+-                    " next frame's lists reach the GPU meanwhile; no present id, frame done from the CPU: VKD3D fex19)" :
++                    " next frame's lists reach the GPU meanwhile; no present id, frame done from the CPU: VKD3D fex19; spare time"
++                    " the smaller of the present's and the GPU's: VKD3D fex20)" :
+                     vkd3d_fex_present_thread_on ? "off (needs the frame done thread and present wait support)" : "off",
+             families[VKD3D_QUEUE_FAMILY_GRAPHICS]->vk_family_index, families[VKD3D_QUEUE_FAMILY_GRAPHICS]->queue_count,
+             families[VKD3D_QUEUE_FAMILY_COMPUTE]->vk_family_index, families[VKD3D_QUEUE_FAMILY_COMPUTE]->queue_count,
+@@ -4260,7 +4261,16 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+          * a later frame would only have saved as far as the GPU had the frame done before vkQueuePresentKHR returned. */
+         held = (int64_t)(qp_end_ns - hold_start_ns);
+         gpu_ahead = (int64_t)qp_end_ns - (int64_t)gpu_done_ns;
+-        spare = queue_wait + min(held, gpu_ahead);
++        /* Present thread (VKD3D fex19): the frame's command lists no longer wait behind the queue thread, so a later
++         * start moves the GPU's finish later right away. The present still had the time it waited for the queue
++         * thread (now mostly for the present thread to finish the present before) and the cap, the GPU only what it had
++         * done ahead: the smaller of the two. Up to fex19 the queue thread's wait was added to the GPU's time ahead
++         * as well (fex19 log: spare times 48-56 ms in busy seconds where the GPU was 30 ms ahead, and a frame made
++         * late by the hold-back every 20 s against every 26-29 s in the fex18 runs). */
++        if (chain->fex_present.enable)
++            spare = min(queue_wait + held, gpu_ahead);
++        else
++            spare = queue_wait + min(held, gpu_ahead);
+         /* Busy GPU (fights): the GPU was still on the frame before when the game called Present(), so this frame's
+          * command lists, all given before Present(), waited for the GPU anyway and would have reached it just as early
+          * had the frame started that much later. The present itself still has to reach the queue thread in time: it
+-- 
+2.43.0
+
