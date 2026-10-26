@@ -39,6 +39,9 @@ namespace {
     {"FEX_MAINCORE", "fast"},
     {"FEX_HELPER_CORES", "little"},
     {"FEX_SERVER_NICE", "-10"},
+    // Build 83: the main thread at nice -10 too. In the build 82 log other programs took most of its core for 6 s and 17 of
+    // the run's 58 frames of 40 ms or more came then (see PriorityGuard.h).
+    {"FEX_MAIN_NICE", "-10"},
     // Build 51: the main thread may leave its core while it waits 40 ms a second or more for it (see PriorityGuard.h).
     {"FEX_MAINCORE_WAIT", "40"},
     // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
@@ -88,6 +91,10 @@ namespace {
     // disk reads during play in the fex10 run, around the 100-140 ms streaming hitches), and read-ahead is shorter
     // (see ARM64EC/NativeUnpackCache.cpp).
     {"FEX_UNPACK_CACHE_PLAY", "1"},
+    // Build 83: unpack cache read-ahead grows along the game's reads instead of reading 8 MB past every hit. In the build 82
+    // run 52% of the 27 GB read ahead was never used, and while the game streamed a new area during play storage read
+    // ~1 GB/s, ~3/4 of it this read-ahead (see ARM64EC/NativeUnpackCache.cpp).
+    {"FEX_UNPACK_CACHE_AHEAD", "ramp"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
@@ -184,6 +191,7 @@ namespace {
     "FEX_UNPACK_CACHE_READAHEAD_MB",
     "FEX_UNPACK_CACHE_DIRECT",
     "FEX_UNPACK_CACHE_PLAY",
+    "FEX_UNPACK_CACHE_AHEAD",
     "FEX_GAME_FILES_UNCACHED",
     "FEX_GAME_FILES_MS",
     "FEX_GAME_FILES_KEEP_MB",
@@ -206,6 +214,7 @@ namespace {
     "FEX_MAINCORE_OTHERS",
     "FEX_HELPER_CORES",
     "FEX_SERVER_NICE",
+    "FEX_MAIN_NICE",
     "FEX_LOADER_CORES",
     "FEX_LOADER_WATCH",
     "FEX_LOADER_GAME_EXCEPTIONS",

@@ -39,6 +39,15 @@ $end_info$
 // used, on the storage the main thread's file reads wait for. So while fewer than PlayMaxLookups lookups came in the last and in the current PlayWindowMs, a hit
 // that isn't in read-ahead memory counts as a miss (the game unpacks it itself), and read-ahead reads PlayAheadChunks
 // past a hit instead of AheadChunks. Loads keep the full cache.
+//
+// Read-ahead that grows along the reads (FEX_UNPACK_CACHE_AHEAD=ramp, from build 83): up to build 82 every hit read the
+// AheadChunks after it, however far the game went on reading in order. In the build 82 run 27 GB were read ahead, 52% of
+// it never used (50-71% at every lookup rate, so not memory that was too small, but reads that stopped long before the
+// 8 MB after them). While the game streamed a new area during play, storage read ~1 GB/s for seconds, ~3/4 of it this
+// read-ahead, with up to 18% of the main thread's core going to interrupts. Now a hit reads 1 chunk past itself, and
+// one more for every 2 chunks before it the game already used in order, up to AheadChunks (PlayAheadChunks while
+// playing); a run of disk hits in sequence reads its own chunk and the next. FEX_UNPACK_CACHE_AHEAD=fixed reads the
+// whole distance past every hit as before.
 
 #include "NativeUnpackCache.h"
 #include "Windows/Common/LinuxSys.h"
@@ -180,6 +189,8 @@ struct Cache {
   uint64_t AheadClock {};
   uint64_t RecentDisk[RecentDiskChunks] {}; // chunk + 1, 0 = empty
   size_t RecentDiskNext {};
+
+  bool AheadRamp {}; // FEX_UNPACK_CACHE_AHEAD, see above
 
   // Telling play from loads by the lookup rate, see FEX_UNPACK_CACHE_PLAY above.
   bool PlayGate {};
@@ -433,7 +444,25 @@ void RequestChunksLocked(Cache* C, uint64_t First, uint64_t Count) {
   }
 }
 
-// Copies the entry's data out of read-ahead memory if all of it is there, and asks for Distance chunks after it.
+// How many chunks to read past a hit at First, at most Distance: with FEX_UNPACK_CACHE_AHEAD=ramp one, plus one for every
+// two chunks right before First the game already used, in order. Takes AheadLock.
+uint64_t LeadLocked(Cache* C, uint64_t First, uint64_t Distance) {
+  if (!C->AheadRamp) {
+    return Distance;
+  }
+  uint64_t Run = 0;
+  for (uint64_t Chunk = First; Chunk > 0 && Run < 2 * Distance;) {
+    --Chunk;
+    const auto It = C->ChunkSlots.find(Chunk);
+    if (It == C->ChunkSlots.end() || C->Slots[It->second].Loading || !C->Slots[It->second].Used) {
+      break;
+    }
+    ++Run;
+  }
+  return std::min(Distance, 1 + Run / 2);
+}
+
+// Copies the entry's data out of read-ahead memory if all of it is there, and asks for up to Distance chunks after it.
 bool CopyFromMemory(Cache* C, const Entry& E, uint8_t* Out, uint64_t Distance) {
   const uint64_t First = E.Offset / ChunkSize;
   const uint64_t Last = (E.Offset + E.Produced - 1) / ChunkSize;
@@ -458,7 +487,7 @@ bool CopyFromMemory(Cache* C, const Entry& E, uint8_t* Out, uint64_t Distance) {
       S.Used = true;
       Pinned[Chunk - First] = Index;
     }
-    RequestChunksLocked(C, Last + 1, Distance);
+    RequestChunksLocked(C, Last + 1, LeadLocked(C, First, Distance));
   }
   uint64_t Done {};
   for (uint64_t Chunk = First; Chunk <= Last; ++Chunk) {
@@ -475,7 +504,8 @@ bool CopyFromMemory(Cache* C, const Entry& E, uint8_t* Out, uint64_t Distance) {
 }
 
 // A hit wasn't in read-ahead memory. When it follows another recent one in data.bin, the hits are coming in sequence:
-// read its chunk and the Distance ones after it into memory.
+// read its chunk and the Distance ones after it into memory (with FEX_UNPACK_CACHE_AHEAD=ramp the next one only; the
+// hits in them then read further).
 void NoteDiskHit(Cache* C, const Entry& E, uint64_t Distance) {
   const uint64_t Chunk = E.Offset / ChunkSize;
   std::scoped_lock Guard {C->AheadLock};
@@ -486,7 +516,7 @@ void NoteDiskHit(Cache* C, const Entry& E, uint64_t Distance) {
   C->RecentDisk[C->RecentDiskNext] = Chunk + 1;
   C->RecentDiskNext = (C->RecentDiskNext + 1) % RecentDiskChunks;
   if (Sequential) {
-    RequestChunksLocked(C, Chunk, Distance + 1);
+    RequestChunksLocked(C, Chunk, (C->AheadRamp ? std::min<uint64_t>(Distance, 1) : Distance) + 1);
   }
 }
 
@@ -1051,6 +1081,8 @@ bool Init(bool MD5Cache) {
   if (C->ReadAheadSlots && C->ReadAheadSlots < AheadChunks + MaxHitChunks) {
     C->ReadAheadSlots = AheadChunks + MaxHitChunks;
   }
+  const char* AheadMode = FEX::Windows::Switch("FEX_UNPACK_CACHE_AHEAD");
+  C->AheadRamp = !(AheadMode && AheadMode[0] == 'f');
   const char* PlayEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_PLAY");
   C->PlayGate = PlayEnv && PlayEnv[0] == '1';
   C->WindowTicks = std::max<uint64_t>(TickFrequency * PlayWindowMs / 1000, 1);
@@ -1083,6 +1115,16 @@ bool Init(bool MD5Cache) {
                                      "(FEX_UNPACK_CACHE_PLAY=0 turns it off)",
                                      PlayMaxLookups, PlayWindowMs, PlayAheadChunks * ChunkSize >> 20, AheadChunks * ChunkSize >> 20) :
                   fextl::string("unpack cache: play and loads alike, every hit read (FEX_UNPACK_CACHE_PLAY=1 leaves disk hits during play to the game)"));
+  if (C->ReadAheadSlots) {
+    FEX::Windows::StatsLogNote(
+      C->AheadRamp ? fextl::fmt::format("unpack cache: read-ahead grows along the reads: 1 MB past a hit, 1 MB more for every 2 MB before it the game "
+                                        "already used in order, up to {} MB ({} while playing); disk hits in sequence read their own MB and the next "
+                                        "(FEX_UNPACK_CACHE_AHEAD=fixed reads the whole distance past every hit, as build 82)",
+                                        AheadChunks * ChunkSize >> 20, PlayAheadChunks * ChunkSize >> 20) :
+                     fextl::fmt::format("unpack cache: read-ahead the whole {} MB past every hit ({} while playing; FEX_UNPACK_CACHE_AHEAD=ramp "
+                                        "grows it along the reads)",
+                                        AheadChunks * ChunkSize >> 20, PlayAheadChunks * ChunkSize >> 20));
+  }
   return true;
 }
 

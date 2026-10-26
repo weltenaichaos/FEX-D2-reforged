@@ -69,6 +69,17 @@ namespace FEX::Windows {
 //
 //   FEX_SERVER_NICE=N  run the wineserver at Linux nice N (D2R default -10; "off" leaves it alone)
 //
+// Main thread. Wine runs it at nice -2 (D2R asks for TIME_CRITICAL, FEX_PRIO=normal puts it back to NORMAL, and Wine adds
+// one for the foreground). In the build 82 log other programs (an app of another Android user and root's processes) took
+// up to 87% of the main thread's core for 6 seconds at 4:58: the main thread waited 110-190 ms a second for a CPU, was
+// eased onto the game's other big cores where the workers keep them ~90% busy, and 17 of the run's 58 frames of 40 ms or
+// more came in those seconds. Linux shares a core between busy threads by their nice: at -2 against a nice-0 program the
+// main thread gets ~61% of it, at -10 ~90%. (A short task that wakes up still runs first; nice limits only the ones
+// that keep running.)
+//
+//   FEX_MAIN_NICE=N    keep the main thread at Linux nice N, checked every 250 ms (D2R default -10, as the wineserver;
+//                      "off" leaves it to Wine). '# prio: main thread ... nice' notes say when it was set.
+//
 // Loader threads. In the fex10 run (FEX build 61) one thread of D2R's (tid 576) ran almost only code in a private
 // allocation next to D2R_loader.dll (the game's protection/loader code), not in D2R.exe or any loaded module. In 36% of
 // the play time it was busy: a CreateEventW / WaitForMultipleObjects / CloseHandle loop at ~0.65 of a big core, plus ~0.25

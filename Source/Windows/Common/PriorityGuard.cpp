@@ -99,7 +99,9 @@ namespace {
     bool HelpersLittle;
     bool ServerNiceOn;
     int ServerNice;
-    uint64_t FastMask;   // the CPU(s) with the highest maximum clock, 0 when all are alike or unknown
+    bool MainNiceOn;
+    int MainNice;
+    uint64_t FastMask;  // the CPU(s) with the highest maximum clock, 0 when all are alike or unknown
     uint64_t LittleMask; // the CPU(s) with the lowest maximum clock, 0 when all are alike or unknown
     uint64_t AllMask;    // every CPU with a known clock, 0 when Windows numbers them differently
     uint32_t MainTID;    // the thread that started the process (FEX's process init runs on it)
@@ -875,6 +877,50 @@ namespace {
   // in build 49): something outside the game runs there then. When it waits FEX_MAINCORE_WAIT ms (default 40) or more in
   // a second, it may also use the game's other big cores until it has waited under 10 ms a second for a while (5 s, longer
   // when it had to leave again soon after coming back).
+  // Keeps the main thread at Linux nice FEX_MAIN_NICE (see PriorityGuard.h). Wine sets a thread's nice from its Windows
+  // priority only when that priority changes (the round above does that once at start, from D2R's TIME_CRITICAL), so
+  // this mostly sets it once; it is checked every 250 ms all the same, like the core.
+  struct MainNiceKeeper {
+    int Tid; // 0: off
+    int Nice;
+    uint32_t Sets;
+    uint32_t Failures;
+    uint32_t FailuresInRow;
+  };
+
+  void KeepMainNice(MainNiceKeeper& K) {
+    if (!K.Tid) {
+      return;
+    }
+    const int Now = Linux::GetNice(K.Tid);
+    if (Now == -1000 || Now == K.Nice) {
+      if (Now == -1000) {
+        StatsLogNote(fextl::fmt::format("prio: main thread (Linux {}) gone, its nice no longer kept", K.Tid));
+        K.Tid = 0;
+      }
+      return;
+    }
+    const int Result = Linux::SetNice(K.Tid, K.Nice);
+    const int After = Linux::GetNice(K.Tid);
+    if (Result == 0) {
+      ++K.Sets;
+      K.FailuresInRow = 0;
+    } else {
+      ++K.Failures;
+      ++K.FailuresInRow;
+    }
+    const uint32_t Times = K.Sets + K.Failures;
+    if (Times <= 4 || (Times & (Times - 1)) == 0) {
+      StatsLogNote(fextl::fmt::format("prio: main thread (Linux {}) nice {} -> {} ({}; set {} times, failed {} times; FEX_MAIN_NICE=off leaves it)",
+                                      K.Tid, Now, After, Result == 0 ? fextl::string("set") : fextl::fmt::format("errno {}", -Result),
+                                      K.Sets, K.Failures));
+    }
+    if (K.FailuresInRow >= 8) {
+      StatsLogNote(fextl::fmt::format("prio: main thread's nice can't be set (errno {}), no longer tried", -Result));
+      K.Tid = 0;
+    }
+  }
+
   struct MainKeeper {
     int Tid;
     uint32_t EaseMs;
@@ -1331,6 +1377,7 @@ namespace {
     int ServerPid {};
     uint32_t ServerCoreReports {};
     MainKeeper Keeper {.Tid = C->Cores == CoreMode::Fast ? C->MainLinuxTid : 0, .EaseMs = C->EaseWaitMs};
+    MainNiceKeeper NiceKeeper {.Tid = C->MainNiceOn ? C->MainLinuxTid : 0, .Nice = C->MainNice};
     Keeper.StatusPath = fextl::fmt::format("/proc/self/task/{}/status", Keeper.Tid);
     uint64_t KeepFast {}, KeepWide {};
     LoaderFinder Finder {.C = C};
@@ -1534,6 +1581,7 @@ namespace {
         LARGE_INTEGER Interval {.QuadPart = -2'500'000}; // 250ms
         NtDelayExecution(FALSE, &Interval);
         KeepMainCore(Keeper, KeepFast, KeepWide);
+        KeepMainNice(NiceKeeper);
         if (C->Loader != LoaderMode::Off) {
           LoaderTick(Finder, Threads);
         }
@@ -1578,6 +1626,11 @@ void StartPriorityGuard(std::string_view AppName) {
     C->ServerNiceOn = true;
     C->ServerNice = std::clamp(atoi(ServerNice), -20, 19);
   }
+  const char* MainNice = Switch("FEX_MAIN_NICE");
+  if (MainNice && MainNice[0] != 'o' && (MainNice[0] == '-' || (MainNice[0] >= '0' && MainNice[0] <= '9'))) {
+    C->MainNiceOn = true;
+    C->MainNice = std::clamp(atoi(MainNice), -20, 19);
+  }
 
   StatsLogNote(C->Prio == PrioMode::Keep ? fextl::fmt::format("prio: off, Windows thread priorities pass through to Linux nice "
                                                                "(FEX_PRIO=normal keeps every thread at nice 0)") :
@@ -1609,6 +1662,10 @@ void StartPriorityGuard(std::string_view AppName) {
   }
   StatsLogNote(C->ServerNiceOn ? fextl::fmt::format("server: wineserver to nice {} (FEX_SERVER_NICE=off leaves it alone)", C->ServerNice) :
                                  fextl::string("server: wineserver nice left alone"));
+  StatsLogNote(C->MainNiceOn ? fextl::fmt::format("prio: main thread (Linux {}) kept at nice {}, checked every 250 ms (FEX_MAIN_NICE=off leaves "
+                                                  "it to Wine)",
+                                                  C->MainLinuxTid, C->MainNice) :
+                               fextl::string("prio: main thread's nice left to Wine"));
 
   const fextl::string Exe = fextl::fmt::format("main exe {:X}-{:X}", C->ExeBase, C->ExeEnd);
   StatsLogNote(C->Loader == LoaderMode::Little ?
@@ -1634,7 +1691,8 @@ void StartPriorityGuard(std::string_view AppName) {
                                                     "keeps threads raising 400 or more within 2 s off the slowest cores)"));
   }
 
-  if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && C->Loader == LoaderMode::Off) {
+  if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && !C->MainNiceOn &&
+      C->Loader == LoaderMode::Off) {
     delete C;
     return;
   }
