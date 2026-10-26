@@ -136,13 +136,15 @@ int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size) {
 }
 
 bool Stat(const char* Path, FileInfo& Out) {
-  // struct stat of arm64 Linux (asm-generic): st_mode at byte 16, st_uid at 24, st_size at 48, 128 bytes in all.
+  // struct stat of arm64 Linux (asm-generic): st_ino at byte 8, st_mode at 16, st_uid at 24, st_size at 48, 128 bytes in
+  // all.
   alignas(8) uint8_t Buffer[128];
   if (Syscall(NR_newfstatat, AT_FDCWD, reinterpret_cast<intptr_t>(Path), reinterpret_cast<intptr_t>(Buffer), 0) != 0) {
     return false;
   }
   uint32_t Mode {};
   int64_t Size {};
+  memcpy(&Out.Inode, Buffer + 8, sizeof(Out.Inode));
   memcpy(&Mode, Buffer + 16, sizeof(Mode));
   memcpy(&Out.Uid, Buffer + 24, sizeof(Out.Uid));
   memcpy(&Size, Buffer + 48, sizeof(Size));

@@ -22,6 +22,7 @@ int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size);
 // What a path names (following symbolic links), from fstatat. False when it can't be looked at.
 struct FileInfo {
   uint64_t Size;
+  uint64_t Inode;
   uint32_t Uid; // the owner
   bool Regular;
   bool Directory;
