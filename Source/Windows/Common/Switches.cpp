@@ -95,11 +95,13 @@ namespace {
     // run 52% of the 27 GB read ahead was never used, and while the game streamed a new area during play storage read
     // ~1 GB/s, ~3/4 of it this read-ahead (see ARM64EC/NativeUnpackCache.cpp).
     {"FEX_UNPACK_CACHE_AHEAD", "ramp"},
-    // Build 84: FEX's translated-code buffer starts at its full 128 MB, and is renewed at a loading screen once half used,
-    // rather than filling (and dropping all code) in play. In the build 83 log every thread reloaded its code at once at
-    // 6:21, 5,301 blocks on the main thread in one second, with no file reads (see ARM64EC/CodeBuffer.h).
+    // Build 84: FEX's translated-code buffer starts at its full 128 MB, and is renewed at a loading screen once half used
+    // (10% at the first three: start-up, menus, entering the game), rather than filling (and dropping all code) in play.
+    // In the build 83 log every thread reloaded its code at once at 6:21, 5,301 blocks on the main thread in one second,
+    // with no file reads (see ARM64EC/CodeBuffer.h).
     {"FEX_CODE_BUFFER_START", "max"},
     {"FEX_CODE_BUFFER_RENEW", "50"},
+    {"FEX_CODE_BUFFER_RENEW_EARLY", "10"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
@@ -199,6 +201,7 @@ namespace {
     "FEX_UNPACK_CACHE_AHEAD",
     "FEX_CODE_BUFFER_START",
     "FEX_CODE_BUFFER_RENEW",
+    "FEX_CODE_BUFFER_RENEW_EARLY",
     "FEX_CODE_BUFFER_LOAD_MS",
     "FEX_GAME_FILES_UNCACHED",
     "FEX_GAME_FILES_MS",

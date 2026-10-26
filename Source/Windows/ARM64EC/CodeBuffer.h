@@ -22,9 +22,13 @@ class Context;
 //   FEX_CODE_BUFFER_START=max   start at 128 MB (the D2R default; upstream does this when it writes its own code cache)
 //   FEX_CODE_BUFFER_START=grow  16 MB, doubling (upstream)
 //   FEX_CODE_BUFFER_RENEW=N     at a loading screen (no new frame for FEX_CODE_BUFFER_LOAD_MS), start a fresh buffer if
-//                               the current one is N% used or more (D2R default 50): the reload then falls in the load and
-//                               the first seconds of the new area, which load new code anyway, instead of a random moment
-//                               of play. "off" or 0 never does.
+//                               the current one is N% used or more (D2R default 50), at most once a load: the reload then
+//                               falls in the load and the first seconds of the new area, which load new code anyway,
+//                               instead of a random moment of play. "off" or 0 never does.
+//   FEX_CODE_BUFFER_RENEW_EARLY=N  the same for the first 3 loading screens (start-up, menus, entering the game; D2R
+//                               default 10): the buffer then holds mostly start-up and menu code. In the build 83 run it
+//                               would have been ~25-45% used when the game was entered, and the area change at 3:01 was
+//                               seamless (no loading screen), so with 50% alone it would still have filled in play.
 //   FEX_CODE_BUFFER_LOAD_MS=N   how long without a frame counts as a loading screen (default 250; play frames stay
 //                               under 100 ms)
 //

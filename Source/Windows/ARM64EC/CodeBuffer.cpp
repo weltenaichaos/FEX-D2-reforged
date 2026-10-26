@@ -36,12 +36,19 @@ namespace {
   // Frames that must have run since the last loading screen before another one is counted (so a load that shows a few
   // frames between its steps counts once).
   constexpr uint64_t PlayFrames = 30;
+  // The first loading screens (start-up, menus, entering the game) renew at RenewEarlyPercent: what the buffer holds then
+  // is mostly start-up and menu code the game won't run again, and the game's own code loads for the first time after
+  // them anyway. In the build 83 run the buffer would have been ~25-45% used when the game was entered.
+  constexpr uint64_t EarlyLoads = 3;
 
   FEXCore::Context::Context* Ctx {};
   bool Logging {};
   bool FrameMarksWanted {};
   uint32_t RenewPercent {};
+  uint32_t RenewEarlyPercent {};
   uint32_t LoadMs {};
+  // Renewals done (NoteStarted), so a loading screen asks for at most one.
+  std::atomic<uint64_t> Renewals {};
 
   uint64_t Counter() {
     uint64_t Result {};
@@ -70,6 +77,7 @@ namespace {
   // Loading screens seen, for the log.
   std::atomic<uint64_t> Loads {};
   std::atomic<uint64_t> LoadAt {};
+  std::atomic<uint32_t> LoadPercent {};
   uint64_t LoadsRead {};
 
   const char* ReasonText(uint8_t Reason) {
@@ -92,9 +100,10 @@ namespace {
 
     const uint64_t LoadCount = Loads.load(std::memory_order_acquire);
     if (LoadCount != LoadsRead) {
-      Out += fextl::fmt::format("# code buffer: loading screen (no frame for {} ms or more, {:.0f} ms before this line), "
+      Out += fextl::fmt::format("# code buffer: loading screen #{} (no frame for {} ms or more, {:.0f} ms before this line), "
                                 "renewal asked if the buffer is {}% used or more\n",
-                                LoadMs, MsAgo(LoadAt.load(std::memory_order_relaxed)), RenewPercent);
+                                LoadCount, LoadMs, MsAgo(LoadAt.load(std::memory_order_relaxed)),
+                                LoadPercent.load(std::memory_order_relaxed));
       LoadsRead = LoadCount;
     }
 
@@ -126,14 +135,18 @@ namespace {
     return Out;
   }
 
-  // Watches the frame clock: no new frame for LoadMs after at least PlayFrames frames is a loading screen. While it lasts,
-  // a renewal is asked for every tick (each valid for two ticks); the first code allocation takes it, and starts a fresh
-  // buffer if the current one is RenewPercent used or more. Asking again later in the same load lets a load that fills
-  // the buffer past that mark renew it still inside the load.
+  // Watches the frame clock: no new frame for LoadMs after at least PlayFrames frames is a loading screen. Until it ends
+  // or a renewal was done, a renewal is asked for every tick (each valid for two ticks); the first code allocation takes
+  // it, and starts a fresh buffer if the current one is used to the load's mark or more (RenewEarlyPercent for the first
+  // EarlyLoads, RenewPercent after). Asking again later in the same load lets a load that fills the buffer past the mark
+  // renew it still inside the load.
   void* WatchThread(void*) {
     const uint64_t Freq = CounterFrequency();
     const uint64_t LoadTicks = static_cast<uint64_t>(LoadMs) * Freq / 1000;
     uint64_t FramesAtLoad {};
+    uint64_t LoadCount {};
+    uint64_t RenewalsAtLoad {};
+    uint32_t Percent {};
     bool InLoad {};
 
     for (;;) {
@@ -154,13 +167,19 @@ namespace {
           FramesAtLoad = Frames;
           continue;
         }
-        Ctx->RequestCodeBufferRenewal(RenewPercent, 2 * TickMs);
+        if (Renewals.load(std::memory_order_relaxed) == RenewalsAtLoad) {
+          Ctx->RequestCodeBufferRenewal(Percent, 2 * TickMs);
+        }
         continue;
       }
       if (Gap && Frames - FramesAtLoad >= PlayFrames) {
         InLoad = true;
-        Ctx->RequestCodeBufferRenewal(RenewPercent, 2 * TickMs);
+        ++LoadCount;
+        Percent = LoadCount <= EarlyLoads ? std::min(RenewEarlyPercent, RenewPercent) : RenewPercent;
+        RenewalsAtLoad = Renewals.load(std::memory_order_relaxed);
+        Ctx->RequestCodeBufferRenewal(Percent, 2 * TickMs);
         LoadAt.store(LastFrame + LoadTicks, std::memory_order_relaxed);
+        LoadPercent.store(Percent, std::memory_order_relaxed);
         Loads.fetch_add(1, std::memory_order_release);
       }
     }
@@ -180,14 +199,20 @@ void Init(FEXCore::Context::Context* CTX, bool StatsLog) {
 
   const char* RenewSwitch = FEX::Windows::Switch("FEX_CODE_BUFFER_RENEW");
   RenewPercent = RenewSwitch && RenewSwitch[0] >= '0' && RenewSwitch[0] <= '9' ? std::min<uint32_t>(strtoul(RenewSwitch, nullptr, 10), 100) : 0;
+  const char* EarlySwitch = FEX::Windows::Switch("FEX_CODE_BUFFER_RENEW_EARLY");
+  RenewEarlyPercent = EarlySwitch && EarlySwitch[0] >= '0' && EarlySwitch[0] <= '9' ?
+                        std::min<uint32_t>(strtoul(EarlySwitch, nullptr, 10), 100) :
+                        RenewPercent;
   const char* LoadSwitch = FEX::Windows::Switch("FEX_CODE_BUFFER_LOAD_MS");
   LoadMs = LoadSwitch && LoadSwitch[0] >= '0' && LoadSwitch[0] <= '9' ? std::clamp<uint32_t>(strtoul(LoadSwitch, nullptr, 10), 100, 5000) : 250;
 
   if (StatsLog) {
     FEX::Windows::StatsLogNote(fextl::fmt::format(
-      "code buffer: {}; {} (FEX_CODE_BUFFER_START=max|grow, FEX_CODE_BUFFER_RENEW=N|off, FEX_CODE_BUFFER_LOAD_MS={})",
+      "code buffer: {}; {} (FEX_CODE_BUFFER_START=max|grow, FEX_CODE_BUFFER_RENEW=N|off, FEX_CODE_BUFFER_RENEW_EARLY=N, "
+      "FEX_CODE_BUFFER_LOAD_MS={})",
       StartMax ? "starts at 128 MB" : "starts at 16 MB and doubles up to 128 MB (upstream)",
-      RenewPercent ? fextl::fmt::format("renewed at a loading screen when {}% used or more", RenewPercent) :
+      RenewPercent ? fextl::fmt::format("renewed at a loading screen when {}% used or more ({}% at the first {})", RenewPercent,
+                                        std::min(RenewEarlyPercent, RenewPercent), EarlyLoads) :
                      fextl::string("never renewed early"),
       LoadMs));
     FEX::Windows::StatsLogSetLineProvider(Lines);
@@ -205,6 +230,9 @@ bool WantsFrameMarks() {
 }
 
 void NoteStarted(const FEXCore::HLE::SyscallHandler::CodeBufferStart& Info) {
+  if (Info.Reason == 2) {
+    Renewals.fetch_add(1, std::memory_order_relaxed);
+  }
   if (!Logging) {
     return;
   }
