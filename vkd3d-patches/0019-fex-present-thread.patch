@@ -1,0 +1,588 @@
+From 0d4ec17010e370c96efa9df3df38b9f72e182637 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 18:56:03 +0000
+Subject: [PATCH] FEX: present on its own thread (VKD3D_FEX_PRESENT_THREAD)
+
+vkd3d ran each present as a callback on the D3D12 queue's thread: the cap
+pre-sleep, the drawn frame wait and the cap's sleep in vkQueuePresentKHR
+held that thread ~32 ms of every 33 ms frame, so the next frame's command
+lists waited 13-16 ms in busy scenes and the GPU idled. The queue thread
+now acquires and submits the copy, then hands the present to a
+"vkd3d-fex-present" thread and goes on with the next frame's lists. The
+next present waits for the present thread before it touches the
+swapchain. Presents carry no present id; the wait worker takes the frame
+done timeline the frame done thread signals from the CPU.
+
+On with frame start pacing unless VKD3D_FEX_PRESENT_THREAD=0; needs the
+frame done thread and present wait support.
+---
+ libs/vkd3d/fex_timeline.c  |  14 +-
+ libs/vkd3d/swapchain.c     | 346 ++++++++++++++++++++++++++++++++++++-
+ libs/vkd3d/vkd3d_private.h |   8 +
+ 3 files changed, 358 insertions(+), 10 deletions(-)
+
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index 813e43c..5e5586b 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -19,7 +19,7 @@
+ #include <inttypes.h>
+ 
+ #define FEX_TIMELINE_MAX_QUEUES 8u
+-#define FEX_TIMELINE_CONFIG_SIZE 1280u
++#define FEX_TIMELINE_CONFIG_SIZE 1600u
+ 
+ /* Read by FEX (found by export name in d3d12core.dll). */
+ struct vkd3d_fex_report vkd3d_fex_present_report = { 0x54584546u /* 'FEXT' */, 1u, 0u, 0u, { 0 } };
+@@ -30,6 +30,7 @@ bool vkd3d_fex_present_presleep_on;
+ bool vkd3d_fex_host_frame_done_on;
+ bool vkd3d_fex_present_drawn_on;
+ bool vkd3d_fex_latency_resync_on;
++bool vkd3d_fex_present_thread_on;
+ uint32_t vkd3d_fex_frame_start_max_ms = 50;
+ uint32_t vkd3d_fex_frame_start_window = 256;
+ uint32_t vkd3d_fex_frame_start_margin_ms = 6;
+@@ -106,6 +107,7 @@ static const char *const fex_step_names[VKD3D_FEX_STEP_COUNT] =
+     "queue lock",
+     "after present",
+     "GPU ahead",
++    "present thread wait",
+ };
+ 
+ static const char *const fex_op_names[VKD3D_FEX_QOP_COUNT] =
+@@ -151,6 +153,11 @@ void vkd3d_fex_timeline_init(void)
+     /* Needs the count a hand-out leaves (ReleaseSemaphore's previous count), which an eventfd doesn't give. */
+     vkd3d_fex_latency_resync_on = false;
+ #endif
++    /* VKD3D fex19: on with frame start pacing (FEX builds up to 81 don't set it) unless 0; 1 turns it on without. */
++    if (vkd3d_get_env_var("VKD3D_FEX_PRESENT_THREAD", env, sizeof(env)))
++        vkd3d_fex_present_thread_on = !strcmp(env, "1");
++    else
++        vkd3d_fex_present_thread_on = vkd3d_fex_frame_start_on;
+     /* Most hold-back in ms (VKD3D fex14: 50 unless set; 1-90 taken, 30 = fex8 to fex13). */
+     if (vkd3d_get_env_var("VKD3D_FEX_START_MAX_MS", env, sizeof(env)))
+     {
+@@ -180,7 +187,8 @@ void vkd3d_fex_timeline_init(void)
+             (vkd3d_fex_present_presleep_on ? VKD3D_FEX_REPORT_FLAG_PRESLEEP : 0) |
+             (vkd3d_fex_host_frame_done_on ? VKD3D_FEX_REPORT_FLAG_HOST_FRAME_DONE : 0) |
+             (vkd3d_fex_present_drawn_on ? VKD3D_FEX_REPORT_FLAG_PRESENT_DRAWN : 0) |
+-            (vkd3d_fex_latency_resync_on ? VKD3D_FEX_REPORT_FLAG_LATENCY_RESYNC : 0), vkd3d_memory_order_release);
++            (vkd3d_fex_latency_resync_on ? VKD3D_FEX_REPORT_FLAG_LATENCY_RESYNC : 0) |
++            (vkd3d_fex_present_thread_on ? VKD3D_FEX_REPORT_FLAG_PRESENT_THREAD : 0), vkd3d_memory_order_release);
+     vkd3d_atomic_uint64_store_explicit(&fex_timeline_last_publish_ns, vkd3d_get_current_time_ns(),
+             vkd3d_memory_order_relaxed);
+     if (vkd3d_fex_timeline_on)
+@@ -196,6 +204,8 @@ void vkd3d_fex_timeline_init(void)
+         INFO("FEX drawn frames only on.\n");
+     if (vkd3d_fex_latency_resync_on)
+         INFO("FEX frame credit resync on.\n");
++    if (vkd3d_fex_present_thread_on)
++        INFO("FEX present thread on.\n");
+ }
+ 
+ uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type)
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index a7a6ba1..a36c792 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -106,6 +106,23 @@ struct present_wait_entry
+     struct fex_frame_times fex;
+ };
+ 
++/* FEX present thread (VKD3D fex19): one Present() as the queue thread hands it over. */
++struct fex_present_job
++{
++    uint64_t present_count;
++    uint64_t begin_frame_time_ns;
++    uint64_t handed_ns;            /* when the queue thread handed it over */
++    struct fex_frame_times fex;
++    bool present;                  /* false: nothing to present (no swapchain, the acquire or the copy failed) */
++    bool tracked;                  /* the frame done thread watches the fence of the copy (fex.blit_value) */
++    bool set_present_mode;
++    VkPresentModeKHR present_mode;
++    VkSwapchainKHR vk_swapchain;
++    VkSemaphore vk_release_semaphore;
++    VkFence vk_present_fence;      /* VK_EXT_swapchain_maintenance1, else VK_NULL_HANDLE */
++    uint32_t swapchain_index;
++};
++
+ #if defined(_WIN32)
+ typedef UINT (WINAPI *PFN_NtDelayExecution) (BOOL, LARGE_INTEGER*);
+ typedef UINT (WINAPI *PFN_NtQueryTimerResolution) (ULONG*, ULONG*, ULONG*);
+@@ -416,6 +433,45 @@ struct dxgi_vk_swap_chain
+         uint64_t action_ns[8];     /* when the last 8 of them were decided */
+         bool stopped;              /* held back 8 times in 60 s: the game doesn't take one credit per frame */
+     } fex_resync;
++
++    /* FEX present thread (VKD3D_FEX_PRESENT_THREAD; VKD3D fex19). vkd3d runs each present as a callback on the D3D12
++     * queue's thread, in order with the game's command lists, and the cap pre-sleep, the drawn frame wait and the frame
++     * cap's own sleep in vkQueuePresentKHR made that callback last ~32 ms of every 33 ms frame. Command lists the game
++     * gave meanwhile, the next frame's, waited in the queue until the present was out. In busy scenes (half of the
++     * fex18 run, the act boss fight included) they waited 13-16 ms on average: the GPU worked only ~20-25 ms of each
++     * frame and idled the rest, frames took 61-64 ms from start to the screen instead of ~39, and frame start pacing
++     * took the late GPU finish for a busy GPU, so it held nothing back and the next frame's lists came early and waited
++     * again. Now the queue thread only acquires the image and submits the copy into it (both stay in order with the
++     * game's lists) and hands the rest to this thread, then goes on with the next frame's lists. The next present
++     * waits for this thread to finish the one before before it touches the swapchain, so the two threads never use it
++     * at once; that costs nothing while the game keeps 2 frames in flight, since it starts the frame after next only
++     * once that present is out.
++     *
++     * Async presents were turned down in VKD3D fex3 because the window system's submit in vkQueuePresentKHR would wait
++     * behind the next frame's GPU work on Adreno's one in-order queue. That submit doesn't hold the image back:
++     * GameNative's Vulkan wrapper sends the image to its X server right after it (its X11 WSI waits for the GPU only in
++     * MAILBOX mode), and the drawn frame wait already made sure the GPU drew the frame. It only signals the present id
++     * that vkWaitForPresentKHR waits for, so with this thread presents carry no present id and the wait worker takes
++     * the frame done timeline instead, which the frame done thread signals from the CPU once the copy is done and the
++     * present was handed over. */
++    struct
++    {
++        bool enable;
++        bool thread_started;
++        bool locks_initialized;
++        pthread_t thread;
++        pthread_mutex_t lock;
++        pthread_cond_t cond;
++        struct fex_present_job job;     /* under lock while busy is false, this thread's own while busy */
++        bool busy;                      /* a present was handed over and isn't finished */
++        bool stop;
++        bool recreate;                  /* a present said out of date or suboptimal: recreate the swapchain */
++        bool surface_lost;
++
++        /* Queue thread only: the job the present being worked on hands over. */
++        struct fex_present_job pending;
++        bool pending_ready;
++    } fex_present;
+ };
+ 
+ static void dxgi_vk_swap_chain_drain_internal_blit_semaphore(struct dxgi_vk_swap_chain *chain, uint64_t value);
+@@ -649,6 +705,8 @@ static void dxgi_vk_swap_chain_drain_user_images(struct dxgi_vk_swap_chain *chai
+     dxgi_vk_swap_chain_drain_complete_semaphore(chain, chain->user.blit_count);
+ }
+ 
++static void dxgi_vk_swap_chain_fex_present_drain(struct dxgi_vk_swap_chain *chain);
++
+ static void dxgi_vk_swap_chain_drain_queue(struct dxgi_vk_swap_chain *chain)
+ {
+     unsigned int i;
+@@ -658,6 +716,8 @@ static void dxgi_vk_swap_chain_drain_queue(struct dxgi_vk_swap_chain *chain)
+      * We intend to submit directly to the queue now and timeline signals must come in the proper order. */
+     if (vkd3d_acquire_vk_queue(&chain->queue->ID3D12CommandQueue_iface))
+         vkd3d_release_vk_queue(&chain->queue->ID3D12CommandQueue_iface);
++    /* FEX present thread: and the last present must be out. */
++    dxgi_vk_swap_chain_fex_present_drain(chain);
+ 
+     /* If we have a lingering semaphore acquire that never went anywhere, ensure it is waited on. */
+     for (i = 0; i < ARRAY_SIZE(chain->present.vk_acquire_semaphore); i++)
+@@ -711,6 +771,24 @@ static void dxgi_vk_swap_chain_cleanup_waiter_thread(struct dxgi_vk_swap_chain *
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+     unsigned int i;
+ 
++    /* FEX present thread: before the wait worker, which it hands its presents to. It finishes the present it has. */
++    if (chain->fex_present.locks_initialized)
++    {
++        if (chain->fex_present.thread_started)
++        {
++            pthread_mutex_lock(&chain->fex_present.lock);
++            chain->fex_present.stop = true;
++            pthread_cond_broadcast(&chain->fex_present.cond);
++            pthread_mutex_unlock(&chain->fex_present.lock);
++            pthread_join(chain->fex_present.thread, NULL);
++            chain->fex_present.thread_started = false;
++        }
++        pthread_mutex_destroy(&chain->fex_present.lock);
++        pthread_cond_destroy(&chain->fex_present.cond);
++        chain->fex_present.locks_initialized = false;
++        chain->fex_present.enable = false;
++    }
++
+     dxgi_vk_swap_chain_push_present_id(chain, 0, 0, 0, NULL);
+     pthread_join(chain->wait_thread.thread, NULL);
+     pthread_mutex_destroy(&chain->wait_thread.lock);
+@@ -1848,6 +1926,9 @@ static void dxgi_vk_swap_chain_destroy_swapchain_in_present_task(struct dxgi_vk_
+     if (!chain->present.vk_swapchain)
+         return;
+ 
++    /* FEX present thread: never in a present with this swapchain (the queue thread waited for it already). */
++    dxgi_vk_swap_chain_fex_present_drain(chain);
++
+     /* If we are going to destroy the swapchain and the device supports VK_NV_low_latency2
+      * take the low latency lock. This ensures none of the other NV low latency functions
+      * will attempt to use the stale swapchain handle. */
+@@ -2177,7 +2258,7 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+ {
+     uint64_t target_interval_ns = chain->frame_rate_limit.target_interval_ns;
+     struct vkd3d_queue_family_info *const *families = chain->queue->device->queue_families;
+-    char text[1280], pacing[448];
++    char text[1600], pacing[448];
+ 
+     if (!vkd3d_fex_timeline_on)
+         return;
+@@ -2198,7 +2279,7 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+     snprintf(text, sizeof(text), "swapchain %ux%u, %u images (asked %u, game BufferCount %u), mode %s%s%s,"
+             " SyncInterval %u, present wait %s, game latency handle %s (max latency %u), internal latency %u,"
+             " vkd3d limiter %.1f fps, frame start pacing %s, cap pre-sleep %s, frame done signal %s, drawn frames only %s,"
+-            " frame credit resync %s,"
++            " frame credit resync %s, present thread %s,"
+             " VkQueues: graphics family %u x%u,"
+             " compute family %u x%u,"
+             " copy family %u x%u",
+@@ -2220,6 +2301,9 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+                     "off (needs the frame done thread)",
+             vkd3d_fex_latency_resync_on ? "on (hand-outs held back when the game runs frames ahead of its latency:"
+                     " VKD3D fex16)" : "off",
++            chain->fex_present.enable ? "on (pre-sleep, drawn frame wait and vkQueuePresentKHR off the queue thread, the"
++                    " next frame's lists reach the GPU meanwhile; no present id, frame done from the CPU: VKD3D fex19)" :
++                    vkd3d_fex_present_thread_on ? "off (needs the frame done thread and present wait support)" : "off",
+             families[VKD3D_QUEUE_FAMILY_GRAPHICS]->vk_family_index, families[VKD3D_QUEUE_FAMILY_GRAPHICS]->queue_count,
+             families[VKD3D_QUEUE_FAMILY_COMPUTE]->vk_family_index, families[VKD3D_QUEUE_FAMILY_COMPUTE]->queue_count,
+             families[VKD3D_QUEUE_FAMILY_TRANSFER]->vk_family_index, families[VKD3D_QUEUE_FAMILY_TRANSFER]->queue_count);
+@@ -2994,8 +3078,9 @@ static void dxgi_vk_swap_chain_fex_watch_blit(struct dxgi_vk_swap_chain *chain,
+  * ~5 ms ahead. The picture jumping back to an older frame and forward again looks like rubber banding.
+  *
+  * The frame done thread sees the copy's fence signalled (it waits for it from its submit) and wakes this wait.
+- * Queue thread only (tracked_blit_value). */
+-static uint64_t dxgi_vk_swap_chain_fex_wait_drawn(struct dxgi_vk_swap_chain *chain, uint64_t blit_value)
++ * Tracked: the frame done thread was handed the copy's fence (blit_value <= tracked_blit_value on the queue thread when
++ * it submitted the copy). Queue thread, or the present thread (VKD3D fex19). */
++static uint64_t dxgi_vk_swap_chain_fex_wait_drawn(struct dxgi_vk_swap_chain *chain, uint64_t blit_value, bool tracked)
+ {
+     bool unfinished, waited = false, gave_up = false;
+     uint64_t start_ns = 0, wait_ns = 0;
+@@ -3003,7 +3088,7 @@ static uint64_t dxgi_vk_swap_chain_fex_wait_drawn(struct dxgi_vk_swap_chain *cha
+     uint64_t now_ns, end_ns;
+ #endif
+ 
+-    if (!blit_value || !chain->fex_done.enable || blit_value > chain->fex_done.tracked_blit_value)
++    if (!blit_value || !chain->fex_done.enable || !tracked)
+         return 0;
+ 
+     pthread_mutex_lock(&chain->fex_done.lock);
+@@ -3037,6 +3122,218 @@ static uint64_t dxgi_vk_swap_chain_fex_wait_drawn(struct dxgi_vk_swap_chain *cha
+     return wait_ns;
+ }
+ 
++/* FEX present thread (VKD3D fex19): waits until the present thread is done with the present before (no-op when it is
++ * idle or off). Doesn't take what that present said about the swapchain. */
++static void dxgi_vk_swap_chain_fex_present_drain(struct dxgi_vk_swap_chain *chain)
++{
++    if (!chain->fex_present.enable)
++        return;
++    pthread_mutex_lock(&chain->fex_present.lock);
++    while (chain->fex_present.busy)
++        pthread_cond_wait(&chain->fex_present.cond, &chain->fex_present.lock);
++    pthread_mutex_unlock(&chain->fex_present.lock);
++}
++
++/* FEX present thread: waits until the present thread finished the present before, then takes what it said about the
++ * swapchain (out of date, suboptimal or a lost surface: recreate it). Queue thread, at the start of each present,
++ * before anything touches the swapchain. */
++static void dxgi_vk_swap_chain_fex_present_wait_idle(struct dxgi_vk_swap_chain *chain)
++{
++    uint64_t start_ns = 0, wait_ns = 0;
++
++    pthread_mutex_lock(&chain->fex_present.lock);
++    if (chain->fex_present.busy)
++    {
++        start_ns = vkd3d_get_current_time_ns();
++        while (chain->fex_present.busy)
++            pthread_cond_wait(&chain->fex_present.cond, &chain->fex_present.lock);
++        wait_ns = vkd3d_get_current_time_ns() - start_ns;
++    }
++    if (chain->fex_present.recreate)
++        chain->present.force_swapchain_recreation = true;
++    if (chain->fex_present.surface_lost)
++        chain->present.is_surface_lost = true;
++    chain->fex_present.recreate = false;
++    chain->fex_present.surface_lost = false;
++    pthread_mutex_unlock(&chain->fex_present.lock);
++
++    if (vkd3d_fex_timeline_on)
++        vkd3d_fex_timeline_step(VKD3D_FEX_STEP_PRESENT_THREAD, wait_ns);
++}
++
++/* FEX present thread: the copy into the acquired image was submitted; gets everything vkQueuePresentKHR needs ready
++ * for the present thread and gives the image up (the next present acquires a new one). Queue thread. */
++static void dxgi_vk_swap_chain_fex_present_prepare(struct dxgi_vk_swap_chain *chain, uint32_t swapchain_index)
++{
++    struct fex_present_job *job = &chain->fex_present.pending;
++
++    memset(job, 0, sizeof(*job));
++    job->present = true;
++    job->tracked = chain->present.fex.blit_value &&
++            chain->present.fex.blit_value <= chain->fex_done.tracked_blit_value;
++    job->vk_swapchain = chain->present.vk_swapchain;
++    job->vk_release_semaphore = chain->present.vk_release_semaphores[swapchain_index];
++    job->swapchain_index = swapchain_index;
++
++    if (chain->swapchain_maintenance1)
++    {
++        chain->present.swapchain_fence_index = (chain->present.swapchain_fence_index + 1) %
++                ARRAY_SIZE(chain->present.vk_swapchain_fences);
++        dxgi_vk_swap_chain_ensure_unsignaled_swapchain_fence(chain, chain->present.swapchain_fence_index);
++        chain->present.vk_swapchain_fences_signalled[chain->present.swapchain_fence_index] = true;
++        job->vk_present_fence = chain->present.vk_swapchain_fences[chain->present.swapchain_fence_index];
++
++        if (chain->present.compatible_unlocked_present_mode)
++        {
++            job->set_present_mode = true;
++            job->present_mode = chain->request.swap_interval > 0 ?
++                    VK_PRESENT_MODE_FIFO_KHR : chain->present.unlocked_present_mode;
++        }
++    }
++
++    chain->fex_present.pending_ready = true;
++    chain->present.current_backbuffer_index = UINT32_MAX;
++}
++
++/* FEX present thread: hands this present to the present thread, with or without an image to present (without one it
++ * only passes the frame on to the wait worker, in order with the others). Queue thread, after the frame done push. */
++static void dxgi_vk_swap_chain_fex_present_hand_over(struct dxgi_vk_swap_chain *chain, uint64_t present_count)
++{
++    struct fex_present_job *job = &chain->fex_present.pending;
++
++    if (!chain->fex_present.pending_ready)
++        memset(job, 0, sizeof(*job));
++    chain->fex_present.pending_ready = false;
++    job->present_count = present_count;
++    job->begin_frame_time_ns = chain->request.begin_frame_time_ns;
++    job->fex = chain->present.fex;
++    job->handed_ns = vkd3d_get_current_time_ns();
++
++    pthread_mutex_lock(&chain->fex_present.lock);
++    assert(!chain->fex_present.busy);
++    chain->fex_present.job = *job;
++    chain->fex_present.busy = true;
++    pthread_cond_broadcast(&chain->fex_present.cond);
++    pthread_mutex_unlock(&chain->fex_present.lock);
++}
++
++/* FEX present thread: what the queue thread did after the copy up to VKD3D fex18 (cap pre-sleep, drawn frame wait,
++ * vkQueuePresentKHR), then the frame goes to the wait worker. Without a present id: the wait worker takes the frame
++ * done timeline, which the frame done thread signals from the CPU. Present thread. */
++static void dxgi_vk_swap_chain_fex_present_run(struct dxgi_vk_swap_chain *chain, struct fex_present_job *job)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
++    VkSwapchainPresentFenceInfoEXT present_fence_info;
++    VkSwapchainPresentModeInfoEXT present_mode_info;
++    VkPresentInfoKHR present_info;
++    VkResult vr, vk_result;
++    uint64_t fex_t0 = 0;
++    VkQueue vk_queue;
++    bool slept;
++
++    if (job->present)
++    {
++        vk_result = VK_SUCCESS;
++        memset(&present_info, 0, sizeof(present_info));
++        present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
++        present_info.pSwapchains = &job->vk_swapchain;
++        present_info.swapchainCount = 1;
++        present_info.pImageIndices = &job->swapchain_index;
++        present_info.waitSemaphoreCount = 1;
++        present_info.pWaitSemaphores = &job->vk_release_semaphore;
++        present_info.pResults = &vk_result;
++
++        if (job->vk_present_fence)
++        {
++            present_fence_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT;
++            present_fence_info.pNext = NULL;
++            present_fence_info.swapchainCount = 1;
++            present_fence_info.pFences = &job->vk_present_fence;
++            vk_prepend_struct(&present_info, &present_fence_info);
++        }
++
++        if (job->set_present_mode)
++        {
++            present_mode_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT;
++            present_mode_info.pNext = NULL;
++            present_mode_info.swapchainCount = 1;
++            present_mode_info.pPresentModes = &job->present_mode;
++            vk_prepend_struct(&present_info, &present_mode_info);
++        }
++
++        job->fex.hold_start_ns = vkd3d_get_current_time_ns();
++        slept = vkd3d_fex_present_presleep_on && dxgi_vk_swap_chain_fex_presleep(chain);
++        job->fex.handoff_wait_ns = dxgi_vk_swap_chain_fex_wait_drawn(chain, job->fex.blit_value, job->tracked);
++
++        if (vkd3d_fex_timeline_on)
++            fex_t0 = vkd3d_get_current_time_ns();
++        vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
++        job->fex.qp_start_ns = vkd3d_get_current_time_ns();
++        if (vkd3d_fex_timeline_on)
++            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_QUEUE_LOCK, job->fex.qp_start_ns - fex_t0);
++        vr = VK_CALL(vkQueuePresentKHR(vk_queue, &present_info));
++        job->fex.qp_end_ns = vkd3d_get_current_time_ns();
++        vkd3d_queue_release(chain->queue->vkd3d_queue);
++        if (vkd3d_fex_timeline_on)
++        {
++            vkd3d_fex_timeline_step(VKD3D_FEX_STEP_QUEUE_PRESENT, job->fex.qp_end_ns - job->fex.qp_start_ns);
++            if (slept)
++                vkd3d_fex_timeline_step(VKD3D_FEX_STEP_PRESLEEP, job->fex.qp_start_ns - job->fex.hold_start_ns);
++        }
++        if (vkd3d_fex_present_presleep_on)
++            dxgi_vk_swap_chain_fex_presleep_note(chain, slept, job->fex.qp_start_ns, job->fex.qp_end_ns);
++        VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(chain->queue->device, vr == VK_ERROR_DEVICE_LOST);
++
++        if (vr == VK_SUCCESS && vk_result != VK_SUCCESS)
++            vr = vk_result;
++
++        vkd3d_queue_timeline_trace_register_instantaneous(&chain->queue->device->queue_timeline_trace,
++                VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_QUEUE_PRESENT, 0);
++
++        /* The queue thread recreates the swapchain at its next present (that frame is lost, where up to VKD3D fex18 an
++         * out of date present was tried again right away). */
++        if (vr == VK_SUBOPTIMAL_KHR || vr < 0)
++        {
++            if (vr < 0)
++                WARN("FEX present thread: vkQueuePresentKHR failed, vr %d.\n", vr);
++            pthread_mutex_lock(&chain->fex_present.lock);
++            chain->fex_present.recreate = true;
++            if (vr == VK_ERROR_SURFACE_LOST_KHR)
++                chain->fex_present.surface_lost = true;
++            pthread_mutex_unlock(&chain->fex_present.lock);
++        }
++    }
++
++    dxgi_vk_swap_chain_push_present_id(chain, job->present_count, 0, job->begin_frame_time_ns, &job->fex);
++}
++
++static void *dxgi_vk_swap_chain_fex_present_worker(void *chain_)
++{
++    struct dxgi_vk_swap_chain *chain = chain_;
++    struct fex_present_job job;
++
++    vkd3d_set_thread_name("vkd3d-fex-present");
++
++    pthread_mutex_lock(&chain->fex_present.lock);
++    for (;;)
++    {
++        while (!chain->fex_present.busy && !chain->fex_present.stop)
++            pthread_cond_wait(&chain->fex_present.cond, &chain->fex_present.lock);
++        if (!chain->fex_present.busy)
++            break;
++        job = chain->fex_present.job;
++        pthread_mutex_unlock(&chain->fex_present.lock);
++
++        dxgi_vk_swap_chain_fex_present_run(chain, &job);
++
++        pthread_mutex_lock(&chain->fex_present.lock);
++        chain->fex_present.busy = false;
++        pthread_cond_broadcast(&chain->fex_present.cond);
++    }
++    pthread_mutex_unlock(&chain->fex_present.lock);
++    return NULL;
++}
++
+ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chain, uint64_t present_count, unsigned int retry_counter)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+@@ -3108,6 +3405,13 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+     if (chain->queue->device->device_info.anti_lag_amd.antiLag)
+         dxgi_vk_swap_chain_anti_lag_state_update(chain);
+ 
++    /* FEX present thread: the rest happens there. */
++    if (chain->fex_present.enable)
++    {
++        dxgi_vk_swap_chain_fex_present_prepare(chain, swapchain_index);
++        return;
++    }
++
+     memset(&present_info, 0, sizeof(present_info));
+     present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+     present_info.pSwapchains = &chain->present.vk_swapchain;
+@@ -3193,7 +3497,8 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+     fex_presleep_slept = vkd3d_fex_present_presleep_on && dxgi_vk_swap_chain_fex_presleep(chain);
+     /* After the cap pre-sleep, which a frame the GPU still works on spends anyway; the cap's own sleep in
+      * vkQueuePresentKHR aims at a due time, so a wait that ends before it costs nothing. */
+-    chain->present.fex.handoff_wait_ns = dxgi_vk_swap_chain_fex_wait_drawn(chain, chain->present.fex.blit_value);
++    chain->present.fex.handoff_wait_ns = dxgi_vk_swap_chain_fex_wait_drawn(chain, chain->present.fex.blit_value,
++            chain->present.fex.blit_value <= chain->fex_done.tracked_blit_value);
+ 
+     if (vkd3d_fex_timeline_on)
+         fex_t0 = vkd3d_get_current_time_ns();
+@@ -3267,6 +3572,14 @@ static void dxgi_vk_swap_chain_present_callback(void *chain_)
+     uint64_t next_present_count;
+     uint64_t fex_t0;
+ 
++    /* FEX present thread (VKD3D fex19): first wait until it's done with the present before. That wait counts as time
++     * this present waited for the queue thread. */
++    if (chain->fex_present.enable)
++    {
++        dxgi_vk_swap_chain_fex_present_wait_idle(chain);
++        chain->fex_present.pending_ready = false;
++    }
++
+     next_present_count = chain->present.present_count + 1;
+     next_request = &chain->request_ring[next_present_count % ARRAY_SIZE(chain->request_ring)];
+     chain->present.fex = next_request->fex;
+@@ -3295,8 +3608,11 @@ static void dxgi_vk_swap_chain_present_callback(void *chain_)
+      * Signal this just once on the outside since we might have retries, which complicates command buffer recycling. */
+     dxgi_vk_swap_chain_present_signal_blit_semaphore(chain, next_present_count);
+ 
+-    /* Signal latency fence. */
+-    dxgi_vk_swap_chain_signal_waitable_handle(chain, next_present_count);
++    /* Signal latency fence. FEX present thread: it does, after vkQueuePresentKHR. */
++    if (chain->fex_present.enable)
++        dxgi_vk_swap_chain_fex_present_hand_over(chain, next_present_count);
++    else
++        dxgi_vk_swap_chain_signal_waitable_handle(chain, next_present_count);
+     if (vkd3d_fex_timeline_on)
+         vkd3d_fex_timeline_step(VKD3D_FEX_STEP_AFTER_PRESENT, vkd3d_get_current_time_ns() - fex_t0);
+ 
+@@ -4309,6 +4625,20 @@ static HRESULT dxgi_vk_swap_chain_init_waiter_thread(struct dxgi_vk_swap_chain *
+         INFO("Enabling present wait path for frame latency.\n");
+     }
+ 
++    /* FEX present thread (VKD3D fex19): needs the frame done thread (the frame done timeline stands in for present
++     * ids) and present wait support (without it the queue thread acquires the next image right after each present). */
++    if (vkd3d_fex_present_thread_on && chain->fex_done.enable && chain->wait_thread.supports_present_wait &&
++            !chain->queue->device->vk_info.NV_low_latency2)
++    {
++        pthread_mutex_init(&chain->fex_present.lock, NULL);
++        pthread_cond_init(&chain->fex_present.cond, NULL);
++        chain->fex_present.locks_initialized = true;
++        chain->fex_present.thread_started =
++                !pthread_create(&chain->fex_present.thread, NULL, dxgi_vk_swap_chain_fex_present_worker, chain);
++        chain->fex_present.enable = chain->fex_present.thread_started;
++        INFO("FEX present thread %s.\n", chain->fex_present.enable ? "on" : "off (thread creation failed)");
++    }
++
+     return S_OK;
+ }
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index c7e2bdc..ddfd902 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3077,6 +3077,7 @@ struct vkd3d_timestamp_profiler_submitted_work;
+ #define VKD3D_FEX_REPORT_FLAG_PRESENT_DRAWN 0x800u /* present report: frames go to the window system only once drawn */
+ #define VKD3D_FEX_REPORT_FLAG_LATENCY_RESYNC 0x1000u /* present report: frame credit resync is on (VKD3D fex16) */
+ #define VKD3D_FEX_REPORT_FLAG_MEMORY_AHEAD 0x2000u /* gpu report: GPU memory made ahead is on (VKD3D fex17) */
++#define VKD3D_FEX_REPORT_FLAG_PRESENT_THREAD 0x4000u /* present report: presents run on their own thread (VKD3D fex19) */
+ #define VKD3D_FEX_REPORT_FLAG_DEVICE 0x80000000u /* a D3D12 device was created */
+ struct vkd3d_fex_report
+ {
+@@ -3154,6 +3155,8 @@ enum vkd3d_fex_present_step
+     VKD3D_FEX_STEP_QUEUE_LOCK,    /* waiting for the VkQueue (shared with the other queues) before vkQueuePresentKHR */
+     VKD3D_FEX_STEP_AFTER_PRESENT, /* the present's work after vkQueuePresentKHR (frame done signal, latency handle) */
+     VKD3D_FEX_STEP_GPU_AHEAD,     /* frame start pacing: GPU done with the frame this long before vkQueuePresentKHR returned */
++    VKD3D_FEX_STEP_PRESENT_THREAD, /* present thread (VKD3D fex19): the queue thread waiting at a present's start for
++                                    * the present thread to finish the present before */
+     VKD3D_FEX_STEP_COUNT
+ };
+ enum vkd3d_fex_queue_op
+@@ -3193,6 +3196,11 @@ extern bool vkd3d_fex_present_drawn_on;
+  * else only with 1): when the game runs frames ahead of the frame latency it set (a frame started without taking a
+  * credit from its frame latency handle), hold back that many of vkd3d's hand-outs on the handle. */
+ extern bool vkd3d_fex_latency_resync_on;
++/* Present thread (VKD3D_FEX_PRESENT_THREAD, VKD3D fex19, swapchain.c; on unless 0 while frame start pacing is on, else
++ * only with 1; needs the frame done thread): the cap pre-sleep, the drawn frame wait and vkQueuePresentKHR run on a
++ * thread of their own instead of the D3D12 queue's thread, so the next frame's command lists reach the GPU while a
++ * present waits for its slot on the screen. */
++extern bool vkd3d_fex_present_thread_on;
+ void vkd3d_fex_timeline_init(void);
+ uint32_t vkd3d_fex_timeline_queue_slot(D3D12_COMMAND_LIST_TYPE type);
+ void vkd3d_fex_timeline_queue_free_slot(uint32_t slot);
+-- 
+2.43.0
+
