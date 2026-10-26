@@ -1,0 +1,154 @@
+From 9921dfd62d59bea0238909b7972fbe940e5215ec Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 08:12:07 +0000
+Subject: [PATCH] FEX: frame start hold-back up to 50 ms
+ (VKD3D_FEX_START_MAX_MS)
+
+The most frame start pacing holds the game's next frame back was 30 ms
+from VKD3D fex8 on. FEX's later builds made the game's own frame ~11 ms
+(release to Present()), and in the FEX build 74 run the hold-back sat at
+those 30 ms in 157 of 200 seconds of play while the last 64 frames'
+spare times allowed 58 ms on average (33 at the least). Frames then took
+~70 ms from their start (input read) to the screen; start to screen is
+~100 ms less the hold-back there. The ceiling is now 50 ms, or
+VKD3D_FEX_START_MAX_MS (1-90 ms; 30 = fex8 to fex13). The pacing itself
+(spare times, margin, late frames) is unchanged. The present note and
+the frame start line name the ceiling.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WZVGoVEaHJ78mpf2D3MiER
+---
+ libs/vkd3d/fex_timeline.c  | 16 +++++++++++++---
+ libs/vkd3d/swapchain.c     | 28 +++++++++++++++++++---------
+ libs/vkd3d/vkd3d_private.h |  2 ++
+ 3 files changed, 34 insertions(+), 12 deletions(-)
+
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index fed0b94..5403900 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -14,6 +14,7 @@
+ 
+ #include "vkd3d_private.h"
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <inttypes.h>
+ 
+@@ -28,6 +29,7 @@ bool vkd3d_fex_frame_start_on;
+ bool vkd3d_fex_present_presleep_on;
+ bool vkd3d_fex_host_frame_done_on;
+ bool vkd3d_fex_present_drawn_on;
++uint32_t vkd3d_fex_frame_start_max_ms = 50;
+ 
+ struct fex_timeline_stat
+ {
+@@ -131,6 +133,13 @@ void vkd3d_fex_timeline_init(void)
+     vkd3d_fex_host_frame_done_on = !(vkd3d_get_env_var("VKD3D_FEX_HOST_FRAME_DONE", env, sizeof(env)) &&
+             !strcmp(env, "0"));
+     vkd3d_fex_present_drawn_on = vkd3d_get_env_var("VKD3D_FEX_PRESENT_DRAWN", env, sizeof(env)) && !strcmp(env, "1");
++    /* Most hold-back in ms (VKD3D fex14: 50 unless set; 1-90 taken, 30 = fex8 to fex13). */
++    if (vkd3d_get_env_var("VKD3D_FEX_START_MAX_MS", env, sizeof(env)))
++    {
++        unsigned long ms = strtoul(env, NULL, 10);
++        if (ms >= 1 && ms <= 90)
++            vkd3d_fex_frame_start_max_ms = ms;
++    }
+     vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_present_report.flags, VKD3D_FEX_REPORT_FLAG_DEVICE |
+             (vkd3d_fex_timeline_on ? VKD3D_FEX_REPORT_FLAG_ON : 0) |
+             (vkd3d_fex_frame_start_on ? VKD3D_FEX_REPORT_FLAG_FRAME_START | VKD3D_FEX_REPORT_FLAG_GRADUAL_START |
+@@ -143,7 +152,7 @@ void vkd3d_fex_timeline_init(void)
+     if (vkd3d_fex_timeline_on)
+         INFO("FEX timeline on.\n");
+     if (vkd3d_fex_frame_start_on)
+-        INFO("FEX frame start pacing on.\n");
++        INFO("FEX frame start pacing on, up to %u ms.\n", vkd3d_fex_frame_start_max_ms);
+     if (vkd3d_fex_present_presleep_on)
+         INFO("FEX cap pre-sleep on.\n");
+     if (vkd3d_fex_host_frame_done_on)
+@@ -460,9 +469,10 @@ static void fex_timeline_publish(double seconds)
+         len = vkd3d_fex_report_append(text, sizeof(text), len,
+                 "  frame start n=%u | held back now %.1f ms (margin %.0f ms) | spare min %.1f ms | late %u (%u from the hold-back)"
+                 " | spare from a busy GPU %u | skipped (GPU finish before not seen) %u"
+-                " | spare times allow %.1f ms (ceiling 30 ms, more than that %u) | paced as GPU-bound %u\n",
++                " | spare times allow %.1f ms (ceiling %u ms, more than that %u) | paced as GPU-bound %u\n",
+                 pacing_frames, pacing_delay_ns / 1e6, pacing_margin_ns / 1e6, pacing_frames ? pacing_spare_min_ns / 1e6 : 0.0,
+-                pacing_late, pacing_caused, pacing_busy, pacing_unseen, pacing_aim_ns / 1e6, pacing_ceiling,
++                pacing_late, pacing_caused, pacing_busy, pacing_unseen, pacing_aim_ns / 1e6, vkd3d_fex_frame_start_max_ms,
++                pacing_ceiling,
+                 pacing_gpu_bound);
+     if (gpu_frame[0].count || gpu_frame[1].count || gpu_frame[2].count)
+     {
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index cf2b995..f4c0f83 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -2134,11 +2134,21 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+ {
+     uint64_t target_interval_ns = chain->frame_rate_limit.target_interval_ns;
+     struct vkd3d_queue_family_info *const *families = chain->queue->device->queue_families;
+-    char text[1024];
++    char text[1024], pacing[320];
+ 
+     if (!vkd3d_fex_timeline_on)
+         return;
+ 
++    if (!chain->fex_start.enable)
++        snprintf(pacing, sizeof(pacing), "%s", vkd3d_fex_frame_start_on ? "off (no game latency handle)" : "off");
++    else if (chain->fex_done.enable)
++        snprintf(pacing, sizeof(pacing), "on (up to %u ms: VKD3D fex14, a busy GPU counts as spare time, GPU finish seen as"
++                " it happens, margin 1 ms smaller per 60 frames without a late one, GPU-bound pacing when 48 of the last 64"
++                " frames had a busy GPU: VKD3D fex10)", vkd3d_fex_frame_start_max_ms);
++    else
++        snprintf(pacing, sizeof(pacing), "on (up to %u ms: VKD3D fex14, a busy GPU counts as spare time: VKD3D fex6)",
++                vkd3d_fex_frame_start_max_ms);
++
+     snprintf(text, sizeof(text), "swapchain %ux%u, %u images (asked %u, game BufferCount %u), mode %s%s%s,"
+             " SyncInterval %u, present wait %s, game latency handle %s (max latency %u), internal latency %u,"
+             " vkd3d limiter %.1f fps, frame start pacing %s, cap pre-sleep %s, frame done signal %s, drawn frames only %s,"
+@@ -2154,12 +2164,7 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+             (chain->desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) ? "yes" : "no",
+             chain->frame_latency, chain->frame_latency_internal,
+             target_interval_ns ? 1e9 / (double)target_interval_ns : 0.0,
+-            chain->fex_start.enable ? (chain->fex_done.enable ?
+-                    "on (up to 30 ms, a busy GPU counts as spare time, GPU finish seen as it happens, margin 1 ms smaller"
+-                    " per 60 frames without a late one, GPU-bound pacing when 48 of the last 64 frames had a busy GPU:"
+-                    " VKD3D fex10)" :
+-                    "on (up to 30 ms, a busy GPU counts as spare time: VKD3D fex6)") :
+-                    vkd3d_fex_frame_start_on ? "off (no game latency handle)" : "off",
++            pacing,
+             vkd3d_fex_present_presleep_on ? "on (grid from every held present, no checks without it: VKD3D fex8)" : "off",
+             chain->fex_done.enable ? "from the CPU after the copy's fence, watched from its submit (VKD3D fex8)" :
+                     vkd3d_fex_host_frame_done_on ? "GPU submit (frame done thread failed)" : "GPU submit",
+@@ -3708,8 +3713,13 @@ static void *dxgi_vk_swap_chain_fex_done_worker(void *chain_)
+ #define FEX_START_LATE_NS 2000000ll        /* this much past its time while held back: the frame came late */
+ /* Most hold-back: 30 ms from VKD3D fex8 on (was 20). In the b61 run with VKD3D fex4 the hold-back sat at 20 ms for 78
+  * of 253 seconds with a median of 6 ms more measured spare time above it; calm frames had ~30 ms more. Each ms of
+- * hold-back is a ms less from the frame start (input read) to the screen. */
+-#define FEX_START_MAX_NS 30000000ll
++ * hold-back is a ms less from the frame start (input read) to the screen.
++ * VKD3D fex14: 50 ms unless VKD3D_FEX_START_MAX_MS says otherwise (1-90). FEX's later builds made the game's own frame
++ * ~11 ms (release to Present()), so in the FEX build 74 run the hold-back sat at 30 ms in 157 of 200 seconds of play
++ * while the last 64 frames' spare times allowed 58 ms on average (33 at the least), and frames took ~70 ms from their
++ * start to the screen (start to screen is ~100 ms less the hold-back there). Replayed per second on that run, 50 ms
++ * cuts ~17 ms off that on average for a frame the hold-back makes late in ~6 more seconds of 200. */
++#define FEX_START_MAX_NS ((int64_t)vkd3d_fex_frame_start_max_ms * 1000000ll)
+ #define FEX_START_CALM_FRAMES 60u          /* frames without a near-late one before the hold-back grows again */
+ /* The hold-back only ever changes by a little from one frame to the next: each change moves the game's frame start, so
+  * a big one makes the time the game steps its world by differ from the time the frame is on screen (build 56 jumped
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index a22d494..e095f12 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3169,6 +3169,8 @@ extern bool vkd3d_fex_timeline_on;
+ /* Frame start pacing (VKD3D_FEX_FRAME_START=1, swapchain.c): hold back the game's frame latency release by the time its
+  * frames were measured to wait anyway, so the game starts each frame (and reads input) as late as still works. */
+ extern bool vkd3d_fex_frame_start_on;
++/* Most hold-back of frame start pacing in ms (VKD3D_FEX_START_MAX_MS, 1-90; VKD3D fex14: 50 unless set, was 30). */
++extern uint32_t vkd3d_fex_frame_start_max_ms;
+ /* Cap pre-sleep (VKD3D_FEX_PRESENT_PRESLEEP=1, swapchain.c): sleep out a frame cap's wait before vkQueuePresentKHR,
+  * without holding the VkQueue the game's other queues share. */
+ extern bool vkd3d_fex_present_presleep_on;
+-- 
+2.43.0
+
