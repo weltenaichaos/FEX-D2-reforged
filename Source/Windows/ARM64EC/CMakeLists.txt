@@ -4,6 +4,7 @@ add_library(arm64ecfex SHARED
   GameFiles.cpp
   GameFilesStore.cpp
   LoaderWatch.cpp
+  LoadScreen.cpp
   Module.cpp
   Module.S
   NativeMD5.c

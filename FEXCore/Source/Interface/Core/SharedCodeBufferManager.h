@@ -187,10 +187,25 @@ public:
     uint64_t Reused;
     uint64_t ReusedBytes;
     uint64_t Dropped;
+    // Build 94: bytes placed after translating / loading, and the placements of LargeMin bytes or more.
+    uint64_t TranslatedBytes;
+    uint64_t LoadedBytes;
+    uint64_t Large;
+    uint64_t LargeBytes;
   };
   Use GetUse() const;
-  // A thread placed code in Buffer (Loaded: from the disk cache, else just translated).
-  void NotePlaced(const CodeBuffer* Buffer, bool Loaded);
+  // A thread placed Size bytes of code in Buffer (Loaded: from the disk cache, else just translated) for the guest code
+  // at GuestRIP (GuestSize bytes of it; 0 when not known).
+  void NotePlaced(const CodeBuffer* Buffer, bool Loaded, size_t Size, uint64_t GuestRIP, uint32_t GuestSize);
+  // Build 94: placement Index (0 = the first of LargeMin bytes or more) if it is still in the ring and written.
+  struct LargePlacement {
+    uint64_t Size;
+    uint64_t GuestRIP;
+    uint32_t GuestSize;
+    bool Loaded;
+  };
+  static constexpr size_t LargeMin = 64 * 1024;
+  bool GetLarge(uint64_t Index, LargePlacement& Out) const;
   void NoteReused(size_t Bytes) {
     ReusedTotal.fetch_add(1, std::memory_order_relaxed);
     ReusedBytesTotal.fetch_add(Bytes, std::memory_order_relaxed);
@@ -232,6 +247,17 @@ private:
   std::atomic<uint64_t> ReusedTotal {};
   std::atomic<uint64_t> ReusedBytesTotal {};
   std::atomic<uint64_t> DroppedTotal {};
+  std::atomic<uint64_t> TranslatedBytesTotal {};
+  std::atomic<uint64_t> LoadedBytesTotal {};
+  std::atomic<uint64_t> LargeBytesTotal {};
+  // Placements of LargeMin bytes or more, for the log (CodeBuffer.cpp's '# code buffer' lines).
+  struct LargeSlot {
+    std::atomic<uint64_t> Seq; // index + 1 once written
+    LargePlacement Info;
+  };
+  static constexpr size_t LargeRing = 64;
+  LargeSlot LargeSlots[LargeRing];
+  std::atomic<uint64_t> LargeCount {};
 
   bool NameJITBuffers {true};
 };

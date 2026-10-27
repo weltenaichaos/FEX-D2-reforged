@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "GameFiles.h"
+#include "LoadScreen.h"
 #include "FrameLatency.h"
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/StatsLog.h"
@@ -615,7 +616,9 @@ namespace {
   }
 
   // What frame Frame (frame marks written when something happened in it: it began at mark Frame - 1) was: 1 one of play
-  // (shorter than PlayFrameMs), 0 a loading screen's, -1 not ended yet and not that long so far, -2 too long ago to tell.
+  // (shorter than PlayFrameMs), 0 a loading screen's, -1 not ended yet and not that long so far (or, build 94, not yet
+  // known to be GPU-light or not), -2 too long ago to tell. Build 94: a short frame in a GPU-light stretch
+  // (LoadScreen.h) is a loading screen's too: D2R draws most of a loading screen at full speed.
   int KindOfFrame(uint64_t Frame) {
     const uint64_t Marks = FrameCount();
     if (!Frame || Marks - Frame >= MarkRing - 1) {
@@ -625,7 +628,11 @@ namespace {
     const uint64_t Began = FrameMark(Frame - 1);
     if (Marks > Frame) {
       const uint64_t Ended = FrameMark(Frame);
-      return Ended > Began && Ended - Began < PlayTicks ? 1 : 0;
+      if (!(Ended > Began && Ended - Began < PlayTicks)) {
+        return 0;
+      }
+      const int Light = LoadScreen::FrameLight(Frame);
+      return Light < 0 ? -1 : Light ? 0 : 1;
     }
     const uint64_t Now = GetCounter();
     return Now > Began && Now - Began >= PlayTicks ? 0 : -1;
@@ -1077,7 +1084,8 @@ namespace {
     const uint64_t Marks = FrameCount();
     const uint64_t Now = GetCounter();
     const uint64_t Last = Marks ? FrameMark(Marks - 1) : 0;
-    const bool Gap = Marks && Now > Last && Now - Last >= CounterFreq * PlayFrameMs / 1000;
+    // Build 94: GPU-light frames are a loading screen too (LoadScreen.h).
+    const bool Gap = (Marks && Now > Last && Now - Last >= CounterFreq * PlayFrameMs / 1000) || LoadScreen::LightNow();
     if (LearnBudget) {
       MatchNewFiles(Matched);
       TakeCandidates();
@@ -1797,7 +1805,7 @@ bool FramesComing() {
   }
   const uint64_t Last = FrameMark(Marks - 1);
   const uint64_t Now = GetCounter();
-  return Now <= Last || Now - Last < CounterFreq * PlayFrameMs / 1000;
+  return (Now <= Last || Now - Last < CounterFreq * PlayFrameMs / 1000) && !LoadScreen::LightNow();
 }
 
 int FrameKind(uint64_t Frame) {

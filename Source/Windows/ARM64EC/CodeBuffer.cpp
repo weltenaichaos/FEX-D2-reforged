@@ -7,6 +7,7 @@ $end_info$
 */
 
 #include "CodeBuffer.h"
+#include "LoadScreen.h"
 #include "Windows/Common/InvalidationTracker.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/Switches.h"
@@ -21,6 +22,7 @@ $end_info$
 #include <atomic>
 #include <iterator>
 #include <cstdlib>
+#include <utility>
 #include <ntstatus.h>
 #include <windef.h>
 #include <winternl.h>
@@ -80,6 +82,7 @@ namespace {
   std::atomic<uint64_t> Loads {};
   std::atomic<uint64_t> LoadAt {};
   std::atomic<uint32_t> LoadPercent {};
+  std::atomic<bool> LoadLight {}; // build 94: seen by GPU-light frames (LoadScreen.h), not a frame gap
   uint64_t LoadsRead {};
 
   const char* ReasonText(uint8_t Reason) {
@@ -99,6 +102,81 @@ namespace {
   FEXCore::Context::Context::CodeBufferUse UseLast {};
   FEX::Windows::InvalidationTracker::DropCounts DropsLast {};
 
+  // Build 94: the main exe's range, to name where big placements' guest code is.
+  uint64_t MainBase {};
+  uint64_t MainSize {};
+
+  fextl::string GuestPlace(uint64_t RIP) {
+    if (!RIP) {
+      return "?";
+    }
+    if (RIP - MainBase < MainSize) {
+      return fextl::fmt::format("exe+{:X}", RIP - MainBase);
+    }
+    MEMORY_BASIC_INFORMATION Info {};
+    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(RIP), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ==
+          STATUS_SUCCESS &&
+        Info.AllocationBase) {
+      const uint64_t Base = reinterpret_cast<uint64_t>(Info.AllocationBase);
+      return fextl::fmt::format("{:X}+{:X}", Base, RIP - Base);
+    }
+    return fextl::fmt::format("{:X}", RIP);
+  }
+
+  // Build 94: placements of 64 KB or more since the last line, by guest address: the biggest share first. In calm play
+  // of the build 93 run the buffer grew 2.9-6.8 MB in some 10 s windows that placed only 120-200 blocks (most ~0.5 KB).
+  fextl::string LargeText(const FEXCore::Context::Context::CodeBufferUse& U) {
+    constexpr double MB = 1024.0 * 1024.0;
+    const uint64_t Count = U.Large - UseLast.Large;
+    if (!Count) {
+      return {};
+    }
+    struct Place {
+      uint64_t RIP;
+      uint64_t Bytes;
+      uint64_t Largest;
+      uint32_t Times;
+      uint32_t GuestSize;
+      bool Loaded;
+    };
+    Place Places[64];
+    size_t Used {};
+    uint64_t Lost {};
+    for (uint64_t i = UseLast.Large; i < U.Large; ++i) {
+      FEXCore::Context::Context::LargeCodePlacement L;
+      if (U.Large - i > 64 || !Ctx->GetLargeCodePlacement(i, L)) {
+        ++Lost;
+        continue;
+      }
+      auto* P = std::find_if(Places, Places + Used, [&](const Place& Q) { return Q.RIP == L.GuestRIP; });
+      if (P == Places + Used) {
+        *P = {L.GuestRIP, 0, 0, 0, L.GuestSize, L.Loaded};
+        ++Used;
+      }
+      P->Bytes += L.Size;
+      P->Largest = std::max<uint64_t>(P->Largest, L.Size);
+      ++P->Times;
+      P->GuestSize = std::max(P->GuestSize, L.GuestSize);
+      P->Loaded = P->Loaded && L.Loaded;
+    }
+    std::sort(Places, Places + Used, [](const Place& a, const Place& b) { return a.Bytes > b.Bytes; });
+    fextl::string Out = fextl::fmt::format(" | of those, {} of 64 KB or more ({:.2f} MB)", Count,
+                                           static_cast<double>(U.LargeBytes - UseLast.LargeBytes) / MB);
+    for (size_t i = 0; i < std::min<size_t>(Used, 4); ++i) {
+      const auto& P = Places[i];
+      Out += fextl::fmt::format("{} {} {}x {:.0f} KB (largest {:.0f} KB, {}, guest {:.1f} KB)", i ? "," : ":", GuestPlace(P.RIP),
+                                P.Times, static_cast<double>(P.Bytes) / 1024.0, static_cast<double>(P.Largest) / 1024.0,
+                                P.Loaded ? "from the disk cache" : "translated", static_cast<double>(P.GuestSize) / 1024.0);
+    }
+    if (Used > 4) {
+      Out += fextl::fmt::format(", {} more places", Used - 4);
+    }
+    if (Lost) {
+      Out += fextl::fmt::format(", {} not read (ring passed)", Lost);
+    }
+    return Out;
+  }
+
   fextl::string UseLine(uint64_t Now, uint64_t Freq) {
     using Tracker = FEX::Windows::InvalidationTracker;
     using R = Tracker::DropReason;
@@ -113,11 +191,13 @@ namespace {
     if (UseLastAt && U.Number == UseLast.Number) {
       Out += fextl::fmt::format(", +{:.2f} MB", static_cast<double>(U.Used - std::min(U.Used, UseLast.Used)) / MB);
     }
-    Out += fextl::fmt::format(") | in the last {:.0f} s: placed {} blocks ({} loaded from the disk cache, {} translated), {} disk cache "
-                              "hits served by the copy already in the buffer ({:.2f} MB not copied)",
+    Out += fextl::fmt::format(") | in the last {:.0f} s: placed {} blocks ({} loaded from the disk cache {:.2f} MB, {} translated {:.2f} MB)",
                               Seconds, (U.Loaded - UseLast.Loaded) + (U.Translated - UseLast.Translated), U.Loaded - UseLast.Loaded,
-                              U.Translated - UseLast.Translated, U.Reused - UseLast.Reused,
-                              static_cast<double>(U.ReusedBytes - UseLast.ReusedBytes) / MB);
+                              static_cast<double>(U.LoadedBytes - UseLast.LoadedBytes) / MB, U.Translated - UseLast.Translated,
+                              static_cast<double>(U.TranslatedBytes - UseLast.TranslatedBytes) / MB);
+    Out += LargeText(U);
+    Out += fextl::fmt::format(" | {} disk cache hits served by the copy already in the buffer ({:.2f} MB not copied)",
+                              U.Reused - UseLast.Reused, static_cast<double>(U.ReusedBytes - UseLast.ReusedBytes) / MB);
     Out += fextl::fmt::format(", dropped {} blocks:", U.Dropped - UseLast.Dropped);
 
     static constexpr const char* ReasonNames[] = {"protection exec->exec", "protection exec removed", "protection made exec",
@@ -167,10 +247,12 @@ namespace {
 
     const uint64_t LoadCount = Loads.load(std::memory_order_acquire);
     if (LoadCount != LoadsRead) {
-      Out += fextl::fmt::format("# code buffer: loading screen #{} (no frame for {} ms or more, {:.0f} ms before this line), "
-                                "renewal asked if the buffer is {}% used or more\n",
-                                LoadCount, LoadMs, MsAgo(LoadAt.load(std::memory_order_relaxed)),
-                                LoadPercent.load(std::memory_order_relaxed));
+      const bool Light = LoadLight.load(std::memory_order_relaxed);
+      Out += fextl::fmt::format("# code buffer: loading screen #{} ({}, {:.0f} ms before this line), renewal asked if the buffer is "
+                                "{}% used or more\n",
+                                LoadCount,
+                                Light ? fextl::string("GPU-light frames") : fextl::fmt::format("no frame for {} ms or more", LoadMs),
+                                MsAgo(LoadAt.load(std::memory_order_relaxed)), LoadPercent.load(std::memory_order_relaxed));
       LoadsRead = LoadCount;
     }
 
@@ -208,8 +290,9 @@ namespace {
     return Out;
   }
 
-  // Watches the frame clock: no new frame for LoadMs after at least PlayFrames frames is a loading screen. Until it ends
-  // or a renewal was done, a renewal is asked for every tick (each valid for two ticks); the first code allocation takes
+  // Watches the frame clock: no new frame for LoadMs after at least PlayFrames frames is a loading screen, and (build 94)
+  // so are frames that ask the GPU for little (LoadScreen::LightNow: D2R draws most of a loading screen at full speed).
+  // Until it ends or a renewal was done, a renewal is asked for every tick (each valid for two ticks); the first code allocation takes
   // it, and starts a fresh buffer if the current one is used to the load's mark or more (RenewEarlyPercent for the first
   // EarlyLoads, RenewPercent after). Asking again later in the same load lets a load that fills the buffer past the mark
   // renew it still inside the load.
@@ -232,7 +315,9 @@ namespace {
       }
       const uint64_t LastFrame = __atomic_load_n(&FEXFrameMarks[1 + ((Frames - 1) & (MarkRing - 1))], __ATOMIC_RELAXED);
       const uint64_t Now = Counter();
-      const bool Gap = Now > LastFrame && Now - LastFrame >= LoadTicks;
+      const bool NoFrame = Now > LastFrame && Now - LastFrame >= LoadTicks;
+      const bool Light = LoadScreen::LightNow();
+      const bool Gap = NoFrame || Light;
 
       if (InLoad) {
         if (!Gap) {
@@ -251,7 +336,8 @@ namespace {
         Percent = LoadCount <= EarlyLoads ? std::min(RenewEarlyPercent, RenewPercent) : RenewPercent;
         RenewalsAtLoad = Renewals.load(std::memory_order_relaxed);
         Ctx->RequestCodeBufferRenewal(Percent, 2 * TickMs);
-        LoadAt.store(LastFrame + LoadTicks, std::memory_order_relaxed);
+        LoadAt.store(NoFrame ? LastFrame + LoadTicks : Now, std::memory_order_relaxed);
+        LoadLight.store(!NoFrame, std::memory_order_relaxed);
         LoadPercent.store(Percent, std::memory_order_relaxed);
         Loads.fetch_add(1, std::memory_order_release);
       }
@@ -309,6 +395,11 @@ void Init(FEXCore::Context::Context* CTX, bool StatsLog) {
 
 bool WantsFrameMarks() {
   return FrameMarksWanted;
+}
+
+void SetMainImage(uint64_t Base, uint64_t Size) {
+  MainBase = Base;
+  MainSize = Size;
 }
 
 void NoteStarted(const FEXCore::HLE::SyscallHandler::CodeBufferStart& Info) {

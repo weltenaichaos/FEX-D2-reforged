@@ -34,6 +34,8 @@ $end_info$
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -860,7 +862,7 @@ bool Arm64JITCore::MoveToLatestCodeBuffer() {
   return false;
 }
 
-CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(size_t Size, bool Loaded) {
+CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(size_t Size, bool Loaded, uint64_t GuestRIP, uint32_t GuestSize) {
   CodeBuffer::CodeBufferAllocation AllocatedInfo {};
   LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
                                                                                                "doesn't match up!\n");
@@ -895,7 +897,7 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
   if (Loaded) {
     CurrentCodeBuffer->CachedBlocks.fetch_add(1, std::memory_order_relaxed);
   }
-  CTX->NotePlaced(CurrentCodeBuffer.get(), Loaded);
+  CTX->NotePlaced(CurrentCodeBuffer.get(), Loaded, Size, GuestRIP, GuestSize);
   return AllocatedInfo;
 }
 
@@ -1168,7 +1170,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   {
     LOGMAN_THROW_A_FMT(CodeData.Size % 16 == 0, "Needs to be 16B aligned!");
 
-    auto AllocatedInfo = AllocateCodeBufferInSharedCache(CodeData.Size);
+    auto AllocatedInfo = AllocateCodeBufferInSharedCache(CodeData.Size, false, Entry, static_cast<uint32_t>(std::min<uint64_t>(Size, UINT32_MAX)));
     // NOTE: 16-byte alignment of the new cursor offset must be preserved for block linking records
     LOGMAN_THROW_A_FMT((reinterpret_cast<uintptr_t>(AllocatedInfo.BufferAllocationOffset) % 16) == 0, "Allocated buffer wasn't 16B "
                                                                                                       "aligned?");
@@ -1245,7 +1247,7 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
     }
   }
 
-  auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size(), true);
+  auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size(), true, Key ? Key->GuestRIP : 0, Key ? Key->GuestSize : 0);
 
   uint8_t* Dest = AllocatedInfo.BufferAllocationOffset;
   memcpy(Dest, HostBytes.data(), HostBytes.size());

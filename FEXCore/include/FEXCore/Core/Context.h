@@ -154,6 +154,8 @@ public:
   //   GetCodeBufferUse: the latest buffer's number, usable size and bytes used, and counts since the start: blocks
   //   placed after translating them or loading them from the disk cache, disk cache blocks served by code already in the
   //   buffer (and the bytes that were not copied), blocks dropped by invalidations.
+  //   (build 94) bytes placed after translating and after loading, and the placements of 64 KB or more (count, bytes);
+  //   GetLargeCodePlacement: such placement Index (0 = the first) while it is still among the last 64.
   struct CodeBufferUse {
     uint32_t Number;
     uint64_t Size;
@@ -163,9 +165,20 @@ public:
     uint64_t Reused;
     uint64_t ReusedBytes;
     uint64_t Dropped;
+    uint64_t TranslatedBytes;
+    uint64_t LoadedBytes;
+    uint64_t Large;
+    uint64_t LargeBytes;
+  };
+  struct LargeCodePlacement {
+    uint64_t Size;
+    uint64_t GuestRIP;
+    uint32_t GuestSize;
+    bool Loaded;
   };
   FEX_DEFAULT_VISIBILITY virtual void SetPlacedCodeReuse(bool Enable) = 0;
   FEX_DEFAULT_VISIBILITY virtual CodeBufferUse GetCodeBufferUse() const = 0;
+  FEX_DEFAULT_VISIBILITY virtual bool GetLargeCodePlacement(uint64_t Index, LargeCodePlacement& Out) const = 0;
   FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual void
   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;

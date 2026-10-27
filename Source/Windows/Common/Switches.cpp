@@ -125,6 +125,11 @@ namespace {
     {"FEX_CODE_BUFFER_START", "max"},
     {"FEX_CODE_BUFFER_RENEW", "50"},
     {"FEX_CODE_BUFFER_RENEW_EARLY", "10"},
+    // Build 94: frames with fewer than 64 push descriptor updates each (FEX's Turnip build counts them) for 500 ms are a
+    // loading screen too. D2R draws most of a loading screen at full speed (~7-9 updates a frame, play 190 or more): in
+    // the build 93 run a 5 s loading screen at 40 FPS went unseen and the code buffer filled in play 2 minutes later
+    // (see ARM64EC/LoadScreen.h).
+    {"FEX_LOAD_LIGHT", "64"},
     // Build 85: in calm play of the build 84 run FEX placed ~78 blocks a second in the code buffer, ~8% of the 128 MB a
     // minute, more than D2R's whole working set (~13,000 blocks) every 3 minutes, nearly all loaded from the disk cache:
     // code that was dropped and runs again (D2R's protection decrypts its code pages on demand). Code that comes back the
@@ -256,6 +261,8 @@ namespace {
     "FEX_CODE_BUFFER_RENEW",
     "FEX_CODE_BUFFER_RENEW_EARLY",
     "FEX_CODE_BUFFER_LOAD_MS",
+    "FEX_LOAD_LIGHT",
+    "FEX_LOAD_LIGHT_MS",
     "FEX_CODE_REUSE",
     "FEX_GAME_FILES_UNCACHED",
     "FEX_GAME_FILES_MS",

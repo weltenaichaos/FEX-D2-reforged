@@ -640,7 +640,8 @@ private:
 
   // Moves this thread to the latest code buffer if another thread started one; returns whether it moved.
   bool MoveToLatestCodeBuffer();
-  [[nodiscard]] CodeBuffer::CodeBufferAllocation AllocateCodeBufferInSharedCache(size_t Size, bool Loaded = false);
+  [[nodiscard]] CodeBuffer::CodeBufferAllocation
+  AllocateCodeBufferInSharedCache(size_t Size, bool Loaded = false, uint64_t GuestRIP = 0, uint32_t GuestSize = 0);
 
 #define DEF_OP(x) void Op_##x(IR::IROp_Header const* IROp, IR::Ref Node)
 

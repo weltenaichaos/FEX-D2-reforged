@@ -61,8 +61,9 @@ bool WantsFrameMarks();
 
 // Build 90, for the unpack cache's learned list (NativeUnpackCache.cpp). Whether FEXFileCache runs (Init found
 // FEX_GAME_FILES_UNCACHED=1); whether the calling thread is the game's main thread; frame marks written so far (0 without
-// the frame clock); whether frames are coming (the last one began less than 250 ms ago: play, not a loading screen);
-// what frame Frame (a FrameNow() value) was: 1 play, 0 a loading screen's, -1 not known yet, -2 too long ago.
+// the frame clock); whether frames are coming (the last one began less than 250 ms ago, and from build 94 they are not
+// GPU-light, LoadScreen.h: play, not a loading screen); what frame Frame (a FrameNow() value) was: 1 play, 0 a loading
+// screen's, -1 not known yet, -2 too long ago.
 bool Running();
 bool OnMainThread();
 uint64_t FrameNow();

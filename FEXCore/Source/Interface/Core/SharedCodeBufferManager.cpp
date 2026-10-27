@@ -134,11 +134,31 @@ void SharedCodeBufferManager::UseMaximal() {
   }
 }
 
-void SharedCodeBufferManager::NotePlaced(const CodeBuffer* Buffer, bool Loaded) {
+void SharedCodeBufferManager::NotePlaced(const CodeBuffer* Buffer, bool Loaded, size_t Size, uint64_t GuestRIP, uint32_t GuestSize) {
   if (Buffer == LatestRaw.load(std::memory_order_acquire)) {
     LatestUsed.store(Buffer->AllocatedSpaceUsed(), std::memory_order_relaxed);
   }
   (Loaded ? LoadedTotal : TranslatedTotal).fetch_add(1, std::memory_order_relaxed);
+  (Loaded ? LoadedBytesTotal : TranslatedBytesTotal).fetch_add(Size, std::memory_order_relaxed);
+  if (Size >= LargeMin) {
+    LargeBytesTotal.fetch_add(Size, std::memory_order_relaxed);
+    // Claim a slot; the reader skips one until its Seq says it was written.
+    const uint64_t Index = LargeCount.fetch_add(1, std::memory_order_acq_rel);
+    auto& Slot = LargeSlots[Index % LargeRing];
+    Slot.Seq.store(0, std::memory_order_relaxed);
+    Slot.Info = {.Size = Size, .GuestRIP = GuestRIP, .GuestSize = GuestSize, .Loaded = Loaded};
+    Slot.Seq.store(Index + 1, std::memory_order_release);
+  }
+}
+
+bool SharedCodeBufferManager::GetLarge(uint64_t Index, LargePlacement& Out) const {
+  const auto& Slot = LargeSlots[Index % LargeRing];
+  if (Slot.Seq.load(std::memory_order_acquire) != Index + 1) {
+    return false;
+  }
+  Out = Slot.Info;
+  // Overwritten while copying: let the reader skip it.
+  return Slot.Seq.load(std::memory_order_acquire) == Index + 1;
 }
 
 SharedCodeBufferManager::Use SharedCodeBufferManager::GetUse() const {
@@ -151,6 +171,10 @@ SharedCodeBufferManager::Use SharedCodeBufferManager::GetUse() const {
     .Reused = ReusedTotal.load(std::memory_order_relaxed),
     .ReusedBytes = ReusedBytesTotal.load(std::memory_order_relaxed),
     .Dropped = DroppedTotal.load(std::memory_order_relaxed),
+    .TranslatedBytes = TranslatedBytesTotal.load(std::memory_order_relaxed),
+    .LoadedBytes = LoadedBytesTotal.load(std::memory_order_relaxed),
+    .Large = LargeCount.load(std::memory_order_acquire),
+    .LargeBytes = LargeBytesTotal.load(std::memory_order_relaxed),
   };
 }
 

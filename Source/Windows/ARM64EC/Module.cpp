@@ -59,6 +59,7 @@ $end_info$
 #include "Rumble.h"
 #include "LoaderWatch.h"
 #include "GameFiles.h"
+#include "LoadScreen.h"
 #include "NativeRedirect.h"
 #include "Vkd3dReport.h"
 #include "TurnipReport.h"
@@ -935,6 +936,7 @@ NTSTATUS ProcessInit() {
   if (const auto* Nt = MainModule ? RtlImageNtHeader(reinterpret_cast<HMODULE>(MainModule)) : nullptr) {
     MainExeBase = reinterpret_cast<uint64_t>(MainModule);
     MainExeSize = Nt->OptionalHeader.SizeOfImage;
+    CodeBufferPolicy::SetMainImage(MainExeBase, MainExeSize);
   }
 
   HandleImageMap(NtDllBase);
@@ -974,6 +976,8 @@ NTSTATUS ProcessInit() {
   FrameLatency::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
   Rumble::Init(StatsLog);
   GameFiles::Init(StatsLog);
+  // Build 94: loading screens that still draw frames, for the code buffer renewal and the learned lists.
+  LoadScreen::Init(StatsLog, CodeBufferPolicy::WantsFrameMarks() || GameFiles::WantsFrameMarks());
   if (StatsLog) {
     Vkd3dReport::Init();
     TurnipReport::Init();

@@ -234,7 +234,16 @@ public:
   }
   CodeBufferUse GetCodeBufferUse() const override {
     const auto U = GetUse();
-    return {U.Number, U.Size, U.Used, U.Translated, U.Loaded, U.Reused, U.ReusedBytes, U.Dropped};
+    return {U.Number,     U.Size,          U.Used,        U.Translated, U.Loaded,   U.Reused,
+            U.ReusedBytes, U.Dropped, U.TranslatedBytes, U.LoadedBytes, U.Large, U.LargeBytes};
+  }
+  bool GetLargeCodePlacement(uint64_t Index, LargeCodePlacement& Out) const override {
+    LargePlacement L;
+    if (!GetLarge(Index, L)) {
+      return false;
+    }
+    Out = {L.Size, L.GuestRIP, L.GuestSize, L.Loaded};
+    return true;
   }
   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
