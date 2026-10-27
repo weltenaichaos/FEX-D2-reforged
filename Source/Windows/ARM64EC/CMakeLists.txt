@@ -2,6 +2,7 @@ add_library(arm64ecfex SHARED
   CodeBuffer.cpp
   FrameLatency.cpp
   GameFiles.cpp
+  GameFilesStore.cpp
   LoaderWatch.cpp
   Module.cpp
   Module.S

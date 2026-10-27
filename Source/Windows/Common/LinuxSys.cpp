@@ -9,6 +9,7 @@
 namespace FEX::Windows::Linux {
 namespace {
   // arm64 Linux system call numbers (asm-generic/unistd.h).
+  constexpr int64_t NR_faccessat = 48;
   constexpr int64_t NR_openat = 56;
   constexpr int64_t NR_close = 57;
   constexpr int64_t NR_statfs = 43;
@@ -141,6 +142,10 @@ int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size) {
 
 int ReadAhead(int Fd, uint64_t Offset, uint64_t Size) {
   return static_cast<int>(Syscall(NR_fadvise64, Fd, static_cast<int64_t>(Offset), static_cast<int64_t>(Size), POSIX_FADV_WILLNEED));
+}
+
+int Access(const char* Path, int Mode) {
+  return static_cast<int>(Syscall(NR_faccessat, AT_FDCWD, reinterpret_cast<intptr_t>(Path), Mode));
 }
 
 bool Stat(const char* Path, FileInfo& Out) {

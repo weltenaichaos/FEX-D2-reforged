@@ -23,6 +23,8 @@ int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size);
 // waiting for them. The kernel takes at most its read-ahead size per call (the device's read_ahead_kb, or its largest
 // request size), so a bigger range needs several calls. 0 or a negative errno.
 int ReadAhead(int Fd, uint64_t Offset, uint64_t Size);
+// Whether this process may use a path as asked (faccessat; Mode 2 = write, 4 = read). 0 or a negative errno.
+int Access(const char* Path, int Mode);
 // What a path names (following symbolic links), from fstatat. False when it can't be looked at.
 struct FileInfo {
   uint64_t Size;

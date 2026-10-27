@@ -122,6 +122,12 @@ namespace {
     // Build 88: off. In the build 87 log the same read took 17.4 ms (25.1 at another spot), still ~230 MB/s, and asking
     // cost ~1 ms each time. Build 88 times what those reads do instead ('slow main' details, 'storage clock' lines).
     {"FEX_GAME_FILES_AHEAD", "0"},
+    // Build 89: the game data the main thread waited for storage for during play is remembered across sessions, read in
+    // at the start and at every loading screen, and kept (budget in MB; see ARM64EC/GameFiles.h). In the build 88 log
+    // storage ran at its low clock (75 of 300 MHz) during every slow main-thread read: in play the game reads in short
+    // bursts, too short for Android to raise the clock, so a 3968 KB read took 20-21 ms (~200 MB/s, against ~950 MB/s in
+    // loading screens), and an area entry had a 124 ms frame. The same reads come back in every session.
+    {"FEX_GAME_FILES_LEARN", "256"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
@@ -230,6 +236,7 @@ namespace {
     "FEX_GAME_FILES_GUARD_MB",
     "FEX_GAME_FILES_READ_WATCH",
     "FEX_GAME_FILES_AHEAD",
+    "FEX_GAME_FILES_LEARN",
     "FEX_UNPACK_CACHE_SKIP_ADLER",
     "FEX_NATIVE_ADLER_NEON",
     "FEX_NATIVE_MD5_CACHE",

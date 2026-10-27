@@ -29,6 +29,7 @@ $end_info$
 #include "NativeRedirect.h"
 #include "CodeBuffer.h"
 #include "FrameLatency.h"
+#include "GameFiles.h"
 #include "NativeStats.h"
 #include "NativeUnpackCache.h"
 #include "Windows/Common/PriorityGuard.h"
@@ -915,7 +916,8 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
   }
   // FrameLatency.cpp counts frames too.
   if (const char* FrameTimes = FEX::Windows::Switch("FEX_FRAMETIMES");
-      (StatsLog || FrameLatency::WantsFrameMarks() || CodeBufferPolicy::WantsFrameMarks()) && !(FrameTimes && FrameTimes[0] == '0')) {
+      (StatsLog || FrameLatency::WantsFrameMarks() || CodeBufferPolicy::WantsFrameMarks() || GameFiles::WantsFrameMarks()) &&
+      !(FrameTimes && FrameTimes[0] == '0')) {
     FrameClock::Enabled = true;
   }
   if (FrameClock::Enabled) {
