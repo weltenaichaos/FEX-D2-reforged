@@ -36,8 +36,12 @@ namespace FEX::Windows {
 //   FEX_MAINCORE=off   leave affinities alone
 //   FEX_MAINCORE_WAIT=N  with "fast": while the main thread waits N ms or more a second for its one core (login and
 //                      loading, where the wineserver and other threads share that core), it may also use the game's
-//                      other big cores until it waits under 10 ms a second for 5 seconds (longer if it keeps bouncing).
-//                      D2R default 40; "off" or 0 keeps it on its core at all times.
+//                      other big cores until it waits under 10 ms a second for 5 seconds (longer if it keeps bouncing),
+//                      and from build 93 for that long at most: then it tries its own core again either way (build 92
+//                      log: widened at login, it never came back and ran 94% of play on the slower cores). While the
+//                      kernel has its core paused (core control), it uses the game's other big cores and goes back
+//                      as soon as the core is in use again. D2R default 40; "off" or 0 keeps it on its core at all
+//                      times (paused or not, as up to build 92).
 //   FEX_MAINCORE_OTHERS=user  with "fast": every other thread of the app's Linux user stays off the main thread's core
 //                      too, checked every 2 seconds at the Linux level: Wine's other programs (steam.exe, winedevice.exe,
 //                      explorer.exe ...), the launcher's own process and this process's threads Wine doesn't list (the D2R

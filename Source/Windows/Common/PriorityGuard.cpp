@@ -876,7 +876,15 @@ namespace {
   // At login and while loading, the main thread alone on the X3 waited up to 650 ms a second for it (build 50; 150-270 ms
   // in build 49): something outside the game runs there then. When it waits FEX_MAINCORE_WAIT ms (default 40) or more in
   // a second, it may also use the game's other big cores until it has waited under 10 ms a second for a while (5 s, longer
-  // when it had to leave again soon after coming back).
+  // when it had to leave again soon after coming back), and from build 93 for that long at most: it then tries its own
+  // core again either way. Its waits on the other big cores count the game's job workers and the wineserver it shares
+  // them with (all at nice -10), so they rarely fall under 10 ms: in the build 92 log it widened at login (13 s) and never
+  // came back, the kernel kept it on the slower cores 94% of play (2.8 GHz A715/A710 instead of the 3.2 GHz X3; build 90:
+  // 97% on the X3), its game work took ~24% longer per frame at the same scene size, it waited up to 118 ms in one frame
+  // for a CPU, and core control paused the idle X3 20-50% of each second from 43 s on.
+  // When the kernel pauses its core while it is pinned there (core control takes an idle CPU out of use; a thread whose
+  // only CPU is paused gets moved and its mask widened to the whole cpuset, little cores included: build 50's "changed to
+  // all 8"), it goes to the game's other big cores and back as soon as its core is in use again (build 93).
   // Keeps the main thread at Linux nice FEX_MAIN_NICE (see PriorityGuard.h). Wine sets a thread's nice from its Windows
   // priority only when that priority changes (the round above does that once at start, from D2R's TIME_CRITICAL), so
   // this mostly sets it once; it is checked every 250 ms all the same, like the core.
@@ -938,6 +946,10 @@ namespace {
     fextl::string StatusPath; // /proc/self/task/<tid>/status
     uint64_t PausedSeen;      // CPUs of its mask the kernel had paused at the last check
     uint32_t Pauses;
+    uint32_t WideSeconds; // seconds on the wide mask since it widened for waits
+    uint32_t Tries;       // returns to its core after WideSeconds reached CalmNeeded without calm seconds
+    bool FastPaused;      // its core is paused by the kernel: on the wide mask until the core is in use again
+    uint32_t FastPauses;
   };
 
   void KeepMainCore(MainKeeper& K, uint64_t FastMask, uint64_t WideMask) {
@@ -953,27 +965,36 @@ namespace {
       if (Linux::ReadSchedStat(fextl::fmt::format("/proc/self/task/{}/schedstat", K.Tid).c_str(), S)) {
         if (K.HaveWait) {
           const double WaitMs = static_cast<double>(S.WaitNs - K.LastWaitNs) / 1e6;
-          if (!K.Widened && WaitMs >= K.EaseMs) {
+          if (!K.Widened && !K.FastPaused && WaitMs >= K.EaseMs) {
             K.Widened = true;
             K.CalmSeconds = 0;
+            K.WideSeconds = 0;
             ++K.Widens;
             if (K.RepinnedAt && K.Tick - K.RepinnedAt <= 40) {
               K.CalmNeeded = std::min<uint32_t>(K.CalmNeeded * 2, 60);
             }
             if (K.Widens <= 5 || K.Widens % 20 == 0) {
               StatsLogNote(fextl::fmt::format("cores: main thread waited {:.0f} ms in the last second for its core (something outside the game "
-                                              "runs there, as at login and while loading); it may use {:#x} until it waits under 10 ms a "
-                                              "second for {} s, #{} (FEX_MAINCORE_WAIT=off keeps it on its core)",
+                                              "runs there, as at login and while loading); it may use {:#x} and tries its own core again "
+                                              "after {} s, #{} (FEX_MAINCORE_WAIT=off keeps it on its core)",
                                               WaitMs, WideMask, K.CalmNeeded, K.Widens));
             }
           } else if (K.Widened) {
             K.CalmSeconds = WaitMs < 10.0 ? K.CalmSeconds + 1 : 0;
-            if (K.CalmSeconds >= K.CalmNeeded) {
+            ++K.WideSeconds;
+            if (K.CalmSeconds >= K.CalmNeeded || K.WideSeconds >= K.CalmNeeded) {
+              const bool Calm = K.CalmSeconds >= K.CalmNeeded;
               K.Widened = false;
               K.RepinnedAt = K.Tick;
+              if (!Calm) {
+                ++K.Tries;
+              }
               if (K.Widens <= 5 || K.Widens % 20 == 0) {
-                StatsLogNote(fextl::fmt::format("cores: main thread back alone on {:#x} after {} s waiting under 10 ms a second", FastMask,
-                                                K.CalmSeconds));
+                StatsLogNote(Calm ? fextl::fmt::format("cores: main thread back alone on {:#x} after {} s waiting under 10 ms a second", FastMask,
+                                                       K.CalmSeconds) :
+                                    fextl::fmt::format("cores: main thread back alone on {:#x} after {} s on {:#x} (waited {:.0f} ms in the last "
+                                                       "second there, where it shares the cores with the game's workers), try #{}",
+                                                       FastMask, K.WideSeconds, WideMask, WaitMs, K.Tries));
               }
             }
           } else if (K.RepinnedAt && K.Tick - K.RepinnedAt > 240) {
@@ -985,17 +1006,46 @@ namespace {
       }
     }
 
-    const uint64_t Want = K.Widened ? WideMask : FastMask;
     const uint64_t Now = Linux::GetAffinity(K.Tid);
+    const bool CanWiden = K.EaseMs && (WideMask & ~FastMask) != 0; // FEX_MAINCORE_WAIT=off: on its core at all times, as before
+    // sched_getaffinity leaves out CPUs the kernel has paused (core control or heat take a CPU out of use without
+    // switching it off), so its core shows in Now again once it is back in use.
+    if (K.FastPaused && (Now & FastMask)) {
+      K.FastPaused = false;
+      if (K.FastPauses <= 5 || K.FastPauses % 50 == 0) {
+        StatsLogNote(fextl::fmt::format("cores: the main thread's core {:#x} is in use again, main thread back on it{}", FastMask,
+                                        K.Widened ? " once it may (it waits for a CPU there)" : ""));
+      }
+    }
+    uint64_t Want = K.Widened || K.FastPaused ? WideMask : FastMask;
     if (Now == Want) {
       K.Applied = Want;
       K.PausedSeen = 0;
       return;
     }
-    // sched_getaffinity leaves out CPUs the kernel has paused (core control or heat take a CPU out of use without
-    // switching it off). When the thread's own mask is still what was set, that is all it is: nothing to set back. The
-    // "changed to 0xb8" and "0x78" of the build 52 log (cores 6 and 7 missing for a moment) look like this.
+    // When the thread's own mask is still what was set, a paused CPU is all it is: nothing to set back. The "changed to
+    // 0xb8" and "0x78" of the build 52 log (cores 6 and 7 missing for a moment) look like this.
     const uint64_t Own = Linux::ReadAllowedMask(K.StatusPath.c_str());
+    if (!Now && !Own) {
+      return;
+    }
+    // Pinned to its core, and the kernel paused that core (its own mask unchanged and nothing usable, or the kernel already
+    // moved it and widened its mask): onto the game's other big cores until the core is back, instead of wherever the
+    // kernel put it (build 93).
+    if (Want == FastMask && CanWiden && !(Now & FastMask)) {
+      K.FastPaused = true;
+      Want = WideMask;
+      const int Result = Linux::SetAffinity(K.Tid, Want);
+      if (Result == 0) {
+        K.Applied = Want;
+      }
+      if (++K.FastPauses <= 5 || K.FastPauses % 50 == 0) {
+        StatsLogNote(fextl::fmt::format("cores: the main thread's core {:#x} is paused by the kernel (core control or heat; its mask {:#x}, usable "
+                                        "{:#x}); on {:#x} until the core is back, result {}, #{}",
+                                        FastMask, Own, Now, Want, Result, K.FastPauses));
+      }
+      return;
+    }
     if (Own == Want) {
       K.Applied = Want;
       const uint64_t Paused = Want & ~Now;
@@ -1007,9 +1057,6 @@ namespace {
                                           Paused, Want, K.Pauses));
         }
       }
-      return;
-    }
-    if (!Now && !Own) {
       return;
     }
     // Its own mask changed: Android or the launcher outside Wine, or the kernel moving it elsewhere because every CPU it was
@@ -1976,7 +2023,9 @@ void StartPriorityGuard(std::string_view AppName) {
                                   C->HelpersLittle ? "on the slowest cores" : "left alone"));
   if (C->Cores == CoreMode::Fast) {
     StatsLogNote(C->EaseWaitMs ? fextl::fmt::format("cores: main thread's Linux cores checked every 250 ms; it may use the other big cores while it "
-                                                    "waits {} ms or more a second for its own (FEX_MAINCORE_WAIT=off keeps it there)",
+                                                    "waits {} ms or more a second for its own, and tries its own again after 5 s (longer when it "
+                                                    "had to leave again soon), and while the kernel has its core paused (FEX_MAINCORE_WAIT=off "
+                                                    "keeps it there)",
                                                     C->EaseWaitMs) :
                                  fextl::string("cores: main thread's Linux cores checked every 250 ms; it stays on its core however long it waits"));
     StatsLogNote(C->Others == OthersMode::User ?

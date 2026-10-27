@@ -17,8 +17,10 @@ $end_info$
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ntstatus.h>
+#include <string_view>
 #include <windef.h>
 #include <winternl.h>
 #include <winnt.h>
@@ -131,6 +133,69 @@ namespace {
     return LdrGetProcedureAddress(reinterpret_cast<HMODULE>(Module), &Text, 0, &Address) == STATUS_SUCCESS ? reinterpret_cast<uint64_t>(Address) : 0;
   }
 
+  // GameNative publishes the screen's refresh grid next to the cap layer's conf.toml (vsync.txt: vsync_ns=<a refresh
+  // time>, period_ns=<refresh period>), and the layer reads it every second. It paces each frame on that grid and rounds
+  // the frame time of fps_limit to whole refreshes: max(1, (1e9/fps_limit + period/2) / period) refreshes a frame
+  // (lsfg-vk-android paceBaseFrame: "30 = every 2nd vsync at 60Hz, every 4th at 120Hz"). At 60 Hz a limit of 40 (25 ms)
+  // becomes 2 refreshes = 30 FPS: the build 92 log ran at limit 40 and showed 30.0 FPS the whole run, presents let out on
+  // a 33.3 ms grid. Noted at start and whenever the period changes (checked every 5 s).
+  struct CapGrid {
+    fextl::string VsyncPath; // empty: no conf.toml known
+    int FpsLimit;            // the last fps_limit in conf.toml, 0 = none
+    int64_t PeriodNs;        // period last noted, -1 = no usable vsync.txt
+    uint32_t Calls;
+  };
+  CapGrid Grid {};
+
+  fextl::string CapGridNote(bool First) {
+    namespace Linux = FEX::Windows::Linux;
+    if (Grid.VsyncPath.empty()) {
+      return {};
+    }
+    static char Text[1024];
+    int64_t Period = -1;
+    if (Linux::ReadSmallFile(Grid.VsyncPath.c_str(), Text, sizeof(Text)) > 0) {
+      std::string_view All {Text};
+      while (!All.empty()) {
+        const size_t End = All.find('\n');
+        const std::string_view Line = All.substr(0, End);
+        All = End == std::string_view::npos ? std::string_view {} : All.substr(End + 1);
+        if (Line.starts_with("period_ns=")) {
+          Period = strtoll(fextl::string(Line.substr(10)).c_str(), nullptr, 10);
+        }
+      }
+      // The layer ignores a period outside 1-100 ms too.
+      if (Period < 1'000'000 || Period > 100'000'000) {
+        Period = -1;
+      }
+    }
+    if (!First && Period == Grid.PeriodNs) {
+      return {};
+    }
+    Grid.PeriodNs = Period;
+    if (Period < 0) {
+      return fextl::fmt::format("# cap: no usable vsync.txt next to the cap's conf.toml ({}): the layer paces fps_limit {} on its own clock, "
+                                "without rounding to screen refreshes\n",
+                                Grid.VsyncPath, Grid.FpsLimit);
+    }
+    const double Hz = 1e9 / static_cast<double>(Period);
+    if (Grid.FpsLimit <= 0) {
+      return fextl::fmt::format("# cap: screen refresh {:.1f} Hz (GameNative's vsync.txt, period {:.3f} ms); no fps_limit, so no cap\n", Hz,
+                                Period / 1e6);
+    }
+    const int64_t Target = 1'000'000'000ll / Grid.FpsLimit;
+    const int64_t Steps = std::max<int64_t>(1, (Target + Period / 2) / Period);
+    const double Fps = 1e9 / static_cast<double>(Steps * Period);
+    const bool Rounded = Fps < Grid.FpsLimit - 0.5 || Fps > Grid.FpsLimit + 0.5;
+    return fextl::fmt::format("# cap: screen refresh {:.1f} Hz (GameNative's vsync.txt, period {:.3f} ms); the cap layer rounds fps_limit {} "
+                              "({:.1f} ms a frame) to whole refreshes: one frame every {} refresh{} = {:.1f} FPS{}\n",
+                              Hz, Period / 1e6, Grid.FpsLimit, Target / 1e6, Steps, Steps == 1 ? "" : "es", Fps,
+                              Rounded ? fextl::fmt::format(" (not {}: {} FPS needs a refresh rate that is a whole multiple of it, "
+                                                           "such as {} Hz)",
+                                                           Grid.FpsLimit, Grid.FpsLimit, Grid.FpsLimit * ((90 + Grid.FpsLimit - 1) / Grid.FpsLimit)) :
+                                        fextl::string {});
+  }
+
   // GameNative's FPS limit: when its Lossless Scaling Vulkan layer (liblsfg-vk-layer.so) is armed, the layer paces each
   // vkQueuePresentKHR to fps_limit from its conf.toml (environment variable LSFG_CONFIG). Says whether the layer is mapped
   // into the process and what its config caps, once.
@@ -183,6 +248,12 @@ namespace {
             Caps += Caps.empty() ? "" : ", ";
             Caps.append(Line.data(), std::min<size_t>(Line.size(), 80));
           }
+          if (Line.starts_with("fps_limit")) {
+            const size_t Eq = Line.find('=');
+            if (Eq != std::string_view::npos) {
+              Grid.FpsLimit = atoi(fextl::string(Line.substr(Eq + 1)).c_str());
+            }
+          }
         }
       } else {
         Caps = "can't be read";
@@ -192,8 +263,13 @@ namespace {
     if (Layer.empty() && Config.empty()) {
       return "# cap: GameNative's frame cap layer isn't loaded (no lsfg mapping, no LSFG_CONFIG)\n";
     }
+    if (!Config.empty()) {
+      const size_t Slash = Config.rfind('/');
+      Grid.VsyncPath = (Slash == fextl::string::npos ? fextl::string {} : Config.substr(0, Slash + 1)) + "vsync.txt";
+    }
     return fextl::fmt::format("# cap: GameNative's frame cap layer {} ({}); LSFG_CONFIG {}: {}\n", Layer.empty() ? "isn't mapped" : "is loaded",
-                              Layer.empty() ? "-" : Layer, Config.empty() ? "-" : Config, Caps.empty() ? "-" : Caps);
+                              Layer.empty() ? "-" : Layer, Config.empty() ? "-" : Config, Caps.empty() ? "-" : Caps) +
+           CapGridNote(true);
   }
 
   enum class ReadResult { Gone, Unchanged, New };
@@ -468,6 +544,8 @@ namespace {
                                        PresentFlags & FlagGradualStart ? "on (gradual, VKD3D fex3: an older VKD3D component is selected)" :
                                                                          "on (build 56 style: an older VKD3D component is selected)"));
       Out += CapLayerNote();
+    } else if (Announced && ++Grid.Calls % 5 == 0) {
+      Out += CapGridNote(false);
     }
     CopyLines(Out);
     return Out;
