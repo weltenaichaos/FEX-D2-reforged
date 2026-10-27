@@ -13,6 +13,9 @@ int64_t Syscall(int64_t Nr, int64_t A0 = 0, int64_t A1 = 0, int64_t A2 = 0, int6
 int Open(const char* Path, bool Directory = false);
 void Close(int Fd);
 int64_t Pread(int Fd, void* Buffer, size_t Size, uint64_t Offset);
+// A read that only takes what is in the kernel's file cache already (preadv2 with RWF_NOWAIT): -EAGAIN (or a short read)
+// instead of waiting for storage.
+int64_t PreadCached(int Fd, void* Buffer, size_t Size, uint64_t Offset);
 // Opens a file for reading. Direct asks for direct reads (O_DIRECT): data goes from storage to the caller's buffer without
 // passing through the kernel's file cache; buffer, offset and size must then be multiples of the storage block size.
 int OpenRead(const char* Path, bool Direct);

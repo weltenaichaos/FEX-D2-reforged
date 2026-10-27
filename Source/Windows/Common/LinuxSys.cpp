@@ -27,6 +27,8 @@ namespace {
   constexpr int64_t NR_getrusage = 165;
   constexpr int64_t RUSAGE_THREAD = 1;
   constexpr int64_t NR_fadvise64 = 223;
+  constexpr int64_t NR_preadv2 = 286;
+  constexpr int64_t RWF_NOWAIT = 0x8;
 
   constexpr int64_t AT_FDCWD = -100;
   constexpr int64_t O_RDONLY = 0;
@@ -130,6 +132,15 @@ void Close(int Fd) {
 
 int64_t Pread(int Fd, void* Buffer, size_t Size, uint64_t Offset) {
   return Syscall(NR_pread64, Fd, reinterpret_cast<intptr_t>(Buffer), static_cast<int64_t>(Size), static_cast<int64_t>(Offset));
+}
+
+int64_t PreadCached(int Fd, void* Buffer, size_t Size, uint64_t Offset) {
+  struct {
+    void* Base;
+    size_t Len;
+  } Vec {Buffer, Size};
+  // preadv2(fd, iov, iovcnt, pos_l, pos_h, flags): on 64-bit Linux the whole offset goes in pos_l.
+  return Syscall(NR_preadv2, Fd, reinterpret_cast<intptr_t>(&Vec), 1, static_cast<int64_t>(Offset), 0, RWF_NOWAIT);
 }
 
 int OpenRead(const char* Path, bool Direct) {

@@ -59,6 +59,19 @@ void Init(bool StatsLog);
 // Whether the frame clock (NativeRedirect.cpp) should run: learning tells play from loading screens by frame times.
 bool WantsFrameMarks();
 
+// Build 90, for the unpack cache's learned list (NativeUnpackCache.cpp). Whether FEXFileCache runs (Init found
+// FEX_GAME_FILES_UNCACHED=1); whether the calling thread is the game's main thread; frame marks written so far (0 without
+// the frame clock); whether frames are coming (the last one began less than 250 ms ago: play, not a loading screen);
+// what frame Frame (a FrameNow() value) was: 1 play, 0 a loading screen's, -1 not known yet, -2 too long ago.
+bool Running();
+bool OnMainThread();
+uint64_t FrameNow();
+bool FramesComing();
+int FrameKind(uint64_t Frame);
+// Hook called on FEXFileCache once per pass (every 500 ms) with whether a loading screen just started and whether
+// available memory is below the memory guard.
+void SetPassHook(void (*Hook)(bool LoadStart, bool LowMemory));
+
 // GameFilesStore.cpp: the learned list's file (kept apart from GameFiles.cpp's NT and Linux headers).
 namespace Store {
   fextl::string LearnedPath();

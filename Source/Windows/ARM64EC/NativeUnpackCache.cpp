@@ -48,8 +48,25 @@ $end_info$
 // one more for every 2 chunks before it the game already used in order, up to AheadChunks (PlayAheadChunks while
 // playing); a run of disk hits in sequence reads its own chunk and the next. FEX_UNPACK_CACHE_AHEAD=fixed reads the
 // whole distance past every hit as before.
+//
+// The main thread while frames come (FEX_UNPACK_CACHE_MAIN_PLAY, from build 90): in the build 89 run storage ran at its
+// low clock (75 of 300 MHz) during play, as it does whenever reads come in short bursts, and the main thread's 11 hits
+// from disk at an area entry took 36.9 ms (3.4 ms each; ~0.45 ms each while storage was busy and fast), against ~0.2 ms
+// for FEX's native inflate of the same ~60 KB. The lookup-rate gate above didn't apply: the entry looked up 221 streams in
+// that second, so it counted as a load. Now a hit the main thread can't take from memory while frames are coming (the
+// last began under 250 ms ago, GameFiles::FramesComing) is always left to the game.
+//
+// Learned streams (FEX_UNPACK_CACHE_LEARN, from build 90): the same 105 ms frame also unpacked 7.6 MB itself (20.9 ms) for
+// streams that were stored but not in memory. The streams the main thread looks up in frames of play are much the same
+// every session (like its game file reads, see GameFiles.h build 89), so their places in data.bin (whole 64 KB blocks)
+// are kept in a list (UnpackCache\learned.txt). At the start and at every loading screen, when storage runs fast anyway,
+// the list is asked of storage into the kernel's file cache (WILLNEED), drops of data.bin leave those blocks there, and
+// a lookup of a learned stream not in read-ahead memory takes it from the file cache without waiting for storage
+// (preadv2 RWF_NOWAIT), on any thread; when it isn't there, the rules above apply. Ranges not used in 30 sessions are
+// forgotten, past the budget the ones used longest ago go first, and the list starts over with data.bin.
 
 #include "NativeUnpackCache.h"
+#include "GameFiles.h"
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/Switches.h"
@@ -69,6 +86,7 @@ $end_info$
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -194,6 +212,8 @@ struct Cache {
 
   // Telling play from loads by the lookup rate, see FEX_UNPACK_CACHE_PLAY above.
   bool PlayGate {};
+  // Build 90: the main thread never reads a hit from disk while frames are coming (FEX_UNPACK_CACHE_MAIN_PLAY).
+  bool MainPlay {};
   uint64_t WindowTicks {1};
   std::atomic<uint64_t> WindowStart {};
   std::atomic<uint32_t> WindowLookups {};
@@ -309,14 +329,524 @@ int64_t LinuxReadUpTo(int Fd, uint8_t* Buffer, uint64_t Size, uint64_t Offset) {
   return static_cast<int64_t>(Total);
 }
 
-// Drops a range of data.bin from the kernel's file cache, see above.
+// Build 90, the learned streams (FEX_UNPACK_CACHE_LEARN, see above). Ranges and their block bits change on FEXFileCache
+// only (Pass); game threads read the bits, and hand in what the main thread used through Push.
+namespace Learned {
+  constexpr uint64_t BlockShift = 16; // ranges cover whole 64 KB blocks of data.bin
+  constexpr uint64_t BlockSize = 1ull << BlockShift;
+  constexpr size_t MaxRanges = 4096;
+  constexpr uint32_t ForgetSessions = 30;
+  constexpr size_t MaxCandidates = 1024;
+  constexpr uint64_t SaveEveryMs = 3'000;
+  constexpr size_t MaxListBytes = 2 << 20;
+  constexpr uint64_t AskPart = 512 << 10; // per WILLNEED call: the device's read-ahead size in the build 88 and 89 logs
+
+  struct Range {
+    uint64_t Offset;
+    uint64_t Bytes;
+    uint32_t Seen; // sessions in which the main thread used it
+    uint32_t Last; // the last of them
+    bool New;      // learned in this session
+    bool Counted;  // this session is counted in Seen
+  };
+
+  struct Candidate {
+    uint64_t Offset;
+    uint32_t Bytes;
+    uint64_t Frame; // GameFiles::FrameNow() when it was used
+  };
+
+  struct Counters {
+    // Per second.
+    std::atomic<uint64_t> NewRanges, NewBytes; // ranges added, bytes added (new ranges and grown ones)
+    std::atomic<uint64_t> LeftOut;             // used in a loading screen's frame, not learned
+    std::atomic<uint64_t> Lost;                // not noted (no room)
+    std::atomic<uint64_t> Evicted;             // ranges dropped for the budget
+    std::atomic<uint64_t> Asks, AskBytes, AskCalls, AskNs;
+    std::atomic<uint64_t> SaveFailed;
+    // Now: ranges and bytes in the list, ranges used this session, ranges and bytes learned this session.
+    std::atomic<uint64_t> ListRanges, ListBytes, UsedRanges, SessionRanges, SessionBytes;
+  };
+
+  uint64_t Budget {}; // bytes, 0 = off
+  fextl::string Path;
+  int Fd {-1}; // data.bin's Linux file (Cache::LinuxRead)
+  uint32_t Session {1};
+  Range Ranges[MaxRanges];
+  size_t Count {};
+  bool Dirty {};
+  bool Unsorted {};
+  uint64_t LastSave {};
+  bool Asked {};
+  uint64_t Words {};
+  std::atomic<uint64_t>* Bits {};     // learned blocks
+  std::atomic<uint64_t>* UsedBits {}; // learned blocks a lookup took this session
+  std::mutex CandidateLock;
+  Candidate Candidates[MaxCandidates];
+  size_t CandidateCount {};
+  Counters Stats {};
+  std::atomic<bool> ErrorNoted {};
+
+  double MB(uint64_t Bytes) {
+    return static_cast<double>(Bytes) / (1024.0 * 1024.0);
+  }
+
+  bool Has(const std::atomic<uint64_t>* Map, uint64_t Block) {
+    return Block < Words * 64 && (Map[Block >> 6].load(std::memory_order_relaxed) & (1ull << (Block & 63)));
+  }
+
+  // Whether every block of Size bytes at Offset is learned.
+  bool AllLearned(uint64_t Offset, uint64_t Size) {
+    if (!Budget || !Size) {
+      return false;
+    }
+    for (uint64_t Block = Offset >> BlockShift; Block <= (Offset + Size - 1) >> BlockShift; ++Block) {
+      if (!Has(Bits, Block)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void Mark(std::atomic<uint64_t>* Map, uint64_t Offset, uint64_t Size) {
+    for (uint64_t Block = Offset >> BlockShift; Size && Block <= (Offset + Size - 1) >> BlockShift && Block < Words * 64; ++Block) {
+      const uint64_t Bit = 1ull << (Block & 63);
+      if (!(Map[Block >> 6].load(std::memory_order_relaxed) & Bit)) {
+        Map[Block >> 6].fetch_or(Bit, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  void MarkUsed(uint64_t Offset, uint64_t Size) {
+    Mark(UsedBits, Offset, Size);
+  }
+
+  // FEXFileCache: the learned bits again from the ranges, after ranges went. Built aside and stored word by word, so a
+  // drop on another thread never sees a block of a remaining range cleared.
+  void RebuildBits() {
+    static std::atomic<uint64_t>* Scratch = new std::atomic<uint64_t>[Words]();
+    for (uint64_t i = 0; i < Words; ++i) {
+      Scratch[i].store(0, std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < Count; ++i) {
+      Mark(Scratch, Ranges[i].Offset, Ranges[i].Bytes);
+    }
+    for (uint64_t i = 0; i < Words; ++i) {
+      Bits[i].store(Scratch[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+  }
+
+  bool RangeUsed(const Range& R) {
+    for (uint64_t Block = R.Offset >> BlockShift; Block <= (R.Offset + R.Bytes - 1) >> BlockShift; ++Block) {
+      if (Has(UsedBits, Block)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  uint64_t TotalBytes() {
+    uint64_t Bytes {};
+    for (size_t i = 0; i < Count; ++i) {
+      Bytes += Ranges[i].Bytes;
+    }
+    return Bytes;
+  }
+
+  // The range least worth keeping among those not used this session: used longest ago, then in the fewest sessions,
+  // then the biggest. Count when there is none.
+  size_t LeastWorth() {
+    size_t Worst = Count;
+    for (size_t i = 0; i < Count; ++i) {
+      const auto& R = Ranges[i];
+      if (R.New || R.Counted) {
+        continue;
+      }
+      if (Worst == Count) {
+        Worst = i;
+        continue;
+      }
+      const auto& B = Ranges[Worst];
+      if (R.Last != B.Last ? R.Last < B.Last : R.Seen != B.Seen ? R.Seen < B.Seen : R.Bytes > B.Bytes) {
+        Worst = i;
+      }
+    }
+    return Worst;
+  }
+
+  void RemoveRange(size_t i) {
+    Ranges[i] = Ranges[--Count];
+    Dirty = true;
+    Unsorted = true;
+  }
+
+  // Past the budget, the ranges least worth keeping go (ranges used this session stay).
+  void FitBudget() {
+    bool Removed = false;
+    while (TotalBytes() > Budget) {
+      const size_t Worst = LeastWorth();
+      if (Worst == Count) {
+        break;
+      }
+      RemoveRange(Worst);
+      Stats.Evicted.fetch_add(1, std::memory_order_relaxed);
+      Removed = true;
+    }
+    if (Removed) {
+      RebuildBits();
+    }
+  }
+
+  // Sorts the ranges by offset and merges those that overlap or touch.
+  void Coalesce() {
+    if (!Unsorted) {
+      return;
+    }
+    Unsorted = false;
+    std::sort(Ranges, Ranges + Count, [](const Range& A, const Range& B) { return A.Offset < B.Offset; });
+    size_t Out = 0;
+    for (size_t i = 0; i < Count; ++i) {
+      const auto& R = Ranges[i];
+      if (Out && R.Offset <= Ranges[Out - 1].Offset + Ranges[Out - 1].Bytes) {
+        auto& Into = Ranges[Out - 1];
+        Into.Bytes = std::max(Into.Offset + Into.Bytes, R.Offset + R.Bytes) - Into.Offset;
+        Into.Seen = std::max(Into.Seen, R.Seen);
+        Into.Last = std::max(Into.Last, R.Last);
+        Into.New = Into.New || R.New;
+        Into.Counted = Into.Counted || R.Counted;
+        Dirty = true;
+      } else {
+        Ranges[Out++] = R;
+      }
+    }
+    Count = Out;
+  }
+
+  void UpdateTotals() {
+    uint64_t Used {}, New {};
+    for (size_t i = 0; i < Count; ++i) {
+      Used += Ranges[i].Counted ? 1 : 0;
+      New += Ranges[i].New ? 1 : 0;
+    }
+    Stats.ListRanges.store(Count, std::memory_order_relaxed);
+    Stats.ListBytes.store(TotalBytes(), std::memory_order_relaxed);
+    Stats.UsedRanges.store(Used, std::memory_order_relaxed);
+    Stats.SessionRanges.store(New, std::memory_order_relaxed);
+  }
+
+  // Game threads: the main thread used a stream of Bytes at Offset of data.bin while frames were coming.
+  void Push(uint64_t Offset, uint32_t Bytes) {
+    const uint64_t Frame = GameFiles::FrameNow();
+    if (!Frame || !Bytes) {
+      return;
+    }
+    std::scoped_lock Guard {CandidateLock};
+    if (CandidateCount < MaxCandidates) {
+      Candidates[CandidateCount++] = {Offset, Bytes, Frame};
+    } else {
+      Stats.Lost.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // Adds a stream to the list: a new range, or one it overlaps or touches grows.
+  void Learn(const Candidate& C) {
+    const uint64_t Start = C.Offset & ~(BlockSize - 1);
+    const uint64_t End = AlignUp(C.Offset + C.Bytes, BlockSize);
+    Range* Into = nullptr;
+    for (size_t i = 0; i < Count; ++i) {
+      auto& R = Ranges[i];
+      if (Start <= R.Offset + R.Bytes && End >= R.Offset) {
+        Into = &R;
+        break;
+      }
+    }
+    uint64_t Grew {};
+    if (Into) {
+      const uint64_t NewStart = std::min(Into->Offset, Start);
+      const uint64_t NewEnd = std::max(Into->Offset + Into->Bytes, End);
+      Grew = (NewEnd - NewStart) - Into->Bytes;
+      Into->Offset = NewStart;
+      Into->Bytes = NewEnd - NewStart;
+      Unsorted = Unsorted || Grew; // it may touch its neighbours now
+    } else {
+      if (Count == MaxRanges) {
+        Coalesce();
+      }
+      if (Count == MaxRanges) {
+        const size_t Worst = LeastWorth();
+        if (Worst == Count) {
+          Stats.Lost.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        RemoveRange(Worst);
+        Stats.Evicted.fetch_add(1, std::memory_order_relaxed);
+        RebuildBits();
+      }
+      Into = &Ranges[Count++];
+      *Into = {Start, End - Start, 0, 0, true, false};
+      Grew = End - Start;
+      Unsorted = true;
+      Stats.NewRanges.fetch_add(1, std::memory_order_relaxed);
+    }
+    Mark(UsedBits, C.Offset, C.Bytes);
+    if (!Grew) {
+      return;
+    }
+    Stats.NewBytes.fetch_add(Grew, std::memory_order_relaxed);
+    Stats.SessionBytes.fetch_add(Grew, std::memory_order_relaxed);
+    Mark(Bits, Into->Offset, Into->Bytes);
+    Dirty = true;
+    FitBudget();
+  }
+
+  // The candidates whose frame ended: learned when it was a frame of play, left out when it was a loading screen's.
+  void TakeCandidates() {
+    static Candidate Local[MaxCandidates]; // FEXFileCache only
+    size_t Taken {};
+    {
+      std::scoped_lock Guard {CandidateLock};
+      Taken = CandidateCount;
+      std::copy(Candidates, Candidates + Taken, Local);
+      CandidateCount = 0;
+    }
+    size_t Waiting {};
+    for (size_t i = 0; i < Taken; ++i) {
+      const auto& C = Local[i];
+      const int Kind = GameFiles::FrameKind(C.Frame);
+      if (Kind == 1) {
+        Learn(C);
+      } else if (Kind == -1) {
+        Local[Waiting++] = C; // its frame hasn't ended yet
+      } else {
+        Stats.LeftOut.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    if (Waiting) {
+      std::scoped_lock Guard {CandidateLock};
+      for (size_t i = 0; i < Waiting; ++i) {
+        if (CandidateCount < MaxCandidates) {
+          Candidates[CandidateCount++] = Local[i];
+        } else {
+          Stats.Lost.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
+  }
+
+  // Ranges a lookup took this session count it once (Seen, Last).
+  void CountUsed() {
+    for (size_t i = 0; i < Count; ++i) {
+      auto& R = Ranges[i];
+      if (!R.Counted && (R.New || RangeUsed(R))) {
+        R.Counted = true;
+        ++R.Seen;
+        R.Last = Session;
+        Dirty = true;
+      }
+    }
+  }
+
+  // Asks storage for every range (WILLNEED); blocks already in the file cache cost only the look-up.
+  void Ask() {
+    const uint64_t Begin = ReadTicks();
+    uint64_t Bytes {}, Calls {};
+    for (size_t i = 0; i < Count; ++i) {
+      const auto& R = Ranges[i];
+      const uint64_t End = R.Offset + R.Bytes;
+      for (uint64_t At = R.Offset; At < End; At += AskPart) {
+        FEX::Windows::Linux::ReadAhead(Fd, At, std::min(AskPart, End - At));
+        ++Calls;
+      }
+      Bytes += R.Bytes;
+    }
+    Stats.Asks.fetch_add(1, std::memory_order_relaxed);
+    Stats.AskBytes.fetch_add(Bytes, std::memory_order_relaxed);
+    Stats.AskCalls.fetch_add(Calls, std::memory_order_relaxed);
+    Stats.AskNs.fetch_add((ReadTicks() - Begin) * 1'000'000'000 / TickFrequency, std::memory_order_relaxed);
+  }
+
+  // A decimal number at P, moving P past it and the spaces after; false when there is none.
+  bool ParseNumber(const char*& P, uint64_t& Out) {
+    if (*P < '0' || *P > '9') {
+      return false;
+    }
+    char* After {};
+    Out = strtoull(P, &After, 10);
+    P = After;
+    while (*P == ' ') {
+      ++P;
+    }
+    return true;
+  }
+
+  constexpr char Header[] = "FEX unpack cache learned 1\n";
+
+  // Reads the list ("FEX unpack cache learned 1", "session N", then "offset bytes seen last" lines). A note for the log.
+  fextl::string Load(uint64_t DataEnd, bool Fresh) {
+    if (Fresh) {
+      return "data.bin started over, so the list does too";
+    }
+    fextl::string Text;
+    if (!GameFiles::Store::ReadText(Path, Text, MaxListBytes)) {
+      return "no list yet: this session learns, the next one reads it in";
+    }
+    if (Text.compare(0, sizeof(Header) - 1, Header) != 0) {
+      return "the list there isn't one this build reads, so it starts over";
+    }
+    const char* P = Text.c_str() + sizeof(Header) - 1;
+    uint64_t Previous {};
+    if (strncmp(P, "session ", 8) != 0 || !ParseNumber(P += 8, Previous)) {
+      return "the list there isn't one this build reads, so it starts over";
+    }
+    Session = static_cast<uint32_t>(std::min<uint64_t>(Previous, 1u << 30)) + 1;
+    uint32_t Loaded {}, Outside {}, Forgotten {}, Unreadable {};
+    while (*P) {
+      while (*P == '\n') {
+        ++P;
+      }
+      if (!*P) {
+        break;
+      }
+      uint64_t Offset, Bytes, Seen, Last;
+      const bool Good = ParseNumber(P, Offset) && ParseNumber(P, Bytes) && ParseNumber(P, Seen) && ParseNumber(P, Last) && Bytes;
+      const char* End = strchr(P, '\n');
+      P = End ? End : P + strlen(P);
+      if (!Good) {
+        ++Unreadable;
+        continue;
+      }
+      if (Offset < HeaderSize || Offset + Bytes > AlignUp(DataEnd, BlockSize)) {
+        ++Outside;
+        continue;
+      }
+      if (Last + ForgetSessions < Session) {
+        ++Forgotten;
+        continue;
+      }
+      if (Count < MaxRanges) {
+        Ranges[Count++] = {Offset, Bytes, static_cast<uint32_t>(Seen), static_cast<uint32_t>(Last), false, false};
+        ++Loaded;
+      }
+    }
+    Unsorted = true;
+    return fextl::fmt::format("{} ranges from earlier sessions{}{}{}", Loaded,
+                              Outside ? fextl::fmt::format(", {} dropped (past the end of data.bin)", Outside) : fextl::string(),
+                              Forgotten ? fextl::fmt::format(", {} dropped (not used in {} sessions)", Forgotten, ForgetSessions) : fextl::string(),
+                              Unreadable ? fextl::fmt::format(", {} lines unreadable", Unreadable) : fextl::string());
+  }
+
+  // Writes the list when it changed, at most every SaveEveryMs unless Now.
+  void Save(bool Now) {
+    if (!Dirty) {
+      return;
+    }
+    const uint64_t At = ReadTicks();
+    if (!Now && LastSave && At - LastSave < SaveEveryMs * TickFrequency / 1000) {
+      return;
+    }
+    LastSave = At;
+    fextl::string Text = fextl::fmt::format("{}session {}\n", Header, Session);
+    for (size_t i = 0; i < Count; ++i) {
+      const auto& R = Ranges[i];
+      Text += fextl::fmt::format("{} {} {} {}\n", R.Offset, R.Bytes, R.Seen, R.Last);
+    }
+    if (GameFiles::Store::WriteText(Path, Text)) {
+      Dirty = false;
+    } else {
+      Stats.SaveFailed.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // FEXFileCache, every pass (GameFiles::SetPassHook): learns the candidates, counts the ranges used, asks storage for
+  // the list at the first pass and when a loading screen starts, saves the list.
+  void Pass(bool LoadStart, bool LowMemory) {
+    TakeCandidates();
+    CountUsed();
+    Coalesce();
+    // The first pass is in the first loading screen (the cache opens when the game first unpacks), so it asks at once;
+    // in a first session the list fills during play, and is asked for at the next loading screen.
+    if ((!Asked || LoadStart) && Count && !LowMemory) {
+      Ask();
+    }
+    Asked = true;
+    UpdateTotals();
+    Save(false);
+  }
+
+  // The 'ucache learned' line, in seconds something happened to the list.
+  fextl::string Line() {
+    if (!Budget) {
+      return {};
+    }
+    const uint64_t NewRanges = Stats.NewRanges.exchange(0, std::memory_order_relaxed);
+    const uint64_t NewBytes = Stats.NewBytes.exchange(0, std::memory_order_relaxed);
+    const uint64_t LeftOut = Stats.LeftOut.exchange(0, std::memory_order_relaxed);
+    const uint64_t Lost = Stats.Lost.exchange(0, std::memory_order_relaxed);
+    const uint64_t Evicted = Stats.Evicted.exchange(0, std::memory_order_relaxed);
+    const uint64_t Asks = Stats.Asks.exchange(0, std::memory_order_relaxed);
+    const uint64_t AskBytes = Stats.AskBytes.exchange(0, std::memory_order_relaxed);
+    const uint64_t AskCalls = Stats.AskCalls.exchange(0, std::memory_order_relaxed);
+    const uint64_t AskNs = Stats.AskNs.exchange(0, std::memory_order_relaxed);
+    const uint64_t SaveFailed = Stats.SaveFailed.exchange(0, std::memory_order_relaxed);
+    if (!NewRanges && !NewBytes && !LeftOut && !Lost && !Evicted && !Asks && !SaveFailed) {
+      return {};
+    }
+    fextl::string Out = fextl::fmt::format(
+      "  ucache learned: {} ranges {:.1f} MB ({} used this session, {} learned this session {:.1f} MB) | this second: learned {} new ranges, "
+      "{:.1f} MB added",
+      Stats.ListRanges.load(std::memory_order_relaxed), MB(Stats.ListBytes.load(std::memory_order_relaxed)),
+      Stats.UsedRanges.load(std::memory_order_relaxed), Stats.SessionRanges.load(std::memory_order_relaxed),
+      MB(Stats.SessionBytes.load(std::memory_order_relaxed)), NewRanges, MB(NewBytes));
+    if (LeftOut) {
+      Out += fextl::fmt::format(", {} used in a loading screen left out", LeftOut);
+    }
+    if (Lost) {
+      Out += fextl::fmt::format(", {} not noted (no room)", Lost);
+    }
+    if (Evicted) {
+      Out += fextl::fmt::format(", {} ranges dropped for the budget", Evicted);
+    }
+    if (Asks) {
+      Out += fextl::fmt::format(" | asked of storage (start or loading screen): {:.1f} MB in {} calls, {:.1f} ms", MB(AskBytes), AskCalls,
+                                static_cast<double>(AskNs) / 1e6);
+    }
+    if (SaveFailed) {
+      Out += fextl::fmt::format(" | saving the list failed ({})", Path);
+    }
+    return Out + "\n";
+  }
+} // namespace Learned
+
+// Drops a range of data.bin from the kernel's file cache, see above. Learned blocks (build 90) stay.
 void DropRange(const Cache* C, uint64_t Offset, uint64_t Size) {
   if (C->LinuxRead < 0 || !Size) {
     return;
   }
   const uint64_t Start = Offset & ~(PageSize - 1);
-  FEX::Windows::Linux::DropFromFileCache(C->LinuxRead, Start, AlignUp(Offset + Size, PageSize) - Start);
-  __atomic_fetch_add(&FEXUnpackCacheStats.CacheDrops, 1, __ATOMIC_RELAXED);
+  const uint64_t End = AlignUp(Offset + Size, PageSize);
+  if (!Learned::Budget) {
+    FEX::Windows::Linux::DropFromFileCache(C->LinuxRead, Start, End - Start);
+    __atomic_fetch_add(&FEXUnpackCacheStats.CacheDrops, 1, __ATOMIC_RELAXED);
+    return;
+  }
+  // Runs of blocks that aren't learned (blocks are whole pages).
+  uint64_t At = Start;
+  while (At < End) {
+    const auto BlockEnd = [End](uint64_t Pos) {
+      return std::min(End, ((Pos >> Learned::BlockShift) + 1) << Learned::BlockShift);
+    };
+    if (Learned::Has(Learned::Bits, At >> Learned::BlockShift)) {
+      At = BlockEnd(At);
+      continue;
+    }
+    uint64_t RunEnd = BlockEnd(At);
+    while (RunEnd < End && !Learned::Has(Learned::Bits, RunEnd >> Learned::BlockShift)) {
+      RunEnd = BlockEnd(RunEnd);
+    }
+    FEX::Windows::Linux::DropFromFileCache(C->LinuxRead, At, RunEnd - At);
+    __atomic_fetch_add(&FEXUnpackCacheStats.CacheDrops, 1, __ATOMIC_RELAXED);
+    At = RunEnd;
+  }
 }
 
 // A stored stream's data, read from disk.
@@ -658,6 +1188,17 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
     return 0;
   }
 
+  // Build 90: the main thread while frames are coming, see FEX_UNPACK_CACHE_MAIN_PLAY and FEX_UNPACK_CACHE_LEARN above.
+  const bool MainPlay = (C->MainPlay || Learned::Budget) && GameFiles::OnMainThread() && GameFiles::FramesComing();
+  const bool Known = Learned::AllLearned(E.Offset, E.Produced);
+  if (MainPlay && Learned::Budget) {
+    if (Known) {
+      Learned::MarkUsed(E.Offset, E.Produced);
+    } else {
+      Learned::Push(E.Offset, E.Produced);
+    }
+  }
+
   // From read-ahead memory if it's there, else from disk. Either way it is checked against its hash.
   const bool Ahead = C->ReadAheadReady.load(std::memory_order_acquire);
   uint64_t Now = ReadTicks();
@@ -674,14 +1215,42 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
       ForgetChunks(C, E.Offset, E.Produced);
     }
   }
+  if (!Good && Known && C->LinuxRead >= 0) {
+    // A learned stream: from the kernel's file cache if it is there, without waiting for storage.
+    const int64_t Got = FEX::Windows::Linux::PreadCached(C->LinuxRead, Out, E.Produced, E.Offset);
+    const uint64_t Copied = ReadTicks();
+    if (Got == static_cast<int64_t>(E.Produced)) {
+      __atomic_fetch_add(&FEXUnpackCacheStats.LearnedHits, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&FEXUnpackCacheStats.LearnedTicks, Copied - Now, __ATOMIC_RELAXED);
+      Good = XXH3_64bits(Out, E.Produced) == E.OutputHash;
+      Now = ReadTicks();
+      __atomic_fetch_add(&FEXUnpackCacheStats.VerifyTicks, Now - Copied, __ATOMIC_RELAXED);
+      if (!Learned::Has(Learned::UsedBits, E.Offset >> Learned::BlockShift)) {
+        Learned::MarkUsed(E.Offset, E.Produced);
+      }
+    } else {
+      __atomic_fetch_add(&FEXUnpackCacheStats.LearnedNotCached, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&FEXUnpackCacheStats.LearnedNotCachedTicks, Copied - Now, __ATOMIC_RELAXED);
+      Now = Copied;
+      constexpr int64_t EAGAIN_ = 11;
+      if (Got < 0 && Got != -EAGAIN_ && !Learned::ErrorNoted.exchange(true, std::memory_order_relaxed)) {
+        FEX::Windows::StatsLogNote(
+          fextl::fmt::format("unpack cache: a read of a learned stream from the file cache failed (error {}), not only 'not there'", -Got));
+      }
+    }
+  }
   if (!Good) {
     if (Ahead) {
       NoteDiskHit(C, E, Distance);
     }
-    if (Play) {
+    if (Play || (MainPlay && C->MainPlay)) {
       // Left to the game: its own unpacking is faster than this read, see FEX_UNPACK_CACHE_PLAY above. The entry stays.
       __atomic_fetch_add(&FEXUnpackCacheStats.PlaySkips, 1, __ATOMIC_RELAXED);
       __atomic_fetch_add(&FEXUnpackCacheStats.PlaySkipBytes, E.Produced, __ATOMIC_RELAXED);
+      if (!Play) {
+        __atomic_fetch_add(&FEXUnpackCacheStats.MainPlaySkips, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&FEXUnpackCacheStats.MainPlaySkipBytes, E.Produced, __ATOMIC_RELAXED);
+      }
       return 0;
     }
     const bool Read = ReadEntry(C, Out, E.Offset, E.Produced);
@@ -849,6 +1418,10 @@ extern "C" void FEXUnpackCachePut(const uint64_t Key[2], const uint8_t* Out, uin
   }
   __atomic_fetch_add(&FEXUnpackCacheStats.Stores, 1, __ATOMIC_RELAXED);
   __atomic_fetch_add(&FEXUnpackCacheStats.StoreBytes, Produced, __ATOMIC_RELAXED);
+  if (Learned::Budget && GameFiles::OnMainThread() && GameFiles::FramesComing()) {
+    // Build 90: a stream the main thread unpacked during play is learned where it is stored.
+    Learned::Push(J->R.Offset, Produced);
+  }
   if (UseRing) {
     memcpy(C->Ring + J->RingStart % RingSize, Out, Produced);
     {
@@ -1086,6 +1659,37 @@ bool Init(bool MD5Cache) {
   const char* PlayEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_PLAY");
   C->PlayGate = PlayEnv && PlayEnv[0] == '1';
   C->WindowTicks = std::max<uint64_t>(TickFrequency * PlayWindowMs / 1000, 1);
+  // Build 90, see the top of this file. Both need the frame clock and FEXFileCache (FEX_GAME_FILES_UNCACHED=1); learning
+  // also needs data.bin's Linux file (FEX_UNPACK_CACHE_DIRECT=1).
+  const char* MainPlayEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_MAIN_PLAY");
+  C->MainPlay = MainPlayEnv && MainPlayEnv[0] == '1' && GameFiles::Running();
+  const char* LearnEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_LEARN");
+  const uint64_t LearnMB = std::min<uint64_t>(LearnEnv && LearnEnv[0] ? strtoull(LearnEnv, nullptr, 10) : 0, 4096);
+  fextl::string LearnNote;
+  if (!LearnMB) {
+    LearnNote = "unpack cache: learned streams off (FEX_UNPACK_CACHE_LEARN=0)";
+  } else if (!GameFiles::Running() || C->LinuxRead < 0) {
+    LearnNote = fextl::fmt::format("unpack cache: learned streams off, they need {}",
+                                   !GameFiles::Running() ? "FEX_GAME_FILES_UNCACHED=1" : "data.bin's Linux file (FEX_UNPACK_CACHE_DIRECT=1)");
+  } else {
+    Learned::Words = ((C->MaxDataBytes >> Learned::BlockShift) + 63) / 64;
+    Learned::Bits = new std::atomic<uint64_t>[Learned::Words]();
+    Learned::UsedBits = new std::atomic<uint64_t>[Learned::Words]();
+    Learned::Path = Dir + "learned.txt";
+    Learned::Fd = C->LinuxRead;
+    const fextl::string From = Learned::Load(C->DataEnd, Reset || Started);
+    Learned::Budget = LearnMB << 20;
+    Learned::Coalesce();
+    Learned::FitBudget();
+    Learned::RebuildBits();
+    Learned::UpdateTotals();
+    Learned::Dirty = true; // the session number moved on
+    LearnNote = fextl::fmt::format(
+      "unpack cache: learned streams: the streams the main thread looks up in frames of play are remembered in {} and asked of storage "
+      "into the file cache at the start and at every loading screen, then read from there without waiting for storage (budget {} MB; "
+      "FEX_UNPACK_CACHE_LEARN=0 turns it off); session {}: {} ({} ranges {:.1f} MB)",
+      Learned::Path, LearnMB, Learned::Session, From, Learned::Count, Learned::MB(Learned::TotalBytes()));
+  }
   OpenTicks = ReadTicks();
   TheCache = C;
   FEXUnpackCacheEnabled = 1;
@@ -1099,7 +1703,15 @@ bool Init(bool MD5Cache) {
     ReaderCache = C;
   }
   ReaderWake.notify_all();
+  if (Learned::Budget) {
+    GameFiles::SetPassHook(Learned::Pass);
+  }
   FEX::Windows::StatsLogNote(LinuxNote);
+  FEX::Windows::StatsLogNote(LearnNote);
+  FEX::Windows::StatsLogNote(C->MainPlay ? "unpack cache: the main thread never reads a hit from disk while frames are coming (the last began under "
+                                           "250 ms ago): it is left to the game to unpack (FEX_UNPACK_CACHE_MAIN_PLAY=0 turns it off)" :
+                                           "unpack cache: the main thread reads hits from disk like any thread (FEX_UNPACK_CACHE_MAIN_PLAY=1 needs "
+                                           "FEX_GAME_FILES_UNCACHED=1)");
   if (MD5Cache) {
     FEX::Windows::StatsLogNote(OpenMD5Cache(Dir, Reset));
   } else {
@@ -1150,7 +1762,7 @@ fextl::string StatsLine() {
     return static_cast<double>(Bytes) / (1024.0 * 1024.0);
   };
   if (!D.Lookups && !D.Stores && !D.Written && !D.Dropped && !D.Failures && !D.AheadChunks && !D.AdlerSkips && !D.MD5Lookups && !D.PlaySkips) {
-    return {};
+    return Learned::Line();
   }
   uint64_t Size, Waiting;
   {
@@ -1162,7 +1774,7 @@ fextl::string StatsLine() {
   // hashing all of them. ahead = chunks the read-ahead thread read (direct = of those, read past the file cache; wasted =
   // dropped unused). uncached = reads and writes dropped from the file cache. adler = checks of a hit's output answered
   // without computing them. play = lookups while playing / of those left to the game (not in read-ahead memory) / their MB.
-  return fextl::fmt::format("  ucache lookups={} play={}/{}/{:.1f}MB key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms ram={}/{:.1f}ms disk={:.1f}ms verify={:.1f}ms "
+  fextl::string Out = fextl::fmt::format("  ucache lookups={} play={}/{}/{:.1f}MB key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms ram={}/{:.1f}ms disk={:.1f}ms verify={:.1f}ms "
                             "ahead={}/{:.1f}MB/{:.1f}ms direct={} wasted={} uncached={} adler={}/{:.1f}MB stored={}/{:.1f}MB/{:.1f}ms "
                             "written={}/{:.1f}ms "
                             "waiting={:.1f}MB dropped={} failed={} size={}MB writer={}{} md5cache={}/{}/{:.1f}MB/{:.1f}ms stored={}\n",
@@ -1171,5 +1783,12 @@ fextl::string StatsLine() {
                             D.CacheDrops, D.AdlerSkips, MB(D.AdlerSkipBytes), D.Stores, MB(D.StoreBytes), Ms(D.StoreTicks), D.Written,
                             Ms(D.WriteTicks), MB(Waiting), D.Dropped, D.Failures, Size >> 20, WriterState.load(std::memory_order_relaxed),
                             TheCache->Full ? " full" : "", D.MD5Hits, D.MD5Lookups, MB(D.MD5HitBytes), Ms(D.MD5Ticks), D.MD5Stores);
+  if (D.MainPlaySkips || D.LearnedHits || D.LearnedNotCached) {
+    Out += fextl::fmt::format("  ucache main thread in play: left to the game {}/{:.1f}MB | learned streams: from the file cache {}/{:.1f}ms, "
+                                        "not there {}/{:.1f}ms\n",
+                                        D.MainPlaySkips, MB(D.MainPlaySkipBytes), D.LearnedHits, Ms(D.LearnedTicks), D.LearnedNotCached,
+                                        Ms(D.LearnedNotCachedTicks));
+  }
+  return Out + Learned::Line();
 }
 } // namespace NativeUnpackCache

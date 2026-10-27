@@ -46,6 +46,12 @@ struct FEXUnpackCacheCounters {
   uint64_t PlayLookups;   // lookups while playing (few lookups a second, see FEX_UNPACK_CACHE_PLAY)
   uint64_t PlaySkips;     // of those, hits not in read-ahead memory, left to the game to unpack instead of read from disk
   uint64_t PlaySkipBytes;
+  uint64_t MainPlaySkips;     // build 90: of the skips, the main thread's while frames came that the lookup rate alone wouldn't have made
+  uint64_t MainPlaySkipBytes;
+  uint64_t LearnedHits;       // build 90: learned streams taken from the kernel's file cache
+  uint64_t LearnedTicks;
+  uint64_t LearnedNotCached;  // learned streams that weren't there (then handled like any other hit)
+  uint64_t LearnedNotCachedTicks;
 };
 extern struct FEXUnpackCacheCounters FEXUnpackCacheStats;
 

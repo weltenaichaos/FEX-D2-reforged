@@ -103,6 +103,14 @@ namespace {
     // run 52% of the 27 GB read ahead was never used, and while the game streamed a new area during play storage read
     // ~1 GB/s, ~3/4 of it this read-ahead (see ARM64EC/NativeUnpackCache.cpp).
     {"FEX_UNPACK_CACHE_AHEAD", "ramp"},
+    // Build 90: the main thread never reads an unpack cache hit from disk while frames are coming. In the build 89 run
+    // storage was at its low clock during play and the main thread's 11 disk hits at an area entry took 36.9 ms (3.4 ms
+    // each, against ~0.2 ms to unpack one), in a 105 ms frame (see ARM64EC/NativeUnpackCache.cpp).
+    {"FEX_UNPACK_CACHE_MAIN_PLAY", "1"},
+    // Build 90: the streams the main thread looks up in frames of play are learned across sessions and read into the
+    // file cache at the start and at every loading screen (budget in MB). The same 105 ms frame unpacked 7.6 MB of
+    // stored streams itself (20.9 ms) because they weren't in memory.
+    {"FEX_UNPACK_CACHE_LEARN", "256"},
     // Build 84: FEX's translated-code buffer starts at its full 128 MB, and is renewed at a loading screen once half used
     // (10% at the first three: start-up, menus, entering the game), rather than filling (and dropping all code) in play.
     // In the build 83 log every thread reloaded its code at once at 6:21, 5,301 blocks on the main thread in one second,
@@ -225,6 +233,8 @@ namespace {
     "FEX_UNPACK_CACHE_DIRECT",
     "FEX_UNPACK_CACHE_PLAY",
     "FEX_UNPACK_CACHE_AHEAD",
+    "FEX_UNPACK_CACHE_MAIN_PLAY",
+    "FEX_UNPACK_CACHE_LEARN",
     "FEX_CODE_BUFFER_START",
     "FEX_CODE_BUFFER_RENEW",
     "FEX_CODE_BUFFER_RENEW_EARLY",

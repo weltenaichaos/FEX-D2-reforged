@@ -191,6 +191,9 @@ namespace {
   std::mutex CandidateLock;
   Candidate Candidates[MaxCandidates];
   size_t CandidateCount {};
+  // Build 90: called once per FEXFileCache pass (SetPassHook).
+  std::atomic<void (*)(bool, bool)> PassHook {};
+  bool UnpackLearnWanted {}; // FEX_UNPACK_CACHE_LEARN asked for: the frame clock is needed
 
   struct HandleSlot {
     uint64_t Handle;
@@ -611,6 +614,23 @@ namespace {
     return __atomic_load_n(&FEXFrameMarks[1 + (Index & (MarkRing - 1))], __ATOMIC_RELAXED);
   }
 
+  // What frame Frame (frame marks written when something happened in it: it began at mark Frame - 1) was: 1 one of play
+  // (shorter than PlayFrameMs), 0 a loading screen's, -1 not ended yet and not that long so far, -2 too long ago to tell.
+  int KindOfFrame(uint64_t Frame) {
+    const uint64_t Marks = FrameCount();
+    if (!Frame || Marks - Frame >= MarkRing - 1) {
+      return -2;
+    }
+    const uint64_t PlayTicks = CounterFreq * PlayFrameMs / 1000;
+    const uint64_t Began = FrameMark(Frame - 1);
+    if (Marks > Frame) {
+      const uint64_t Ended = FrameMark(Frame);
+      return Ended > Began && Ended - Began < PlayTicks ? 1 : 0;
+    }
+    const uint64_t Now = GetCounter();
+    return Now > Began && Now - Began >= PlayTicks ? 0 : -1;
+  }
+
   // Game threads: the main thread's read of Bytes at Offset of watched file Watch waited for storage.
   void PushCandidate(int32_t Watch, uint64_t Offset, uint64_t Bytes) {
     const uint64_t Frame = FrameCount();
@@ -802,28 +822,16 @@ namespace {
     if (!Count) {
       return;
     }
-    const uint64_t Marks = FrameCount();
-    const uint64_t Now = GetCounter();
-    const uint64_t PlayTicks = CounterFreq * PlayFrameMs / 1000;
     size_t Waiting {};
     for (size_t i = 0; i < Count; ++i) {
       const auto& C = Local[i];
-      if (Marks - C.Frame >= MarkRing - 1) {
-        Learning.Skipped.fetch_add(1, std::memory_order_relaxed); // too long ago to tell
-        continue;
-      }
-      const uint64_t Began = FrameMark(C.Frame - 1);
-      if (Marks > C.Frame) {
-        const uint64_t Ended = FrameMark(C.Frame);
-        if (Ended > Began && Ended - Began < PlayTicks) {
-          Learn(C);
-        } else {
-          Learning.Skipped.fetch_add(1, std::memory_order_relaxed);
-        }
-      } else if (Now > Began && Now - Began >= PlayTicks) {
-        Learning.Skipped.fetch_add(1, std::memory_order_relaxed); // its frame is a loading screen's
-      } else {
+      const int Kind = KindOfFrame(C.Frame);
+      if (Kind == 1) {
+        Learn(C);
+      } else if (Kind == -1) {
         Local[Waiting++] = C; // its frame hasn't ended yet
+      } else {
+        Learning.Skipped.fetch_add(1, std::memory_order_relaxed); // a loading screen's frame, or too long ago to tell
       }
     }
     if (Waiting) {
@@ -1066,21 +1074,31 @@ namespace {
   // keep pieces (the read watch found ReadFile; before that a pass drops the files whole) and when a loading screen
   // starts, saves the list.
   void LearnPass(bool& InLoad, bool& Asked, bool LowMemory, uint32_t& Matched) {
-    MatchNewFiles(Matched);
-    TakeCandidates();
-    CountUsed();
     const uint64_t Marks = FrameCount();
     const uint64_t Now = GetCounter();
     const uint64_t Last = Marks ? FrameMark(Marks - 1) : 0;
     const bool Gap = Marks && Now > Last && Now - Last >= CounterFreq * PlayFrameMs / 1000;
-    const bool Keeping = Armed.load(std::memory_order_acquire);
-    if (Keeping && !LowMemory && Learning.HereRanges.load(std::memory_order_relaxed) && (!Asked || (Gap && !InLoad))) {
-      AskLearned();
-      Asked = true;
+    if (LearnBudget) {
+      MatchNewFiles(Matched);
+      TakeCandidates();
+      CountUsed();
+      // Asked once the drops keep pieces (the read watch is armed), then at each loading screen; a list that was empty
+      // then fills during play and is asked for at the next loading screen (build 89 asked mid-play then).
+      const bool Keeping = Armed.load(std::memory_order_acquire);
+      if (Keeping) {
+        if ((!Asked || (Gap && !InLoad)) && !LowMemory && Learning.HereRanges.load(std::memory_order_relaxed)) {
+          AskLearned();
+        }
+        Asked = true;
+      }
+      UpdateLearnTotals();
+      SaveLearned(false);
+    }
+    // Build 90: the unpack cache's learned list (NativeUnpackCache.cpp) on the same passes.
+    if (const auto Hook = PassHook.load(std::memory_order_acquire)) {
+      Hook(Gap && !InLoad, LowMemory);
     }
     InLoad = Gap;
-    UpdateLearnTotals();
-    SaveLearned(false);
   }
 
   void* FileCacheThread(void*) {
@@ -1178,7 +1196,7 @@ namespace {
       Stats.KeptMain.store(Kept[1], std::memory_order_relaxed);
       Stats.KeptAhead.store(Kept[2], std::memory_order_relaxed);
       Stats.KeptLearned.store(Kept[3], std::memory_order_relaxed);
-      if (LearnBudget) {
+      if (LearnBudget || PassHook.load(std::memory_order_relaxed)) {
         const uint64_t AvailableMB = Stats.AvailableMB.load(std::memory_order_relaxed);
         LearnPass(InLoad, Asked, AvailableMB && AvailableMB < GuardMB, Matched);
       }
@@ -1757,7 +1775,37 @@ namespace {
 } // namespace
 
 bool WantsFrameMarks() {
-  return LearnBudget > 0;
+  return LearnBudget > 0 || UnpackLearnWanted;
+}
+
+bool Running() {
+  return MainTeb != 0;
+}
+
+bool OnMainThread() {
+  return MainTeb && reinterpret_cast<uint64_t>(NtCurrentTeb()) == MainTeb;
+}
+
+uint64_t FrameNow() {
+  return MainTeb ? FrameCount() : 0;
+}
+
+bool FramesComing() {
+  const uint64_t Marks = FrameNow();
+  if (!Marks) {
+    return false;
+  }
+  const uint64_t Last = FrameMark(Marks - 1);
+  const uint64_t Now = GetCounter();
+  return Now <= Last || Now - Last < CounterFreq * PlayFrameMs / 1000;
+}
+
+int FrameKind(uint64_t Frame) {
+  return MainTeb ? KindOfFrame(Frame) : -2;
+}
+
+void SetPassHook(void (*Hook)(bool LoadStart, bool LowMemory)) {
+  PassHook.store(Hook, std::memory_order_release);
 }
 
 void Init(bool StatsLog) {
@@ -1780,6 +1828,9 @@ void Init(bool StatsLog) {
   if (LearnBudget) {
     LearnFile = Store::LearnedPath();
   }
+  // Build 90: the unpack cache's learned list tells play from loading screens by the frame clock too.
+  const char* Unpack = FEX::Windows::Switch("FEX_UNPACK_CACHE");
+  UnpackLearnWanted = Unpack && Unpack[0] == '1' && Number("FEX_UNPACK_CACHE_LEARN", 0, 0, 4096) > 0;
   // A quarter for what anyone read lately (an area load's own readahead and re-reads), the rest for the main thread's
   // reads.
   KeepRecent = (KeepMB << 20) / 4;
