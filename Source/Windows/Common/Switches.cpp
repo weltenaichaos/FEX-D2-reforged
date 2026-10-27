@@ -82,6 +82,12 @@ namespace {
     // slow frames allow (see EnvironmentVariablesHandling.h).
     {"FEX_VKD3D_CAP_PRESLEEP", "1"},
     {"FEX_VKD3D_FRAME_START", "1"},
+    // Build 97: FEX hands the cap's exact frame time (fps_limit rounded to whole screen refreshes, from the cap layer's
+    // conf.toml and GameNative's vsync.txt) to FEX's vkd3d-proton build (fex22), whose pre-sleep learned it from held
+    // presents up to fex21. In the fex21 log it learned 30.4 ms instead of 25 ms while loading in and kept it all
+    // session: 37 FPS at a 40 FPS cap, every 4th frame one refresh long (also seen in builds 89, 92 and 93) (see
+    // ARM64EC/Vkd3dReport.cpp).
+    {"FEX_VKD3D_CAP_GRID", "1"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -321,6 +327,7 @@ namespace {
     "FEX_VKD3D_TIMELINE",
     "FEX_VKD3D_CAP_PRESLEEP",
     "FEX_VKD3D_FRAME_START",
+    "FEX_VKD3D_CAP_GRID",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",

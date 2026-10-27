@@ -9,6 +9,7 @@ $end_info$
 #include "Vkd3dReport.h"
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/StatsLog.h"
+#include "Windows/Common/Switches.h"
 
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
@@ -16,6 +17,7 @@ $end_info$
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +28,7 @@ $end_info$
 #include <winnt.h>
 
 extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE Process, const void* Address, void* Buffer, SIZE_T Size, SIZE_T* BytesRead);
+extern "C" NTSTATUS WINAPI NtWriteVirtualMemory(HANDLE Process, void* Address, const void* Buffer, SIZE_T Size, SIZE_T* BytesWritten);
 extern "C" NTSTATUS WINAPI RtlQueryEnvironmentVariable_U(PWSTR Environment, PUNICODE_STRING Name, PUNICODE_STRING Value);
 
 namespace Vkd3dReport {
@@ -87,9 +90,23 @@ namespace {
     uint64_t Data;
   };
   static_assert(sizeof(CopyHeader) == 24 && sizeof(CopyBlob) == 40);
+
+  // struct vkd3d_fex_cap_grid in vkd3d-patches/ (VKD3D fex22): FEX writes the frame cap's exact frame time there, and
+  // vkd3d's cap pre-sleep uses it instead of learning it from held presents.
+  struct CapGridData {
+    uint32_t Magic;
+    uint32_t Version;
+    uint64_t StepNs;
+    uint64_t RefreshNs;
+    uint32_t FpsLimit;
+    uint32_t Writes;
+  };
+  static_assert(sizeof(CapGridData) == 32);
+  constexpr uint32_t CapGridMagic = 0x43584546u; // 'FEXC'
+  constexpr uint32_t CapGridVersion = 1;
   constexpr uint32_t CopyMagic = 0x53584546u; // 'FEXS'
   constexpr uint32_t CopyVersion = 1;
-  constexpr uint32_t CopyMax = 128;
+  constexpr uint32_t CopyMax = 512; // VKD3D fex22: 512 entries (compute shaders too); older builds have 128
   // Output a second at most, so the copies spread over the first seconds of play instead of one long log write.
   constexpr size_t CopyBytesPerSecond = 192 * 1024;
   constexpr size_t CopyBase64Line = 96; // bytes per base64 line (128 characters)
@@ -139,18 +156,138 @@ namespace {
   // (lsfg-vk-android paceBaseFrame: "30 = every 2nd vsync at 60Hz, every 4th at 120Hz"). At 60 Hz a limit of 40 (25 ms)
   // becomes 2 refreshes = 30 FPS: the build 92 log ran at limit 40 and showed 30.0 FPS the whole run, presents let out on
   // a 33.3 ms grid. Noted at start and whenever the period changes (checked every 5 s).
+  //
+  // Build 97: FEX also hands the cap's frame time (the rounded one) to FEX's VKD3D (fex22 and later), whose cap pre-sleep
+  // learned it from presents the cap held up to fex21 and could lock onto a wrong one (see WriteCapGrid). fps_limit is
+  // read again every 5 s too, in case GameNative's setting changes in game.
   struct CapGrid {
-    fextl::string VsyncPath; // empty: no conf.toml known
-    int FpsLimit;            // the last fps_limit in conf.toml, 0 = none
-    int64_t PeriodNs;        // period last noted, -1 = no usable vsync.txt
+    fextl::string ConfigPath; // LSFG_CONFIG, empty: none
+    fextl::string VsyncPath;  // empty: no conf.toml known
+    bool LayerLoaded;         // the cap layer is mapped into the process (at the announce)
+    int FpsLimit;             // the last fps_limit in conf.toml, 0 = none
+    int64_t PeriodNs;         // period last noted, -1 = no usable vsync.txt
     uint32_t Calls;
+    uint64_t DataAddress;     // vkd3d_fex_cap_grid in d3d12core.dll (VKD3D fex22 and later), 0 = none
+    int64_t StepWritten;      // the frame time last written there, -1 = none yet
+    bool OldNoted;            // said that the VKD3D build can't take it
   };
-  CapGrid Grid {};
+  CapGrid Grid {.PeriodNs = -1, .StepWritten = -1};
+
+  // fps_limit in the cap layer's conf.toml: the limit (0 = no such line), or -1 when the file can't be read. Caps gets the
+  // lines worth noting when given.
+  int ReadFpsLimit(const fextl::string& Config, fextl::string* Caps) {
+    namespace Linux = FEX::Windows::Linux;
+    static char Text[8192];
+    if (Linux::ReadSmallFile(Config.c_str(), Text, sizeof(Text)) <= 0) {
+      return -1;
+    }
+    int Limit = 0;
+    std::string_view All {Text};
+    while (!All.empty()) {
+      const size_t End = All.find('\n');
+      std::string_view Line = All.substr(0, End);
+      All = End == std::string_view::npos ? std::string_view {} : All.substr(End + 1);
+      while (!Line.empty() && (Line.front() == ' ' || Line.front() == '\t')) {
+        Line.remove_prefix(1);
+      }
+      if (Caps && (Line.starts_with("fps_limit") || Line.starts_with("multiplier") || Line.starts_with("["))) {
+        *Caps += Caps->empty() ? "" : ", ";
+        Caps->append(Line.data(), std::min<size_t>(Line.size(), 80));
+      }
+      if (Line.starts_with("fps_limit")) {
+        const size_t Eq = Line.find('=');
+        if (Eq != std::string_view::npos) {
+          Limit = atoi(fextl::string(Line.substr(Eq + 1)).c_str());
+        }
+      }
+    }
+    return Limit;
+  }
+
+  // The cap's frame time as the layer paces it: fps_limit rounded to whole refreshes on GameNative's grid, or its own
+  // clock without a usable vsync.txt. 0 = no cap.
+  int64_t CapStepNs() {
+    if (Grid.FpsLimit <= 0) {
+      return 0;
+    }
+    const int64_t Target = 1'000'000'000ll / Grid.FpsLimit;
+    if (Grid.PeriodNs <= 0) {
+      return Target;
+    }
+    return std::max<int64_t>(1, (Target + Grid.PeriodNs / 2) / Grid.PeriodNs) * Grid.PeriodNs;
+  }
+
+  // Writes the cap's frame time into VKD3D's vkd3d_fex_cap_grid when it changed. VKD3D's cap pre-sleep (fex22) uses it
+  // instead of the period it learned from presents the cap held: in the fex21 log it learned 30.4 ms instead of the cap's
+  // 25 ms while loading in (slow frames get long holds from the window system too, at the frame time) and kept it all
+  // session, so the game ran at 37 FPS at a 40 FPS cap with every 4th frame one refresh long (also seen in builds 89, 92
+  // and 93 at 30 FPS caps). Off with FEX_VKD3D_CAP_GRID=0 (VKD3D then learns it as before, with fex22's safer learning).
+  fextl::string WriteCapGrid() {
+    if (!Grid.DataAddress || !Grid.LayerLoaded) {
+      return {};
+    }
+    const char* Switch = FEX::Windows::Switch("FEX_VKD3D_CAP_GRID");
+    if (!Switch || !strcmp(Switch, "0")) {
+      return {};
+    }
+    CapGridData Data {};
+    if (!ReadMemory(Grid.DataAddress, &Data, sizeof(Data)) || Data.Magic != CapGridMagic || Data.Version != CapGridVersion) {
+      if (Grid.OldNoted) {
+        return {};
+      }
+      Grid.OldNoted = true;
+      return fextl::fmt::format("# cap: this VKD3D build has a cap grid FEX doesn't know (magic {:08X} version {}): its pre-sleep learns the "
+                                "cap's frame time on its own\n",
+                                Data.Magic, Data.Version);
+    }
+    const int64_t Step = CapStepNs();
+    if (Step == Grid.StepWritten) {
+      return {};
+    }
+    const uint64_t RefreshNs = Grid.PeriodNs > 0 ? Grid.PeriodNs : 0;
+    const uint32_t FpsLimit = Grid.FpsLimit > 0 ? Grid.FpsLimit : 0;
+    const uint64_t StepNs = Step;
+    const uint32_t Writes = Data.Writes + 1;
+    SIZE_T Written {};
+    // Refresh and limit first (VKD3D's log line reads them only once the step is there), the step as one 8-byte write.
+    const bool Ok =
+      NtWriteVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Grid.DataAddress + offsetof(CapGridData, RefreshNs)), &RefreshNs,
+                           sizeof(RefreshNs), &Written) == STATUS_SUCCESS &&
+      NtWriteVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Grid.DataAddress + offsetof(CapGridData, FpsLimit)), &FpsLimit,
+                           sizeof(FpsLimit), &Written) == STATUS_SUCCESS &&
+      NtWriteVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Grid.DataAddress + offsetof(CapGridData, StepNs)), &StepNs,
+                           sizeof(StepNs), &Written) == STATUS_SUCCESS &&
+      NtWriteVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Grid.DataAddress + offsetof(CapGridData, Writes)), &Writes,
+                           sizeof(Writes), &Written) == STATUS_SUCCESS;
+    if (!Ok) {
+      Grid.DataAddress = 0;
+      return "# cap: writing the cap's frame time into VKD3D failed; its pre-sleep learns it on its own\n";
+    }
+    Grid.StepWritten = Step;
+    if (!Step) {
+      return "# cap: no fps_limit: VKD3D's pre-sleep gets no frame time from FEX\n";
+    }
+    return fextl::fmt::format("# cap: VKD3D takes the cap's frame time from FEX: {:.3f} ms (fps_limit {}{}); its pre-sleep no longer learns "
+                              "it from held presents (VKD3D fex22, FEX_VKD3D_CAP_GRID)\n",
+                              Step / 1e6, FpsLimit,
+                              RefreshNs ? fextl::fmt::format(", {} refresh{} of {:.3f} ms", Step / RefreshNs, Step / RefreshNs == 1 ? "" : "es",
+                                                             RefreshNs / 1e6) :
+                                          fextl::string(", the layer's own clock"));
+  }
 
   fextl::string CapGridNote(bool First) {
     namespace Linux = FEX::Windows::Linux;
     if (Grid.VsyncPath.empty()) {
       return {};
+    }
+    fextl::string Out;
+    if (!First && !Grid.ConfigPath.empty()) {
+      const int Limit = ReadFpsLimit(Grid.ConfigPath, nullptr);
+      if (Limit >= 0 && Limit != Grid.FpsLimit) {
+        Out += fextl::fmt::format("# cap: fps_limit changed from {} to {} in the cap's conf.toml\n", Grid.FpsLimit, Limit);
+        Grid.FpsLimit = Limit;
+        First = true;
+      }
     }
     static char Text[1024];
     int64_t Period = -1;
@@ -170,24 +307,24 @@ namespace {
       }
     }
     if (!First && Period == Grid.PeriodNs) {
-      return {};
+      return Out;
     }
     Grid.PeriodNs = Period;
     if (Period < 0) {
-      return fextl::fmt::format("# cap: no usable vsync.txt next to the cap's conf.toml ({}): the layer paces fps_limit {} on its own clock, "
+      return Out + fextl::fmt::format("# cap: no usable vsync.txt next to the cap's conf.toml ({}): the layer paces fps_limit {} on its own clock, "
                                 "without rounding to screen refreshes\n",
                                 Grid.VsyncPath, Grid.FpsLimit);
     }
     const double Hz = 1e9 / static_cast<double>(Period);
     if (Grid.FpsLimit <= 0) {
-      return fextl::fmt::format("# cap: screen refresh {:.1f} Hz (GameNative's vsync.txt, period {:.3f} ms); no fps_limit, so no cap\n", Hz,
+      return Out + fextl::fmt::format("# cap: screen refresh {:.1f} Hz (GameNative's vsync.txt, period {:.3f} ms); no fps_limit, so no cap\n", Hz,
                                 Period / 1e6);
     }
     const int64_t Target = 1'000'000'000ll / Grid.FpsLimit;
     const int64_t Steps = std::max<int64_t>(1, (Target + Period / 2) / Period);
     const double Fps = 1e9 / static_cast<double>(Steps * Period);
     const bool Rounded = Fps < Grid.FpsLimit - 0.5 || Fps > Grid.FpsLimit + 0.5;
-    return fextl::fmt::format("# cap: screen refresh {:.1f} Hz (GameNative's vsync.txt, period {:.3f} ms); the cap layer rounds fps_limit {} "
+    return Out + fextl::fmt::format("# cap: screen refresh {:.1f} Hz (GameNative's vsync.txt, period {:.3f} ms); the cap layer rounds fps_limit {} "
                               "({:.1f} ms a frame) to whole refreshes: one frame every {} refresh{} = {:.1f} FPS{}\n",
                               Hz, Period / 1e6, Grid.FpsLimit, Target / 1e6, Steps, Steps == 1 ? "" : "es", Fps,
                               Rounded ? fextl::fmt::format(" (not {}: {} FPS needs a refresh rate that is a whole multiple of it, "
@@ -234,32 +371,16 @@ namespace {
       for (size_t i = 0; i < ValueText.Length / sizeof(wchar_t); ++i) {
         Config += Value[i] < 0x80 ? static_cast<char>(Value[i]) : '?';
       }
-      static char Text[8192];
-      if (Linux::ReadSmallFile(Config.c_str(), Text, sizeof(Text)) > 0) {
-        std::string_view All {Text};
-        while (!All.empty()) {
-          const size_t End = All.find('\n');
-          std::string_view Line = All.substr(0, End);
-          All = End == std::string_view::npos ? std::string_view {} : All.substr(End + 1);
-          while (!Line.empty() && (Line.front() == ' ' || Line.front() == '\t')) {
-            Line.remove_prefix(1);
-          }
-          if (Line.starts_with("fps_limit") || Line.starts_with("multiplier") || Line.starts_with("[")) {
-            Caps += Caps.empty() ? "" : ", ";
-            Caps.append(Line.data(), std::min<size_t>(Line.size(), 80));
-          }
-          if (Line.starts_with("fps_limit")) {
-            const size_t Eq = Line.find('=');
-            if (Eq != std::string_view::npos) {
-              Grid.FpsLimit = atoi(fextl::string(Line.substr(Eq + 1)).c_str());
-            }
-          }
-        }
-      } else {
+      const int Limit = ReadFpsLimit(Config, &Caps);
+      if (Limit < 0) {
         Caps = "can't be read";
+      } else {
+        Grid.FpsLimit = Limit;
       }
     }
 
+    Grid.ConfigPath = Config;
+    Grid.LayerLoaded = !Layer.empty();
     if (Layer.empty() && Config.empty()) {
       return "# cap: GameNative's frame cap layer isn't loaded (no lsfg mapping, no LSFG_CONFIG)\n";
     }
@@ -345,6 +466,8 @@ namespace {
     case 7: return "pso";
     case 8: return "root signature";
     case 9: return "note";
+    case 10: return "compute shader dxbc";
+    case 11: return "compute shader spirv";
     default: return "unknown";
     }
   }
@@ -382,8 +505,9 @@ namespace {
     }
     if (!Copy.Announced) {
       Copy.Announced = true;
-      Out += fextl::fmt::format("# shader copy: FEX's VKD3D copies {} listed pixel shaders (FEX_VKD3D_SHADER_COPY) when the game "
-                                "creates their PSOs; each copy is a 'shader copy N begin' note, '  sc N' lines (base64 bytes, or "
+      Out += fextl::fmt::format("# shader copy: FEX's VKD3D copies {} listed pixel shaders (FEX_VKD3D_SHADER_COPY), and from VKD3D fex22 "
+                                "on every compute shader while the GPU pass meter runs (VKD3D_FEX_COPY_COMPUTE=0 turns that off), when "
+                                "the game creates their PSOs; each copy is a 'shader copy N begin' note, '  sc N' lines (base64 bytes, or "
                                 "'|' text lines with '+' continuations) and a 'shader copy N end' note with the byte count and "
                                 "FNV-1a check\n",
                                 H.Listed);
@@ -485,6 +609,9 @@ namespace {
       }
       Copy = {};
       Copy.Address = FindExport(Module, "vkd3d_fex_shader_copy");
+      Grid.DataAddress = FindExport(Module, "vkd3d_fex_cap_grid");
+      Grid.StepWritten = -1;
+      Grid.OldNoted = false;
       ModuleAddress = Module;
       if (!Sources[Pass].Address && !Sources[Present].Address) {
         NotFexBuild = true;
@@ -509,6 +636,7 @@ namespace {
           Other.Address = 0;
         }
         Copy = {};
+        Grid.DataAddress = 0;
         return Out;
       }
       if (R == ReadResult::New) {
@@ -544,8 +672,13 @@ namespace {
                                        PresentFlags & FlagGradualStart ? "on (gradual, VKD3D fex3: an older VKD3D component is selected)" :
                                                                          "on (build 56 style: an older VKD3D component is selected)"));
       Out += CapLayerNote();
+      Out += WriteCapGrid();
+      if (!Grid.DataAddress && Grid.LayerLoaded && Grid.FpsLimit > 0) {
+        Out += "# cap: this VKD3D build (older than fex22) learns the cap's frame time from held presents; FEX can't hand it over\n";
+      }
     } else if (Announced && ++Grid.Calls % 5 == 0) {
       Out += CapGridNote(false);
+      Out += WriteCapGrid();
     }
     CopyLines(Out);
     return Out;
