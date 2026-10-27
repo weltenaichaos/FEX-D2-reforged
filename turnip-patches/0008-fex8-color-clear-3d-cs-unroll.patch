@@ -1,0 +1,512 @@
+diff --git a/src/freedreno/ir3/ir3_compiler.c b/src/freedreno/ir3/ir3_compiler.c
+index 2f35c19..48be873 100644
+--- a/src/freedreno/ir3/ir3_compiler.c
++++ b/src/freedreno/ir3/ir3_compiler.c
+@@ -441,6 +441,10 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
+    compiler->nir_options.max_offset_shift = ir3_nir_max_offset_shift;
+    compiler->nir_options.cb_data = compiler;
+ 
++   /* FEX (fex8): see ir3_compiler::fex_cs_nir_options. 128 as on AMD. */
++   compiler->fex_cs_nir_options = compiler->nir_options;
++   compiler->fex_cs_nir_options.max_unroll_iterations_aggressive = 128;
++
+    if (!options->disable_cache)
+       ir3_disk_cache_init(compiler);
+ 
+diff --git a/src/freedreno/ir3/ir3_compiler.h b/src/freedreno/ir3/ir3_compiler.h
+index d35fd26..75e5c19 100644
+--- a/src/freedreno/ir3/ir3_compiler.h
++++ b/src/freedreno/ir3/ir3_compiler.h
+@@ -41,6 +41,13 @@ struct ir3_compiler_options {
+     */
+    bool fex_loop_prefetch;
+ 
++   /* FEX (fex8): compute shader loops with a known trip count whose loads
++    * could overlap are unrolled up to 128 iterations (stock: 32), as
++    * nir_opt_loop_unroll does for drivers that set
++    * max_unroll_iterations_aggressive (ir3_compiler::fex_cs_nir_options).
++    */
++   bool fex_cs_unroll;
++
+    /* If true, disable the shader cache. The driver is then responsible for
+     * caching.
+     */
+@@ -78,6 +85,11 @@ struct ir3_compiler {
+ 
+    struct nir_shader_compiler_options nir_options;
+ 
++   /* FEX (fex8): nir_options with max_unroll_iterations_aggressive set, for
++    * nir_opt_loop_unroll on compute shaders when options.fex_cs_unroll.
++    */
++   nir_shader_compiler_options fex_cs_nir_options;
++
+    /*
+     * Configuration options for things handled differently by turnip vs
+     * gallium
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index 15c10e1..ff44e37 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -400,7 +400,22 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
+          OPT(s, nir_opt_dce);
+       }
+       progress |= OPT(s, nir_opt_if, nir_opt_if_optimize_phi_true_false);
+-      progress |= OPT(s, nir_opt_loop_unroll);
++      if (compiler->options.fex_cs_unroll &&
++          s->info.stage == MESA_SHADER_COMPUTE) {
++         /* FEX (fex8): a loop with a known trip count whose body is one
++          * block with loads that depend on the iteration is unrolled up to
++          * 128 iterations, so its loads go out together instead of one
++          * memory wait per iteration. D2R's 66a6aa1d0c34c002 (16 x 32
++          * iterations of 2 buffer reads in each of 1024 threads) took
++          * 0.23 ms of every frame on the GPU, almost all of it waiting.
++          */
++         const nir_shader_compiler_options *stock = s->options;
++         s->options = &compiler->fex_cs_nir_options;
++         progress |= OPT(s, nir_opt_loop_unroll);
++         s->options = stock;
++      } else {
++         progress |= OPT(s, nir_opt_loop_unroll);
++      }
+       progress |= OPT(s, nir_opt_phi_to_bool);
+       progress |= OPT(s, nir_opt_remove_phis);
+       progress |= OPT(s, nir_opt_undef);
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index b769eec..12c9991 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -5415,28 +5415,47 @@ tu_clear_sysmem_attachment(struct tu_cmd_buffer *cmd,
+ }
+ TU_GENX(tu_clear_sysmem_attachment);
+ 
+-/* FEX link (fex3): the start-of-pass clear of a depth/stencil attachment as a
++/* FEX link (fex3/fex8): the start-of-pass clears of the subpass's
++ * depth/stencil attachment (depth = attachment + 1, 0 = none) and of the
++ * color attachments in the colors mask (bit = index in the subpass) as one
+  * 3D draw, the way vkCmdClearAttachments clears inside a direct pass: depth
+  * test ALWAYS with depth (and stencil) writes through the depth unit and its
+- * cache, so no CCU color -> depth flush and no wait for idle are needed after
+- * it. LRZ is left alone: the pass already cleared it to the same value. Only
+- * runs in direct (sysmem) mode; tiled passes clear in GMEM as before.
+- * With TU_FEX_MODE_DEPTH_CLEAR_FASTZ (fex4) the draw runs with the fragment
+- * shader disabled: the depth comes from the clear vertex shader's position,
+- * nothing reads the fragment shader's outputs.
++ * cache, colors through the color cache the pass's draws use, so no CCU flush
++ * and no wait for idle are needed after it (the 2D engine path needs both).
++ * LRZ is left alone: the pass already cleared it to the same value. Only runs
++ * in direct (sysmem) mode; tiled passes clear in GMEM as before.
+  */
+ template <chip CHIP>
+ void
+-tu_fex_clear_depth_3d(struct tu_cmd_buffer *cmd, uint32_t a)
+-{
+-   const struct tu_render_pass_attachment *att = &cmd->state.pass->attachments[a];
+-   VkClearAttachment clear = {};
+-   /* tu_pass.cc keeps COLOR_BIT ("the whole attachment") for depth-only
+-    * formats and DEPTH/STENCIL bits for D24S8. */
+-   clear.aspectMask = att->format == VK_FORMAT_D24_UNORM_S8_UINT ?
+-      att->clear_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) :
+-      VK_IMAGE_ASPECT_DEPTH_BIT;
+-   clear.clearValue = cmd->state.clear_values[a];
++tu_fex_clear_3d(struct tu_cmd_buffer *cmd, uint32_t depth, uint32_t colors)
++{
++   const struct tu_subpass *subpass = cmd->state.subpass;
++   VkClearAttachment clears[MAX_RTS + 1] = {};
++   uint32_t count = 0;
++
++   u_foreach_bit(c, colors) {
++      const uint32_t a = subpass->color_attachments[c].attachment;
++      clears[count].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++      clears[count].colorAttachment = c;
++      clears[count].clearValue = cmd->state.clear_values[a];
++      count++;
++   }
++
++   if (depth) {
++      const uint32_t a = depth - 1;
++      const struct tu_render_pass_attachment *att = &cmd->state.pass->attachments[a];
++      /* tu_pass.cc keeps COLOR_BIT ("the whole attachment") for depth-only
++       * formats and DEPTH/STENCIL bits for D24S8. */
++      clears[count].aspectMask = att->format == VK_FORMAT_D24_UNORM_S8_UINT ?
++         att->clear_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) :
++         VK_IMAGE_ASPECT_DEPTH_BIT;
++      clears[count].clearValue = cmd->state.clear_values[a];
++      count++;
++   }
++
++   if (!count)
++      return;
++
+    VkClearRect rect = {};
+    rect.rect = cmd->state.render_areas[0];
+    rect.baseArrayLayer = 0;
+@@ -5449,13 +5468,10 @@ tu_fex_clear_depth_3d(struct tu_cmd_buffer *cmd, uint32_t a)
+    tu_emit_cache_flush_renderpass<CHIP>(cmd);
+ 
+    tu_cond_exec_start(cs, CP_COND_EXEC_0_RENDER_MODE_SYSMEM);
+-   cmd->state.fex.clear_fs_disable =
+-      CHIP >= A7XX && (cmd->state.fex.mode & TU_FEX_MODE_DEPTH_CLEAR_FASTZ);
+-   tu_clear_sysmem_attachments<CHIP>(cmd, 1, &clear, 1, &rect);
+-   cmd->state.fex.clear_fs_disable = false;
++   tu_clear_sysmem_attachments<CHIP>(cmd, count, clears, 1, &rect);
+    tu_cond_exec_end(cs);
+ }
+-TU_GENX(tu_fex_clear_depth_3d);
++TU_GENX(tu_fex_clear_3d);
+ 
+ template <chip CHIP>
+ void
+diff --git a/src/freedreno/vulkan/tu_clear_blit.h b/src/freedreno/vulkan/tu_clear_blit.h
+index d312425..e1b4b7b 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.h
++++ b/src/freedreno/vulkan/tu_clear_blit.h
+@@ -63,12 +63,14 @@ tu_clear_sysmem_attachment(struct tu_cmd_buffer *cmd,
+                            struct tu_cs *cs,
+                            uint32_t a);
+ 
+-/* FEX link (fex3): clear attachment a, the current subpass's depth/stencil
+- * attachment, over the render area with a 3D draw in direct (sysmem) mode,
+- * after the subpass state is emitted. See TU_FEX_MODE_DEPTH_CLEAR_3D. */
++/* FEX link (fex3/fex8): clear the current subpass's depth/stencil attachment
++ * (depth = attachment + 1, 0 = none) and the color attachments in colors (bit
++ * = index in the subpass) over the render area with one 3D draw in direct
++ * (sysmem) mode, after the subpass state is emitted. See
++ * TU_FEX_MODE_DEPTH_CLEAR_3D. */
+ template <chip CHIP>
+ void
+-tu_fex_clear_depth_3d(struct tu_cmd_buffer *cmd, uint32_t a);
++tu_fex_clear_3d(struct tu_cmd_buffer *cmd, uint32_t depth, uint32_t colors);
+ 
+ template <chip CHIP>
+ void
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index eddcebf..07d4a48 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -6980,12 +6980,58 @@ tu_emit_subpass_begin_gmem(struct tu_cmd_buffer *cmd, struct tu_resolve_group *r
+ 
+ }
+ 
++/* FEX link (fex3/fex8): can a clear at the start of this subpass be one 3D
++ * draw over the render area? One single-sampled layer, and nothing that
++ * changes how a draw covers the render area: no multiview, per-layer areas,
++ * fragment density maps, predication (it would skip the draw), custom
++ * resolves or unresolves. */
++static bool
++tu_fex_clear_3d_area_ok(const struct tu_cmd_buffer *cmd)
++{
++   const struct tu_subpass *subpass = cmd->state.subpass;
++   return subpass->samples <= 1 &&
++          !subpass->multiview_mask && !subpass->custom_resolve &&
++          !subpass->unresolve_count && !cmd->state.pass->num_views &&
++          cmd->state.framebuffer->layers == 1 &&
++          !cmd->state.per_layer_render_area && !cmd->state.fdm_enabled &&
++          !cmd->state.predication_active &&
++          cmd->state.render_areas[0].extent.width &&
++          cmd->state.render_areas[0].extent.height;
++}
++
++/* FEX link (fex8): the index in this subpass's color attachments of color
++ * attachment a, if its clear at the start of the subpass can join the 3D
++ * clear draw (tu_fex_clear_3d), else -1. The 2D engine fills ~25 pixels per
++ * clock on a740 and every such clear ends with a CCU flush and a wait for
++ * idle; D2R clears ~14 color targets a frame this way. Off with
++ * TU_FEX_MODE_DEPTH_CLEAR_FASTZ (FEX_TU_DEPTH_CLEAR=2 compares both ways). The
++ * E5B9G9R9 format the 2D path clears as R32_UINT stays there. */
++static int
++tu_fex_color_clear_3d_index(const struct tu_cmd_buffer *cmd, uint32_t a)
++{
++   const struct tu_fex_device *fex = cmd->device->fex;
++   if (!fex || !fex->color_clear_3d ||
++       !(cmd->state.fex.mode & TU_FEX_MODE_DEPTH_CLEAR_3D) ||
++       (cmd->state.fex.mode & TU_FEX_MODE_DEPTH_CLEAR_FASTZ))
++      return -1;
++
++   const struct tu_subpass *subpass = cmd->state.subpass;
++   const struct tu_render_pass_attachment *att = &cmd->state.pass->attachments[a];
++   if (!(att->clear_mask & VK_IMAGE_ASPECT_COLOR_BIT) || att->samples > 1 ||
++       att->format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)
++      return -1;
++
++   for (uint32_t c = 0; c < subpass->color_count; c++) {
++      if (subpass->color_attachments[c].attachment == a)
++         return tu_fex_clear_3d_area_ok(cmd) ? (int)c : -1;
++   }
++   return -1;
++}
++
+ /* FEX link (fex3, TU_FEX_MODE_DEPTH_CLEAR_3D): can attachment a's clear at the
+- * start of this subpass be a 3D draw (tu_fex_clear_depth_3d) instead of a 2D
++ * start of this subpass be a 3D draw (tu_fex_clear_3d) instead of a 2D
+  * engine fill? Only the subpass's own single-sampled depth/stencil attachment
+- * (no separate stencil plane), one layer, and nothing that changes how a draw
+- * covers the render area: no multiview, per-layer areas, fragment density
+- * maps, predication, custom resolves or unresolves. */
++ * (no separate stencil plane), within tu_fex_clear_3d_area_ok's limits. */
+ static bool
+ tu_fex_depth_clear_3d_ok(const struct tu_cmd_buffer *cmd, uint32_t a)
+ {
+@@ -7008,18 +7054,11 @@ tu_fex_depth_clear_3d_ok(const struct tu_cmd_buffer *cmd, uint32_t a)
+    }
+ 
+    /* tu_pass.cc: COLOR_BIT for depth-only formats, DEPTH/STENCIL bits for
+-    * D24S8; tu_fex_clear_depth_3d maps it back. */
++    * D24S8; tu_fex_clear_3d maps it back. */
+    if (!att->clear_mask)
+       return false;
+ 
+-   return att->samples <= 1 && subpass->samples <= 1 &&
+-          !subpass->multiview_mask && !subpass->custom_resolve &&
+-          !subpass->unresolve_count && !cmd->state.pass->num_views &&
+-          cmd->state.framebuffer->layers == 1 &&
+-          !cmd->state.per_layer_render_area && !cmd->state.fdm_enabled &&
+-          !cmd->state.predication_active &&
+-          cmd->state.render_areas[0].extent.width &&
+-          cmd->state.render_areas[0].extent.height;
++   return att->samples <= 1 && tu_fex_clear_3d_area_ok(cmd);
+ }
+ 
+ /* Emits sysmem clears that are first used in this subpass. */
+@@ -7049,13 +7088,24 @@ tu_emit_subpass_begin_sysmem(struct tu_cmd_buffer *cmd)
+          if (cmd->device->fex && vk_format_is_depth_or_stencil(att->format)) {
+             const bool draw = tu_fex_depth_clear_3d_ok(cmd, i);
+             const VkExtent2D ext = cmd->state.render_areas[0].extent;
+-            tu_fex_count_depth_clear(cmd->device, draw,
+-                                     cmd->state.fex.mode & TU_FEX_MODE_DEPTH_CLEAR_FASTZ,
++            /* fex8: no fast Z any more (the bit now means color clears on
++             * the 2D engine). */
++            tu_fex_count_depth_clear(cmd->device, draw, false,
+                                      (uint64_t)ext.width * ext.height);
+             if (draw) {
+                cmd->state.fex.depth_clear_3d = i + 1;
+                continue;
+             }
++         } else if (cmd->device->fex) {
++            /* fex8: color clears join the same 3D draw. */
++            const int c = tu_fex_color_clear_3d_index(cmd, i);
++            if (c >= 0) {
++               const VkExtent2D ext = cmd->state.render_areas[0].extent;
++               tu_fex_count_color_clear(cmd->device,
++                                        (uint64_t)ext.width * ext.height);
++               cmd->state.fex.color_clear_3d |= 1u << c;
++               continue;
++            }
+          }
+          tu_clear_sysmem_attachment<CHIP>(cmd, cs, i);
+       }
+@@ -7265,12 +7315,15 @@ tu_emit_subpass_begin(struct tu_cmd_buffer *cmd)
+ 
+    vk_cmd_set_cb_attachment_count(&cmd->vk, cmd->state.subpass->color_count);
+ 
+-   /* FEX link (fex3): the depth clear tu_emit_subpass_begin_sysmem left for
+-    * the 3D path, now that the depth buffer state is emitted. */
+-   if (cmd->state.fex.depth_clear_3d) {
+-      const uint32_t a = cmd->state.fex.depth_clear_3d - 1;
++   /* FEX link (fex3/fex8): the clears tu_emit_subpass_begin_sysmem left for
++    * the 3D path, now that the depth buffer and render target state is
++    * emitted: one draw for all of them. */
++   if (cmd->state.fex.depth_clear_3d || cmd->state.fex.color_clear_3d) {
++      const uint32_t depth = cmd->state.fex.depth_clear_3d;
++      const uint32_t colors = cmd->state.fex.color_clear_3d;
+       cmd->state.fex.depth_clear_3d = 0;
+-      tu_fex_clear_depth_3d<CHIP>(cmd, a);
++      cmd->state.fex.color_clear_3d = 0;
++      tu_fex_clear_3d<CHIP>(cmd, depth, colors);
+    }
+ 
+    cmd->state.dirty |= TU_CMD_DIRTY_SUBPASS;
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 00ad9a6..3a931bd 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3303,6 +3303,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+       !!(tu_fex_compile(device->fex) & TU_FEX_COMPILE_PREAMBLE_LOADS);
+    device->compiler->options.fex_loop_prefetch =
+       !!(tu_fex_compile(device->fex) & TU_FEX_COMPILE_LOOP_PREFETCH);
++   /* fex8: likewise (tu_shader_key::fex_cs_unroll). */
++   device->compiler->options.fex_cs_unroll = tu_fex_cs_unroll(device->fex);
+ 
+    *pDevice = tu_device_to_handle(device);
+    return VK_SUCCESS;
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index 7059a87..69041d5 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -97,6 +97,11 @@ tu_fex_device_init(struct tu_device *dev)
+       fex->desc_patch = true;
+       status |= TU_FEX_STATUS_DESC_PATCH | TU_FEX_STATUS_DEPTH_CLEAR_3D |
+                 TU_FEX_STATUS_DEPTH_CLEAR_FASTZ;
++      /* fex8: on unless the Unix environment says TU_FEX_COLOR_CLEAR=0. */
++      const char *cc = getenv("TU_FEX_COLOR_CLEAR");
++      fex->color_clear_3d = !(cc && !strcmp(cc, "0"));
++      if (fex->color_clear_3d)
++         status |= TU_FEX_STATUS_COLOR_CLEAR_3D;
+    } else {
+       status |= TU_FEX_STATUS_NOT_A7XX;
+    }
+@@ -111,6 +116,11 @@ tu_fex_device_init(struct tu_device *dev)
+       status |= TU_FEX_STATUS_PREAMBLE_LOADS;
+    if (fex->compile & TU_FEX_COMPILE_LOOP_PREFETCH)
+       status |= TU_FEX_STATUS_LOOP_PREFETCH;
++   /* fex8: on unless TU_FEX_CS_UNROLL=0; read once (shader keys carry it). */
++   const char *cu = getenv("TU_FEX_CS_UNROLL");
++   fex->cs_unroll = !(cu && !strcmp(cu, "0"));
++   if (fex->cs_unroll)
++      status |= TU_FEX_STATUS_CS_UNROLL;
+ 
+    chan->patch = TU_FEX_PATCH;
+    snprintf(chan->driver, sizeof(chan->driver), "Mesa " PACKAGE_VERSION " fex%d",
+@@ -347,6 +357,16 @@ tu_fex_count_depth_clear(struct tu_device *dev, bool draw, bool fastz, uint64_t
+    }
+ }
+ 
++void
++tu_fex_count_color_clear(struct tu_device *dev, uint64_t pixels)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex)
++      return;
++   __atomic_fetch_add(&fex->chan->depth_clears_fastz, 1, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&fex->chan->depth_clear_px_fastz, pixels, __ATOMIC_RELAXED);
++}
++
+ void
+ tu_fex_count_loop_prefetch(struct tu_device *dev, unsigned loads)
+ {
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index c2ac11d..adf5ce0 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -22,6 +22,10 @@
+  *    system memory it read from /proc/meminfo for 250 ms instead of reading
+  *    the file on every call (tu_fex_channel::mode, read at every query), and
+  *    counts the queries, the file reads and the time they took.
++ *  - (fex8) with TU_FEX_MODE_DEPTH_CLEAR_3D, color attachments cleared at the
++ *    start of a direct (sysmem) pass get the same 3D draw as depth (all of a
++ *    pass's clears in one draw), and compute shader loops whose loads can
++ *    overlap are unrolled further (tu_fex_device::cs_unroll).
+  * Without the variable (or with a block that fails the checks) the driver
+  * behaves like stock Turnip.
+  *
+@@ -37,7 +41,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 7
++#define TU_FEX_PATCH 8
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -59,7 +63,12 @@
+  * pipelines): no fragment shader waves for its pixels, and the depth unit's
+  * Z-only mode. With fex3's clear every pixel of a 4096x4096 shadow map ran
+  * the (empty) clear fragment shader and kept all shader cores busy. Only
+- * for clears without color (always so for TU_FEX_MODE_DEPTH_CLEAR_3D). */
++ * for clears without color (always so for TU_FEX_MODE_DEPTH_CLEAR_3D).
++ * fex8: fast Z gave nothing (FEX build 74: same pass times), so this bit now
++ * keeps color clears on the 2D engine while depth stays a 3D draw (with the
++ * fragment shader): FEX_TU_DEPTH_CLEAR=2 then compares color clears both ways
++ * a second each, and FEX's "fast z" clear counts are the color clears done by
++ * a 3D draw (tu_fex_count_color_clear). */
+ #define TU_FEX_MODE_DEPTH_CLEAR_FASTZ 0x8u
+ /* Mode bits for command buffers (tu_fex_begin_cmdbuf). */
+ #define TU_FEX_MODE_MASK 0xfu
+@@ -107,6 +116,12 @@
+ #define TU_FEX_STATUS_BUDGET_CACHE 0x400u /* TU_FEX_MODE_BUDGET_CACHE honored (fex5) */
+ #define TU_FEX_STATUS_PREAMBLE_LOADS 0x800u /* TU_FEX_COMPILE_PREAMBLE_LOADS honored (fex6) */
+ #define TU_FEX_STATUS_LOOP_PREFETCH 0x1000u /* TU_FEX_COMPILE_LOOP_PREFETCH honored (fex7) */
++/* fex8: color clears at the start of direct passes by a 3D draw under
++ * TU_FEX_MODE_DEPTH_CLEAR_3D (a7xx; Unix env TU_FEX_COLOR_CLEAR=0 turns it off) */
++#define TU_FEX_STATUS_COLOR_CLEAR_3D 0x2000u
++/* fex8: compute loops unrolled up to 128 iterations when their loads can
++ * overlap (Unix env TU_FEX_CS_UNROLL=0 turns it off) */
++#define TU_FEX_STATUS_CS_UNROLL 0x4000u
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -162,7 +177,8 @@ struct tu_fex_channel {
+    volatile uint64_t depth_clears[2];
+    volatile uint64_t depth_clear_px[2];
+    /* 0x288 (fex4): of the 3D draw clears, the ones with the fragment shader
+-    * disabled (TU_FEX_MODE_DEPTH_CLEAR_FASTZ), and their pixels */
++    * disabled (TU_FEX_MODE_DEPTH_CLEAR_FASTZ), and their pixels.
++    * fex8: color clears done by a 3D draw instead, and their pixels. */
+    volatile uint64_t depth_clears_fastz;
+    volatile uint64_t depth_clear_px_fastz;
+    /* 0x298 (fex5): memory budget queries, and the nanoseconds they spent
+@@ -226,17 +242,23 @@ struct tu_fex_cmd_state {
+    uint32_t push_prev_size;
+    uint32_t cmdbuf_seq;
+    /* fex3: attachment + 1 whose start-of-subpass clear waits for the 3D path
+-    * (tu_fex_clear_depth_3d), 0 = none */
++    * (tu_fex_clear_3d), 0 = none */
+    uint32_t depth_clear_3d;
+    /* fex4: tu_clear_sysmem_attachments runs a depth/stencil-only clear with
+-    * the fragment shader disabled (set around tu_fex_clear_depth_3d's call) */
++    * the fragment shader disabled (set around the 3D depth clear's call).
++    * Unused since fex8. */
+    bool clear_fs_disable;
++   /* fex8: subpass color attachments (bit = index in the subpass) whose
++    * start-of-subpass clear waits for the 3D path, with depth_clear_3d's */
++   uint32_t color_clear_3d;
+ };
+ 
+ struct tu_fex_device {
+    struct tu_fex_channel *chan;
+    bool desc_patch;            /* mode bits honored */
+    uint32_t compile;           /* TU_FEX_COMPILE_* for this device */
++   bool color_clear_3d;        /* fex8: TU_FEX_STATUS_COLOR_CLEAR_3D */
++   bool cs_unroll;             /* fex8: TU_FEX_STATUS_CS_UNROLL */
+    uint32_t counter_count;     /* == chan->counter_count */
+    uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
+    uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];
+@@ -252,6 +274,13 @@ struct tu_fex_device {
+ 
+ void tu_fex_device_init(struct tu_device *dev);
+ 
++/* fex8: compute loop unrolling in effect (false without a channel). */
++static inline bool
++tu_fex_cs_unroll(const struct tu_fex_device *fex)
++{
++   return fex && fex->cs_unroll;
++}
++
+ /* TU_FEX_COMPILE_* bits in effect (0 without a channel). */
+ static inline uint32_t
+ tu_fex_compile(const struct tu_fex_device *fex)
+@@ -267,6 +296,8 @@ uint32_t tu_fex_begin_cmdbuf(struct tu_device *dev);
+ void tu_fex_count_desc(struct tu_device *dev, uint32_t mode, uint32_t sets_flushed);
+ void tu_fex_count_push(struct tu_device *dev, uint32_t mode, bool reused);
+ void tu_fex_count_depth_clear(struct tu_device *dev, bool draw, bool fastz, uint64_t pixels);
++/* fex8: a color clear done by a 3D draw (counted in depth_clears_fastz) */
++void tu_fex_count_color_clear(struct tu_device *dev, uint64_t pixels);
+ void tu_fex_count_loop_prefetch(struct tu_device *dev, unsigned loads);
+ 
+ /* fex5: the available system memory for the memory budget (bytes), as
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 794fa0e..547ce24 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -4115,6 +4115,7 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
+    /* fex6: every pipeline key is made here (graphics and compute). */
+    key->fex_preamble_loads = dev->compiler->options.fex_preamble_loads_first;
+    key->fex_loop_prefetch = dev->compiler->options.fex_loop_prefetch;
++   key->fex_cs_unroll = dev->compiler->options.fex_cs_unroll;
+ }
+ 
+ void
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index b1acb9f..880018c 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -145,7 +145,9 @@ struct tu_shader_key {
+    bool fex_preamble_loads : 1;
+    /* fex7: TU_FEX_COMPILE_LOOP_PREFETCH, likewise. */
+    bool fex_loop_prefetch : 1;
+-   uint32_t padding : 21;
++   /* fex8: compute loop unrolling (ir3_compiler_options::fex_cs_unroll). */
++   bool fex_cs_unroll : 1;
++   uint32_t padding : 20;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 

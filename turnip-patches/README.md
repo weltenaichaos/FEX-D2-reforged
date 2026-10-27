@@ -146,3 +146,38 @@ next entry's `isam` are issued together before one (sy) (stock: `isam` entry, (s
 (moved, guarded), t2 do-while whose entry is used after the loop (left), t3 do-while (moved, no guard),
 t4 nested lists (both moved), t5 conditional step (left), t6 continue (NIR folds it: moved), t7 break
 in the body (moved).
+
+- `0008-fex8-color-clear-3d-cs-unroll.patch` (fex8, with VKD3D fex27): two trims, both on by default
+  with FEX's link (no FEX build needed), each with a Unix environment variable to turn it off.
+  - Color clears: with `TU_FEX_MODE_DEPTH_CLEAR_3D` (FEX_TU_DEPTH_CLEAR=1, the default since build
+    75), a color attachment cleared at the start of a direct (sysmem) pass joins the 3D clear draw
+    (`tu_fex_clear_3d`, renamed from `tu_fex_clear_depth_3d`): one `tu_clear_sysmem_attachments` draw
+    for the pass's depth/stencil and color clears, after the subpass state is emitted, inside
+    `CP_COND_REG_EXEC RENDER_MODE|SYSMEM`. Same limits as fex3 (single sample, one layer, no
+    multiview, per-layer areas, FDM, predication, custom resolves, unresolves), and E5B9G9R9 stays on
+    the 2D engine. Stock clears every such attachment with `CP_BLIT` (2D engine, ~25 pixels a clock
+    on a740) followed by `CCU_CLEAN_COLOR`, `CCU_INVALIDATE_COLOR` and a wait for idle.
+  - Why: D2R clears ~14 color targets a frame this way (main pass 2, ~10 one-draw full-screen passes,
+    the 1280x720 RGBA16F UI pass, ...), ~11 Mpx a frame; build 73 showed the 3D draw clears depth
+    about twice as fast as the 2D engine.
+  - `TU_FEX_MODE_DEPTH_CLEAR_FASTZ` (0x8) now means "color clears on the 2D engine" (depth stays a 3D
+    draw, with the fragment shader): fast Z gave nothing in build 74, and FEX_TU_DEPTH_CLEAR=2 now
+    compares the color clear both ways a second each. `depth_clears_fastz` / `depth_clear_px_fastz`
+    count the color clears done by the 3D draw (FEX's line: "of them fast z N (Mpx)").
+    `TU_FEX_COLOR_CLEAR=0` turns it off. Status bit 0x2000.
+  - Compute loop unrolling: `ir3_compiler::fex_cs_nir_options` is the compiler's NIR options with
+    `max_unroll_iterations_aggressive = 128` (as on AMD), used by `nir_opt_loop_unroll` in
+    `ir3_optimize_loop` for compute shaders when `ir3_compiler_options::fex_cs_unroll`: a loop with
+    an exact trip count whose body is one block with loads that depend on the iteration
+    (`can_pipeline_loads`) is unrolled up to 128 iterations (stock limit 32 x 26 cost), so its loads
+    go out together. Carried in `tu_shader_key::fex_cs_unroll`. `TU_FEX_CS_UNROLL=0` turns it off.
+    Status bit 0x4000.
+  - Why: D2R's compute shader 66a6aa1d0c34c002 (4x4 groups of 8x8) runs 16 x 32 iterations of two
+    buffer reads per thread; each iteration waited for memory (0.23 ms of every frame on the GPU).
+
+Host check (fex8): `cltest/` (mode 4: case B's RGBA8 color clear and D24S8 depth clear are one
+`DI_PT_RECTLIST` draw with `RB_MRT[0].CONTROL COMPONENT_ENABLE = 0xf` and `ZFUNC_ALWAYS`, no `CP_BLIT`,
+no CCU flush or wait for idle after it; mode 12: color by `CP_BLIT`, depth by the draw; counts "fast z
+1 (4096 px)" in mode 4). Compute (scratchpad tool cstest, D2R's 17 compute shaders from build 97):
+only 66a6aa1d0c34c002 changes, 82 -> 768 instructions, 5 -> 12 registers, 16 waves kept, loops 2 -> 1,
+32 `isam` per outer iteration with 9 (sy) instead of one (sy) per read.

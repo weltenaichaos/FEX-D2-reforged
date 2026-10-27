@@ -6,6 +6,8 @@
 // engine), mode 4 with a DI_PT_RECTLIST draw (RB_DEPTH_CNTL Z_WRITE_ENABLE, ZFUNC ALWAYS) inside
 // CP_COND_REG_EXEC RENDER_MODE|SYSMEM, after RB_DEPTH_BUFFER_INFO is set; mode 12 (fex4) the same draw with
 // RB_RENDER_CNTL / GRAS_SU_RENDER_CNTL / SP_RENDER_CNTL FS_DISABLE set before it.
+// fex8: mode 4 clears case B's color in the same draw as its depth (no CP_BLIT, "fast z 1" = one color clear by
+// the draw); mode 12 clears color with CP_BLIT and depth with the draw (with fragment shader, no FS_DISABLE).
 // Build (tu_fex.h from a Mesa tree with the patches):
 //   glslangValidator -V --vn tri_vert_spv -o tri_vert_spv.h tri.vert
 //   glslangValidator -V --vn col_frag_spv -o col_frag_spv.h col.frag
