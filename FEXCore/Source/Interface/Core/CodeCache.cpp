@@ -426,7 +426,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
       .subspan(0, CachedCode.size_bytes());
 
   while (!GuestBlocks.empty()) {
-    auto [CompiledBlocks, _, _2, _3, _4] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0 /* TODO: Set MaxInst? */);
+    auto [CompiledBlocks, _, _2, _3, _4, _5] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0 /* TODO: Set MaxInst? */);
     for (auto& Entry : CompiledBlocks.EntryPoints) {
       GuestBlocks.erase(Entry.first);
     }
@@ -467,7 +467,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
 
         if (i == 1) {
           if (tail->RIP >= Section.BeginVA && tail->RIP < Section.EndVA) {
-            auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, _] =
+            auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, _, _ReuseKey, _Reused] =
               ValidationCTX->GenerateIR(ValidationThread.get(), tail->RIP, false, FEXCore::Config::Get_MAXINST());
             fextl::ostringstream ss;
             FEXCore::IR::Dump(&ss, &*IRView);

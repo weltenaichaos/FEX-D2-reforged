@@ -232,10 +232,14 @@ public:
   void SetPlacedCodeReuse(bool Enable) override {
     SetReusePlaced(Enable);
   }
+  void SetTranslatedCodeReuse(bool Enable) override {
+    SetReuseTranslated(Enable);
+  }
   CodeBufferUse GetCodeBufferUse() const override {
     const auto U = GetUse();
     return {U.Number,     U.Size,          U.Used,        U.Translated, U.Loaded,   U.Reused,
-            U.ReusedBytes, U.Dropped, U.TranslatedBytes, U.LoadedBytes, U.Large, U.LargeBytes};
+            U.ReusedBytes, U.Dropped, U.TranslatedBytes, U.LoadedBytes, U.Large, U.LargeBytes,
+            U.ReusedTranslated, U.ReusedTranslatedBytes, U.ReusedSelfCheck, U.TranslatedChanged, U.TranslatedForgotten};
   }
   bool GetLargeCodePlacement(uint64_t Index, LargeCodePlacement& Out) const override {
     LargePlacement L;
@@ -435,9 +439,15 @@ public:
     uint64_t StartAddr;
     uint64_t Length;
     bool NeedsAddGuestCodeRanges;
+    // Build 95 (FEX_JIT_REUSE): what the decoded code would be translated from (when reuse is on for this compile), and
+    // the translation of the same key still in the current buffer, if there is one (then there is no IR).
+    std::optional<CPU::TranslatedCodeKey> ReuseKey {};
+    std::optional<CPU::CPUBackend::CompiledCode> Reused {};
   };
   [[nodiscard]]
   GenerateIRResult GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst);
+  // Build 95 (FEX_JIT_REUSE): the key of the code the thread's decoder just decoded at GuestRIP (CPU::TranslatedCodeKey).
+  CPU::TranslatedCodeKey MakeTranslatedCodeKey(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool Patchable);
 
   struct CompileCodeResult {
     CPU::CPUBackend::CompiledCode CompiledCode;
@@ -445,6 +455,8 @@ public:
     uint64_t StartAddr;
     uint64_t Length;
     bool NeedsAddGuestCodeRanges;
+    // Build 95: CompiledCode is an earlier translation of the same guest code, mapped again (no DebugData).
+    bool Reused {};
   };
   [[nodiscard]]
   CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst = 0);

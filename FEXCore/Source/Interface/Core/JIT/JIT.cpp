@@ -1266,6 +1266,69 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
   return Result;
 }
 
+std::optional<CPUBackend::CompiledCode> Arm64JITCore::FindTranslatedCode(const TranslatedCodeKey& Key) {
+  // Look in the buffer new code would be placed in.
+  MoveToLatestCodeBuffer();
+  GuestToHostMap::TranslatedCode Found;
+  GuestToHostMap::TranslatedLookup Lookup;
+  {
+    auto lk = CurrentCodeBuffer->LookupCache->AcquireReadLock();
+    Lookup = CurrentCodeBuffer->LookupCache->FindTranslated(Key, Found, lk);
+  }
+  if (Lookup == GuestToHostMap::TranslatedLookup::Changed) {
+    CTX->NoteTranslatedChanged();
+  }
+  if (Lookup != GuestToHostMap::TranslatedLookup::Found) {
+    return std::nullopt;
+  }
+
+  CTX->NoteReusedTranslated(Found.HostSize, (Key.Flags & TranslatedFlagSelfCheck) != 0);
+  FEXCORE_PROFILE_INSTANT_INCREMENT(ThreadState, AccumulatedJITReuseCount, 1);
+  CPUBackend::CompiledCode Code;
+  Code.BlockBegin = Found.HostCode;
+  Code.Size = Found.HostSize;
+  Code.HostCodeOffset = Found.HostCode - CurrentCodeBuffer->GetBufferBase();
+  for (const auto& [GuestRIP, Offset] : Found.Entries) {
+    Code.EntryPoints.emplace(GuestRIP, Found.HostCode + Offset);
+  }
+  return Code;
+}
+
+void Arm64JITCore::RememberTranslatedCode(const TranslatedCodeKey& Key, const CPUBackend::CompiledCode& Code) {
+  // CompileCode placed the code in this thread's current buffer (moving to the latest one first): keep it there, and only
+  // if it is there.
+  const uint8_t* Base = CurrentCodeBuffer->GetBufferBase();
+  if (!Code.BlockBegin || Code.BlockBegin < Base || Code.BlockBegin + Code.Size > Base + CurrentCodeBuffer->UsableSize() ||
+      Code.Size > UINT32_MAX) {
+    return;
+  }
+  GuestToHostMap::TranslatedCode Kept {
+    .Key = Key,
+    .HostCode = Code.BlockBegin,
+    .HostSize = static_cast<uint32_t>(Code.Size),
+  };
+  Kept.Entries.reserve(Code.EntryPoints.size());
+  for (const auto& [GuestRIP, HostCode] : Code.EntryPoints) {
+    Kept.Entries.emplace_back(GuestRIP, static_cast<uint32_t>(HostCode - Code.BlockBegin));
+  }
+  auto lk = CurrentCodeBuffer->LookupCache->AcquireWriteLock();
+  CurrentCodeBuffer->LookupCache->RememberTranslated(std::move(Kept), lk);
+}
+
+void Arm64JITCore::ForgetTranslatedCode(uint64_t GuestRIP) {
+  if (!CTX->ReuseTranslatedCode()) {
+    return;
+  }
+  bool Forgot {};
+  {
+    auto lk = CurrentCodeBuffer->LookupCache->AcquireWriteLock();
+    Forgot = CurrentCodeBuffer->LookupCache->ForgetTranslated(GuestRIP, lk);
+  }
+  if (Forgot) {
+    CTX->NoteTranslatedForgotten();
+  }
+}
+
 void Arm64JITCore::ResetStack() {
   if (SpillSlots == 0) {
     return;

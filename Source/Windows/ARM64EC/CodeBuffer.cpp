@@ -198,6 +198,14 @@ namespace {
     Out += LargeText(U);
     Out += fextl::fmt::format(" | {} disk cache hits served by the copy already in the buffer ({:.2f} MB not copied)",
                               U.Reused - UseLast.Reused, static_cast<double>(U.ReusedBytes - UseLast.ReusedBytes) / MB);
+    // Build 95 (FEX_JIT_REUSE): compiles served by a translation of the same code still in the buffer, and translations
+    // made where one was made before from other bytes (or a self-check found its bytes changed).
+    Out += fextl::fmt::format(", {} translations mapped again ({:.2f} MB not translated again, {} of them self-checking), {} "
+                              "translated again from other bytes, {} self-check failures",
+                              U.ReusedTranslated - UseLast.ReusedTranslated,
+                              static_cast<double>(U.ReusedTranslatedBytes - UseLast.ReusedTranslatedBytes) / MB,
+                              U.ReusedSelfCheck - UseLast.ReusedSelfCheck, U.TranslatedChanged - UseLast.TranslatedChanged,
+                              U.TranslatedForgotten - UseLast.TranslatedForgotten);
     Out += fextl::fmt::format(", dropped {} blocks:", U.Dropped - UseLast.Dropped);
 
     static constexpr const char* ReasonNames[] = {"protection exec->exec", "protection exec removed", "protection made exec",
@@ -367,14 +375,19 @@ void Init(FEXCore::Context::Context* CTX, bool StatsLog) {
   const char* ReuseSwitch = FEX::Windows::Switch("FEX_CODE_REUSE");
   const bool Reuse = ReuseSwitch && ReuseSwitch[0] == '1';
   CTX->SetPlacedCodeReuse(Reuse);
+  // FEX_JIT_REUSE=1 (the D2R default, build 95): the same for translated code, which the disk cache doesn't keep for
+  // code that checks its own bytes (D2R's protection module).
+  const char* JitReuseSwitch = FEX::Windows::Switch("FEX_JIT_REUSE");
+  const bool JitReuse = JitReuseSwitch && JitReuseSwitch[0] == '1';
+  CTX->SetTranslatedCodeReuse(JitReuse);
 
   const char* LoadSwitch = FEX::Windows::Switch("FEX_CODE_BUFFER_LOAD_MS");
   LoadMs = LoadSwitch && LoadSwitch[0] >= '0' && LoadSwitch[0] <= '9' ? std::clamp<uint32_t>(strtoul(LoadSwitch, nullptr, 10), 100, 5000) : 250;
 
   if (StatsLog) {
     FEX::Windows::StatsLogNote(fextl::fmt::format(
-      "code buffer: {}; {}; {} (FEX_CODE_BUFFER_START=max|grow, FEX_CODE_BUFFER_RENEW=N|off, FEX_CODE_BUFFER_RENEW_EARLY=N, "
-      "FEX_CODE_BUFFER_LOAD_MS={}, FEX_CODE_REUSE=1|0)",
+      "code buffer: {}; {}; {}; {} (FEX_CODE_BUFFER_START=max|grow, FEX_CODE_BUFFER_RENEW=N|off, FEX_CODE_BUFFER_RENEW_EARLY=N, "
+      "FEX_CODE_BUFFER_LOAD_MS={}, FEX_CODE_REUSE=1|0, FEX_JIT_REUSE=1|0)",
       StartMax ? "starts at 128 MB" : "starts at 16 MB and doubles up to 128 MB (upstream)",
       RenewPercent ? fextl::fmt::format("renewed at a loading screen when {}% used or more ({}% at the first {})", RenewPercent,
                                         std::min(RenewEarlyPercent, RenewPercent), EarlyLoads) :
@@ -382,6 +395,9 @@ void Init(FEXCore::Context::Context* CTX, bool StatsLog) {
       Reuse ? "disk cache code that comes back the same after its blocks were dropped is mapped again from the copy already in the "
               "buffer" :
               "dropped code is always placed again (upstream)",
+      JitReuse ? "translated code that comes back the same (same bytes, decoded the same, same self-checks) is mapped again from its "
+                 "translation still in the buffer" :
+                 "dropped code that isn't in the disk cache is always translated again (upstream)",
       LoadMs));
     FEX::Windows::StatsLogSetLineProvider(Lines);
   }

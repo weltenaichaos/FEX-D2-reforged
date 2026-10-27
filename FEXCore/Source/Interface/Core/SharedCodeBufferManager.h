@@ -41,6 +41,26 @@ struct PlacedCodeKey {
   }
 };
 
+// What a translation was made from (build 95, FEX_JIT_REUSE): the guest address it starts at, a 128-bit hash of the
+// decoded guest code (every decoded block's address, size, instruction count, decode result and whether its code checks
+// its own bytes, then the bytes themselves), the decoded size, and Flags (TranslatedFlag*). Equal keys decode to the same
+// instructions with the same checks, so they translate to the same host code, and a translation made for one key can
+// serve it again (GuestToHostMap::FindTranslated).
+struct TranslatedCodeKey {
+  uint64_t GuestRIP;
+  uint64_t HashLow;
+  uint64_t HashHigh;
+  uint32_t GuestSize;
+  uint32_t Flags;
+
+  bool operator==(const TranslatedCodeKey&) const = default;
+};
+// TranslatedCodeKey::Flags
+constexpr uint32_t TranslatedFlag64Bit = 1U << 0;      // decoded in 64-bit mode
+constexpr uint32_t TranslatedFlagTrapFlag = 1U << 1;   // EFLAGS.TF was set: the code checks it before each instruction
+constexpr uint32_t TranslatedFlagPatchable = 1U << 2;  // the disk cache was on: guest values went in as patchable literals
+constexpr uint32_t TranslatedFlagSelfCheck = 1U << 3;  // some of its blocks check their own bytes (on a hot SMC page)
+
 struct CodeBuffer {
   fextl::unique_ptr<GuestToHostMap> LookupCache;
 
@@ -192,6 +212,13 @@ public:
     uint64_t LoadedBytes;
     uint64_t Large;
     uint64_t LargeBytes;
+    // Build 95: translations mapped again (count, bytes, how many of them check their own bytes), translations at an
+    // address translated before from other bytes, and self-check failures that dropped what was kept for an address.
+    uint64_t ReusedTranslated;
+    uint64_t ReusedTranslatedBytes;
+    uint64_t ReusedSelfCheck;
+    uint64_t TranslatedChanged;
+    uint64_t TranslatedForgotten;
   };
   Use GetUse() const;
   // A thread placed Size bytes of code in Buffer (Loaded: from the disk cache, else just translated) for the guest code
@@ -212,6 +239,34 @@ public:
   }
   void NoteDropped(size_t Blocks) {
     DroppedTotal.fetch_add(Blocks, std::memory_order_relaxed);
+  }
+
+  // Build 95 (FEX_JIT_REUSE): mapping a translation again that is still in the current buffer, when the guest code it was
+  // made from comes back the same after its blocks were dropped (a guest that writes into its code pages, or changes
+  // their protection, without changing the code). Without this, the same code is translated once more each time, and the
+  // old translation stays in the buffer as waste.
+  void SetReuseTranslated(bool Enable) {
+    ReuseTranslated.store(Enable, std::memory_order_relaxed);
+  }
+  bool ReuseTranslatedCode() const {
+    return ReuseTranslated.load(std::memory_order_relaxed);
+  }
+  // A translation mapped again (Bytes: its size); SelfCheck: one of its blocks checks its own bytes.
+  void NoteReusedTranslated(size_t Bytes, bool SelfCheck) {
+    ReusedTranslatedTotal.fetch_add(1, std::memory_order_relaxed);
+    ReusedTranslatedBytesTotal.fetch_add(Bytes, std::memory_order_relaxed);
+    if (SelfCheck) {
+      ReusedSelfCheckTotal.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  // Translating at an address translated before in this buffer, but from other bytes (or other checks): Older says the
+  // two last translations kept there were both different.
+  void NoteTranslatedChanged() {
+    TranslatedChangedTotal.fetch_add(1, std::memory_order_relaxed);
+  }
+  // A translation that checks its own bytes found them changed, and the translations kept for its address were dropped.
+  void NoteTranslatedForgotten() {
+    TranslatedForgottenTotal.fetch_add(1, std::memory_order_relaxed);
   }
 
   // Start at the largest size instead of growing to it: every growth step starts a new buffer, which drops all code.
@@ -238,6 +293,12 @@ private:
   std::atomic<uint32_t> Started {};
 
   std::atomic<bool> ReusePlaced {};
+  std::atomic<bool> ReuseTranslated {};
+  std::atomic<uint64_t> ReusedTranslatedTotal {};
+  std::atomic<uint64_t> ReusedTranslatedBytesTotal {};
+  std::atomic<uint64_t> ReusedSelfCheckTotal {};
+  std::atomic<uint64_t> TranslatedChangedTotal {};
+  std::atomic<uint64_t> TranslatedForgottenTotal {};
   // The latest buffer, only compared against (never followed: the log thread reads these without the buffer's lock).
   std::atomic<const CodeBuffer*> LatestRaw {};
   std::atomic<uint64_t> LatestSize {};

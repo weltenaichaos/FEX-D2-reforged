@@ -18,6 +18,7 @@ $end_info$
 #include <FEXCore/fextl/map.h>
 
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace FEXCore::CPU {
@@ -123,6 +124,17 @@ namespace CPU {
     virtual CompiledCode LoadCachedCode(std::span<const uint8_t> HostBytes, const PlacedCodeKey* Key = nullptr) {
       return {};
     }
+
+    // Build 95 (FEX_JIT_REUSE), see GuestToHostMap::Translated:
+    //   FindTranslatedCode: the translation made for Key that is still in the current buffer, as CompileCode returned it
+    //   (moves this thread to the latest buffer first, as placing code would).
+    //   RememberTranslatedCode: Code was just translated for Key (kept in the buffer it went to).
+    //   ForgetTranslatedCode: a translation starting at GuestRIP found its own bytes changed.
+    virtual std::optional<CompiledCode> FindTranslatedCode(const TranslatedCodeKey& Key) {
+      return std::nullopt;
+    }
+    virtual void RememberTranslatedCode(const TranslatedCodeKey& Key, const CompiledCode& Code) {}
+    virtual void ForgetTranslatedCode(uint64_t GuestRIP) {}
 
     virtual fextl::vector<FEXCore::CPU::Relocation> TakeRelocations(uint64_t GuestBaseAddress) = 0;
 

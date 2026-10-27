@@ -13,6 +13,7 @@
 #include <FEXCore/fextl/memory_resource.h>
 
 #include <cstdint>
+#include <initializer_list>
 #include <span>
 #include <stddef.h>
 #include <utility>
@@ -163,6 +164,66 @@ struct GuestToHostMap {
 
   void RememberPlaced(const CPU::PlacedCodeKey& Key, uint8_t* HostCode, const LookupCacheWriteLockToken&) {
     Placed.insert_or_assign(Key.Hash(), PlacedCode {Key, HostCode});
+  }
+
+  // Build 95 (FEX_JIT_REUSE): translations made in this buffer, by the guest address they start at, with what they were
+  // made from (CPU::TranslatedCodeKey) and their entry points (guest address, offset from HostCode). The same reasoning
+  // as for Placed lets one be mapped again as it is once its blocks were dropped: its code never moves, its exits stay
+  // linked only to blocks that are still mapped, and a translation that checks its own bytes checks the bytes it was
+  // made from, which a key match says are the bytes there now. The last two per address are kept (a block decoded
+  // while a neighbour it branches to was in one of two states), and at most MaxTranslatedPlaces addresses.
+  struct TranslatedCode {
+    CPU::TranslatedCodeKey Key {};
+    uint8_t* HostCode {};
+    uint32_t HostSize {};
+    fextl::vector<std::pair<uint64_t, uint32_t>> Entries;
+  };
+  struct TranslatedPlace {
+    TranslatedCode Latest;
+    TranslatedCode Older; // HostCode null when there is none
+  };
+  static constexpr size_t MaxTranslatedPlaces = 32768;
+  fextl::robin_map<uint64_t, TranslatedPlace> Translated;
+
+  enum class TranslatedLookup { Found, NewPlace, Changed };
+  // The translation kept for Key, copied into Out (Found); else whether its address had none (NewPlace) or only ones made
+  // from other bytes or checks (Changed).
+  TranslatedLookup FindTranslated(const CPU::TranslatedCodeKey& Key, TranslatedCode& Out, const LookupCacheBaseLockToken&) const {
+    auto It = Translated.find(Key.GuestRIP);
+    if (It == Translated.end()) {
+      return TranslatedLookup::NewPlace;
+    }
+    for (const auto* Code : {&It->second.Latest, &It->second.Older}) {
+      if (Code->HostCode && Code->Key == Key) {
+        Out = *Code;
+        return TranslatedLookup::Found;
+      }
+    }
+    return TranslatedLookup::Changed;
+  }
+
+  void RememberTranslated(TranslatedCode&& Code, const LookupCacheWriteLockToken&) {
+    auto It = Translated.find(Code.Key.GuestRIP);
+    if (It == Translated.end()) {
+      if (Translated.size() >= MaxTranslatedPlaces) {
+        return;
+      }
+      const uint64_t RIP = Code.Key.GuestRIP;
+      Translated.emplace(RIP, TranslatedPlace {std::move(Code), {}});
+      return;
+    }
+    auto& Place = It->second;
+    if (Place.Latest.HostCode && Place.Latest.Key == Code.Key) {
+      // Raced with another thread translating the same: keep the first.
+      return;
+    }
+    Place.Older = std::move(Place.Latest);
+    Place.Latest = std::move(Code);
+  }
+
+  // A translation starting at GuestRIP found its own bytes changed: nothing kept for that address is mapped again.
+  bool ForgetTranslated(uint64_t GuestRIP, const LookupCacheWriteLockToken&) {
+    return Translated.erase(GuestRIP) != 0;
   }
 
   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,

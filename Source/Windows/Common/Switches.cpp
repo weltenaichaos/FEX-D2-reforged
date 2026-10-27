@@ -135,6 +135,11 @@ namespace {
     // code that was dropped and runs again (D2R's protection decrypts its code pages on demand). Code that comes back the
     // same is now mapped again from the copy already in the buffer instead of placing another.
     {"FEX_CODE_REUSE", "1"},
+    // Build 95: the same for translated code. In the build 94 run D2R's protection module rewrote its ~4.5 MB of code
+    // pages every minute or two, and FEX translated the same functions again each time (up to 55 times in 10 s, 70-170 KB
+    // each with self-checks, which the disk cache doesn't keep): 42 MB of the code buffer that filled at 12:47, and
+    // 0.3-0.5 s of CPU a second on that thread. Code that comes back the same now maps its earlier translation again.
+    {"FEX_JIT_REUSE", "1"},
     // Build 87: a main thread read of 256 KB or more of a game data file is asked of storage whole before it runs (many
     // requests at once instead of one read-ahead window after another). In the build 82-86 logs the main thread's cold
     // reads went at ~180 MB/s, and one 3968 KB read at an area's entry took 18-23 ms in every run (see
@@ -264,6 +269,7 @@ namespace {
     "FEX_LOAD_LIGHT",
     "FEX_LOAD_LIGHT_MS",
     "FEX_CODE_REUSE",
+    "FEX_JIT_REUSE",
     "FEX_GAME_FILES_UNCACHED",
     "FEX_GAME_FILES_MS",
     "FEX_GAME_FILES_KEEP_MB",

@@ -175,6 +175,11 @@ SharedCodeBufferManager::Use SharedCodeBufferManager::GetUse() const {
     .LoadedBytes = LoadedBytesTotal.load(std::memory_order_relaxed),
     .Large = LargeCount.load(std::memory_order_acquire),
     .LargeBytes = LargeBytesTotal.load(std::memory_order_relaxed),
+    .ReusedTranslated = ReusedTranslatedTotal.load(std::memory_order_relaxed),
+    .ReusedTranslatedBytes = ReusedTranslatedBytesTotal.load(std::memory_order_relaxed),
+    .ReusedSelfCheck = ReusedSelfCheckTotal.load(std::memory_order_relaxed),
+    .TranslatedChanged = TranslatedChangedTotal.load(std::memory_order_relaxed),
+    .TranslatedForgotten = TranslatedForgottenTotal.load(std::memory_order_relaxed),
   };
 }
 

@@ -156,6 +156,10 @@ public:
   //   buffer (and the bytes that were not copied), blocks dropped by invalidations.
   //   (build 94) bytes placed after translating and after loading, and the placements of 64 KB or more (count, bytes);
   //   GetLargeCodePlacement: such placement Index (0 = the first) while it is still among the last 64.
+  //   SetTranslatedCodeReuse (build 95): when code is translated again from the same guest bytes (decoded the same, with
+  //   the same self-checks) while its earlier translation is still in the current buffer, map that one again. The use
+  //   counts translations mapped again (and bytes, and how many of them check their own bytes), translations at an
+  //   address translated before from other bytes, and self-check failures that dropped what was kept for an address.
   struct CodeBufferUse {
     uint32_t Number;
     uint64_t Size;
@@ -169,6 +173,11 @@ public:
     uint64_t LoadedBytes;
     uint64_t Large;
     uint64_t LargeBytes;
+    uint64_t ReusedTranslated;
+    uint64_t ReusedTranslatedBytes;
+    uint64_t ReusedSelfCheck;
+    uint64_t TranslatedChanged;
+    uint64_t TranslatedForgotten;
   };
   struct LargeCodePlacement {
     uint64_t Size;
@@ -177,6 +186,7 @@ public:
     bool Loaded;
   };
   FEX_DEFAULT_VISIBILITY virtual void SetPlacedCodeReuse(bool Enable) = 0;
+  FEX_DEFAULT_VISIBILITY virtual void SetTranslatedCodeReuse(bool Enable) = 0;
   FEX_DEFAULT_VISIBILITY virtual CodeBufferUse GetCodeBufferUse() const = 0;
   FEX_DEFAULT_VISIBILITY virtual bool GetLargeCodePlacement(uint64_t Index, LargeCodePlacement& Out) const = 0;
   FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;

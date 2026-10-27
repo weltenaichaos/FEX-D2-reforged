@@ -38,6 +38,15 @@ class Context;
 //                               from the copy already in the buffer, instead of placing another copy. In the build 84 run
 //                               calm play placed ~78 blocks a second (~8% of the buffer a minute), nearly all from the
 //                               disk cache, more than D2R's whole working set every 3 minutes. 0 = upstream.
+//   FEX_JIT_REUSE=1             (D2R default, build 95) the same for translated code: code that comes back with the same
+//                               bytes, decoded the same way and with the same self-checks, is mapped again from its
+//                               translation still in the buffer instead of translated once more. The disk cache never
+//                               keeps code that checks its own bytes (code on pages its own writes keep hitting), and in
+//                               the build 94 run D2R's protection module (an anonymous ~4.5 MB region) rewrote its pages
+//                               every minute or two: the same functions were translated up to 55 times in 10 s (70-170 KB
+//                               each, with the self-checks), 42 MB of the buffer that filled at 12:47 and 0.3-0.5 s of CPU
+//                               a second for its thread. A translation whose self-check later fails is never mapped again.
+//                               0 = upstream.
 //
 // With the stats log on, a "# code buffer" line names every new buffer (why, how full the old one was, how many blocks
 // it held and how many of those came from the disk cache) and every loading screen seen, and every 10 s says how full the
@@ -45,7 +54,8 @@ class Context;
 // changes by their new protection, write faults, frees, unmaps, instruction cache flushes, file reads). Build 94 adds
 // the megabytes placed each way and the placements of 64 KB or more by guest address (how many, how big, translated or
 // from the disk cache, how much guest code): in calm play of the build 93 run the buffer grew by megabytes in windows
-// that placed only a few hundred small blocks.
+// that placed only a few hundred small blocks. Build 95 adds the translations mapped again (FEX_JIT_REUSE), those made
+// again from other bytes at an address translated before, and self-check failures.
 namespace CodeBufferPolicy {
 // Call on the process's first thread, in process init, right after InitCore and before any code is translated.
 void Init(FEXCore::Context::Context* CTX, bool StatsLog);

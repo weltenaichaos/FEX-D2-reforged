@@ -76,6 +76,8 @@ $end_info$
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
+// XXH3_state_t for MakeTranslatedCodeKey (the static part of the header has its own guard).
+#define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 
 namespace FEXCore::Context {
@@ -530,6 +532,76 @@ bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Th
   return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
 }
 
+CPU::TranslatedCodeKey ContextImpl::MakeTranslatedCodeKey(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool Patchable) {
+  // Everything the translation of this decode depends on that can differ between two decodes at the same address: the
+  // decoded blocks (address, size, instruction count, decode result, whether they are entry points), whether each block's
+  // code checks its own bytes (decided as GenerateIR decides it), the bytes of the decoded instructions (a failed
+  // instruction adds none: it becomes the same fault whatever its bytes), and the thread's mode and trap flag.
+  const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
+  uint32_t Flags = (BlockInfo->Is64BitMode ? CPU::TranslatedFlag64Bit : 0) | (Patchable ? CPU::TranslatedFlagPatchable : 0) |
+                   (Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC] ? CPU::TranslatedFlagTrapFlag : 0);
+
+  XXH3_state_t State;
+  XXH3_128bits_reset(&State);
+  struct __attribute__((packed)) {
+    uint64_t RIP;
+    uint64_t Min;
+    uint64_t Max;
+    uint64_t Blocks;
+    uint64_t Entries;
+    uint8_t MonoBackpatcher;
+  } Head {
+    .RIP = GuestRIP,
+    .Min = Thread->FrontendDecoder->DecodedMinAddress,
+    .Max = Thread->FrontendDecoder->DecodedMaxAddress,
+    .Blocks = BlockInfo->Blocks.size(),
+    .Entries = BlockInfo->EntryPoints.size(),
+    .MonoBackpatcher = AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP,
+  };
+  XXH3_128bits_update(&State, &Head, sizeof(Head));
+  for (const auto& Block : BlockInfo->Blocks) {
+    const bool SelfCheck = Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection ||
+                           (Block.NumInstructions && SyscallHandler->IsFullSMCRange(Thread, Block.Entry, std::max<uint64_t>(Block.Size, 1)));
+    if (SelfCheck) {
+      Flags |= CPU::TranslatedFlagSelfCheck;
+    }
+    struct __attribute__((packed)) {
+      uint64_t Entry;
+      uint64_t Size;
+      uint64_t Insts;
+      uint8_t Status;
+      uint8_t EntryPoint;
+      uint8_t ForceSelfCheck;
+      uint8_t SelfCheck;
+    } BlockHead {
+      .Entry = Block.Entry,
+      .Size = Block.Size,
+      .Insts = Block.NumInstructions,
+      .Status = static_cast<uint8_t>(Block.BlockStatus),
+      .EntryPoint = Block.IsEntryPoint,
+      .ForceSelfCheck = Block.ForceFullSMCDetection,
+      .SelfCheck = SelfCheck,
+    };
+    XXH3_128bits_update(&State, &BlockHead, sizeof(BlockHead));
+    if (Block.Size) {
+      // The decoder read these bytes just now (a read fault here restarts the compile, as one in the decoder does).
+      XXH3_128bits_update(&State, reinterpret_cast<const void*>(Block.Entry), Block.Size);
+    }
+  }
+  for (uint64_t Entry : BlockInfo->EntryPoints) {
+    XXH3_128bits_update(&State, &Entry, sizeof(Entry));
+  }
+  const auto Hash = XXH3_128bits_digest(&State);
+  const uint64_t Span = Thread->FrontendDecoder->DecodedMaxAddress - Thread->FrontendDecoder->DecodedMinAddress;
+  return {
+    .GuestRIP = GuestRIP,
+    .HashLow = Hash.low64,
+    .HashHigh = Hash.high64,
+    .GuestSize = static_cast<uint32_t>(std::min<uint64_t>(Span, UINT32_MAX)),
+    .Flags = Flags,
+  };
+}
+
 ContextImpl::GenerateIRResult
 ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("GenerateIR");
@@ -540,6 +612,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   uint64_t TotalInstructionsLength {0};
 
   bool HasCustomIR {};
+  std::optional<CPU::TranslatedCodeKey> ReuseKey;
 
   bool WantsDiskCachePatching = DiskCache.IsReadingDiskCache() || DiskCache.IsWritingDiskCache();
 
@@ -561,6 +634,29 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
     const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     const auto& CodeBlocks = BlockInfo->Blocks;
+
+    // Build 95 (FEX_JIT_REUSE): the same code decoded the same way, translated before and still in the buffer, is mapped
+    // again instead of translated once more. Only for plain compiles (not single instructions, not with debug output or
+    // a code cache being made or checked).
+    if (MaxInst == 0 && ReuseTranslatedCode() && !ExtendedDebugInfo && !Config.BlockJITNaming() && !Config.LibraryJITNaming() &&
+        !CodeCache.IsGeneratingCache && !DiskCache.IsValidating() && !BLOCK_DEBUGGING) {
+      const auto Key = MakeTranslatedCodeKey(Thread, GuestRIP, WantsDiskCachePatching);
+      if (auto Found = Thread->CPUBackend->FindTranslatedCode(Key)) {
+        Thread->FrontendDecoder->DelayedDisownBuffer();
+        Thread->OpDispatcher->DelayedDisownBuffer();
+        return {
+          .IRView = std::nullopt,
+          .TotalInstructions = BlockInfo->TotalInstructionCount,
+          .TotalInstructionsLength = 0,
+          .StartAddr = Thread->FrontendDecoder->DecodedMinAddress,
+          .Length = Thread->FrontendDecoder->DecodedMaxAddress - Thread->FrontendDecoder->DecodedMinAddress,
+          .NeedsAddGuestCodeRanges = true,
+          .ReuseKey = Key,
+          .Reused = std::move(Found),
+        };
+      }
+      ReuseKey = Key;
+    }
 
     Thread->OpDispatcher->BeginFunction(GuestRIP, &CodeBlocks, BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode,
                                         AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP);
@@ -802,6 +898,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     .StartAddr = Thread->FrontendDecoder->DecodedMinAddress,
     .Length = Thread->FrontendDecoder->DecodedMaxAddress - Thread->FrontendDecoder->DecodedMinAddress,
     .NeedsAddGuestCodeRanges = !HasCustomIR,
+    .ReuseKey = ReuseKey,
   };
 }
 
@@ -815,8 +912,21 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   }
 
   // Generate IR + Meta Info
-  auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
+  auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges, ReuseKey, Reused] =
     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
+  if (Reused) {
+    // An earlier translation of the same code, still in the buffer (FEX_JIT_REUSE).
+    Thread->FrontendDecoder->ValidateDisownedOrFree();
+    Thread->OpDispatcher->ValidateDisownedOrFree();
+    return {
+      .CompiledCode = std::move(*Reused),
+      .DebugData = nullptr,
+      .StartAddr = StartAddr,
+      .Length = Length,
+      .NeedsAddGuestCodeRanges = NeedsAddGuestCodeRanges,
+      .Reused = true,
+    };
+  }
   if (!IRView) {
     Thread->FrontendDecoder->ValidateDisownedOrFree();
     Thread->OpDispatcher->ValidateDisownedOrFree();
@@ -849,6 +959,14 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
 
   auto CompiledCode = Thread->CPUBackend->CompileCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
+
+  // Keep the translation for its key (FEX_JIT_REUSE). Code that checks its own bytes took them from guest memory again
+  // while the IR was made: keep it only if they are still those the key was made from, so the checks match the key.
+  if (ReuseKey && CompiledCode.BlockBegin && CompiledCode.EntryPoints.contains(GuestRIP) &&
+      (!(ReuseKey->Flags & CPU::TranslatedFlagSelfCheck) ||
+       MakeTranslatedCodeKey(Thread, GuestRIP, (ReuseKey->Flags & CPU::TranslatedFlagPatchable) != 0) == *ReuseKey)) {
+    Thread->CPUBackend->RememberTranslatedCode(*ReuseKey, CompiledCode);
+  }
 
   // Release the IR
   Thread->OpDispatcher->DelayedDisownBuffer();
@@ -1001,27 +1119,28 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheMissCount, 1);
   }
 
-  // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
-  FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
-
-  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
+  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges, Reused] = CompileCode(Thread, GuestRIP, MaxInst);
+  if (!Reused) {
+    // Count a compile, even if another thread raced us.
+    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
+  }
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     return 0;
-  } else if (!DebugData) {
+  } else if (!DebugData && !Reused) {
     // DebugData wasn't populated, indicating another thread raced us for compiling this block
     return reinterpret_cast<uintptr_t>(CodePtr);
   }
 
-  if (DiskCacheGuestCodeKey && Hit && DiskCache.IsValidating()) {
+  if (!Reused && DiskCacheGuestCodeKey && Hit && DiskCache.IsValidating()) {
     DiskCache.Validate(*DiskCacheGuestCodeKey, *Hit, CompiledCode, Region);
   }
 
   // if this ever fires, we need to serialize the offset into disk cache
   LOGMAN_THROW_A_FMT(StartAddr == GuestRIP, "StartAddr offset from GuestRIP");
 
-  // The core managed to compile the code.
-  if (Config.BlockJITNaming()) {
+  // The core managed to compile the code (a translation mapped again was named when it was made).
+  if (!Reused && Config.BlockJITNaming()) {
     auto FragmentBasePtr = CompiledCode.BlockBegin;
 
     auto GuestRIPLookup = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
@@ -1046,7 +1165,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  if (Config.LibraryJITNaming() || Config.GDBSymbols()) {
+  if (!Reused && (Config.LibraryJITNaming() || Config.GDBSymbols())) {
     auto MappedSection = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
     if (MappedSection) {
       if (Config.LibraryJITNaming()) {
@@ -1076,7 +1195,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // Disk Cache
   if (!CodeCache.IsGeneratingCache) {
-    if (DiskCacheGuestCodeKey && SyscallHandler->IsFullSMCRange(Thread, StartAddr, std::max<uint64_t>(Length, 1))) {
+    if (Reused) {
+      // Stored when it was made, if it could be.
+    } else if (DiskCacheGuestCodeKey && SyscallHandler->IsFullSMCRange(Thread, StartAddr, std::max<uint64_t>(Length, 1))) {
       // Self-checking code from a page that is no longer write-protected: keep it out of the cache (the frontend counts
       // these compiles itself).
     } else if (DiskCacheGuestCodeKey) {
@@ -1129,7 +1250,7 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   }
 
   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1);
-  auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
+  auto [CompiledCode, DebugData, StartAddr, Length, _, _2] = CompileCode(Thread, GuestRIP, 1);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     return 0;
@@ -1173,6 +1294,9 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
 }
 
 void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  // Code that checks its own bytes found them changed: what was kept for its address is not mapped again (FEX_JIT_REUSE),
+  // so a translation whose checks don't match the bytes its key was made from can't come back.
+  Frame->Thread->CPUBackend->ForgetTranslatedCode(GuestRIP);
   static_cast<ContextImpl*>(Frame->Thread->CTX)->SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, GuestRIP, 1);
 }
 

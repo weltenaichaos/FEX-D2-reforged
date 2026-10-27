@@ -57,6 +57,10 @@ public:
   [[nodiscard]]
   CPUBackend::CompiledCode LoadCachedCode(std::span<const uint8_t> HostBytes, const PlacedCodeKey* Key = nullptr) override;
 
+  std::optional<CPUBackend::CompiledCode> FindTranslatedCode(const TranslatedCodeKey& Key) override;
+  void RememberTranslatedCode(const TranslatedCodeKey& Key, const CPUBackend::CompiledCode& Code) override;
+  void ForgetTranslatedCode(uint64_t GuestRIP) override;
+
   void ClearCache() override;
 
   void ClearRelocations() override {

@@ -107,6 +107,7 @@ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
   // All code is gone, clear the block list
   BlockList.clear();
   Placed.clear();
+  Translated.clear();
 }
 
 } // namespace FEXCore
