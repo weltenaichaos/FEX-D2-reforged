@@ -1,0 +1,73 @@
+From 5a79428479cf29eda5f4d33cdd51740bd8be0b53 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 22:23:22 +0000
+Subject: [PATCH] FEX: draw probe device enables VK_KHR_swapchain
+
+GameNative's frame cap layer (liblsfg-vk-layer.so) keeps one global set
+of device function pointers and fetches them again from every new
+device, vkQueuePresentKHR included. Mesa returns no swapchain functions
+for a device without VK_KHR_swapchain, so after the fex24 probe made its
+device the layer's present pointer was NULL and the game's next present
+crashed on vkd3d's present thread (with the layer off the probe ran).
+The probe's device now enables VK_KHR_swapchain too, so the layer gets
+the same driver functions as from the game's device.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WZVGoVEaHJ78mpf2D3MiER
+---
+ libs/vkd3d/fex_draw_probe.c | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/libs/vkd3d/fex_draw_probe.c b/libs/vkd3d/fex_draw_probe.c
+index 0361a8c..0c7bff0 100644
+--- a/libs/vkd3d/fex_draw_probe.c
++++ b/libs/vkd3d/fex_draw_probe.c
+@@ -1,5 +1,5 @@
+ /*
+- * FEX draw probe (VKD3D fex23, fex24): times on the GPU how long small draws take when they are recorded in different
++ * FEX draw probe (VKD3D fex23-fex25): times on the GPU how long small draws take when they are recorded in different
+  * ways, and puts the result in a '#' note of the gpu report (FEX's stats log). It answers whether D2R's draws are slow
+  * on Adreno because of what changes before every draw (new push constants and new root constant buffers, which Turnip
+  * turns into new register values for every draw) or because of the draws themselves, and whether drawing many objects
+@@ -16,6 +16,8 @@
+  * GPU, so a GPU fault in the probe loses only that device, not the game's), one test per submission, each named
+  * in the log 1.5 s before it is sent to the GPU (a '  draw probe:' line in the gpu report), so a crash shows which
+  * test it was. A test that fails stops the probe; the note then gives the tests done so far and where it stopped.
++ * fex25: the probe's device also enables VK_KHR_swapchain, which GameNative's frame cap layer needs from every device
++ * (see fex_probe_create_device); fex24 crashed the game's next present without it.
+  * Runs while the pass meter runs (VKD3D_FEX_PASSES); VKD3D_FEX_DRAW_PROBE=0 turns it off.
+  *
+  * The shaders (fex_draw_probe_spv.h, glslangValidator -V --target-env vulkan1.1):
+@@ -313,7 +315,15 @@ static bool fex_probe_alloc(struct fex_probe *p, const VkMemoryRequirements *req
+ 
+ static VkResult fex_probe_create_device(struct fex_probe *p)
+ {
+-    static const char * const extensions[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME };
++    /* VK_KHR_swapchain although the probe never presents (fex25): GameNative's frame cap layer (liblsfg-vk-layer.so)
++     * keeps one global set of device function pointers, fetched again from every new device, presents included. Mesa
++     * hands out no swapchain functions for a device without the extension, so with fex24's device the layer's
++     * vkQueuePresentKHR became NULL and the game's next present crashed (on vkd3d's present thread). */
++    static const char * const extensions[] =
++    {
++        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
++        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
++    };
+     VkPhysicalDeviceVulkan13Features features13;
+     VkPhysicalDeviceVulkan11Features features11;
+     VkPhysicalDeviceFeatures2 features;
+@@ -1024,9 +1034,9 @@ static void fex_probe_report(struct fex_probe *p, uint64_t cpu_ns, const char *s
+         empty_us = best[FEX_PROBE_T_EMPTY] * p->setup.ns_per_tick / 1000.0;
+ 
+     len = fex_probe_len(0, snprintf(fex_probe_text, sizeof(fex_probe_text),
+-            "# draw probe (VKD3D fex24): GPU time per draw, 1000 small draws per test (8-pixel triangles into a 2048x2048"
+-            " target, one render pass per round, best of %u rounds, slowest round in brackets, the empty pass's own"
+-            " %.0f us taken off; on a GPU device of its own, %.1f s after the game's was made, took %.1f s; "
++            "# draw probe (VKD3D fex25): GPU time per draw, 1000 small draws per test (8-pixel triangles into a"
++            " 2048x2048 target, one render pass per round, best of %u rounds, slowest round in brackets, the empty"
++            " pass's own %.0f us taken off; on a GPU device of its own, %.1f s after the game's was made, took %.1f s; "
+             "VKD3D_FEX_DRAW_PROBE=0 turns it off)%s%s: ", FEX_PROBE_ROUNDS, empty_us, p->setup.delay_ms / 1000.0,
+             cpu_ns / 1e9, status ? " " : "", status ? status : ""));
+ 
+-- 
+2.43.0
+
