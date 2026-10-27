@@ -1,0 +1,831 @@
+From 54d4f1668eabacd499a757a28079c9669e016848 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 20:35:31 +0000
+Subject: [PATCH] FEX: cap frame time from FEX; time dispatches and copy
+ compute shaders
+
+Cap pre-sleep: the cap's period was the median of the intervals between
+presents the cap held 3 ms or more. Frames slower than the cap get long
+holds from the window system too, at the frame time, so while loading
+in the median rose (fex21 log: 25.0 -> 30.4 ms at a 25 ms cap). With a
+period that long every pre-slept present reached the cap after its due
+time, the cap never held one long again, nothing corrected it, and the
+game ran at 37 FPS at a 40 FPS cap for the whole session (also seen at
+30 FPS caps). Now FEX writes the cap's own frame time (fps_limit rounded
+to whole refreshes of GameNative's vsync.txt period, as the cap layer
+does) into the new export vkd3d_fex_cap_grid, and the pre-sleep uses it
+unless the learned median is more than 1 ms shorter. Without FEX's
+figure the learned period is the lower quartile, and it is dropped when
+pre-sleeping goes 90 presents without a long hold. The cap line says
+where the period came from.
+
+Pass meter, measured frames: each Dispatch is timed alone (all-commands
+timestamps right before and after it) and added up per compute shader
+('gpu dispatches' line, costliest 6). The game's work between render
+passes cost 2.3-3.4 ms a frame in the fex21 log, mostly in gaps with
+dispatches. While the meter runs the shader copy takes every compute
+shader's D3D bytecode and SPIR-V once (kinds 10/11, up to 64 shaders,
+VKD3D_FEX_COPY_COMPUTE=0 turns it off); a pipeline made from the
+driver's cache has no SPIR-V at hand and is compiled again for the
+copy. Shader copy table 128 -> 512 entries.
+
+VKD3D_FEX_ROOT_DEDUPE is on by default now (0 off, 2 by turns every
+second): the fex21 log showed the same GPU and CPU time per draw either
+way, with fewer push descriptor sets and constants sent.
+---
+ libs/d3d12core/d3d12core.def |   1 +
+ libs/vkd3d/command.c         |   2 +
+ libs/vkd3d/fex_pass_meter.c  | 169 +++++++++++++++++++++++++++++++++--
+ libs/vkd3d/fex_shader_copy.c |  53 ++++++++++-
+ libs/vkd3d/fex_timeline.c    |  43 +++++++--
+ libs/vkd3d/state.c           |  32 +++++++
+ libs/vkd3d/swapchain.c       |  71 +++++++++++++--
+ libs/vkd3d/vkd3d_private.h   |  46 +++++++++-
+ 8 files changed, 395 insertions(+), 22 deletions(-)
+
+diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
+index 7f05c5f..45f725d 100644
+--- a/libs/d3d12core/d3d12core.def
++++ b/libs/d3d12core/d3d12core.def
+@@ -7,3 +7,4 @@ EXPORTS
+     vkd3d_fex_present_report DATA
+     vkd3d_fex_gpu_report DATA
+     vkd3d_fex_shader_copy DATA
++    vkd3d_fex_cap_grid DATA
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ea467b5..9f9f4ef 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8264,10 +8264,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
+ 
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
+ 
++    vkd3d_fex_dispatch_begin(list);
+     if (!list->predication.fallback_enabled)
+         VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, x, y, z));
+     else
+         VK_CALL(vkCmdDispatchIndirect(list->cmd.vk_command_buffer, scratch.buffer, scratch.offset));
++    vkd3d_fex_dispatch_end(list, x, y, z);
+ 
+     VKD3D_BREADCRUMB_AUX32(x);
+     VKD3D_BREADCRUMB_AUX32(y);
+diff --git a/libs/vkd3d/fex_pass_meter.c b/libs/vkd3d/fex_pass_meter.c
+index b2bc869..c235c84 100644
+--- a/libs/vkd3d/fex_pass_meter.c
++++ b/libs/vkd3d/fex_pass_meter.c
+@@ -44,7 +44,14 @@
+  * dynamic state and vertex/index buffers, and whether vkd3d sent a push descriptor set or push constants for the
+  * draw. Adreno keeps only 2 copies of a stage's state, so every draw that makes the driver write the pixel stage's
+  * state anew has to wait for the draw two back to finish its pixel work. A Set*Root* call with the value already set
+- * doesn't make vkd3d send it again (VKD3D_FEX_ROOT_DEDUPE, on and off by turns every second by default).
++ * doesn't make vkd3d send it again (VKD3D_FEX_ROOT_DEDUPE; on by default since VKD3D fex22: the fex21 log showed the
++ * same GPU and CPU time per draw on and off, and it sends less).
++ *
++ * Dispatches (VKD3D fex22), in the measured frames: every Dispatch gets an all-commands timestamp right before and
++ * right after it, so it runs with the GPU idle before it and is timed alone; added up per compute shader (its D3D
++ * bytecode hash) with its thread groups. The game's work between render passes cost 2.3-3.4 ms a frame in every scene
++ * in the fex21 log, mostly in gaps with dispatches. While the meter runs, the shader copy also takes the D3D bytecode
++ * and SPIR-V of every compute shader (fex_shader_copy.c), so the costly ones can be studied off the device.
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -167,6 +174,16 @@ struct vkd3d_fex_report vkd3d_fex_pass_report = { 0x50584546u /* 'FEXP' */, 1u,
+ struct vkd3d_fex_report vkd3d_fex_gpu_report = { 0x47584546u /* 'FEXG' */, 1u, 0u, 0u, { 0 } };
+ 
+ #define FEX_GAP_KINDS 64u
++#define FEX_DISPATCH_SHADERS 64u
++#define FEX_DISPATCH_TOP 6u
++
++/* VKD3D fex22: dispatches by compute shader, in the measured frames of one report. */
++struct fex_dispatch_stats
++{
++    uint64_t hash;
++    uint64_t count, groups, ticks, max_ticks;
++    uint32_t x, y, z; /* the last dispatch's thread groups */
++};
+ 
+ struct fex_gap_stats
+ {
+@@ -282,6 +299,11 @@ struct vkd3d_fex_pass_meter
+     /* VKD3D fex21 */
+     struct fex_chg_sig chg[FEX_CHG_SIGS];
+     struct fex_chg_sig chg_snap[FEX_CHG_SIGS]; /* the meter thread's copy */
++
++    /* VKD3D fex22 */
++    struct fex_dispatch_stats dispatches[FEX_DISPATCH_SHADERS];
++    uint32_t dispatch_shaders;
++    uint64_t dispatch_count, dispatch_ticks, dispatch_unlisted;
+ };
+ 
+ static const char *fex_pass_op_name(uint8_t op)
+@@ -624,6 +646,7 @@ void vkd3d_fex_pass_meter_begin_list(struct d3d12_command_list *list)
+     list->fex_pass.gap_mask = 0;
+     list->fex_pass.gap_cmds = 0;
+     list->fex_pass.gap_bytes = 0;
++    list->fex_pass.dispatch_open = false;
+     list->fex_pass.wait_pair = VKD3D_FEX_PASS_NO_QUERY;
+     if (list->fex_pass.draw)
+         fex_draw_abandon(list);
+@@ -961,6 +984,43 @@ void vkd3d_fex_pass_meter_outside(struct d3d12_command_list *list, uint32_t type
+     list->fex_pass.gap_bytes += bytes;
+ }
+ 
++/* VKD3D fex22: right before vkCmdDispatch (no render pass runs then). The begin timestamp waits for the GPU to finish
++ * everything before it, so the pair times the dispatch alone. */
++void vkd3d_fex_pass_meter_dispatch_begin(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++
++    if (!meter || !list->fex_pass.list_active || list->fex_pass.pass_active || list->is_inside_render_pass)
++        return;
++    list->fex_pass.dispatch_pair = fex_pass_alloc_pair(list);
++    VK_CALL(vkCmdWriteTimestamp2(list->cmd.vk_command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++            meter->pool, 2 * list->fex_pass.dispatch_pair));
++    list->fex_pass.dispatch_open = true;
++}
++
++void vkd3d_fex_pass_meter_dispatch_end(struct d3d12_command_list *list, uint32_t x, uint32_t y, uint32_t z)
++{
++    const struct d3d12_pipeline_state *state = list->state;
++    struct vkd3d_fex_pass_record rec;
++    uint64_t groups = (uint64_t)x * y * z;
++
++    list->fex_pass.dispatch_open = false;
++    fex_pass_write_end(list, list->fex_pass.dispatch_pair);
++    memset(&rec, 0, sizeof(rec));
++    rec.pair = list->fex_pass.dispatch_pair;
++    rec.sig = 0xffff;
++    rec.kind = VKD3D_FEX_PASS_KIND_DISPATCH;
++    rec.draws = groups > UINT32_MAX ? UINT32_MAX : (uint32_t)groups;
++    rec.direct_draws = x;
++    rec.pipelines = y;
++    rec.end_line = z > 0xffff ? 0xffff : z;
++    rec.vertices = state && d3d12_pipeline_state_is_compute(state) ? state->compute.code.meta.hash : 0;
++    rec.inside_pair = VKD3D_FEX_PASS_NO_QUERY;
++    rec.stats_slot = VKD3D_FEX_PASS_NO_QUERY;
++    fex_pass_add_record(list, &rec);
++}
++
+ void vkd3d_fex_pass_meter_submit_list(struct d3d12_command_list *list)
+ {
+     struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
+@@ -1068,6 +1128,44 @@ static void fex_pass_note_gap(struct vkd3d_fex_pass_meter *meter, const struct v
+     g->bytes += rec->vertices;
+ }
+ 
++/* VKD3D fex22: one timed Dispatch. */
++static void fex_pass_note_dispatch(struct vkd3d_fex_pass_meter *meter, const struct vkd3d_fex_pass_record *rec,
++        uint64_t ticks)
++{
++    struct fex_dispatch_stats *d = NULL;
++    uint32_t i;
++
++    meter->dispatch_count++;
++    meter->dispatch_ticks += ticks;
++    for (i = 0; i < meter->dispatch_shaders; i++)
++    {
++        if (meter->dispatches[i].hash == rec->vertices)
++        {
++            d = &meter->dispatches[i];
++            break;
++        }
++    }
++    if (!d)
++    {
++        if (meter->dispatch_shaders == FEX_DISPATCH_SHADERS)
++        {
++            meter->dispatch_unlisted += ticks;
++            return;
++        }
++        d = &meter->dispatches[meter->dispatch_shaders++];
++        memset(d, 0, sizeof(*d));
++        d->hash = rec->vertices;
++    }
++    d->count++;
++    d->groups += rec->draws;
++    d->ticks += ticks;
++    if (ticks > d->max_ticks)
++        d->max_ticks = ticks;
++    d->x = rec->direct_draws;
++    d->y = rec->pipelines;
++    d->z = rec->end_line;
++}
++
+ /* inside_ticks: begin to the after-begin timestamp, or -1 when there is none; stats: NULL when not sampled. */
+ static void fex_pass_account(struct vkd3d_fex_pass_meter *meter, const struct vkd3d_fex_pass_record *rec, uint64_t ticks,
+         int64_t inside_ticks, const uint64_t *stats)
+@@ -1097,6 +1195,12 @@ static void fex_pass_account(struct vkd3d_fex_pass_meter *meter, const struct vk
+         return;
+     }
+ 
++    if (rec->kind == VKD3D_FEX_PASS_KIND_DISPATCH)
++    {
++        fex_pass_note_dispatch(meter, rec, ticks);
++        return;
++    }
++
+     if (rec->kind == VKD3D_FEX_PASS_KIND_CLEAR)
+     {
+         meter->clears++;
+@@ -1971,8 +2075,8 @@ static size_t fex_chg_publish(struct vkd3d_fex_pass_meter *meter, char *text, si
+                 " stencil reference, ...) or vertex/index buffers set; 'PS data any' = PS data whatever else changed;"
+                 " 'sent set/consts' = draws vkd3d sent a push descriptor set / push constants for (the driver then"
+                 " writes the shader state of every stage anew); 'same' = Set*Root* calls with the value already set,"
+-                " not sent again while 'skip same' is on (VKD3D_FEX_ROOT_DEDUPE: unset = on and off by turns every"
+-                " second); params: #root parameter type/visibility, %% of the draws that changed it, 'read' = the"
++                " not sent again while 'skip same' is on (VKD3D_FEX_ROOT_DEDUPE: unset = on since VKD3D fex22, 2 = on and"
++                " off by turns every second); params: #root parameter type/visibility, %% of the draws that changed it, 'read' = the"
+                 " pixel shader reads it\n");
+ 
+     if (!draws)
+@@ -2038,6 +2142,54 @@ static size_t fex_chg_publish(struct vkd3d_fex_pass_meter *meter, char *text, si
+ }
+ 
+ /* VKD3D fex11: the gpu report (memory, vkd3d's transfers, GPU time outside render passes), once a second. */
++/* VKD3D fex22: the dispatch line, costliest compute shaders first. */
++static size_t fex_dispatch_publish(struct vkd3d_fex_pass_meter *meter, char *text, size_t size, size_t len, double ms)
++{
++    uint32_t top[FEX_DISPATCH_TOP], top_count = 0, i, j;
++
++    if (meter->gpu_publishes > 2 * FEX_DRAW_FIRST_PUBLISH && meter->gpu_publishes <= 3 * FEX_DRAW_FIRST_PUBLISH)
++        len = vkd3d_fex_report_append(text, size, len,
++                "# gpu dispatches (VKD3D fex22), measured frames only (per frame = figure / 'frames measured'): each"
++                " Dispatch timed alone (the GPU finishes everything before it first, so dispatches the game let overlap"
++                " run one after another in these frames); by compute shader (its D3D bytecode hash; the shader copy"
++                " holds its bytecode and SPIR-V as 'compute shader dxbc/spirv'): n = dispatches, groups = thread groups"
++                " per dispatch on average (x*y*z of the last one), gpu ms in all, longest, us per dispatch\n");
++
++    if (!meter->dispatch_count)
++        return len;
++
++    for (i = 0; i < meter->dispatch_shaders; i++)
++    {
++        for (j = top_count; j > 0 && meter->dispatches[top[j - 1]].ticks < meter->dispatches[i].ticks; j--)
++        {
++            if (j < ARRAY_SIZE(top))
++                top[j] = top[j - 1];
++        }
++        if (j < ARRAY_SIZE(top))
++        {
++            top[j] = i;
++            if (top_count < ARRAY_SIZE(top))
++                top_count++;
++        }
++    }
++    len = vkd3d_fex_report_append(text, size, len, "  gpu dispatches: n=%"PRIu64" gpu=%.2fms shaders=%u |",
++            meter->dispatch_count, meter->dispatch_ticks * ms, meter->dispatch_shaders);
++    for (i = 0; i < top_count; i++)
++    {
++        const struct fex_dispatch_stats *d = &meter->dispatches[top[i]];
++
++        len = vkd3d_fex_report_append(text, size, len,
++                " %016"PRIx64" n=%"PRIu64" groups=%.0f (%ux%ux%u) %.2fms max %.2f %.0fus;", d->hash, d->count,
++                (double)d->groups / d->count, d->x, d->y, d->z, d->ticks * ms, d->max_ticks * ms,
++                d->ticks * ms * 1000.0 / d->count);
++    }
++    if (meter->dispatch_shaders > top_count)
++        len = vkd3d_fex_report_append(text, size, len, " %u other shaders", meter->dispatch_shaders - top_count);
++    if (meter->dispatch_unlisted)
++        len = vkd3d_fex_report_append(text, size, len, " (+%.2fms not told apart)", meter->dispatch_unlisted * ms);
++    return vkd3d_fex_report_append(text, size, len, "\n");
++}
++
+ static void fex_gpu_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+ {
+     static char text[VKD3D_FEX_REPORT_SIZE];
+@@ -2165,11 +2317,15 @@ static void fex_gpu_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+         len = vkd3d_fex_report_append(text, sizeof(text), len, "\n");
+     }
+ 
++    len = fex_dispatch_publish(meter, text, sizeof(text), len, ms);
++
+     len = fex_chg_publish(meter, text, sizeof(text), len);
+ 
+     vkd3d_fex_report_publish(&vkd3d_fex_gpu_report, text, len);
+ 
+     memset(&meter->xfer, 0, sizeof(meter->xfer));
++    meter->dispatch_shaders = 0;
++    meter->dispatch_count = meter->dispatch_ticks = meter->dispatch_unlisted = 0;
+     meter->gap_kinds = 0;
+     meter->gap_count = meter->gap_ticks = meter->gaps_unlisted = 0;
+     meter->list_waits = meter->list_wait_ticks = meter->list_wait_max = 0;
+@@ -2602,15 +2758,16 @@ void vkd3d_fex_pass_meter_deinit(struct vkd3d_fex_pass_meter *meter)
+ /* VKD3D fex21: VKD3D_FEX_ROOT_DEDUPE. */
+ void vkd3d_fex_root_dedupe_init(void)
+ {
+-    uint32_t mode = 2;
++    uint32_t mode = 1;
+     char env[16];
+ 
++    /* VKD3D fex22: on unless asked otherwise (0 off, 2 on and off by turns every second with the pass meter). */
+     if (vkd3d_get_env_var("VKD3D_FEX_ROOT_DEDUPE", env, sizeof(env)))
+     {
+         if (!strcmp(env, "0"))
+             mode = 0;
+-        else if (!strcmp(env, "1"))
+-            mode = 1;
++        else if (!strcmp(env, "2") || !strcmp(env, "alt"))
++            mode = 2;
+     }
+     fex_root_dedupe_alt = mode == 2;
+     vkd3d_atomic_uint32_store_explicit(&vkd3d_fex_root_dedupe_now, mode ? 1u : 0u, vkd3d_memory_order_relaxed);
+diff --git a/libs/vkd3d/fex_shader_copy.c b/libs/vkd3d/fex_shader_copy.c
+index 35f85d2..9a3cbc6 100644
+--- a/libs/vkd3d/fex_shader_copy.c
++++ b/libs/vkd3d/fex_shader_copy.c
+@@ -5,6 +5,10 @@
+  * Nothing about rendering changes; the only side effect is that the driver compiles the first few listed shaders
+  * once more with its internal representations kept (no driver cache use for those few pipelines).
+  *
++ * Compute shaders (VKD3D fex22): while the pass meter runs (VKD3D_FEX_PASSES), every compute shader's D3D bytecode and
++ * SPIR-V are copied once (VKD3D_FEX_COPY_COMPUTE=0 turns that off), up to FEX_COPY_CS_MAX of them. A pipeline the
++ * driver made from its cache by identifier has no SPIR-V at hand; state.c compiles it again just for the copy.
++ *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+  * License as published by the Free Software Foundation; either
+@@ -26,6 +30,8 @@ struct vkd3d_fex_shader_copy vkd3d_fex_shader_copy = { 0x53584546u /* 'FEXS' */,
+ #define FEX_COPY_ROOT_SIGS 16u
+ #define FEX_COPY_BUDGET (16u << 20)
+ #define FEX_COPY_TEXT 16384u
++#define FEX_COPY_CS_MAX 64u
++#define FEX_COPY_CS_BUDGET (8u << 20)
+ 
+ /* Per listed pixel shader: what was copied already. */
+ #define FEX_COPY_DONE_DXBC 0x1u
+@@ -48,6 +54,11 @@ static struct
+     unsigned int root_sig_count;
+     size_t bytes;
+     bool device_done;
++    /* VKD3D fex22: compute shaders */
++    bool compute;
++    vkd3d_shader_hash_t cs_hashes[FEX_COPY_CS_MAX];
++    unsigned int cs_count;
++    size_t cs_bytes;
+ } fex_copy = { PTHREAD_ONCE_INIT, PTHREAD_MUTEX_INITIALIZER };
+ 
+ static void fex_copy_init_once(void)
+@@ -57,8 +68,12 @@ static void fex_copy_init_once(void)
+     char *end;
+     uint64_t h;
+ 
++    /* VKD3D fex22: compute shaders while the pass meter runs. */
++    if (vkd3d_get_env_var("VKD3D_FEX_PASSES", env, sizeof(env)) && strcmp(env, "0"))
++        fex_copy.compute = !vkd3d_get_env_var("VKD3D_FEX_COPY_COMPUTE", env, sizeof(env)) || strcmp(env, "0");
++
+     if (!vkd3d_get_env_var("VKD3D_FEX_SHADER_COPY", env, sizeof(env)))
+-        return;
++        env[0] = '\0';
+ 
+     for (p = env; *p && fex_copy.hash_count < FEX_COPY_HASHES;)
+     {
+@@ -74,7 +89,7 @@ static void fex_copy_init_once(void)
+         p = end;
+     }
+ 
+-    fex_copy.enabled = fex_copy.hash_count != 0;
++    fex_copy.enabled = fex_copy.hash_count != 0 || fex_copy.compute;
+     vkd3d_fex_shader_copy.listed = fex_copy.hash_count;
+     if (fex_copy.enabled)
+         vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_fex_shader_copy.flags, VKD3D_FEX_REPORT_FLAG_ON,
+@@ -411,6 +426,40 @@ void vkd3d_fex_shader_copy_spirv(VkShaderStageFlagBits stage, const struct vkd3d
+     pthread_mutex_unlock(&fex_copy.lock);
+ }
+ 
++/* VKD3D fex22: true once per compute shader while compute copies are on and there is room; the caller then copies its
++ * D3D bytecode and SPIR-V with vkd3d_fex_shader_copy_cs. */
++bool vkd3d_fex_shader_copy_cs_claim(struct d3d12_device *device, vkd3d_shader_hash_t hash)
++{
++    bool claim = false;
++    unsigned int i;
++
++    if (!hash || !fex_copy_enabled() || !fex_copy.compute)
++        return false;
++
++    pthread_mutex_lock(&fex_copy.lock);
++    for (i = 0; i < fex_copy.cs_count; i++)
++        if (fex_copy.cs_hashes[i] == hash)
++            break;
++    if (i == fex_copy.cs_count && fex_copy.cs_count < FEX_COPY_CS_MAX && fex_copy.cs_bytes < FEX_COPY_CS_BUDGET)
++    {
++        fex_copy.cs_hashes[fex_copy.cs_count++] = hash;
++        fex_copy_device_locked(device);
++        claim = true;
++    }
++    pthread_mutex_unlock(&fex_copy.lock);
++    return claim;
++}
++
++void vkd3d_fex_shader_copy_cs(vkd3d_shader_hash_t hash, uint32_t kind, const void *data, size_t size)
++{
++    if (!data || !size)
++        return;
++    pthread_mutex_lock(&fex_copy.lock);
++    fex_copy.cs_bytes += size;
++    fex_copy_publish_locked(hash, 0, kind, 0, VK_SHADER_STAGE_COMPUTE_BIT, data, size);
++    pthread_mutex_unlock(&fex_copy.lock);
++}
++
+ /* True when this PSO's static pipeline should be compiled with the driver's internal representations kept: its pixel
+  * shader is one of the first few listed and no compile for it got them yet. */
+ bool vkd3d_fex_shader_copy_claim_code(struct d3d12_pipeline_state *state)
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index 5e5586b..71784c6 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -23,6 +23,8 @@
+ 
+ /* Read by FEX (found by export name in d3d12core.dll). */
+ struct vkd3d_fex_report vkd3d_fex_present_report = { 0x54584546u /* 'FEXT' */, 1u, 0u, 0u, { 0 } };
++/* Written by FEX (VKD3D fex22): the frame cap's frame time. */
++struct vkd3d_fex_cap_grid vkd3d_fex_cap_grid = { 0x43584546u /* 'FEXC' */, 1u, 0u, 0u, 0u, 0u };
+ 
+ bool vkd3d_fex_timeline_on;
+ bool vkd3d_fex_frame_start_on;
+@@ -72,8 +74,8 @@ static struct
+     struct fex_timeline_stat vkq_wait, vkq_held;
+     uint32_t vkq_held_long;
+     /* cap pre-sleep */
+-    uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored;
+-    bool cap_active;
++    uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored, cap_forgot;
++    bool cap_active, cap_from_fex;
+     uint64_t cap_step_ns, cap_guard_ns;
+     /* handoff to the window system (VKD3D fex12) */
+     uint32_t handoff_presents, handoff_unfinished, handoff_waited, handoff_gave_up;
+@@ -282,7 +284,7 @@ void vkd3d_fex_timeline_present(uint32_t sync_interval, uint32_t queued)
+ }
+ 
+ void vkd3d_fex_timeline_cap(bool presleep, bool held_long, bool not_held, bool anchored, bool active, uint64_t step_ns,
+-        uint64_t guard_ns)
++        uint64_t guard_ns, bool step_from_fex, bool forgot)
+ {
+     if (!vkd3d_fex_timeline_on)
+         return;
+@@ -296,7 +298,10 @@ void vkd3d_fex_timeline_cap(bool presleep, bool held_long, bool not_held, bool a
+         fex_timeline.cap_not_held++;
+     if (anchored)
+         fex_timeline.cap_anchored++;
++    if (forgot)
++        fex_timeline.cap_forgot++;
+     fex_timeline.cap_active = active;
++    fex_timeline.cap_from_fex = step_from_fex;
+     fex_timeline.cap_step_ns = step_ns;
+     fex_timeline.cap_guard_ns = guard_ns;
+     spinlock_release(&fex_timeline.lock);
+@@ -450,7 +455,9 @@ static void fex_timeline_publish(double seconds)
+     uint32_t pacing_frames, pacing_late, pacing_caused, pacing_busy, pacing_unseen;
+     struct fex_timeline_stat vkq_wait, vkq_held;
+     uint32_t vkq_held_long;
+-    uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored;
++    uint32_t cap_presents, cap_presleeps, cap_held_long, cap_not_held, cap_anchored, cap_forgot;
++    uint32_t cap_fps_limit;
++    uint64_t cap_refresh_ns;
+     uint32_t handoff_presents, handoff_unfinished, handoff_waited, handoff_gave_up;
+     struct fex_timeline_stat handoff_wait;
+     uint32_t resync_windows, resync_held, resync_taken_back;
+@@ -461,7 +468,7 @@ static void fex_timeline_publish(double seconds)
+     uint32_t pacing_ceiling, pacing_gpu_bound, pacing_memory;
+     int64_t pacing_memory_less_ns;
+     struct fex_timeline_stat gpu_frame[3];
+-    bool cap_active;
++    bool cap_active, cap_from_fex;
+     size_t len = 0;
+     uint32_t i, j;
+ 
+@@ -517,6 +524,9 @@ static void fex_timeline_publish(double seconds)
+     cap_not_held = fex_timeline.cap_not_held;
+     cap_anchored = fex_timeline.cap_anchored;
+     cap_active = fex_timeline.cap_active;
++    cap_from_fex = fex_timeline.cap_from_fex;
++    cap_forgot = fex_timeline.cap_forgot;
++    fex_timeline.cap_forgot = 0;
+     cap_step_ns = fex_timeline.cap_step_ns;
+     cap_guard_ns = fex_timeline.cap_guard_ns;
+     fex_timeline.cap_presents = 0;
+@@ -586,10 +596,29 @@ static void fex_timeline_publish(double seconds)
+                 vkq_held.count, vkq_wait.sum_ns / 1e6 / seconds, vkq_wait.max_ns / 1e6,
+                 vkq_held.sum_ns / 1e6 / seconds, vkq_held.max_ns / 1e6, vkq_held_long);
+     if (cap_presents)
++    {
+         len = vkd3d_fex_report_append(text, sizeof(text), len,
+                 "  cap n=%u | pre-slept %u | held 3ms+ in vkQueuePresentKHR %u (grid measured %u) | not held %u | pre-sleep %s,"
+-                " period %.2f ms, guard %.1f ms\n", cap_presents, cap_presleeps, cap_held_long, cap_anchored, cap_not_held,
+-                cap_active ? "on" : "waiting", cap_step_ns / 1e6, cap_guard_ns / 1e6);
++                " period %.2f ms", cap_presents, cap_presleeps, cap_held_long, cap_anchored, cap_not_held,
++                cap_active ? "on" : "waiting", cap_step_ns / 1e6);
++        if (cap_from_fex)
++        {
++            cap_fps_limit = vkd3d_atomic_uint32_load_explicit((uint32_t *)&vkd3d_fex_cap_grid.fps_limit,
++                    vkd3d_memory_order_relaxed);
++            cap_refresh_ns = vkd3d_atomic_uint64_load_explicit((uint64_t *)&vkd3d_fex_cap_grid.refresh_ns,
++                    vkd3d_memory_order_relaxed);
++            len = vkd3d_fex_report_append(text, sizeof(text), len, " (the cap's own, from FEX: fps_limit %u", cap_fps_limit);
++            if (cap_refresh_ns)
++                len = vkd3d_fex_report_append(text, sizeof(text), len, " on %.1f Hz", 1e9 / (double)cap_refresh_ns);
++            len = vkd3d_fex_report_append(text, sizeof(text), len, ")");
++        }
++        else
++            len = vkd3d_fex_report_append(text, sizeof(text), len, " (learned from held presents)");
++        len = vkd3d_fex_report_append(text, sizeof(text), len, ", guard %.1f ms", cap_guard_ns / 1e6);
++        if (cap_forgot)
++            len = vkd3d_fex_report_append(text, sizeof(text), len, " | learned period dropped %u times", cap_forgot);
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "\n");
++    }
+     if (handoff_presents)
+     {
+         len = vkd3d_fex_report_append(text, sizeof(text), len,
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 0026014..ee012e7 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3190,6 +3190,36 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+     return S_OK;
+ }
+ 
++/* VKD3D fex22: while the pass meter runs, the shader copy takes every compute shader's D3D bytecode and SPIR-V once,
++ * so the costly ones in the 'gpu dispatches' line can be studied off the device. A pipeline made from the driver's
++ * cache by identifier has no SPIR-V at hand: it is compiled again just for the copy (once per shader). */
++static void d3d12_pipeline_state_fex_copy_compute(struct d3d12_pipeline_state *state, struct d3d12_device *device,
++        const D3D12_SHADER_BYTECODE *code)
++{
++    struct vkd3d_shader_code dxbc = {code->pShaderBytecode, code->BytecodeLength};
++    struct vkd3d_shader_code spirv;
++    vkd3d_shader_hash_t hash;
++
++    if (!device->fex_pass_meter || !code->pShaderBytecode || !code->BytecodeLength)
++        return;
++    hash = state->compute.code.meta.hash ? state->compute.code.meta.hash : vkd3d_shader_hash(&dxbc);
++    if (!vkd3d_fex_shader_copy_cs_claim(device, hash))
++        return;
++
++    vkd3d_fex_shader_copy_cs(hash, VKD3D_FEX_COPY_CS_DXBC, dxbc.code, dxbc.size);
++    if (state->compute.code.code && state->compute.code.size)
++    {
++        vkd3d_fex_shader_copy_cs(hash, VKD3D_FEX_COPY_CS_SPIRV, state->compute.code.code, state->compute.code.size);
++        return;
++    }
++    memset(&spirv, 0, sizeof(spirv));
++    if (SUCCEEDED(vkd3d_compile_shader_stage(state, device, VK_SHADER_STAGE_COMPUTE_BIT, code, &spirv, NULL)))
++    {
++        vkd3d_fex_shader_copy_cs(hash, VKD3D_FEX_COPY_CS_SPIRV, spirv.code, spirv.size);
++        vkd3d_shader_free_shader_code(&spirv);
++    }
++}
++
+ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *state,
+         struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc,
+         const struct d3d12_cached_pipeline_state *cached_pso)
+@@ -3216,6 +3246,8 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
+         return hr;
+     }
+ 
++    d3d12_pipeline_state_fex_copy_compute(state, device, &desc->cs);
++
+     if (FAILED(hr = vkd3d_private_store_init(&state->private_store)))
+     {
+         VK_CALL(vkDestroyPipeline(device->vk_device, state->compute.vk_pipeline, NULL));
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index e74ad3b..0041c3b 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -243,11 +243,16 @@ struct dxgi_vk_swap_chain
+         {
+             bool active;
+             bool last_held_long;
++            bool step_from_fex;     /* step_ns is the cap's frame time FEX handed over (VKD3D fex22) */
+             uint32_t start_count;   /* long holds in a row, before pre-sleeping starts */
+             uint32_t late_count;    /* presents in a row the cap didn't hold at all, while pre-sleeping */
++            uint32_t since_long;    /* presents since the last long hold, while pre-sleeping (VKD3D fex22) */
+             uint64_t due_ns;        /* when the last present came out, or would have on the cap's grid */
+             uint64_t last_end_ns;
+-            uint64_t step_ns;       /* the cap's period: median of the last intervals between held presents */
++            uint64_t step_ns;       /* the cap's period in use */
++            uint64_t learned_ns;    /* the period learned from held presents: the lower quartile of the last intervals
++                                     * between long holds in a row (VKD3D fex22; up to fex21 the median), 0 = none */
++            uint64_t median_ns;     /* their median: only a median clearly below FEX's figure overrides it */
+             uint64_t intervals_ns[15];
+             uint32_t interval_pos;
+             uint32_t interval_count;
+@@ -2945,6 +2950,19 @@ static void dxgi_vk_swap_chain_platform_sleep_for_ns(struct platform_sleep_state
+ #define FEX_PRESLEEP_LONG_NS 3000000ull      /* the cap held the present this long: it came out at the cap's due time */
+ #define FEX_PRESLEEP_START_COUNT 8u          /* long holds in a row before pre-sleeping starts */
+ #define FEX_PRESLEEP_LATE_COUNT 4u           /* stop after this many presents in a row the cap didn't hold */
++#define FEX_PRESLEEP_FORGET_COUNT 90u        /* pre-sleeping and no long hold in this many presents: the period is wrong
++                                              * (pre-slept presents come after the cap's due time), start over */
++#define FEX_PRESLEEP_FEX_SLACK_NS 1000000ull /* a learned median this much shorter than FEX's figure wins (the cap
++                                              * paces faster than FEX read: its config changed) */
++
++/* The cap's frame time FEX read from the cap's config (VKD3D fex22), 0 when none or out of range. */
++static uint64_t dxgi_vk_swap_chain_fex_cap_step_from_fex(void)
++{
++    uint64_t step_ns = vkd3d_atomic_uint64_load_explicit((uint64_t *)&vkd3d_fex_cap_grid.step_ns,
++            vkd3d_memory_order_relaxed);
++
++    return step_ns >= 5000000ull && step_ns <= 250000000ull ? step_ns : 0;
++}
+ 
+ /* Cap pre-sleep: sleeps, without holding the VkQueue, until shortly before the cap's next due time. Returns whether
+  * it slept. */
+@@ -2970,12 +2988,22 @@ static bool dxgi_vk_swap_chain_fex_presleep(struct dxgi_vk_swap_chain *chain)
+  * pre-slept presents only move the expected time along the grid or earlier, never later, so waking late can't add up.
+  * Up to VKD3D fex7, only presents without pre-sleep measured the grid, so every 150 presents two went without it and
+  * held the VkQueue ~33 ms in vkQueuePresentKHR (b61 log with fex7: the game's copy and compute submits waited up to
+- * 33 ms for it, and seconds with such a check had twice as many frames of 40 ms or more). */
++ * 33 ms for it, and seconds with such a check had twice as many frames of 40 ms or more).
++ *
++ * The period (VKD3D fex22): FEX hands over the cap's own frame time (vkd3d_fex_cap_grid). Up to fex21 the period was
++ * the median of the intervals between long holds in a row, and that could lock onto a wrong one: frames slower than
++ * the cap (loading in, fights) get long holds from the window system too, at the frame time, so the median rose (b97
++ * log: 25.0 -> 30.4 ms while loading in at a cap of 25 ms). With a period that long every pre-slept present reached
++ * the cap after its due time, so the cap no longer held any long, no interval corrected it, and the game ran at
++ * 37 FPS with a 25 ms cap for the whole session (also seen at 30 FPS caps: 34.6-35.3 ms for minutes). Without FEX's
++ * figure the learned period is now the lower quartile (a wrong interval is always longer than the cap's period), and
++ * it is dropped when pre-sleeping goes FEX_PRESLEEP_FORGET_COUNT presents without a long hold. */
+ static void dxgi_vk_swap_chain_fex_presleep_note(struct dxgi_vk_swap_chain *chain, bool slept,
+         uint64_t start_ns, uint64_t end_ns)
+ {
+-    uint64_t held_ns = end_ns - start_ns, interval_ns, expected_ns, sorted[15], v;
++    uint64_t held_ns = end_ns - start_ns, interval_ns, expected_ns, sorted[15], v, fex_step_ns, step_ns;
+     bool held = held_ns >= FEX_PRESLEEP_HELD_NS, held_long = held_ns >= FEX_PRESLEEP_LONG_NS, anchored = false;
++    bool forgot = false;
+     uint32_t i, j, n;
+ 
+     /* Two long holds in a row: the cap's period. */
+@@ -3000,11 +3028,21 @@ static void dxgi_vk_swap_chain_fex_presleep_note(struct dxgi_vk_swap_chain *chai
+                         sorted[j] = sorted[j - 1];
+                     sorted[j] = v;
+                 }
+-                chain->present.fex_presleep.step_ns = sorted[n / 2];
++                chain->present.fex_presleep.learned_ns = sorted[n / 4];
++                chain->present.fex_presleep.median_ns = sorted[n / 2];
+             }
+         }
+     }
+ 
++    /* The period: FEX's figure of the cap, unless most intervals show the cap pacing clearly faster than that (a
++     * window system hold can make a single interval shorter: a present let out late shortens the next interval). A
++     * period too short is the safe side: the cap then holds the pre-slept present a little longer. */
++    fex_step_ns = dxgi_vk_swap_chain_fex_cap_step_from_fex();
++    step_ns = chain->present.fex_presleep.learned_ns;
++    chain->present.fex_presleep.step_from_fex = fex_step_ns && (!step_ns ||
++            chain->present.fex_presleep.median_ns + FEX_PRESLEEP_FEX_SLACK_NS >= fex_step_ns);
++    chain->present.fex_presleep.step_ns = chain->present.fex_presleep.step_from_fex ? fex_step_ns : step_ns;
++
+     if (!chain->present.fex_presleep.active)
+     {
+         if (held_long)
+@@ -3043,13 +3081,36 @@ static void dxgi_vk_swap_chain_fex_presleep_note(struct dxgi_vk_swap_chain *chai
+             chain->present.fex_presleep.active = false;
+             chain->present.fex_presleep.start_count = 0;
+         }
++
++        if (held_long)
++            chain->present.fex_presleep.since_long = 0;
++        else if (chain->present.fex_presleep.active &&
++                ++chain->present.fex_presleep.since_long >= FEX_PRESLEEP_FORGET_COUNT)
++        {
++            /* Held, but never long: the presents reach the cap after its due time, so the period is too long.
++             * Learn it again from scratch (FEX's figure stays). */
++            chain->present.fex_presleep.active = false;
++            chain->present.fex_presleep.start_count = 0;
++            if (!chain->present.fex_presleep.step_from_fex)
++            {
++                chain->present.fex_presleep.learned_ns = 0;
++                chain->present.fex_presleep.median_ns = 0;
++                chain->present.fex_presleep.step_ns = 0;
++                chain->present.fex_presleep.interval_count = 0;
++                chain->present.fex_presleep.interval_pos = 0;
++                forgot = true;
++            }
++        }
++        if (!chain->present.fex_presleep.active)
++            chain->present.fex_presleep.since_long = 0;
+     }
+ 
+     chain->present.fex_presleep.last_held_long = held_long;
+     chain->present.fex_presleep.last_end_ns = end_ns;
+ 
+     vkd3d_fex_timeline_cap(slept, held_long, !held, anchored, chain->present.fex_presleep.active,
+-            chain->present.fex_presleep.step_ns, FEX_PRESLEEP_GUARD_NS);
++            chain->present.fex_presleep.step_ns, FEX_PRESLEEP_GUARD_NS, chain->present.fex_presleep.step_from_fex,
++            forgot);
+ }
+ 
+ /* Frame start pacing: has the GPU watcher note when this blit finishes on the GPU. */
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 8761488..2a9917d 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3096,6 +3096,21 @@ struct vkd3d_fex_report
+ extern struct vkd3d_fex_report vkd3d_fex_pass_report;    /* magic 'FEXP' */
+ extern struct vkd3d_fex_report vkd3d_fex_present_report; /* magic 'FEXT' */
+ extern struct vkd3d_fex_report vkd3d_fex_gpu_report;     /* magic 'FEXG' (VKD3D fex11) */
++
++/* FEX cap grid (VKD3D fex22, fex_timeline.c): FEX's stats log thread writes the frame cap's exact frame time here.
++ * GameNative's cap layer paces presents on whole screen refreshes (frame time = fps_limit rounded to whole refreshes
++ * of the period in its vsync.txt); FEX reads the same conf.toml and vsync.txt. The cap pre-sleep uses it instead of
++ * the period it learns from held presents, which could lock onto a wrong, longer one. */
++struct vkd3d_fex_cap_grid
++{
++    uint32_t magic;               /* 'FEXC' */
++    uint32_t version;             /* 1 */
++    volatile uint64_t step_ns;    /* the cap's frame time, 0 = no cap known (written by FEX) */
++    volatile uint64_t refresh_ns; /* the screen's refresh period, 0 = not known (written by FEX) */
++    volatile uint32_t fps_limit;  /* the cap's fps_limit, 0 = none (written by FEX) */
++    volatile uint32_t writes;     /* how often FEX wrote it */
++};
++extern struct vkd3d_fex_cap_grid vkd3d_fex_cap_grid; /* magic 'FEXC' (VKD3D fex22) */
+ void vkd3d_fex_report_publish(struct vkd3d_fex_report *report, const char *text, size_t len);
+ size_t vkd3d_fex_report_append(char *buf, size_t size, size_t len, const char *fmt, ...);
+ 
+@@ -3103,7 +3118,7 @@ size_t vkd3d_fex_report_append(char *buf, size_t size, size_t len, const char *f
+  * hash (16 hex digits, comma separated, costliest first). Their D3D bytecode, the PSO around them (vertex shader,
+  * targets, root signature) and, for the first VKD3D_FEX_SHADER_COPY_FULL of them, the SPIR-V and the driver's compiled
+  * code go into memory blocks FEX's stats log copies out (export vkd3d_fex_shader_copy). Nothing else changes. */
+-#define VKD3D_FEX_SHADER_COPY_MAX 128u
++#define VKD3D_FEX_SHADER_COPY_MAX 512u
+ #define VKD3D_FEX_SHADER_COPY_FULL 4u
+ enum vkd3d_fex_shader_copy_kind
+ {
+@@ -3117,6 +3132,8 @@ enum vkd3d_fex_shader_copy_kind
+     VKD3D_FEX_COPY_PSO = 7,      /* text: vertex shader, targets, depth, blend, root signature mapping */
+     VKD3D_FEX_COPY_ROOT_SIG = 8, /* binary: the serialized D3D12 root signature (other = its compatibility hash) */
+     VKD3D_FEX_COPY_NOTE = 9,     /* text: why something could not be copied */
++    VKD3D_FEX_COPY_CS_DXBC = 10, /* binary: a compute shader's D3D bytecode (hash = its hash; VKD3D fex22) */
++    VKD3D_FEX_COPY_CS_SPIRV = 11, /* binary: the SPIR-V vkd3d made of it for the driver (VKD3D fex22) */
+ };
+ struct vkd3d_fex_shader_blob
+ {
+@@ -3222,8 +3239,10 @@ void vkd3d_fex_timeline_pacing(uint64_t delay_ns, uint64_t margin_ns, int64_t sp
+ void vkd3d_fex_timeline_gpu_frame(uint64_t ns, uint32_t pass_frame);
+ /* VkQueue lock: wait_ns / held_ns, or UINT64_MAX for none. */
+ void vkd3d_fex_timeline_vkqueue_lock(uint64_t wait_ns, uint64_t held_ns);
++/* step_from_fex: step_ns is the cap's frame time FEX handed over (VKD3D fex22), else learned from held presents;
++ * forgot: a learned period was dropped at this present (no long hold for a while: it was wrong). */
+ void vkd3d_fex_timeline_cap(bool presleep, bool held_long, bool not_held, bool anchored, bool active, uint64_t step_ns,
+-        uint64_t guard_ns);
++        uint64_t guard_ns, bool step_from_fex, bool forgot);
+ uint64_t vkd3d_fex_timeline_last_release(void);
+ void vkd3d_fex_timeline_config(const char *text);
+ /* One present's handoff to the window system (VKD3D fex12): whether the GPU had the frame's copy done when the queue
+@@ -3242,6 +3261,9 @@ void vkd3d_fex_timeline_tick(uint64_t now_ns);
+ #define VKD3D_FEX_PASS_KIND_LIST 3
+ #define VKD3D_FEX_PASS_KIND_GAP 4  /* VKD3D fex11: GPU time between render passes; pipelines = what was recorded there
+                                     * (VKD3D_FEX_OUTSIDE_*), draws = commands, vertices = bytes */
++#define VKD3D_FEX_PASS_KIND_DISPATCH 5 /* VKD3D fex22: one Dispatch, timed with the GPU idle before and after it;
++                                        * vertices = compute shader hash, draws = thread groups (x*y*z), direct_draws
++                                        * = x, pipelines = y, end_line = z (at most 0xffff) */
+ /* VKD3D fex11: what a command list records outside render passes. */
+ #define VKD3D_FEX_OUTSIDE_COPY_B2I 0x1u   /* CopyTextureRegion buffer to texture */
+ #define VKD3D_FEX_OUTSIDE_COPY_I2I 0x2u   /* CopyTextureRegion texture to texture */
+@@ -3478,6 +3500,9 @@ struct d3d12_command_list
+         uint32_t chg_flags;    /* VKD3D_FEX_CHG_* */
+         uint32_t chg_same;     /* Set*Root* calls with the value already set */
+         uint64_t last_ps_hash; /* pixel shader of the last pipeline bound */
++        /* VKD3D fex22: the timestamp pair of the Dispatch being recorded (vkd3d_fex_dispatch_begin/end). */
++        uint32_t dispatch_pair;
++        bool dispatch_open;
+     } fex_pass;
+ 
+     struct
+@@ -3535,11 +3560,24 @@ void vkd3d_fex_pass_meter_free_list(struct d3d12_command_list *list);
+ void vkd3d_fex_pass_meter_count_clears(struct d3d12_device *device, uint32_t folded, uint32_t own_pass);
+ /* VKD3D fex11: a command recorded outside render passes (VKD3D_FEX_OUTSIDE_*), bytes it moves if known. */
+ void vkd3d_fex_pass_meter_outside(struct d3d12_command_list *list, uint32_t type, uint64_t bytes);
++/* VKD3D fex22: times one Dispatch in measured frames (all-commands timestamps right before and after it). */
++void vkd3d_fex_pass_meter_dispatch_begin(struct d3d12_command_list *list);
++void vkd3d_fex_pass_meter_dispatch_end(struct d3d12_command_list *list, uint32_t x, uint32_t y, uint32_t z);
+ static inline void vkd3d_fex_outside(struct d3d12_command_list *list, uint32_t type, uint64_t bytes)
+ {
+     if (list->fex_pass.measured)
+         vkd3d_fex_pass_meter_outside(list, type, bytes);
+ }
++static inline void vkd3d_fex_dispatch_begin(struct d3d12_command_list *list)
++{
++    if (list->fex_pass.measured)
++        vkd3d_fex_pass_meter_dispatch_begin(list);
++}
++static inline void vkd3d_fex_dispatch_end(struct d3d12_command_list *list, uint32_t x, uint32_t y, uint32_t z)
++{
++    if (list->fex_pass.dispatch_open)
++        vkd3d_fex_pass_meter_dispatch_end(list, x, y, z);
++}
+ 
+ /* FEX memory counters (VKD3D fex11, memory.c): what new GPU memory needed, counted since the last take. */
+ enum vkd3d_fex_mem_stat
+@@ -3590,6 +3628,10 @@ void vkd3d_fex_shader_copy_pso(struct d3d12_pipeline_state *state, const struct
+ void vkd3d_fex_shader_copy_spirv(VkShaderStageFlagBits stage, const struct vkd3d_shader_code *spirv);
+ bool vkd3d_fex_shader_copy_claim_code(struct d3d12_pipeline_state *state);
+ void vkd3d_fex_shader_copy_code(struct d3d12_pipeline_state *state, VkPipeline pipeline, VkResult vr);
++/* VKD3D fex22: compute shaders are copied (D3D bytecode + SPIR-V) while the pass meter runs, each once. claim returns
++ * true once per hash while there is room; the caller then hands in what it has. */
++bool vkd3d_fex_shader_copy_cs_claim(struct d3d12_device *device, vkd3d_shader_hash_t hash);
++void vkd3d_fex_shader_copy_cs(vkd3d_shader_hash_t hash, uint32_t kind, const void *data, size_t size);
+ void d3d12_command_list_invalidate_all_state(struct d3d12_command_list *list);
+ 
+ void d3d12_command_list_debug_mark_label(struct d3d12_command_list *list, const char *tag,
+-- 
+2.43.0
+
