@@ -1,0 +1,1406 @@
+From 1f086972afab3ed895461ba039b9a4a426da62ae Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:30:09 +0000
+Subject: [PATCH] FEX: start-up draw probe
+
+D2R's busy frames spend about half their GPU time on a fixed cost per
+draw (main pass ~6 us, lighting draws ~10 us), and earlier shader and
+descriptor changes didn't move it. Before rebuilding how draws are
+recorded, this measures on the device what that cost comes from: once,
+right after the device is made (while the pass meter runs), 1000 small
+draws are timed in 11 ways - no changes between draws, new push
+constants, new root constant buffers (push descriptors), both as D2R
+does, a pipeline switch, a new instance index, all 1000 in one
+multi-draw call that finds each draw's data by its draw index, one
+instanced draw, and a lit pixel shader with no changes, D2R's changes
+and in one multi-draw call. Each test is one render pass into a
+2048x2048 target timed by timestamps; best of 3 rounds less the empty
+pass. The result is a '#' note in the gpu report (reports 31-33).
+VKD3D_FEX_DRAW_PROBE=0 turns it off. Nothing about the game's
+rendering changes.
+---
+ libs/vkd3d/device.c             |   2 +
+ libs/vkd3d/fex_draw_probe.c     | 995 ++++++++++++++++++++++++++++++++
+ libs/vkd3d/fex_draw_probe_spv.h | 300 ++++++++++
+ libs/vkd3d/fex_pass_meter.c     |   7 +
+ libs/vkd3d/meson.build          |   2 +-
+ libs/vkd3d/vkd3d_private.h      |   3 +
+ 6 files changed, 1308 insertions(+), 1 deletion(-)
+ create mode 100644 libs/vkd3d/fex_draw_probe.c
+ create mode 100644 libs/vkd3d/fex_draw_probe_spv.h
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index baee92a..83bae22 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -10068,6 +10068,8 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+     vkd3d_fex_shader_copy_init();
+     vkd3d_fex_root_dedupe_init();
+     device->fex_pass_meter = vkd3d_fex_pass_meter_init(device);
++    if (device->fex_pass_meter)
++        vkd3d_fex_draw_probe(device);
+ 
+     hash_map_init(&device->vertex_input_pipelines,
+             vkd3d_vertex_input_pipeline_desc_hash,
+diff --git a/libs/vkd3d/fex_draw_probe.c b/libs/vkd3d/fex_draw_probe.c
+new file mode 100644
+index 0000000..4cc266a
+--- /dev/null
++++ b/libs/vkd3d/fex_draw_probe.c
+@@ -0,0 +1,995 @@
++/*
++ * FEX draw probe (VKD3D fex23): once, right after the device is made, times on the GPU how long small draws take when
++ * they are recorded in different ways, and puts the result in a '#' note of the gpu report (FEX's stats log). It
++ * answers whether D2R's draws are slow on Adreno because of what changes before every draw (new push constants and
++ * new root constant buffers, which Turnip turns into new register values for every draw) or because of the draws
++ * themselves, and whether drawing many objects with one call (each finding its data by its draw index) avoids it.
++ *
++ * Every test is one render pass of 1000 draws of an 8-pixel triangle into a 2048x2048 RGBA8 target (loaded and stored,
++ * so Turnip draws it straight to memory as it does D2R's big passes), timed by timestamps around the pass (the GPU
++ * finishes everything before each of them). The tests run 3 times in a row; per test the fastest round counts, less
++ * the empty pass's own time, divided by 1000. The game's own work is not touched; the probe takes well under a second
++ * of the start. Runs while the pass meter runs (VKD3D_FEX_PASSES); VKD3D_FEX_DRAW_PROBE=0 turns it off.
++ *
++ * The shaders (fex_draw_probe_spv.h, glslangValidator -V --target-env vulkan1.1):
++ *
++ * simple.vert:
++ *   layout(set = 0, binding = 0) uniform Cam { vec4 scale; } cam;
++ *   layout(set = 0, binding = 1) uniform Obj { vec4 pos; } obj;
++ *   layout(push_constant) uniform PC { uint idx; uint pad[12]; } pc;
++ *   void main() {
++ *       vec2 v = vec2(gl_VertexIndex == 1 ? 1.0 : 0.0, gl_VertexIndex == 2 ? 1.0 : 0.0);
++ *       gl_Position = vec4(obj.pos.xy + v * cam.scale.xy + vec2(float(pc.idx) * cam.scale.z), 0.0, 1.0); }
++ * simple.frag:
++ *   layout(set = 0, binding = 2) uniform Mat { vec4 color; vec4 lights[32]; } mat;
++ *   layout(location = 0) out vec4 o;
++ *   void main() { o = mat.color; }
++ * lit.frag (a lit-like pixel shader; its 32 lights are the same for the whole draw, so Turnip loads them once per
++ * draw ahead of the pixels):
++ *   layout(set = 0, binding = 2) uniform Mat { vec4 color; vec4 lights[32]; } mat;
++ *   layout(location = 0) out vec4 o;
++ *   void main() {
++ *       vec4 c = mat.color; vec2 p = gl_FragCoord.xy * 0.001;
++ *       for (int i = 0; i < 32; i++) c += mat.lights[i] * max(0.0, dot(p, mat.lights[i].xy));
++ *       o = c; }
++ * batch.vert (GL_ARB_shader_draw_parameters; the draw's data by its draw index, or by its instance index):
++ *   layout(constant_id = 0) const int USE_INSTANCE = 0;
++ *   layout(set = 0, binding = 0) uniform Cam { vec4 scale; } cam;
++ *   layout(set = 0, binding = 3, std430) readonly buffer Objs { vec4 pos[]; } objs;
++ *   layout(set = 0, binding = 4, std430) readonly buffer Mats { vec4 color[]; } mats;
++ *   layout(location = 0) flat out vec4 col;
++ *   layout(location = 1) flat out uint id;
++ *   void main() {
++ *       uint i = USE_INSTANCE != 0 ? uint(gl_InstanceIndex) : uint(gl_DrawIDARB);
++ *       vec2 v = vec2(gl_VertexIndex == 1 ? 1.0 : 0.0, gl_VertexIndex == 2 ? 1.0 : 0.0);
++ *       gl_Position = vec4(objs.pos[i].xy + v * cam.scale.xy, 0.0, 1.0);
++ *       col = mats.color[i]; id = i; }
++ * batch.frag:
++ *   layout(location = 0) flat in vec4 col;
++ *   layout(location = 0) out vec4 o;
++ *   void main() { o = col; }
++ * lit_batch.frag (lit.frag for batched draws: the lights come from the draw's block, found by its index, so they are
++ * read by the pixels themselves):
++ *   struct Mat { vec4 color; vec4 lights[32]; vec4 pad[31]; };
++ *   layout(set = 0, binding = 5, std430) readonly buffer LitMats { Mat m[]; } mats;
++ *   layout(location = 1) flat in uint id;
++ *   layout(location = 0) out vec4 o;
++ *   void main() {
++ *       vec4 c = mats.m[id].color; vec2 p = gl_FragCoord.xy * 0.001;
++ *       for (int i = 0; i < 32; i++) c += mats.m[id].lights[i] * max(0.0, dot(p, mats.m[id].lights[i].xy));
++ *       o = c; }
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "vkd3d_private.h"
++#include <stdio.h>
++#include <string.h>
++#include <inttypes.h>
++
++#include "fex_draw_probe_spv.h"
++
++#define FEX_PROBE_DRAWS 1000u
++#define FEX_PROBE_ROUNDS 3u
++#define FEX_PROBE_SIZE 2048u
++#define FEX_PROBE_STRIDE 1024u      /* per-draw block: object position at 0, material (color + 32 lights) at 256 */
++#define FEX_PROBE_MAT_OFFSET 256u
++#define FEX_PROBE_MAT_SIZE (33u * 16u)
++#define FEX_PROBE_PUSH_SIZE 52u     /* like a 13-dword root constant block */
++#define FEX_PROBE_ALIGN(x) (((x) + 255u) & ~(VkDeviceSize)255u)
++#define FEX_PROBE_BINDINGS 6u
++
++/* Where things are in the one host-visible buffer. */
++#define FEX_PROBE_CAM 0u
++#define FEX_PROBE_DRAW_BLOCKS 1024u
++#define FEX_PROBE_OBJS FEX_PROBE_ALIGN(FEX_PROBE_DRAW_BLOCKS + (VkDeviceSize)FEX_PROBE_DRAWS * FEX_PROBE_STRIDE)
++#define FEX_PROBE_COLORS FEX_PROBE_ALIGN(FEX_PROBE_OBJS + FEX_PROBE_DRAWS * 16u)
++#define FEX_PROBE_CMDS FEX_PROBE_ALIGN(FEX_PROBE_COLORS + FEX_PROBE_DRAWS * 16u)
++#define FEX_PROBE_BUFFER_SIZE FEX_PROBE_ALIGN(FEX_PROBE_CMDS + FEX_PROBE_DRAWS * sizeof(VkDrawIndirectCommand))
++
++enum fex_probe_pipeline
++{
++    FEX_PROBE_P_SIMPLE,
++    FEX_PROBE_P_SIMPLE2,    /* the same as FEX_PROBE_P_SIMPLE, another pipeline object */
++    FEX_PROBE_P_LIT,
++    FEX_PROBE_P_INSTANCE,
++    FEX_PROBE_P_BATCH,
++    FEX_PROBE_P_LIT_BATCH,
++    FEX_PROBE_P_COUNT,
++};
++
++enum fex_probe_test
++{
++    FEX_PROBE_T_EMPTY,
++    FEX_PROBE_T_NONE,
++    FEX_PROBE_T_CONSTS,
++    FEX_PROBE_T_CBVS,
++    FEX_PROBE_T_BOTH,
++    FEX_PROBE_T_PIPELINE,
++    FEX_PROBE_T_FIRST_INSTANCE,
++    FEX_PROBE_T_MULTI_DRAW,
++    FEX_PROBE_T_INSTANCED,
++    FEX_PROBE_T_LIT_NONE,
++    FEX_PROBE_T_LIT_BOTH,
++    FEX_PROBE_T_LIT_MULTI_DRAW,
++    FEX_PROBE_T_COUNT,
++};
++
++static const char * const fex_probe_test_names[FEX_PROBE_T_COUNT] =
++{
++    "empty pass",
++    "no changes",
++    "push constants",
++    "root CBVs",
++    "both (like D2R)",
++    "pipeline switch",
++    "first instance",
++    "one multi-draw call",
++    "one instanced draw",
++    "lit, no changes",
++    "lit, both (like D2R)",
++    "lit, one multi-draw call",
++};
++
++struct fex_probe
++{
++    struct d3d12_device *device;
++    const struct vkd3d_vk_device_procs *vk_procs;
++    VkDevice vk_device;
++
++    VkImage image;
++    VkImageView view;
++    VkDeviceMemory image_memory;
++    VkBuffer buffer;
++    VkDeviceMemory buffer_memory;
++    VkDescriptorSetLayout set_layout;
++    VkPipelineLayout layout;
++    VkShaderModule modules[6];
++    VkPipeline pipelines[FEX_PROBE_P_COUNT];
++    VkQueryPool pool;
++    VkCommandPool cmd_pool;
++    VkCommandBuffer cmd;
++    VkFence fence;
++    bool multi_draw;
++};
++
++static char fex_probe_text[2048];
++static uint32_t fex_probe_state; /* 0 not run, 1 running, 2 text ready */
++
++const char *vkd3d_fex_draw_probe_result(void)
++{
++    if (vkd3d_atomic_uint32_load_explicit(&fex_probe_state, vkd3d_memory_order_acquire) != 2)
++        return NULL;
++    return fex_probe_text[0] ? fex_probe_text : NULL;
++}
++
++static void fex_probe_set_text(const char *fmt, ...)
++{
++    va_list args;
++
++    va_start(args, fmt);
++    vsnprintf(fex_probe_text, sizeof(fex_probe_text), fmt, args);
++    va_end(args);
++}
++
++static uint32_t fex_probe_memory_type(const struct d3d12_device *device, uint32_t type_bits, VkMemoryPropertyFlags flags)
++{
++    const VkPhysicalDeviceMemoryProperties *props = &device->memory_properties;
++    uint32_t i;
++
++    for (i = 0; i < props->memoryTypeCount; i++)
++    {
++        if ((type_bits & (1u << i)) && (props->memoryTypes[i].propertyFlags & flags) == flags)
++            return i;
++    }
++    return UINT32_MAX;
++}
++
++static bool fex_probe_alloc(struct fex_probe *p, const VkMemoryRequirements *reqs, VkMemoryPropertyFlags flags,
++        VkDeviceMemory *memory)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    VkMemoryAllocateInfo info;
++    uint32_t type;
++
++    if ((type = fex_probe_memory_type(p->device, reqs->memoryTypeBits, flags)) == UINT32_MAX)
++        return false;
++    memset(&info, 0, sizeof(info));
++    info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    info.allocationSize = reqs->size;
++    info.memoryTypeIndex = type;
++    return VK_CALL(vkAllocateMemory(p->vk_device, &info, NULL, memory)) == VK_SUCCESS;
++}
++
++static bool fex_probe_create_target(struct fex_probe *p)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    VkBindImageMemoryInfo bind_info;
++    VkImageViewCreateInfo view_info;
++    VkImageCreateInfo image_info;
++    VkMemoryRequirements reqs;
++
++    memset(&image_info, 0, sizeof(image_info));
++    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    image_info.imageType = VK_IMAGE_TYPE_2D;
++    image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++    image_info.extent.width = FEX_PROBE_SIZE;
++    image_info.extent.height = FEX_PROBE_SIZE;
++    image_info.extent.depth = 1;
++    image_info.mipLevels = 1;
++    image_info.arrayLayers = 1;
++    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++    image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (VK_CALL(vkCreateImage(p->vk_device, &image_info, NULL, &p->image)) != VK_SUCCESS)
++        return false;
++
++    VK_CALL(vkGetImageMemoryRequirements(p->vk_device, p->image, &reqs));
++    if (!fex_probe_alloc(p, &reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &p->image_memory))
++        return false;
++    memset(&bind_info, 0, sizeof(bind_info));
++    bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
++    bind_info.image = p->image;
++    bind_info.memory = p->image_memory;
++    if (VK_CALL(vkBindImageMemory2(p->vk_device, 1, &bind_info)) != VK_SUCCESS)
++        return false;
++
++    memset(&view_info, 0, sizeof(view_info));
++    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    view_info.image = p->image;
++    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    view_info.format = image_info.format;
++    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    view_info.subresourceRange.levelCount = 1;
++    view_info.subresourceRange.layerCount = 1;
++    return VK_CALL(vkCreateImageView(p->vk_device, &view_info, NULL, &p->view)) == VK_SUCCESS;
++}
++
++static bool fex_probe_create_buffer(struct fex_probe *p)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    VkDrawIndirectCommand *cmds;
++    VkBindBufferMemoryInfo bind_info;
++    VkBufferCreateInfo buffer_info;
++    VkMemoryRequirements reqs;
++    float *f, x, y;
++    uint8_t *data;
++    void *map;
++    uint32_t i, k;
++
++    memset(&buffer_info, 0, sizeof(buffer_info));
++    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++    buffer_info.size = FEX_PROBE_BUFFER_SIZE;
++    buffer_info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
++    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    if (VK_CALL(vkCreateBuffer(p->vk_device, &buffer_info, NULL, &p->buffer)) != VK_SUCCESS)
++        return false;
++
++    VK_CALL(vkGetBufferMemoryRequirements(p->vk_device, p->buffer, &reqs));
++    if (!fex_probe_alloc(p, &reqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++            &p->buffer_memory))
++        return false;
++    memset(&bind_info, 0, sizeof(bind_info));
++    bind_info.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
++    bind_info.buffer = p->buffer;
++    bind_info.memory = p->buffer_memory;
++    if (VK_CALL(vkBindBufferMemory2(p->vk_device, 1, &bind_info)) != VK_SUCCESS)
++        return false;
++    if (VK_CALL(vkMapMemory(p->vk_device, p->buffer_memory, 0, VK_WHOLE_SIZE, 0, &map)) != VK_SUCCESS)
++        return false;
++
++    data = map;
++    memset(data, 0, FEX_PROBE_BUFFER_SIZE);
++
++    /* 8-pixel triangles (2 clip space units = 2048 pixels); the push constant index moves one by a pixel. */
++    f = (float *)(data + FEX_PROBE_CAM);
++    f[0] = 8.0f / 1024.0f;
++    f[1] = 8.0f / 1024.0f;
++    f[2] = 1.0f / 1024.0f;
++
++    for (i = 0; i < FEX_PROBE_DRAWS; i++)
++    {
++        /* A 40 x 25 grid over the target, so the draws don't paint over each other. */
++        x = -0.95f + (float)(i % 40u) * 0.0475f;
++        y = -0.95f + (float)(i / 40u) * 0.075f;
++
++        f = (float *)(data + FEX_PROBE_DRAW_BLOCKS + (VkDeviceSize)i * FEX_PROBE_STRIDE);
++        f[0] = x;
++        f[1] = y;
++        f = (float *)(data + FEX_PROBE_DRAW_BLOCKS + (VkDeviceSize)i * FEX_PROBE_STRIDE + FEX_PROBE_MAT_OFFSET);
++        f[0] = (float)(i % 7u) / 7.0f;
++        f[1] = (float)(i % 5u) / 5.0f;
++        f[2] = (float)(i % 3u) / 3.0f;
++        f[3] = 1.0f;
++        for (k = 0; k < 32; k++)
++        {
++            f[4 + 4 * k + 0] = 0.01f * (float)(k + 1);
++            f[4 + 4 * k + 1] = 0.02f * (float)((k + i) % 9u);
++            f[4 + 4 * k + 2] = 0.005f;
++            f[4 + 4 * k + 3] = 0.0f;
++        }
++
++        f = (float *)(data + FEX_PROBE_OBJS + i * 16u);
++        f[0] = x;
++        f[1] = y;
++        f = (float *)(data + FEX_PROBE_COLORS + i * 16u);
++        f[0] = (float)(i % 7u) / 7.0f;
++        f[1] = (float)(i % 5u) / 5.0f;
++        f[2] = (float)(i % 3u) / 3.0f;
++        f[3] = 1.0f;
++    }
++
++    cmds = (VkDrawIndirectCommand *)(data + FEX_PROBE_CMDS);
++    for (i = 0; i < FEX_PROBE_DRAWS; i++)
++    {
++        cmds[i].vertexCount = 3;
++        cmds[i].instanceCount = 1;
++        cmds[i].firstVertex = 0;
++        cmds[i].firstInstance = 0;
++    }
++
++    VK_CALL(vkUnmapMemory(p->vk_device, p->buffer_memory));
++    return true;
++}
++
++static bool fex_probe_create_layout(struct fex_probe *p)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    VkDescriptorSetLayoutBinding bindings[FEX_PROBE_BINDINGS];
++    VkDescriptorSetLayoutCreateInfo set_info;
++    VkPipelineLayoutCreateInfo layout_info;
++    VkPushConstantRange push_range;
++    uint32_t i;
++
++    for (i = 0; i < FEX_PROBE_BINDINGS; i++)
++    {
++        bindings[i].binding = i;
++        bindings[i].descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        bindings[i].descriptorCount = 1;
++        bindings[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++        bindings[i].pImmutableSamplers = NULL;
++    }
++    memset(&set_info, 0, sizeof(set_info));
++    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++    set_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
++    set_info.bindingCount = FEX_PROBE_BINDINGS;
++    set_info.pBindings = bindings;
++    if (VK_CALL(vkCreateDescriptorSetLayout(p->vk_device, &set_info, NULL, &p->set_layout)) != VK_SUCCESS)
++        return false;
++
++    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++    push_range.offset = 0;
++    push_range.size = FEX_PROBE_PUSH_SIZE;
++    memset(&layout_info, 0, sizeof(layout_info));
++    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    layout_info.setLayoutCount = 1;
++    layout_info.pSetLayouts = &p->set_layout;
++    layout_info.pushConstantRangeCount = 1;
++    layout_info.pPushConstantRanges = &push_range;
++    return VK_CALL(vkCreatePipelineLayout(p->vk_device, &layout_info, NULL, &p->layout)) == VK_SUCCESS;
++}
++
++static bool fex_probe_create_pipelines(struct fex_probe *p)
++{
++    static const struct { const uint32_t *code; size_t size; } spirv[6] =
++    {
++        { fex_probe_simple_vert, sizeof(fex_probe_simple_vert) },
++        { fex_probe_simple_frag, sizeof(fex_probe_simple_frag) },
++        { fex_probe_lit_frag, sizeof(fex_probe_lit_frag) },
++        { fex_probe_batch_vert, sizeof(fex_probe_batch_vert) },
++        { fex_probe_batch_frag, sizeof(fex_probe_batch_frag) },
++        { fex_probe_lit_batch_frag, sizeof(fex_probe_lit_batch_frag) },
++    };
++    /* vertex module, fragment module, USE_INSTANCE */
++    static const uint32_t shaders[FEX_PROBE_P_COUNT][3] =
++    {
++        { 0, 1, 0 },    /* simple */
++        { 0, 1, 0 },    /* simple, again */
++        { 0, 2, 0 },    /* lit */
++        { 3, 4, 1 },    /* by instance index */
++        { 3, 4, 0 },    /* by draw index */
++        { 3, 5, 0 },    /* lit, by draw index */
++    };
++    static const VkDynamicState dynamic_states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    VkPipelineColorBlendAttachmentState blend_attachment;
++    VkPipelineInputAssemblyStateCreateInfo input_assembly;
++    VkPipelineVertexInputStateCreateInfo vertex_input;
++    VkPipelineRasterizationStateCreateInfo raster;
++    VkPipelineMultisampleStateCreateInfo multisample;
++    VkPipelineDynamicStateCreateInfo dynamic_state;
++    VkPipelineColorBlendStateCreateInfo blend;
++    VkPipelineViewportStateCreateInfo viewport;
++    VkPipelineShaderStageCreateInfo stages[2];
++    VkPipelineRenderingCreateInfo rendering;
++    VkGraphicsPipelineCreateInfo info;
++    VkShaderModuleCreateInfo module_info;
++    VkSpecializationMapEntry spec_entry;
++    VkSpecializationInfo spec_info;
++    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
++    uint32_t i, use_instance;
++
++    for (i = 0; i < ARRAY_SIZE(spirv); i++)
++    {
++        memset(&module_info, 0, sizeof(module_info));
++        module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++        module_info.codeSize = spirv[i].size;
++        module_info.pCode = spirv[i].code;
++        if (VK_CALL(vkCreateShaderModule(p->vk_device, &module_info, NULL, &p->modules[i])) != VK_SUCCESS)
++            return false;
++    }
++
++    memset(&vertex_input, 0, sizeof(vertex_input));
++    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++    memset(&input_assembly, 0, sizeof(input_assembly));
++    input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    memset(&viewport, 0, sizeof(viewport));
++    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++    viewport.viewportCount = 1;
++    viewport.scissorCount = 1;
++    memset(&raster, 0, sizeof(raster));
++    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++    raster.polygonMode = VK_POLYGON_MODE_FILL;
++    raster.cullMode = VK_CULL_MODE_NONE;
++    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    raster.lineWidth = 1.0f;
++    memset(&multisample, 0, sizeof(multisample));
++    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++    memset(&blend_attachment, 0, sizeof(blend_attachment));
++    blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++    memset(&blend, 0, sizeof(blend));
++    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++    blend.attachmentCount = 1;
++    blend.pAttachments = &blend_attachment;
++    memset(&dynamic_state, 0, sizeof(dynamic_state));
++    dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++    dynamic_state.dynamicStateCount = ARRAY_SIZE(dynamic_states);
++    dynamic_state.pDynamicStates = dynamic_states;
++    memset(&rendering, 0, sizeof(rendering));
++    rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++    rendering.colorAttachmentCount = 1;
++    rendering.pColorAttachmentFormats = &format;
++
++    spec_entry.constantID = 0;
++    spec_entry.offset = 0;
++    spec_entry.size = sizeof(use_instance);
++    spec_info.mapEntryCount = 1;
++    spec_info.pMapEntries = &spec_entry;
++    spec_info.dataSize = sizeof(use_instance);
++    spec_info.pData = &use_instance;
++
++    for (i = 0; i < FEX_PROBE_P_COUNT; i++)
++    {
++        if ((i == FEX_PROBE_P_BATCH || i == FEX_PROBE_P_LIT_BATCH) && !p->multi_draw)
++            continue;
++
++        use_instance = shaders[i][2];
++        memset(stages, 0, sizeof(stages));
++        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++        stages[0].module = p->modules[shaders[i][0]];
++        stages[0].pName = "main";
++        stages[0].pSpecializationInfo = shaders[i][0] == 3 ? &spec_info : NULL;
++        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++        stages[1].module = p->modules[shaders[i][1]];
++        stages[1].pName = "main";
++
++        memset(&info, 0, sizeof(info));
++        info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++        info.pNext = &rendering;
++        info.stageCount = 2;
++        info.pStages = stages;
++        info.pVertexInputState = &vertex_input;
++        info.pInputAssemblyState = &input_assembly;
++        info.pViewportState = &viewport;
++        info.pRasterizationState = &raster;
++        info.pMultisampleState = &multisample;
++        info.pColorBlendState = &blend;
++        info.pDynamicState = &dynamic_state;
++        info.layout = p->layout;
++        info.basePipelineIndex = -1;
++        if (VK_CALL(vkCreateGraphicsPipelines(p->vk_device, VK_NULL_HANDLE, 1, &info, NULL,
++                &p->pipelines[i])) != VK_SUCCESS)
++            return false;
++    }
++    return true;
++}
++
++static void fex_probe_buffer_write(VkWriteDescriptorSet *write, VkDescriptorBufferInfo *info, uint32_t binding,
++        VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range)
++{
++    info->buffer = buffer;
++    info->offset = offset;
++    info->range = range;
++    memset(write, 0, sizeof(*write));
++    write->sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    write->dstBinding = binding;
++    write->descriptorCount = 1;
++    write->descriptorType = binding < 3 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    write->pBufferInfo = info;
++}
++
++/* Push bindings first..first+count-1 for draw 'draw' (bindings 1 and 2 are the draw's own blocks). */
++static void fex_probe_push_set(struct fex_probe *p, uint32_t first, uint32_t count, uint32_t draw)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    VkWriteDescriptorSet writes[FEX_PROBE_BINDINGS];
++    VkDescriptorBufferInfo infos[FEX_PROBE_BINDINGS];
++    VkDeviceSize block = FEX_PROBE_DRAW_BLOCKS + (VkDeviceSize)draw * FEX_PROBE_STRIDE;
++    uint32_t i, n = 0;
++
++    for (i = first; i < first + count; i++, n++)
++    {
++        switch (i)
++        {
++            case 0:
++                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, FEX_PROBE_CAM, 16);
++                break;
++            case 1:
++                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, block, 16);
++                break;
++            case 2:
++                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, block + FEX_PROBE_MAT_OFFSET,
++                        FEX_PROBE_MAT_SIZE);
++                break;
++            case 3:
++                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, FEX_PROBE_OBJS, FEX_PROBE_DRAWS * 16u);
++                break;
++            case 4:
++                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, FEX_PROBE_COLORS, FEX_PROBE_DRAWS * 16u);
++                break;
++            default:
++                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer,
++                        FEX_PROBE_DRAW_BLOCKS + FEX_PROBE_MAT_OFFSET,
++                        (VkDeviceSize)FEX_PROBE_DRAWS * FEX_PROBE_STRIDE - FEX_PROBE_MAT_OFFSET);
++                break;
++        }
++    }
++    VK_CALL(vkCmdPushDescriptorSetKHR(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, n, writes));
++}
++
++static void fex_probe_push_consts(struct fex_probe *p, uint32_t draw)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    uint32_t consts[FEX_PROBE_PUSH_SIZE / 4];
++
++    memset(consts, 0, sizeof(consts));
++    consts[0] = draw;
++    consts[1] = draw * 3u;
++    VK_CALL(vkCmdPushConstants(p->cmd, p->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
++            0, sizeof(consts), consts));
++}
++
++static void fex_probe_record_test(struct fex_probe *p, enum fex_probe_test test)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    enum fex_probe_pipeline pipeline;
++    VkViewport viewport;
++    VkRect2D scissor;
++    uint32_t i;
++
++    switch (test)
++    {
++        case FEX_PROBE_T_FIRST_INSTANCE:
++        case FEX_PROBE_T_INSTANCED:
++            pipeline = FEX_PROBE_P_INSTANCE;
++            break;
++        case FEX_PROBE_T_MULTI_DRAW:
++            pipeline = FEX_PROBE_P_BATCH;
++            break;
++        case FEX_PROBE_T_LIT_NONE:
++        case FEX_PROBE_T_LIT_BOTH:
++            pipeline = FEX_PROBE_P_LIT;
++            break;
++        case FEX_PROBE_T_LIT_MULTI_DRAW:
++            pipeline = FEX_PROBE_P_LIT_BATCH;
++            break;
++        default:
++            pipeline = FEX_PROBE_P_SIMPLE;
++            break;
++    }
++    if (!p->pipelines[pipeline])
++        return;
++
++    VK_CALL(vkCmdBindPipeline(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipelines[pipeline]));
++    viewport.x = 0.0f;
++    viewport.y = 0.0f;
++    viewport.width = (float)FEX_PROBE_SIZE;
++    viewport.height = (float)FEX_PROBE_SIZE;
++    viewport.minDepth = 0.0f;
++    viewport.maxDepth = 1.0f;
++    VK_CALL(vkCmdSetViewport(p->cmd, 0, 1, &viewport));
++    scissor.offset.x = 0;
++    scissor.offset.y = 0;
++    scissor.extent.width = FEX_PROBE_SIZE;
++    scissor.extent.height = FEX_PROBE_SIZE;
++    VK_CALL(vkCmdSetScissor(p->cmd, 0, 1, &scissor));
++    fex_probe_push_set(p, 0, FEX_PROBE_BINDINGS, 0);
++    fex_probe_push_consts(p, 0);
++
++    switch (test)
++    {
++        case FEX_PROBE_T_NONE:
++        case FEX_PROBE_T_LIT_NONE:
++            for (i = 0; i < FEX_PROBE_DRAWS; i++)
++                VK_CALL(vkCmdDraw(p->cmd, 3, 1, 0, 0));
++            break;
++        case FEX_PROBE_T_CONSTS:
++            for (i = 0; i < FEX_PROBE_DRAWS; i++)
++            {
++                fex_probe_push_consts(p, i);
++                VK_CALL(vkCmdDraw(p->cmd, 3, 1, 0, 0));
++            }
++            break;
++        case FEX_PROBE_T_CBVS:
++            for (i = 0; i < FEX_PROBE_DRAWS; i++)
++            {
++                fex_probe_push_set(p, 1, 2, i);
++                VK_CALL(vkCmdDraw(p->cmd, 3, 1, 0, 0));
++            }
++            break;
++        case FEX_PROBE_T_BOTH:
++        case FEX_PROBE_T_LIT_BOTH:
++            for (i = 0; i < FEX_PROBE_DRAWS; i++)
++            {
++                fex_probe_push_set(p, 1, 2, i);
++                fex_probe_push_consts(p, i);
++                VK_CALL(vkCmdDraw(p->cmd, 3, 1, 0, 0));
++            }
++            break;
++        case FEX_PROBE_T_PIPELINE:
++            for (i = 0; i < FEX_PROBE_DRAWS; i++)
++            {
++                VK_CALL(vkCmdBindPipeline(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                        p->pipelines[(i & 1) ? FEX_PROBE_P_SIMPLE2 : FEX_PROBE_P_SIMPLE]));
++                VK_CALL(vkCmdDraw(p->cmd, 3, 1, 0, 0));
++            }
++            break;
++        case FEX_PROBE_T_FIRST_INSTANCE:
++            for (i = 0; i < FEX_PROBE_DRAWS; i++)
++                VK_CALL(vkCmdDraw(p->cmd, 3, 1, 0, i));
++            break;
++        case FEX_PROBE_T_INSTANCED:
++            VK_CALL(vkCmdDraw(p->cmd, 3, FEX_PROBE_DRAWS, 0, 0));
++            break;
++        case FEX_PROBE_T_MULTI_DRAW:
++        case FEX_PROBE_T_LIT_MULTI_DRAW:
++            VK_CALL(vkCmdDrawIndirect(p->cmd, p->buffer, FEX_PROBE_CMDS, FEX_PROBE_DRAWS,
++                    sizeof(VkDrawIndirectCommand)));
++            break;
++        default:
++            break;
++    }
++}
++
++static bool fex_probe_record(struct fex_probe *p)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    VkRenderingAttachmentInfo attachment;
++    VkCommandBufferBeginInfo begin_info;
++    VkImageMemoryBarrier2 image_barrier;
++    VkMemoryBarrier2 memory_barrier;
++    VkRenderingInfo rendering;
++    VkDependencyInfo dep;
++    uint32_t round, test, query;
++
++    memset(&begin_info, 0, sizeof(begin_info));
++    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    if (VK_CALL(vkBeginCommandBuffer(p->cmd, &begin_info)) != VK_SUCCESS)
++        return false;
++
++    VK_CALL(vkCmdResetQueryPool(p->cmd, p->pool, 0, 2 * FEX_PROBE_ROUNDS * FEX_PROBE_T_COUNT));
++
++    memset(&image_barrier, 0, sizeof(image_barrier));
++    image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++    image_barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
++    image_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++    image_barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
++    image_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    image_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    image_barrier.image = p->image;
++    image_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    image_barrier.subresourceRange.levelCount = 1;
++    image_barrier.subresourceRange.layerCount = 1;
++    memset(&dep, 0, sizeof(dep));
++    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep.imageMemoryBarrierCount = 1;
++    dep.pImageMemoryBarriers = &image_barrier;
++    VK_CALL(vkCmdPipelineBarrier2(p->cmd, &dep));
++
++    /* Between the passes (outside the timed span): each pass loads what the one before stored. */
++    memset(&memory_barrier, 0, sizeof(memory_barrier));
++    memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    memory_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++    memory_barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
++    memory_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++    memory_barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
++
++    memset(&attachment, 0, sizeof(attachment));
++    attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++    attachment.imageView = p->view;
++    attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    memset(&rendering, 0, sizeof(rendering));
++    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++    rendering.renderArea.extent.width = FEX_PROBE_SIZE;
++    rendering.renderArea.extent.height = FEX_PROBE_SIZE;
++    rendering.layerCount = 1;
++    rendering.colorAttachmentCount = 1;
++    rendering.pColorAttachments = &attachment;
++
++    for (round = 0; round < FEX_PROBE_ROUNDS; round++)
++    {
++        for (test = 0; test < FEX_PROBE_T_COUNT; test++)
++        {
++            query = 2 * (round * FEX_PROBE_T_COUNT + test);
++            memset(&dep, 0, sizeof(dep));
++            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++            dep.memoryBarrierCount = 1;
++            dep.pMemoryBarriers = &memory_barrier;
++            VK_CALL(vkCmdPipelineBarrier2(p->cmd, &dep));
++
++            VK_CALL(vkCmdWriteTimestamp2(p->cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, p->pool, query));
++            VK_CALL(vkCmdBeginRendering(p->cmd, &rendering));
++            if (test != FEX_PROBE_T_EMPTY)
++                fex_probe_record_test(p, test);
++            VK_CALL(vkCmdEndRendering(p->cmd));
++            VK_CALL(vkCmdWriteTimestamp2(p->cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, p->pool, query + 1));
++        }
++    }
++
++    return VK_CALL(vkEndCommandBuffer(p->cmd)) == VK_SUCCESS;
++}
++
++/* Returns false when the GPU may still use the objects (they are then left alone, not destroyed). */
++static bool fex_probe_run(struct fex_probe *p, uint64_t *results, VkResult *vr)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    struct vkd3d_queue_family_info *family = p->device->queue_families[VKD3D_QUEUE_FAMILY_GRAPHICS];
++    VkCommandBufferSubmitInfo cmd_info;
++    VkSubmitInfo2 submit;
++    VkQueue vk_queue;
++
++    memset(&cmd_info, 0, sizeof(cmd_info));
++    cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
++    cmd_info.commandBuffer = p->cmd;
++    memset(&submit, 0, sizeof(submit));
++    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
++    submit.commandBufferInfoCount = 1;
++    submit.pCommandBufferInfos = &cmd_info;
++
++    if (!(vk_queue = vkd3d_queue_acquire(family->queues[0])))
++    {
++        *vr = VK_ERROR_INITIALIZATION_FAILED;
++        return true;
++    }
++    *vr = VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit, p->fence));
++    vkd3d_queue_release(family->queues[0]);
++    if (*vr != VK_SUCCESS)
++        return true;
++
++    if ((*vr = VK_CALL(vkWaitForFences(p->vk_device, 1, &p->fence, VK_TRUE, 2000000000ull))) != VK_SUCCESS)
++        return false;
++
++    *vr = VK_CALL(vkGetQueryPoolResults(p->vk_device, p->pool, 0, 2 * FEX_PROBE_ROUNDS * FEX_PROBE_T_COUNT,
++            2 * FEX_PROBE_ROUNDS * FEX_PROBE_T_COUNT * sizeof(*results), results, sizeof(*results),
++            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
++    return true;
++}
++
++static void fex_probe_destroy(struct fex_probe *p)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = p->vk_procs;
++    uint32_t i;
++
++    VK_CALL(vkDestroyFence(p->vk_device, p->fence, NULL));
++    VK_CALL(vkDestroyCommandPool(p->vk_device, p->cmd_pool, NULL));
++    VK_CALL(vkDestroyQueryPool(p->vk_device, p->pool, NULL));
++    for (i = 0; i < FEX_PROBE_P_COUNT; i++)
++        VK_CALL(vkDestroyPipeline(p->vk_device, p->pipelines[i], NULL));
++    for (i = 0; i < ARRAY_SIZE(p->modules); i++)
++        VK_CALL(vkDestroyShaderModule(p->vk_device, p->modules[i], NULL));
++    VK_CALL(vkDestroyPipelineLayout(p->vk_device, p->layout, NULL));
++    VK_CALL(vkDestroyDescriptorSetLayout(p->vk_device, p->set_layout, NULL));
++    VK_CALL(vkDestroyImageView(p->vk_device, p->view, NULL));
++    VK_CALL(vkDestroyImage(p->vk_device, p->image, NULL));
++    VK_CALL(vkFreeMemory(p->vk_device, p->image_memory, NULL));
++    VK_CALL(vkDestroyBuffer(p->vk_device, p->buffer, NULL));
++    VK_CALL(vkFreeMemory(p->vk_device, p->buffer_memory, NULL));
++}
++
++/* The text's length after snprintf wrote n more characters at len (it cuts at the end of the buffer). */
++static size_t fex_probe_len(size_t len, int n)
++{
++    return len + (size_t)n >= sizeof(fex_probe_text) ? sizeof(fex_probe_text) - 1 : len + (size_t)n;
++}
++
++static void fex_probe_report(struct fex_probe *p, const uint64_t *results, uint64_t cpu_ns)
++{
++    const struct vkd3d_queue_family_info *family = p->device->queue_families[VKD3D_QUEUE_FAMILY_GRAPHICS];
++    const double ns_per_tick = p->device->device_info.properties2.properties.limits.timestampPeriod;
++    uint64_t best[FEX_PROBE_T_COUNT], worst[FEX_PROBE_T_COUNT], ticks, mask;
++    uint32_t round, test;
++    size_t len;
++    int n;
++
++    mask = family->timestamp_bits >= 64 ? ~(uint64_t)0 : ((uint64_t)1 << family->timestamp_bits) - 1;
++    for (test = 0; test < FEX_PROBE_T_COUNT; test++)
++    {
++        best[test] = UINT64_MAX;
++        worst[test] = 0;
++        for (round = 0; round < FEX_PROBE_ROUNDS; round++)
++        {
++            const uint64_t *q = &results[2 * (round * FEX_PROBE_T_COUNT + test)];
++
++            ticks = (q[1] - q[0]) & mask;
++            if (ticks < best[test])
++                best[test] = ticks;
++            if (ticks > worst[test])
++                worst[test] = ticks;
++        }
++    }
++
++    len = 0;
++    n = snprintf(fex_probe_text, sizeof(fex_probe_text),
++            "# draw probe (VKD3D fex23): GPU time per draw, 1000 small draws per test (8-pixel triangles into a 2048x2048"
++            " target, one render pass per test, best of %u rounds, slowest round in brackets, the empty pass's own"
++            " %.0f us taken off; probe took %.0f ms at device start, VKD3D_FEX_DRAW_PROBE=0 turns it off): ",
++            FEX_PROBE_ROUNDS, best[FEX_PROBE_T_EMPTY] * ns_per_tick / 1000.0, cpu_ns / 1e6);
++    if (n > 0)
++        len = fex_probe_len(0, n);
++
++    for (test = FEX_PROBE_T_EMPTY + 1; test < FEX_PROBE_T_COUNT && len < sizeof(fex_probe_text) - 1; test++)
++    {
++        if (!p->pipelines[test == FEX_PROBE_T_MULTI_DRAW ? FEX_PROBE_P_BATCH :
++                test == FEX_PROBE_T_LIT_MULTI_DRAW ? FEX_PROBE_P_LIT_BATCH : FEX_PROBE_P_SIMPLE])
++        {
++            n = snprintf(fex_probe_text + len, sizeof(fex_probe_text) - len, "%s n/a (no multi-draw)%s",
++                    fex_probe_test_names[test], test + 1 < FEX_PROBE_T_COUNT ? " | " : "\n");
++        }
++        else
++        {
++            n = snprintf(fex_probe_text + len, sizeof(fex_probe_text) - len, "%s %.2f us (%.2f)%s",
++                    fex_probe_test_names[test],
++                    ((double)best[test] - (double)best[FEX_PROBE_T_EMPTY]) * ns_per_tick / 1000.0 / FEX_PROBE_DRAWS,
++                    ((double)worst[test] - (double)best[FEX_PROBE_T_EMPTY]) * ns_per_tick / 1000.0 / FEX_PROBE_DRAWS,
++                    test + 1 < FEX_PROBE_T_COUNT ? " | " : "\n");
++        }
++        if (n > 0)
++            len = fex_probe_len(len, n);
++    }
++
++    n = snprintf(fex_probe_text + len, sizeof(fex_probe_text) - len,
++            "# draw probe tests: 'both (like D2R)' = new push constants and new root constant buffers (push"
++            " descriptors) before every draw, as D2R does; 'push constants' / 'root CBVs' = only that one; 'pipeline"
++            " switch' = another pipeline object every draw; 'first instance' = every draw its own instance index;"
++            " 'one multi-draw call' = all 1000 in one vkCmdDrawIndirect, each finding its data by its draw index;"
++            " 'one instanced draw' = 1000 instances in one draw; 'lit' = a pixel shader with 32 lights (loaded once per"
++            " draw ahead of the pixels; in the multi-draw test the pixels read them by the draw index)\n");
++    if (n > 0)
++        len = fex_probe_len(len, n);
++    fex_probe_text[len] = 0;
++}
++
++void vkd3d_fex_draw_probe(struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_queue_family_info *family = device->queue_families[VKD3D_QUEUE_FAMILY_GRAPHICS];
++    uint64_t results[2 * FEX_PROBE_ROUNDS * FEX_PROBE_T_COUNT];
++    VkCommandBufferAllocateInfo alloc_info;
++    VkCommandPoolCreateInfo pool_info;
++    VkQueryPoolCreateInfo query_info;
++    VkFenceCreateInfo fence_info;
++    uint64_t start_ns;
++    struct fex_probe p;
++    const char *step;
++    VkResult vr;
++    char env[16];
++
++    if (vkd3d_get_env_var("VKD3D_FEX_DRAW_PROBE", env, sizeof(env)) && !strcmp(env, "0"))
++        return;
++    if (!family || !family->queue_count || !family->timestamp_bits || !vk_procs->vkCmdPushDescriptorSetKHR)
++    {
++        INFO("FEX draw probe: not possible here (queue %u, timestamp bits %u, push descriptors %s).\n",
++                family ? family->queue_count : 0, family ? family->timestamp_bits : 0,
++                vk_procs->vkCmdPushDescriptorSetKHR ? "yes" : "no");
++        return;
++    }
++    /* Once per process: the first device. */
++    if (vkd3d_atomic_uint32_compare_exchange(&fex_probe_state, 0, 1, vkd3d_memory_order_acq_rel,
++            vkd3d_memory_order_acquire) != 0)
++        return;
++
++    start_ns = vkd3d_get_current_time_ns();
++    memset(&p, 0, sizeof(p));
++    p.device = device;
++    p.vk_procs = vk_procs;
++    p.vk_device = device->vk_device;
++    p.multi_draw = device->device_info.features2.features.multiDrawIndirect &&
++            device->device_info.vulkan_1_1_features.shaderDrawParameters;
++    vr = VK_SUCCESS;
++
++    step = "target";
++    if (!fex_probe_create_target(&p))
++        goto fail;
++    step = "buffer";
++    if (!fex_probe_create_buffer(&p))
++        goto fail;
++    step = "layout";
++    if (!fex_probe_create_layout(&p))
++        goto fail;
++    step = "pipelines";
++    if (!fex_probe_create_pipelines(&p))
++        goto fail;
++
++    step = "timers";
++    memset(&query_info, 0, sizeof(query_info));
++    query_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++    query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++    query_info.queryCount = 2 * FEX_PROBE_ROUNDS * FEX_PROBE_T_COUNT;
++    if (VK_CALL(vkCreateQueryPool(p.vk_device, &query_info, NULL, &p.pool)) != VK_SUCCESS)
++        goto fail;
++
++    step = "command buffer";
++    memset(&pool_info, 0, sizeof(pool_info));
++    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
++    pool_info.queueFamilyIndex = family->vk_family_index;
++    if (VK_CALL(vkCreateCommandPool(p.vk_device, &pool_info, NULL, &p.cmd_pool)) != VK_SUCCESS)
++        goto fail;
++    memset(&alloc_info, 0, sizeof(alloc_info));
++    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++    alloc_info.commandPool = p.cmd_pool;
++    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    alloc_info.commandBufferCount = 1;
++    if (VK_CALL(vkAllocateCommandBuffers(p.vk_device, &alloc_info, &p.cmd)) != VK_SUCCESS)
++        goto fail;
++    memset(&fence_info, 0, sizeof(fence_info));
++    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++    if (VK_CALL(vkCreateFence(p.vk_device, &fence_info, NULL, &p.fence)) != VK_SUCCESS)
++        goto fail;
++
++    step = "recording";
++    if (!fex_probe_record(&p))
++        goto fail;
++
++    step = "run";
++    if (!fex_probe_run(&p, results, &vr))
++    {
++        /* The GPU may still be on it: leave everything as it is (a few MB, once). */
++        fex_probe_set_text("# draw probe (VKD3D fex23): the GPU didn't finish the test within 2 s (%d); no result\n", vr);
++        INFO("%s", fex_probe_text);
++        vkd3d_atomic_uint32_store_explicit(&fex_probe_state, 2, vkd3d_memory_order_release);
++        return;
++    }
++    if (vr != VK_SUCCESS)
++        goto fail;
++
++    fex_probe_report(&p, results, vkd3d_get_current_time_ns() - start_ns);
++    fex_probe_destroy(&p);
++    INFO("%s", fex_probe_text);
++    vkd3d_atomic_uint32_store_explicit(&fex_probe_state, 2, vkd3d_memory_order_release);
++    return;
++
++fail:
++    fex_probe_set_text("# draw probe (VKD3D fex23): failed at %s (%d); no result\n", step, vr);
++    INFO("%s", fex_probe_text);
++    fex_probe_destroy(&p);
++    vkd3d_atomic_uint32_store_explicit(&fex_probe_state, 2, vkd3d_memory_order_release);
++}
+diff --git a/libs/vkd3d/fex_draw_probe_spv.h b/libs/vkd3d/fex_draw_probe_spv.h
+new file mode 100644
+index 0000000..6f678a3
+--- /dev/null
++++ b/libs/vkd3d/fex_draw_probe_spv.h
+@@ -0,0 +1,300 @@
++/* SPIR-V of the FEX draw probe shaders (fex_draw_probe.c), compiled with glslangValidator -V --target-env vulkan1.1
++ * from the GLSL in the comments of fex_draw_probe.c. */
++static const uint32_t fex_probe_simple_vert[] =
++{
++    0x07230203, 0x00010300, 0x0008000b, 0x00000046, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
++    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
++    0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000c, 0x0000001f, 0x00030003,
++    0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000009,
++    0x00000076, 0x00060005, 0x0000000c, 0x565f6c67, 0x65747265, 0x646e4978, 0x00007865, 0x00060005,
++    0x0000001d, 0x505f6c67, 0x65567265, 0x78657472, 0x00000000, 0x00060006, 0x0000001d, 0x00000000,
++    0x505f6c67, 0x7469736f, 0x006e6f69, 0x00070006, 0x0000001d, 0x00000001, 0x505f6c67, 0x746e696f,
++    0x657a6953, 0x00000000, 0x00070006, 0x0000001d, 0x00000002, 0x435f6c67, 0x4470696c, 0x61747369,
++    0x0065636e, 0x00070006, 0x0000001d, 0x00000003, 0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e,
++    0x00030005, 0x0000001f, 0x00000000, 0x00030005, 0x00000021, 0x006a624f, 0x00040006, 0x00000021,
++    0x00000000, 0x00736f70, 0x00030005, 0x00000023, 0x006a626f, 0x00030005, 0x00000029, 0x006d6143,
++    0x00050006, 0x00000029, 0x00000000, 0x6c616373, 0x00000065, 0x00030005, 0x0000002b, 0x006d6163,
++    0x00030005, 0x00000033, 0x00004350, 0x00040006, 0x00000033, 0x00000000, 0x00786469, 0x00040006,
++    0x00000033, 0x00000001, 0x00646170, 0x00030005, 0x00000035, 0x00006370, 0x00040047, 0x0000000c,
++    0x0000000b, 0x0000002a, 0x00030047, 0x0000001d, 0x00000002, 0x00050048, 0x0000001d, 0x00000000,
++    0x0000000b, 0x00000000, 0x00050048, 0x0000001d, 0x00000001, 0x0000000b, 0x00000001, 0x00050048,
++    0x0000001d, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000001d, 0x00000003, 0x0000000b,
++    0x00000004, 0x00030047, 0x00000021, 0x00000002, 0x00050048, 0x00000021, 0x00000000, 0x00000023,
++    0x00000000, 0x00040047, 0x00000023, 0x00000021, 0x00000001, 0x00040047, 0x00000023, 0x00000022,
++    0x00000000, 0x00030047, 0x00000029, 0x00000002, 0x00050048, 0x00000029, 0x00000000, 0x00000023,
++    0x00000000, 0x00040047, 0x0000002b, 0x00000021, 0x00000000, 0x00040047, 0x0000002b, 0x00000022,
++    0x00000000, 0x00040047, 0x00000032, 0x00000006, 0x00000004, 0x00030047, 0x00000033, 0x00000002,
++    0x00050048, 0x00000033, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000033, 0x00000001,
++    0x00000023, 0x00000004, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
++    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020, 0x00000008,
++    0x00000007, 0x00000007, 0x00040015, 0x0000000a, 0x00000020, 0x00000001, 0x00040020, 0x0000000b,
++    0x00000001, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c, 0x00000001, 0x0004002b, 0x0000000a,
++    0x0000000e, 0x00000001, 0x00020014, 0x0000000f, 0x0004002b, 0x00000006, 0x00000011, 0x3f800000,
++    0x0004002b, 0x00000006, 0x00000012, 0x00000000, 0x0004002b, 0x0000000a, 0x00000015, 0x00000002,
++    0x00040017, 0x00000019, 0x00000006, 0x00000004, 0x00040015, 0x0000001a, 0x00000020, 0x00000000,
++    0x0004002b, 0x0000001a, 0x0000001b, 0x00000001, 0x0004001c, 0x0000001c, 0x00000006, 0x0000001b,
++    0x0006001e, 0x0000001d, 0x00000019, 0x00000006, 0x0000001c, 0x0000001c, 0x00040020, 0x0000001e,
++    0x00000003, 0x0000001d, 0x0004003b, 0x0000001e, 0x0000001f, 0x00000003, 0x0004002b, 0x0000000a,
++    0x00000020, 0x00000000, 0x0003001e, 0x00000021, 0x00000019, 0x00040020, 0x00000022, 0x00000002,
++    0x00000021, 0x0004003b, 0x00000022, 0x00000023, 0x00000002, 0x00040020, 0x00000024, 0x00000002,
++    0x00000019, 0x0003001e, 0x00000029, 0x00000019, 0x00040020, 0x0000002a, 0x00000002, 0x00000029,
++    0x0004003b, 0x0000002a, 0x0000002b, 0x00000002, 0x0004002b, 0x0000001a, 0x00000031, 0x0000000c,
++    0x0004001c, 0x00000032, 0x0000001a, 0x00000031, 0x0004001e, 0x00000033, 0x0000001a, 0x00000032,
++    0x00040020, 0x00000034, 0x00000009, 0x00000033, 0x0004003b, 0x00000034, 0x00000035, 0x00000009,
++    0x00040020, 0x00000036, 0x00000009, 0x0000001a, 0x0004002b, 0x0000001a, 0x0000003a, 0x00000002,
++    0x00040020, 0x0000003b, 0x00000002, 0x00000006, 0x00040020, 0x00000044, 0x00000003, 0x00000019,
++    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b,
++    0x00000008, 0x00000009, 0x00000007, 0x0004003d, 0x0000000a, 0x0000000d, 0x0000000c, 0x000500aa,
++    0x0000000f, 0x00000010, 0x0000000d, 0x0000000e, 0x000600a9, 0x00000006, 0x00000013, 0x00000010,
++    0x00000011, 0x00000012, 0x0004003d, 0x0000000a, 0x00000014, 0x0000000c, 0x000500aa, 0x0000000f,
++    0x00000016, 0x00000014, 0x00000015, 0x000600a9, 0x00000006, 0x00000017, 0x00000016, 0x00000011,
++    0x00000012, 0x00050050, 0x00000007, 0x00000018, 0x00000013, 0x00000017, 0x0003003e, 0x00000009,
++    0x00000018, 0x00050041, 0x00000024, 0x00000025, 0x00000023, 0x00000020, 0x0004003d, 0x00000019,
++    0x00000026, 0x00000025, 0x0007004f, 0x00000007, 0x00000027, 0x00000026, 0x00000026, 0x00000000,
++    0x00000001, 0x0004003d, 0x00000007, 0x00000028, 0x00000009, 0x00050041, 0x00000024, 0x0000002c,
++    0x0000002b, 0x00000020, 0x0004003d, 0x00000019, 0x0000002d, 0x0000002c, 0x0007004f, 0x00000007,
++    0x0000002e, 0x0000002d, 0x0000002d, 0x00000000, 0x00000001, 0x00050085, 0x00000007, 0x0000002f,
++    0x00000028, 0x0000002e, 0x00050081, 0x00000007, 0x00000030, 0x00000027, 0x0000002f, 0x00050041,
++    0x00000036, 0x00000037, 0x00000035, 0x00000020, 0x0004003d, 0x0000001a, 0x00000038, 0x00000037,
++    0x00040070, 0x00000006, 0x00000039, 0x00000038, 0x00060041, 0x0000003b, 0x0000003c, 0x0000002b,
++    0x00000020, 0x0000003a, 0x0004003d, 0x00000006, 0x0000003d, 0x0000003c, 0x00050085, 0x00000006,
++    0x0000003e, 0x00000039, 0x0000003d, 0x00050050, 0x00000007, 0x0000003f, 0x0000003e, 0x0000003e,
++    0x00050081, 0x00000007, 0x00000040, 0x00000030, 0x0000003f, 0x00050051, 0x00000006, 0x00000041,
++    0x00000040, 0x00000000, 0x00050051, 0x00000006, 0x00000042, 0x00000040, 0x00000001, 0x00070050,
++    0x00000019, 0x00000043, 0x00000041, 0x00000042, 0x00000012, 0x00000011, 0x00050041, 0x00000044,
++    0x00000045, 0x0000001f, 0x00000020, 0x0003003e, 0x00000045, 0x00000043, 0x000100fd, 0x00010038,
++};
++static const uint32_t fex_probe_simple_frag[] =
++{
++    0x07230203, 0x00010300, 0x0008000b, 0x00000015, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
++    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
++    0x0006000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00030010, 0x00000004,
++    0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
++    0x00030005, 0x00000009, 0x0000006f, 0x00030005, 0x0000000d, 0x0074614d, 0x00050006, 0x0000000d,
++    0x00000000, 0x6f6c6f63, 0x00000072, 0x00050006, 0x0000000d, 0x00000001, 0x6867696c, 0x00007374,
++    0x00030005, 0x0000000f, 0x0074616d, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00040047,
++    0x0000000c, 0x00000006, 0x00000010, 0x00030047, 0x0000000d, 0x00000002, 0x00050048, 0x0000000d,
++    0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000d, 0x00000001, 0x00000023, 0x00000010,
++    0x00040047, 0x0000000f, 0x00000021, 0x00000002, 0x00040047, 0x0000000f, 0x00000022, 0x00000000,
++    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020,
++    0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007,
++    0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00040015, 0x0000000a, 0x00000020, 0x00000000,
++    0x0004002b, 0x0000000a, 0x0000000b, 0x00000020, 0x0004001c, 0x0000000c, 0x00000007, 0x0000000b,
++    0x0004001e, 0x0000000d, 0x00000007, 0x0000000c, 0x00040020, 0x0000000e, 0x00000002, 0x0000000d,
++    0x0004003b, 0x0000000e, 0x0000000f, 0x00000002, 0x00040015, 0x00000010, 0x00000020, 0x00000001,
++    0x0004002b, 0x00000010, 0x00000011, 0x00000000, 0x00040020, 0x00000012, 0x00000002, 0x00000007,
++    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x00050041,
++    0x00000012, 0x00000013, 0x0000000f, 0x00000011, 0x0004003d, 0x00000007, 0x00000014, 0x00000013,
++    0x0003003e, 0x00000009, 0x00000014, 0x000100fd, 0x00010038,
++};
++static const uint32_t fex_probe_lit_frag[] =
++{
++    0x07230203, 0x00010300, 0x0008000b, 0x0000003d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
++    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
++    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000019, 0x0000003b, 0x00030010,
++    0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
++    0x00000000, 0x00030005, 0x00000009, 0x00000063, 0x00030005, 0x0000000d, 0x0074614d, 0x00050006,
++    0x0000000d, 0x00000000, 0x6f6c6f63, 0x00000072, 0x00050006, 0x0000000d, 0x00000001, 0x6867696c,
++    0x00007374, 0x00030005, 0x0000000f, 0x0074616d, 0x00030005, 0x00000017, 0x00000070, 0x00060005,
++    0x00000019, 0x465f6c67, 0x43676172, 0x64726f6f, 0x00000000, 0x00030005, 0x0000001f, 0x00000069,
++    0x00030005, 0x0000003b, 0x0000006f, 0x00040047, 0x0000000c, 0x00000006, 0x00000010, 0x00030047,
++    0x0000000d, 0x00000002, 0x00050048, 0x0000000d, 0x00000000, 0x00000023, 0x00000000, 0x00050048,
++    0x0000000d, 0x00000001, 0x00000023, 0x00000010, 0x00040047, 0x0000000f, 0x00000021, 0x00000002,
++    0x00040047, 0x0000000f, 0x00000022, 0x00000000, 0x00040047, 0x00000019, 0x0000000b, 0x0000000f,
++    0x00040047, 0x0000003b, 0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
++    0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004,
++    0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00040015, 0x0000000a, 0x00000020, 0x00000000,
++    0x0004002b, 0x0000000a, 0x0000000b, 0x00000020, 0x0004001c, 0x0000000c, 0x00000007, 0x0000000b,
++    0x0004001e, 0x0000000d, 0x00000007, 0x0000000c, 0x00040020, 0x0000000e, 0x00000002, 0x0000000d,
++    0x0004003b, 0x0000000e, 0x0000000f, 0x00000002, 0x00040015, 0x00000010, 0x00000020, 0x00000001,
++    0x0004002b, 0x00000010, 0x00000011, 0x00000000, 0x00040020, 0x00000012, 0x00000002, 0x00000007,
++    0x00040017, 0x00000015, 0x00000006, 0x00000002, 0x00040020, 0x00000016, 0x00000007, 0x00000015,
++    0x00040020, 0x00000018, 0x00000001, 0x00000007, 0x0004003b, 0x00000018, 0x00000019, 0x00000001,
++    0x0004002b, 0x00000006, 0x0000001c, 0x3a83126f, 0x00040020, 0x0000001e, 0x00000007, 0x00000010,
++    0x0004002b, 0x00000010, 0x00000026, 0x00000020, 0x00020014, 0x00000027, 0x0004002b, 0x00000010,
++    0x00000029, 0x00000001, 0x0004002b, 0x00000006, 0x0000002d, 0x00000000, 0x00040020, 0x0000003a,
++    0x00000003, 0x00000007, 0x0004003b, 0x0000003a, 0x0000003b, 0x00000003, 0x00050036, 0x00000002,
++    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009,
++    0x00000007, 0x0004003b, 0x00000016, 0x00000017, 0x00000007, 0x0004003b, 0x0000001e, 0x0000001f,
++    0x00000007, 0x00050041, 0x00000012, 0x00000013, 0x0000000f, 0x00000011, 0x0004003d, 0x00000007,
++    0x00000014, 0x00000013, 0x0003003e, 0x00000009, 0x00000014, 0x0004003d, 0x00000007, 0x0000001a,
++    0x00000019, 0x0007004f, 0x00000015, 0x0000001b, 0x0000001a, 0x0000001a, 0x00000000, 0x00000001,
++    0x0005008e, 0x00000015, 0x0000001d, 0x0000001b, 0x0000001c, 0x0003003e, 0x00000017, 0x0000001d,
++    0x0003003e, 0x0000001f, 0x00000011, 0x000200f9, 0x00000020, 0x000200f8, 0x00000020, 0x000400f6,
++    0x00000022, 0x00000023, 0x00000000, 0x000200f9, 0x00000024, 0x000200f8, 0x00000024, 0x0004003d,
++    0x00000010, 0x00000025, 0x0000001f, 0x000500b1, 0x00000027, 0x00000028, 0x00000025, 0x00000026,
++    0x000400fa, 0x00000028, 0x00000021, 0x00000022, 0x000200f8, 0x00000021, 0x0004003d, 0x00000010,
++    0x0000002a, 0x0000001f, 0x00060041, 0x00000012, 0x0000002b, 0x0000000f, 0x00000029, 0x0000002a,
++    0x0004003d, 0x00000007, 0x0000002c, 0x0000002b, 0x0004003d, 0x00000015, 0x0000002e, 0x00000017,
++    0x0004003d, 0x00000010, 0x0000002f, 0x0000001f, 0x00060041, 0x00000012, 0x00000030, 0x0000000f,
++    0x00000029, 0x0000002f, 0x0004003d, 0x00000007, 0x00000031, 0x00000030, 0x0007004f, 0x00000015,
++    0x00000032, 0x00000031, 0x00000031, 0x00000000, 0x00000001, 0x00050094, 0x00000006, 0x00000033,
++    0x0000002e, 0x00000032, 0x0007000c, 0x00000006, 0x00000034, 0x00000001, 0x00000028, 0x0000002d,
++    0x00000033, 0x0005008e, 0x00000007, 0x00000035, 0x0000002c, 0x00000034, 0x0004003d, 0x00000007,
++    0x00000036, 0x00000009, 0x00050081, 0x00000007, 0x00000037, 0x00000036, 0x00000035, 0x0003003e,
++    0x00000009, 0x00000037, 0x000200f9, 0x00000023, 0x000200f8, 0x00000023, 0x0004003d, 0x00000010,
++    0x00000038, 0x0000001f, 0x00050080, 0x00000010, 0x00000039, 0x00000038, 0x00000029, 0x0003003e,
++    0x0000001f, 0x00000039, 0x000200f9, 0x00000020, 0x000200f8, 0x00000022, 0x0004003d, 0x00000007,
++    0x0000003c, 0x00000009, 0x0003003e, 0x0000003b, 0x0000003c, 0x000100fd, 0x00010038,
++};
++static const uint32_t fex_probe_batch_vert[] =
++{
++    0x07230203, 0x00010300, 0x0008000b, 0x00000053, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
++    0x0000114b, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
++    0x00000000, 0x00000001, 0x000b000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x00000012,
++    0x00000016, 0x0000001e, 0x0000002f, 0x00000048, 0x00000051, 0x00030003, 0x00000002, 0x000001c2,
++    0x00090004, 0x415f4c47, 0x735f4252, 0x65646168, 0x72645f72, 0x705f7761, 0x6d617261, 0x72657465,
++    0x00000073, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000008, 0x00000069,
++    0x00060005, 0x0000000a, 0x5f455355, 0x54534e49, 0x45434e41, 0x00000000, 0x00070005, 0x00000012,
++    0x495f6c67, 0x6174736e, 0x4965636e, 0x7865646e, 0x00000000, 0x00060005, 0x00000016, 0x445f6c67,
++    0x49776172, 0x42524144, 0x00000000, 0x00030005, 0x0000001d, 0x00000076, 0x00060005, 0x0000001e,
++    0x565f6c67, 0x65747265, 0x646e4978, 0x00007865, 0x00060005, 0x0000002d, 0x505f6c67, 0x65567265,
++    0x78657472, 0x00000000, 0x00060006, 0x0000002d, 0x00000000, 0x505f6c67, 0x7469736f, 0x006e6f69,
++    0x00070006, 0x0000002d, 0x00000001, 0x505f6c67, 0x746e696f, 0x657a6953, 0x00000000, 0x00070006,
++    0x0000002d, 0x00000002, 0x435f6c67, 0x4470696c, 0x61747369, 0x0065636e, 0x00070006, 0x0000002d,
++    0x00000003, 0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000002f, 0x00000000,
++    0x00040005, 0x00000031, 0x736a624f, 0x00000000, 0x00040006, 0x00000031, 0x00000000, 0x00736f70,
++    0x00040005, 0x00000033, 0x736a626f, 0x00000000, 0x00030005, 0x0000003a, 0x006d6143, 0x00050006,
++    0x0000003a, 0x00000000, 0x6c616373, 0x00000065, 0x00030005, 0x0000003c, 0x006d6163, 0x00030005,
++    0x00000048, 0x006c6f63, 0x00040005, 0x0000004a, 0x7374614d, 0x00000000, 0x00050006, 0x0000004a,
++    0x00000000, 0x6f6c6f63, 0x00000072, 0x00040005, 0x0000004c, 0x7374616d, 0x00000000, 0x00030005,
++    0x00000051, 0x00006469, 0x00040047, 0x0000000a, 0x00000001, 0x00000000, 0x00040047, 0x00000012,
++    0x0000000b, 0x0000002b, 0x00040047, 0x00000016, 0x0000000b, 0x0000114a, 0x00040047, 0x0000001e,
++    0x0000000b, 0x0000002a, 0x00030047, 0x0000002d, 0x00000002, 0x00050048, 0x0000002d, 0x00000000,
++    0x0000000b, 0x00000000, 0x00050048, 0x0000002d, 0x00000001, 0x0000000b, 0x00000001, 0x00050048,
++    0x0000002d, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000002d, 0x00000003, 0x0000000b,
++    0x00000004, 0x00040047, 0x00000030, 0x00000006, 0x00000010, 0x00030047, 0x00000031, 0x00000002,
++    0x00040048, 0x00000031, 0x00000000, 0x00000018, 0x00050048, 0x00000031, 0x00000000, 0x00000023,
++    0x00000000, 0x00030047, 0x00000033, 0x00000018, 0x00040047, 0x00000033, 0x00000021, 0x00000003,
++    0x00040047, 0x00000033, 0x00000022, 0x00000000, 0x00030047, 0x0000003a, 0x00000002, 0x00050048,
++    0x0000003a, 0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x0000003c, 0x00000021, 0x00000000,
++    0x00040047, 0x0000003c, 0x00000022, 0x00000000, 0x00030047, 0x00000048, 0x0000000e, 0x00040047,
++    0x00000048, 0x0000001e, 0x00000000, 0x00040047, 0x00000049, 0x00000006, 0x00000010, 0x00030047,
++    0x0000004a, 0x00000002, 0x00040048, 0x0000004a, 0x00000000, 0x00000018, 0x00050048, 0x0000004a,
++    0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x0000004c, 0x00000018, 0x00040047, 0x0000004c,
++    0x00000021, 0x00000004, 0x00040047, 0x0000004c, 0x00000022, 0x00000000, 0x00030047, 0x00000051,
++    0x0000000e, 0x00040047, 0x00000051, 0x0000001e, 0x00000001, 0x00020013, 0x00000002, 0x00030021,
++    0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020, 0x00000000, 0x00040020, 0x00000007,
++    0x00000007, 0x00000006, 0x00040015, 0x00000009, 0x00000020, 0x00000001, 0x00040032, 0x00000009,
++    0x0000000a, 0x00000000, 0x0004002b, 0x00000009, 0x0000000b, 0x00000000, 0x00020014, 0x0000000c,
++    0x00060034, 0x0000000c, 0x0000000d, 0x000000ab, 0x0000000a, 0x0000000b, 0x00040020, 0x00000011,
++    0x00000001, 0x00000009, 0x0004003b, 0x00000011, 0x00000012, 0x00000001, 0x0004003b, 0x00000011,
++    0x00000016, 0x00000001, 0x00030016, 0x0000001a, 0x00000020, 0x00040017, 0x0000001b, 0x0000001a,
++    0x00000002, 0x00040020, 0x0000001c, 0x00000007, 0x0000001b, 0x0004003b, 0x00000011, 0x0000001e,
++    0x00000001, 0x0004002b, 0x00000009, 0x00000020, 0x00000001, 0x0004002b, 0x0000001a, 0x00000022,
++    0x3f800000, 0x0004002b, 0x0000001a, 0x00000023, 0x00000000, 0x0004002b, 0x00000009, 0x00000026,
++    0x00000002, 0x00040017, 0x0000002a, 0x0000001a, 0x00000004, 0x0004002b, 0x00000006, 0x0000002b,
++    0x00000001, 0x0004001c, 0x0000002c, 0x0000001a, 0x0000002b, 0x0006001e, 0x0000002d, 0x0000002a,
++    0x0000001a, 0x0000002c, 0x0000002c, 0x00040020, 0x0000002e, 0x00000003, 0x0000002d, 0x0004003b,
++    0x0000002e, 0x0000002f, 0x00000003, 0x0003001d, 0x00000030, 0x0000002a, 0x0003001e, 0x00000031,
++    0x00000030, 0x00040020, 0x00000032, 0x0000000c, 0x00000031, 0x0004003b, 0x00000032, 0x00000033,
++    0x0000000c, 0x00040020, 0x00000035, 0x0000000c, 0x0000002a, 0x0003001e, 0x0000003a, 0x0000002a,
++    0x00040020, 0x0000003b, 0x00000002, 0x0000003a, 0x0004003b, 0x0000003b, 0x0000003c, 0x00000002,
++    0x00040020, 0x0000003d, 0x00000002, 0x0000002a, 0x00040020, 0x00000046, 0x00000003, 0x0000002a,
++    0x0004003b, 0x00000046, 0x00000048, 0x00000003, 0x0003001d, 0x00000049, 0x0000002a, 0x0003001e,
++    0x0000004a, 0x00000049, 0x00040020, 0x0000004b, 0x0000000c, 0x0000004a, 0x0004003b, 0x0000004b,
++    0x0000004c, 0x0000000c, 0x00040020, 0x00000050, 0x00000003, 0x00000006, 0x0004003b, 0x00000050,
++    0x00000051, 0x00000003, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
++    0x00000005, 0x0004003b, 0x00000007, 0x00000008, 0x00000007, 0x0004003b, 0x00000007, 0x0000000e,
++    0x00000007, 0x0004003b, 0x0000001c, 0x0000001d, 0x00000007, 0x000300f7, 0x00000010, 0x00000000,
++    0x000400fa, 0x0000000d, 0x0000000f, 0x00000015, 0x000200f8, 0x0000000f, 0x0004003d, 0x00000009,
++    0x00000013, 0x00000012, 0x0004007c, 0x00000006, 0x00000014, 0x00000013, 0x0003003e, 0x0000000e,
++    0x00000014, 0x000200f9, 0x00000010, 0x000200f8, 0x00000015, 0x0004003d, 0x00000009, 0x00000017,
++    0x00000016, 0x0004007c, 0x00000006, 0x00000018, 0x00000017, 0x0003003e, 0x0000000e, 0x00000018,
++    0x000200f9, 0x00000010, 0x000200f8, 0x00000010, 0x0004003d, 0x00000006, 0x00000019, 0x0000000e,
++    0x0003003e, 0x00000008, 0x00000019, 0x0004003d, 0x00000009, 0x0000001f, 0x0000001e, 0x000500aa,
++    0x0000000c, 0x00000021, 0x0000001f, 0x00000020, 0x000600a9, 0x0000001a, 0x00000024, 0x00000021,
++    0x00000022, 0x00000023, 0x0004003d, 0x00000009, 0x00000025, 0x0000001e, 0x000500aa, 0x0000000c,
++    0x00000027, 0x00000025, 0x00000026, 0x000600a9, 0x0000001a, 0x00000028, 0x00000027, 0x00000022,
++    0x00000023, 0x00050050, 0x0000001b, 0x00000029, 0x00000024, 0x00000028, 0x0003003e, 0x0000001d,
++    0x00000029, 0x0004003d, 0x00000006, 0x00000034, 0x00000008, 0x00060041, 0x00000035, 0x00000036,
++    0x00000033, 0x0000000b, 0x00000034, 0x0004003d, 0x0000002a, 0x00000037, 0x00000036, 0x0007004f,
++    0x0000001b, 0x00000038, 0x00000037, 0x00000037, 0x00000000, 0x00000001, 0x0004003d, 0x0000001b,
++    0x00000039, 0x0000001d, 0x00050041, 0x0000003d, 0x0000003e, 0x0000003c, 0x0000000b, 0x0004003d,
++    0x0000002a, 0x0000003f, 0x0000003e, 0x0007004f, 0x0000001b, 0x00000040, 0x0000003f, 0x0000003f,
++    0x00000000, 0x00000001, 0x00050085, 0x0000001b, 0x00000041, 0x00000039, 0x00000040, 0x00050081,
++    0x0000001b, 0x00000042, 0x00000038, 0x00000041, 0x00050051, 0x0000001a, 0x00000043, 0x00000042,
++    0x00000000, 0x00050051, 0x0000001a, 0x00000044, 0x00000042, 0x00000001, 0x00070050, 0x0000002a,
++    0x00000045, 0x00000043, 0x00000044, 0x00000023, 0x00000022, 0x00050041, 0x00000046, 0x00000047,
++    0x0000002f, 0x0000000b, 0x0003003e, 0x00000047, 0x00000045, 0x0004003d, 0x00000006, 0x0000004d,
++    0x00000008, 0x00060041, 0x00000035, 0x0000004e, 0x0000004c, 0x0000000b, 0x0000004d, 0x0004003d,
++    0x0000002a, 0x0000004f, 0x0000004e, 0x0003003e, 0x00000048, 0x0000004f, 0x0004003d, 0x00000006,
++    0x00000052, 0x00000008, 0x0003003e, 0x00000051, 0x00000052, 0x000100fd, 0x00010038,
++};
++static const uint32_t fex_probe_batch_frag[] =
++{
++    0x07230203, 0x00010300, 0x0008000b, 0x0000000d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
++    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
++    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000000b, 0x00030010,
++    0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
++    0x00000000, 0x00030005, 0x00000009, 0x0000006f, 0x00030005, 0x0000000b, 0x006c6f63, 0x00040047,
++    0x00000009, 0x0000001e, 0x00000000, 0x00030047, 0x0000000b, 0x0000000e, 0x00040047, 0x0000000b,
++    0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
++    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
++    0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00040020, 0x0000000a,
++    0x00000001, 0x00000007, 0x0004003b, 0x0000000a, 0x0000000b, 0x00000001, 0x00050036, 0x00000002,
++    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000007, 0x0000000c,
++    0x0000000b, 0x0003003e, 0x00000009, 0x0000000c, 0x000100fd, 0x00010038,
++};
++static const uint32_t fex_probe_lit_batch_frag[] =
++{
++    0x07230203, 0x00010300, 0x0008000b, 0x00000046, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
++    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
++    0x0008000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000017, 0x00000020, 0x00000044,
++    0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
++    0x6e69616d, 0x00000000, 0x00030005, 0x00000009, 0x00000063, 0x00030005, 0x0000000f, 0x0074614d,
++    0x00050006, 0x0000000f, 0x00000000, 0x6f6c6f63, 0x00000072, 0x00050006, 0x0000000f, 0x00000001,
++    0x6867696c, 0x00007374, 0x00040006, 0x0000000f, 0x00000002, 0x00646170, 0x00040005, 0x00000011,
++    0x4d74694c, 0x00737461, 0x00040006, 0x00000011, 0x00000000, 0x0000006d, 0x00040005, 0x00000013,
++    0x7374616d, 0x00000000, 0x00030005, 0x00000017, 0x00006469, 0x00030005, 0x0000001e, 0x00000070,
++    0x00060005, 0x00000020, 0x465f6c67, 0x43676172, 0x64726f6f, 0x00000000, 0x00030005, 0x00000026,
++    0x00000069, 0x00030005, 0x00000044, 0x0000006f, 0x00040047, 0x0000000c, 0x00000006, 0x00000010,
++    0x00040047, 0x0000000e, 0x00000006, 0x00000010, 0x00050048, 0x0000000f, 0x00000000, 0x00000023,
++    0x00000000, 0x00050048, 0x0000000f, 0x00000001, 0x00000023, 0x00000010, 0x00050048, 0x0000000f,
++    0x00000002, 0x00000023, 0x00000210, 0x00040047, 0x00000010, 0x00000006, 0x00000400, 0x00030047,
++    0x00000011, 0x00000002, 0x00040048, 0x00000011, 0x00000000, 0x00000018, 0x00050048, 0x00000011,
++    0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000013, 0x00000018, 0x00040047, 0x00000013,
++    0x00000021, 0x00000005, 0x00040047, 0x00000013, 0x00000022, 0x00000000, 0x00030047, 0x00000017,
++    0x0000000e, 0x00040047, 0x00000017, 0x0000001e, 0x00000001, 0x00040047, 0x00000020, 0x0000000b,
++    0x0000000f, 0x00040047, 0x00000044, 0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021,
++    0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
++    0x00000004, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00040015, 0x0000000a, 0x00000020,
++    0x00000000, 0x0004002b, 0x0000000a, 0x0000000b, 0x00000020, 0x0004001c, 0x0000000c, 0x00000007,
++    0x0000000b, 0x0004002b, 0x0000000a, 0x0000000d, 0x0000001f, 0x0004001c, 0x0000000e, 0x00000007,
++    0x0000000d, 0x0005001e, 0x0000000f, 0x00000007, 0x0000000c, 0x0000000e, 0x0003001d, 0x00000010,
++    0x0000000f, 0x0003001e, 0x00000011, 0x00000010, 0x00040020, 0x00000012, 0x0000000c, 0x00000011,
++    0x0004003b, 0x00000012, 0x00000013, 0x0000000c, 0x00040015, 0x00000014, 0x00000020, 0x00000001,
++    0x0004002b, 0x00000014, 0x00000015, 0x00000000, 0x00040020, 0x00000016, 0x00000001, 0x0000000a,
++    0x0004003b, 0x00000016, 0x00000017, 0x00000001, 0x00040020, 0x00000019, 0x0000000c, 0x00000007,
++    0x00040017, 0x0000001c, 0x00000006, 0x00000002, 0x00040020, 0x0000001d, 0x00000007, 0x0000001c,
++    0x00040020, 0x0000001f, 0x00000001, 0x00000007, 0x0004003b, 0x0000001f, 0x00000020, 0x00000001,
++    0x0004002b, 0x00000006, 0x00000023, 0x3a83126f, 0x00040020, 0x00000025, 0x00000007, 0x00000014,
++    0x0004002b, 0x00000014, 0x0000002d, 0x00000020, 0x00020014, 0x0000002e, 0x0004002b, 0x00000014,
++    0x00000031, 0x00000001, 0x0004002b, 0x00000006, 0x00000035, 0x00000000, 0x00040020, 0x00000043,
++    0x00000003, 0x00000007, 0x0004003b, 0x00000043, 0x00000044, 0x00000003, 0x00050036, 0x00000002,
++    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009,
++    0x00000007, 0x0004003b, 0x0000001d, 0x0000001e, 0x00000007, 0x0004003b, 0x00000025, 0x00000026,
++    0x00000007, 0x0004003d, 0x0000000a, 0x00000018, 0x00000017, 0x00070041, 0x00000019, 0x0000001a,
++    0x00000013, 0x00000015, 0x00000018, 0x00000015, 0x0004003d, 0x00000007, 0x0000001b, 0x0000001a,
++    0x0003003e, 0x00000009, 0x0000001b, 0x0004003d, 0x00000007, 0x00000021, 0x00000020, 0x0007004f,
++    0x0000001c, 0x00000022, 0x00000021, 0x00000021, 0x00000000, 0x00000001, 0x0005008e, 0x0000001c,
++    0x00000024, 0x00000022, 0x00000023, 0x0003003e, 0x0000001e, 0x00000024, 0x0003003e, 0x00000026,
++    0x00000015, 0x000200f9, 0x00000027, 0x000200f8, 0x00000027, 0x000400f6, 0x00000029, 0x0000002a,
++    0x00000000, 0x000200f9, 0x0000002b, 0x000200f8, 0x0000002b, 0x0004003d, 0x00000014, 0x0000002c,
++    0x00000026, 0x000500b1, 0x0000002e, 0x0000002f, 0x0000002c, 0x0000002d, 0x000400fa, 0x0000002f,
++    0x00000028, 0x00000029, 0x000200f8, 0x00000028, 0x0004003d, 0x0000000a, 0x00000030, 0x00000017,
++    0x0004003d, 0x00000014, 0x00000032, 0x00000026, 0x00080041, 0x00000019, 0x00000033, 0x00000013,
++    0x00000015, 0x00000030, 0x00000031, 0x00000032, 0x0004003d, 0x00000007, 0x00000034, 0x00000033,
++    0x0004003d, 0x0000001c, 0x00000036, 0x0000001e, 0x0004003d, 0x0000000a, 0x00000037, 0x00000017,
++    0x0004003d, 0x00000014, 0x00000038, 0x00000026, 0x00080041, 0x00000019, 0x00000039, 0x00000013,
++    0x00000015, 0x00000037, 0x00000031, 0x00000038, 0x0004003d, 0x00000007, 0x0000003a, 0x00000039,
++    0x0007004f, 0x0000001c, 0x0000003b, 0x0000003a, 0x0000003a, 0x00000000, 0x00000001, 0x00050094,
++    0x00000006, 0x0000003c, 0x00000036, 0x0000003b, 0x0007000c, 0x00000006, 0x0000003d, 0x00000001,
++    0x00000028, 0x00000035, 0x0000003c, 0x0005008e, 0x00000007, 0x0000003e, 0x00000034, 0x0000003d,
++    0x0004003d, 0x00000007, 0x0000003f, 0x00000009, 0x00050081, 0x00000007, 0x00000040, 0x0000003f,
++    0x0000003e, 0x0003003e, 0x00000009, 0x00000040, 0x000200f9, 0x0000002a, 0x000200f8, 0x0000002a,
++    0x0004003d, 0x00000014, 0x00000041, 0x00000026, 0x00050080, 0x00000014, 0x00000042, 0x00000041,
++    0x00000031, 0x0003003e, 0x00000026, 0x00000042, 0x000200f9, 0x00000027, 0x000200f8, 0x00000029,
++    0x0004003d, 0x00000007, 0x00000045, 0x00000009, 0x0003003e, 0x00000044, 0x00000045, 0x000100fd,
++    0x00010038,
++};
+diff --git a/libs/vkd3d/fex_pass_meter.c b/libs/vkd3d/fex_pass_meter.c
+index c235c84..46d788e 100644
+--- a/libs/vkd3d/fex_pass_meter.c
++++ b/libs/vkd3d/fex_pass_meter.c
+@@ -2199,6 +2199,7 @@ static void fex_gpu_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+     struct vkd3d_fex_mem_counts mem;
+     uint32_t top[6], top_count = 0;
+     bool any_mem = false;
++    const char *probe;
+     uint32_t i, j;
+     size_t len = 0;
+ 
+@@ -2239,6 +2240,12 @@ static void fex_gpu_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+                 meter->device->memory_info.fex_ahead.on ? "on" : "off");
+     }
+ 
++    /* VKD3D fex23: the start-up draw probe's result, first in reports 31-33 (after the dispatch note's; 3 times as
++     * FEX prints each note once). */
++    if (meter->gpu_publishes > 3 * FEX_DRAW_FIRST_PUBLISH && meter->gpu_publishes <= 3 * FEX_DRAW_FIRST_PUBLISH + 3 &&
++            (probe = vkd3d_fex_draw_probe_result()))
++        len = vkd3d_fex_report_append(text, sizeof(text), len, "%s", probe);
++
+     vkd3d_fex_memory_take(&mem);
+     for (i = 0; i < VKD3D_FEX_MEM_COUNT; i++)
+         any_mem |= mem.n[i] != 0;
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index f908904..13020ef 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -118,7 +118,7 @@ if enable_profiling
+   vkd3d_src += ['timestamp_profiler.c']
+ endif
+ 
+-vkd3d_src += ['fex_pass_meter.c', 'fex_timeline.c', 'fex_shader_copy.c']
++vkd3d_src += ['fex_pass_meter.c', 'fex_timeline.c', 'fex_shader_copy.c', 'fex_draw_probe.c']
+ 
+ vkd3d_lib = static_library('vkd3d-proton', vkd3d_src, glsl_generator.process(vkd3d_shaders), vkd3d_build, vkd3d_version,
+   dependencies        : [ vkd3d_common_dep, vkd3d_shader_dep ] + vkd3d_extra_libs,
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 2a9917d..4e6ec08 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3624,6 +3624,9 @@ bool vkd3d_fex_ds_store_none_enabled(void);
+  * DXBC -> SPIR-V compile (or SPIR-V cache load), and around the driver compile of a PSO's static pipeline. */
+ /* Reads VKD3D_FEX_SHADER_COPY (once), so the table's flags are set before FEX sees the device. */
+ void vkd3d_fex_shader_copy_init(void);
++/* VKD3D fex23: the start-up draw probe (fex_draw_probe.c); its result is a '#' note of the gpu report. */
++void vkd3d_fex_draw_probe(struct d3d12_device *device);
++const char *vkd3d_fex_draw_probe_result(void);
+ void vkd3d_fex_shader_copy_pso(struct d3d12_pipeline_state *state, const struct d3d12_pipeline_state_desc *desc);
+ void vkd3d_fex_shader_copy_spirv(VkShaderStageFlagBits stage, const struct vkd3d_shader_code *spirv);
+ bool vkd3d_fex_shader_copy_claim_code(struct d3d12_pipeline_state *state);
+-- 
+2.43.0
+
