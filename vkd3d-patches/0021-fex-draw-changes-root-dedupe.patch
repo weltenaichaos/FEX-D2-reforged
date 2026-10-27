@@ -1,0 +1,998 @@
+From 8d0ea9672422b3fd11498218f9da879b4ecca590 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 19:35:45 +0000
+Subject: [PATCH] FEX: count what each draw changes; skip root parameters set
+ again with the same value
+
+Adreno keeps only 2 copies of a stage's register state. Every D2R draw
+makes Turnip write the pixel stage's state anew (each push descriptor
+set is a new copy with a new address, push constants are written for
+all stages), so a draw waits for the draw two back to finish its pixel
+work. Whether a driver change that leaves the pixel stage alone for
+vertex-only changes can pay depends on what D2R's draws change.
+
+Pass meter, measured frames: each draw after the first of a pass is
+counted per kind of pass by what changed since the draw before it
+(another pipeline with or without another pixel shader, root
+parameters the pixel shader reads, other root parameters only, sent
+again only, dynamic state or buffers only, nothing), plus the draws
+vkd3d sent a push descriptor set / push constants for and the Set*Root*
+calls with an unchanged value. The pixel shader's root parameter reads
+come from its SPIR-V (descriptor set/binding of the variables it uses,
+push constant members by constant index). New 'gpu draw changes' lines
+in the gpu report.
+
+VKD3D_FEX_ROOT_DEDUPE: a Set*Root* call with the value already set no
+longer marks the parameter to be sent (a dirty bit that is already set
+stays). Unset = on and off by turns every second while the pass meter
+runs, 1 = on, 0 = off.
+---
+ libs/vkd3d/command.c        |  93 +++++-
+ libs/vkd3d/device.c         |   1 +
+ libs/vkd3d/fex_pass_meter.c | 604 ++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/state.c          |   1 +
+ libs/vkd3d/vkd3d_private.h  |  31 ++
+ 5 files changed, 725 insertions(+), 5 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index dc44b61..ea467b5 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -6644,6 +6644,14 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+     return true;
+ }
+ 
++/* VKD3D fex21: the pass meter notes what vkd3d sent for the next draw. */
++static inline void d3d12_command_list_fex_sent(struct d3d12_command_list *list,
++        const struct vkd3d_pipeline_bindings *bindings, uint32_t flag)
++{
++    if (bindings == &list->graphics_bindings)
++        list->fex_pass.chg_flags |= flag;
++}
++
+ static void d3d12_command_list_update_descriptor_table_offsets(struct d3d12_command_list *list,
+         struct vkd3d_pipeline_bindings *bindings, VkPipelineLayout layout, VkShaderStageFlags push_stages)
+ {
+@@ -6672,6 +6680,7 @@ static void d3d12_command_list_update_descriptor_table_offsets(struct d3d12_comm
+                 root_signature->descriptor_table_offset,
+                 root_signature->descriptor_table_count * sizeof(uint32_t),
+                 table_offsets));
++        d3d12_command_list_fex_sent(list, bindings, VKD3D_FEX_CHG_SENT_CONSTS);
+     }
+ 
+     bindings->dirty_flags &= ~VKD3D_PIPELINE_DIRTY_DESCRIPTOR_TABLE_OFFSETS;
+@@ -6837,6 +6846,7 @@ static void d3d12_command_list_update_root_constants(struct d3d12_command_list *
+                 root_constant->constant_index * sizeof(uint32_t),
+                 root_constant->constant_count * sizeof(uint32_t),
+                 &bindings->root_constants[root_constant->constant_index]));
++        d3d12_command_list_fex_sent(list, bindings, VKD3D_FEX_CHG_SENT_CONSTS);
+     }
+ }
+ 
+@@ -6982,6 +6992,7 @@ static void d3d12_command_list_update_root_descriptors(struct d3d12_command_list
+                 layout, push_stages,
+                 0, va_count * sizeof(*root_parameter_data.root_descriptor_vas),
+                 root_parameter_data.root_descriptor_vas));
++        d3d12_command_list_fex_sent(list, bindings, VKD3D_FEX_CHG_SENT_CONSTS);
+     }
+ 
+ #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+@@ -7010,6 +7021,7 @@ static void d3d12_command_list_update_root_descriptors(struct d3d12_command_list
+         VK_CALL(vkCmdPushDescriptorSetKHR(list->cmd.vk_command_buffer, vk_bind_point,
+                 layout, root_signature->root_descriptor_set,
+                 descriptor_write_count, descriptor_writes));
++        d3d12_command_list_fex_sent(list, bindings, VKD3D_FEX_CHG_SENT_SET);
+     }
+ }
+ 
+@@ -7242,6 +7254,12 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
+     /* Make sure we only update states that are dynamic in the pipeline */
+     dyn_state->dirty_flags &= list->dynamic_state.active_flags;
+ 
++    /* VKD3D fex21: for the pass meter (the values may be the same as before). */
++    if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE)
++        list->fex_pass.chg_flags |= VKD3D_FEX_CHG_BUFFERS;
++    if (dyn_state->dirty_flags & ~VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE)
++        list->fex_pass.chg_flags |= VKD3D_FEX_CHG_DYNAMIC;
++
+     if (dyn_state->viewport_count)
+     {
+         if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_VIEWPORT)
+@@ -8038,6 +8056,7 @@ static bool d3d12_command_list_update_index_buffer(struct d3d12_command_list *li
+                     list->index_buffer.offset, list->index_buffer.vk_type));
+         }
+         list->index_buffer.is_dirty = false;
++        list->fex_pass.chg_flags |= VKD3D_FEX_CHG_BUFFERS;
+     }
+ 
+     return true;
+@@ -12070,6 +12089,21 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetGraphicsRootSignature(d3d12_
+             impl_from_ID3D12RootSignature(root_signature));
+ }
+ 
++/* VKD3D fex21: a Set*Root* call. Notes for the pass meter what the next draw changes; same = the value was already
++ * set. The callers then skip marking the parameter to be sent again when same and VKD3D_FEX_ROOT_DEDUPE is on. That is
++ * safe because whatever makes the sent state differ from the bindings (a new root signature, another bind point,
++ * vkd3d's own shaders, a new command buffer) sets the dirty bits itself, and those stay set. */
++static inline void d3d12_command_list_fex_root_set(struct d3d12_command_list *list,
++        const struct vkd3d_pipeline_bindings *bindings, unsigned int index, bool same)
++{
++    if (bindings != &list->graphics_bindings)
++        return;
++    if (same)
++        list->fex_pass.chg_same++;
++    else if (index < 64)
++        list->fex_pass.chg_params |= 1ull << index;
++}
++
+ static inline void d3d12_command_list_set_descriptor_table_embedded(struct d3d12_command_list *list,
+         struct vkd3d_pipeline_bindings *bindings, unsigned int index,
+         D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor,
+@@ -12077,14 +12111,20 @@ static inline void d3d12_command_list_set_descriptor_table_embedded(struct d3d12
+         unsigned int sampler_size_log2)
+ {
+     const struct d3d12_root_signature *root_signature = bindings->root_signature;
++    uint32_t old_offset;
++    bool same;
+ 
+     assert(index < ARRAY_SIZE(bindings->descriptor_tables));
++    old_offset = bindings->descriptor_tables[index];
+     bindings->descriptor_tables[index] = d3d12_desc_heap_offset_from_embedded_gpu_handle(
+             base_descriptor, cbv_srv_uav_size_log2, sampler_size_log2);
+ 
+     if (root_signature)
+     {
+-        if (root_signature->descriptor_table_count)
++        /* VKD3D fex21: all table offsets are sent together, so they match what was sent while the flag is clear. */
++        same = old_offset == bindings->descriptor_tables[index];
++        d3d12_command_list_fex_root_set(list, bindings, index, same);
++        if (root_signature->descriptor_table_count && (!same || !vkd3d_fex_root_dedupe_on()))
+             bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_DESCRIPTOR_TABLE_OFFSETS;
+         if (root_signature->hoist_info.num_desc)
+             bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_HOISTED_DESCRIPTORS;
+@@ -12099,13 +12139,19 @@ static inline void d3d12_command_list_set_descriptor_table(struct d3d12_command_
+         struct vkd3d_pipeline_bindings *bindings, unsigned int index, D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor)
+ {
+     const struct d3d12_root_signature *root_signature = bindings->root_signature;
++    uint32_t old_offset;
++    bool same;
+ 
+     assert(index < ARRAY_SIZE(bindings->descriptor_tables));
++    old_offset = bindings->descriptor_tables[index];
+     bindings->descriptor_tables[index] = d3d12_desc_heap_offset_from_gpu_handle(base_descriptor);
+ 
+     if (root_signature)
+     {
+-        if (root_signature->descriptor_table_count)
++        /* VKD3D fex21: all table offsets are sent together, so they match what was sent while the flag is clear. */
++        same = old_offset == bindings->descriptor_tables[index];
++        d3d12_command_list_fex_root_set(list, bindings, index, same);
++        if (root_signature->descriptor_table_count && (!same || !vkd3d_fex_root_dedupe_on()))
+             bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_DESCRIPTOR_TABLE_OFFSETS;
+         if (root_signature->hoist_info.num_desc)
+             bindings->dirty_flags |= VKD3D_PIPELINE_DIRTY_HOISTED_DESCRIPTORS;
+@@ -12231,11 +12277,17 @@ static void d3d12_command_list_set_root_constants(struct d3d12_command_list *lis
+     const struct d3d12_root_signature *root_signature = bindings->root_signature;
+     const struct vkd3d_shader_root_constant *c;
+     VKD3D_UNUSED unsigned int i;
++    bool same;
+ 
+     c = root_signature_get_32bit_constants(root_signature, index);
+-    memcpy(&bindings->root_constants[c->constant_index + offset], data, count * sizeof(uint32_t));
++    /* VKD3D fex21: root constants are sent from these values, so they match what was sent while the bit is clear. */
++    same = !memcmp(&bindings->root_constants[c->constant_index + offset], data, count * sizeof(uint32_t));
++    if (!same)
++        memcpy(&bindings->root_constants[c->constant_index + offset], data, count * sizeof(uint32_t));
++    d3d12_command_list_fex_root_set(list, bindings, index, same);
+ 
+-    bindings->root_constant_dirty_mask |= 1ull << index;
++    if (!same || !vkd3d_fex_root_dedupe_on())
++        bindings->root_constant_dirty_mask |= 1ull << index;
+ 
+ #ifdef VKD3D_ENABLE_BREADCRUMBS
+     for (i = 0; i < count; i++)
+@@ -12380,17 +12432,48 @@ static void d3d12_command_list_set_root_descriptor_va(struct d3d12_command_list
+     descriptor->info.va = gpu_address;
+ }
+ 
++/* VKD3D fex21: the same descriptor as before. */
++static bool vkd3d_fex_root_descriptor_equal(const struct vkd3d_root_descriptor_info *a,
++        const struct vkd3d_root_descriptor_info *b)
++{
++    if (a->vk_descriptor_type != b->vk_descriptor_type)
++        return false;
++    switch (a->vk_descriptor_type)
++    {
++        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
++        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++            return a->info.buffer.buffer == b->info.buffer.buffer && a->info.buffer.offset == b->info.buffer.offset &&
++                    a->info.buffer.range == b->info.buffer.range;
++        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
++        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++            return a->info.buffer_view == b->info.buffer_view;
++        case VK_DESCRIPTOR_TYPE_MAX_ENUM:
++            return a->info.va == b->info.va;
++        default:
++            return false;
++    }
++}
++
+ static void d3d12_command_list_set_root_descriptor(struct d3d12_command_list *list,
+         struct vkd3d_pipeline_bindings *bindings, unsigned int index, D3D12_GPU_VIRTUAL_ADDRESS gpu_address)
+ {
+     struct vkd3d_root_descriptor_info *descriptor = &bindings->root_descriptors[index];
++    struct vkd3d_root_descriptor_info old_descriptor = *descriptor;
++    bool same;
+ 
+     if (bindings->root_signature->root_descriptor_raw_va_mask & (1ull << index))
+         d3d12_command_list_set_root_descriptor_va(list, descriptor, gpu_address);
+     else
+         d3d12_command_list_set_push_descriptor_info(list, bindings, index, gpu_address);
+ 
+-    bindings->root_descriptor_dirty_mask |= 1ull << index;
++    /* VKD3D fex21: dirty root descriptors are sent from these values (active ones; raw VAs all together), so an active
++     * one matches what was sent while its bit is clear. */
++    same = (bindings->root_descriptor_active_mask & (1ull << index)) &&
++            vkd3d_fex_root_descriptor_equal(&old_descriptor, descriptor);
++    d3d12_command_list_fex_root_set(list, bindings, index, same);
++
++    if (!same || !vkd3d_fex_root_dedupe_on())
++        bindings->root_descriptor_dirty_mask |= 1ull << index;
+     bindings->root_descriptor_active_mask |= 1ull << index;
+ 
+     VKD3D_BREADCRUMB_AUX32(index);
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 96861f2..baee92a 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -10066,6 +10066,7 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+     device->fex_ds_store_none = vkd3d_fex_ds_store_none_enabled();
+     vkd3d_fex_timeline_init();
+     vkd3d_fex_shader_copy_init();
++    vkd3d_fex_root_dedupe_init();
+     device->fex_pass_meter = vkd3d_fex_pass_meter_init(device);
+ 
+     hash_map_init(&device->vertex_input_pipelines,
+diff --git a/libs/vkd3d/fex_pass_meter.c b/libs/vkd3d/fex_pass_meter.c
+index e25d160..b2bc869 100644
+--- a/libs/vkd3d/fex_pass_meter.c
++++ b/libs/vkd3d/fex_pass_meter.c
+@@ -38,6 +38,14 @@
+  * submissions. Results are reset from the CPU once read (when the driver can): a pair used again can't show the
+  * timestamps of its earlier use before the GPU wrote the new ones (before fex11 it could, once the pool wrapped).
+  *
++ * Draw changes (VKD3D fex21), in the measured frames: what each draw after the first of a pass changed since the draw
++ * before it, counted per kind of pass: another pipeline (with another pixel shader or not), root parameters set to
++ * another value (split by whether the pixel shader reads them: its SPIR-V is scanned when the pipeline is made),
++ * dynamic state and vertex/index buffers, and whether vkd3d sent a push descriptor set or push constants for the
++ * draw. Adreno keeps only 2 copies of a stage's state, so every draw that makes the driver write the pixel stage's
++ * state anew has to wait for the draw two back to finish its pixel work. A Set*Root* call with the value already set
++ * doesn't make vkd3d send it again (VKD3D_FEX_ROOT_DEDUPE, on and off by turns every second by default).
++ *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+  * License as published by the Free Software Foundation; either
+@@ -79,6 +87,32 @@
+ 
+ #define FEX_PASS_EVERY_LIGHT 8u      /* VKD3D_FEX_PASSES=1: 1 frame in this many gets GPU timers */
+ 
++/* Draw changes (VKD3D fex21). */
++#define FEX_CHG_SIGS 256u          /* kinds of pass counted (by signature index) */
++#define FEX_CHG_PARAMS 64u
++#define FEX_CHG_CLASSES 7u
++#define FEX_CHG_TOP_KINDS 3u
++#define FEX_CHG_TOP_PARAMS 6u
++
++/* Counted by the recording threads (atomics), taken by the meter thread once a second. */
++struct fex_chg_sig
++{
++    uint32_t draws;                    /* draws after the first of a pass */
++    uint32_t cls[FEX_CHG_CLASSES];     /* the first that applies: another pixel shader, another pipeline with the same
++                                        * pixel shader, root parameters the pixel shader reads, other root parameters
++                                        * only, sent again only, dynamic state or buffers only, nothing */
++    uint32_t pixel_any;                /* draws that changed a root parameter the pixel shader reads, whatever else */
++    uint32_t sent_set, sent_consts;    /* draws vkd3d sent a push descriptor set / push constants for */
++    uint32_t same;                     /* Set*Root* calls with the value already set */
++    uint32_t unknown;                  /* draws whose pipeline's pixel shader reads weren't known (visibility used) */
++    uint32_t param[FEX_CHG_PARAMS];    /* draws that changed this root parameter */
++    uint32_t param_ps[FEX_CHG_PARAMS]; /* ... while the pixel shader reads it */
++    uint8_t ptype[FEX_CHG_PARAMS];     /* root parameter type << 4 | shader visibility (15 = other), last seen */
++};
++
++uint32_t vkd3d_fex_root_dedupe_now = 1u;
++static bool fex_root_dedupe_alt;       /* on and off by turns every second while the meter runs */
++
+ #define FEX_DRAW_FLAG_DIRECT 0x1u   /* vertices known on the CPU */
+ #define FEX_DRAW_FLAG_NEW_PSO 0x2u  /* another VkPipeline than the draw before */
+ 
+@@ -244,6 +278,10 @@ struct vkd3d_fex_pass_meter
+     uint64_t list_waits, list_wait_ticks, list_wait_max;
+     struct vkd3d_fex_transfer_totals xfer;
+     uint32_t gpu_publishes;
++
++    /* VKD3D fex21 */
++    struct fex_chg_sig chg[FEX_CHG_SIGS];
++    struct fex_chg_sig chg_snap[FEX_CHG_SIGS]; /* the meter thread's copy */
+ };
+ 
+ static const char *fex_pass_op_name(uint8_t op)
+@@ -689,6 +727,11 @@ void vkd3d_fex_pass_meter_begin_pass(struct d3d12_command_list *list, const VkRe
+     pipelines = list->fex_pass.binds;
+     list->fex_pass.binds = 0;
+ 
++    /* Draw changes count from the pass's first draw on. */
++    list->fex_pass.chg_params = 0;
++    list->fex_pass.chg_flags = 0;
++    list->fex_pass.chg_same = 0;
++
+     memset(current, 0, sizeof(*current));
+     current->pair = fex_pass_alloc_pair(list);
+     current->sig = fex_pass_intern_sig(meter, &sig);
+@@ -764,6 +807,15 @@ void vkd3d_fex_pass_meter_vertices(struct d3d12_command_list *list, uint64_t ver
+ 
+ void vkd3d_fex_pass_meter_pipeline_bind(struct d3d12_command_list *list)
+ {
++    uint64_t ps_hash = list->state ? list->state->graphics.fex_ps_hash : 0;
++
++    list->fex_pass.chg_flags |= VKD3D_FEX_CHG_PIPELINE;
++    if (ps_hash != list->fex_pass.last_ps_hash)
++    {
++        list->fex_pass.chg_flags |= VKD3D_FEX_CHG_NEW_PS;
++        list->fex_pass.last_ps_hash = ps_hash;
++    }
++
+     if (list->fex_pass.pass_active)
+         list->fex_pass.current.pipelines++;
+     else
+@@ -780,10 +832,106 @@ void vkd3d_fex_pass_meter_game_query_heap(struct d3d12_device *device, D3D12_QUE
+         INFO("FEX pass meter: the game uses pipeline statistics, not sampling them any more.\n");
+ }
+ 
++static uint32_t fex_chg_visibility(const struct vkd3d_shader_root_parameter *p)
++{
++    enum vkd3d_shader_visibility vis = VKD3D_SHADER_VISIBILITY_ALL;
++
++    if (p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++    {
++        if (p->descriptor_table.binding_count && p->descriptor_table.first_binding)
++            vis = p->descriptor_table.first_binding->shader_visibility;
++    }
++    else if (p->parameter_type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++    {
++        if (p->descriptor.binding)
++            vis = p->descriptor.binding->shader_visibility;
++    }
++    return (uint32_t)vis <= VKD3D_SHADER_VISIBILITY_MESH ? (uint32_t)vis : 15u;
++}
++
++/* VKD3D fex21: what this draw changed since the draw before it, for a measured pass. */
++static void fex_chg_count(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_pass_meter *meter = list->device->fex_pass_meter;
++    const struct d3d12_root_signature *rs = list->graphics_bindings.root_signature;
++    const struct d3d12_graphics_pipeline_state *graphics = NULL;
++    uint32_t flags = list->fex_pass.chg_flags;
++    uint64_t params = list->fex_pass.chg_params;
++    struct fex_chg_sig *c;
++    bool pixel = false;
++    uint32_t cls, i;
++    bool known;
++
++    if (!meter || list->fex_pass.current.sig >= FEX_CHG_SIGS)
++        return;
++    c = &meter->chg[list->fex_pass.current.sig];
++    if (list->state && list->state->pipeline_type != VKD3D_PIPELINE_TYPE_COMPUTE)
++        graphics = &list->state->graphics;
++    known = graphics && graphics->fex_ps_reads_known;
++    if (!rs)
++        params = 0;
++
++    while (params)
++    {
++        const struct vkd3d_shader_root_parameter *p;
++        uint32_t vis;
++        bool reads;
++
++        i = vkd3d_bitmask_iter64(&params);
++        if (i >= rs->parameter_count || i >= FEX_CHG_PARAMS)
++            continue;
++        p = &rs->parameters[i];
++        vis = fex_chg_visibility(p);
++        reads = known ? !!(graphics->fex_ps_root_reads & (1ull << i)) :
++                (vis == VKD3D_SHADER_VISIBILITY_ALL || vis == VKD3D_SHADER_VISIBILITY_PIXEL);
++        vkd3d_atomic_uint32_add(&c->param[i], 1, vkd3d_memory_order_relaxed);
++        if (reads)
++        {
++            pixel = true;
++            vkd3d_atomic_uint32_add(&c->param_ps[i], 1, vkd3d_memory_order_relaxed);
++        }
++        c->ptype[i] = (uint8_t)(((uint32_t)p->parameter_type << 4) | vis);
++    }
++
++    if (flags & VKD3D_FEX_CHG_NEW_PS)
++        cls = 0;
++    else if (flags & VKD3D_FEX_CHG_PIPELINE)
++        cls = 1;
++    else if (pixel)
++        cls = 2;
++    else if (list->fex_pass.chg_params)
++        cls = 3;
++    else if (flags & (VKD3D_FEX_CHG_SENT_SET | VKD3D_FEX_CHG_SENT_CONSTS))
++        cls = 4;
++    else if (flags & (VKD3D_FEX_CHG_DYNAMIC | VKD3D_FEX_CHG_BUFFERS))
++        cls = 5;
++    else
++        cls = 6;
++
++    vkd3d_atomic_uint32_add(&c->draws, 1, vkd3d_memory_order_relaxed);
++    vkd3d_atomic_uint32_add(&c->cls[cls], 1, vkd3d_memory_order_relaxed);
++    if (pixel)
++        vkd3d_atomic_uint32_add(&c->pixel_any, 1, vkd3d_memory_order_relaxed);
++    if (flags & VKD3D_FEX_CHG_SENT_SET)
++        vkd3d_atomic_uint32_add(&c->sent_set, 1, vkd3d_memory_order_relaxed);
++    if (flags & VKD3D_FEX_CHG_SENT_CONSTS)
++        vkd3d_atomic_uint32_add(&c->sent_consts, 1, vkd3d_memory_order_relaxed);
++    if (list->fex_pass.chg_same)
++        vkd3d_atomic_uint32_add(&c->same, list->fex_pass.chg_same, vkd3d_memory_order_relaxed);
++    if (!known)
++        vkd3d_atomic_uint32_add(&c->unknown, 1, vkd3d_memory_order_relaxed);
++}
++
+ void vkd3d_fex_pass_meter_draw(struct d3d12_command_list *list)
+ {
+     if (list->fex_pass.pass_active)
++    {
+         list->fex_pass.current.draws++;
++        fex_chg_count(list);
++    }
++    list->fex_pass.chg_params = 0;
++    list->fex_pass.chg_flags = 0;
++    list->fex_pass.chg_same = 0;
+     if (list->fex_pass.draw_open)
+         fex_draw_stamp(list);
+ }
+@@ -1727,6 +1875,168 @@ static size_t fex_gap_describe_mask(uint32_t mask, char *buf, size_t size, size_
+     return len;
+ }
+ 
++/* VKD3D fex21: a kind of pass in a few characters: size, color formats (c), depth format (ds). */
++static size_t fex_chg_describe_sig(const struct fex_pass_sig *sig, char *buf, size_t size, size_t len)
++{
++    bool first = true;
++    unsigned int i;
++
++    len = vkd3d_fex_report_append(buf, size, len, "%ux%u", sig->width, sig->height);
++    if (sig->layers > 1)
++        len = vkd3d_fex_report_append(buf, size, len, "x%u", sig->layers);
++    for (i = 0; i < sig->color_count; i++)
++    {
++        if (!sig->color_bytes[i])
++            continue;
++        len = vkd3d_fex_report_append(buf, size, len, first ? " c%u" : ",%u", sig->color_dxgi[i]);
++        first = false;
++    }
++    if (sig->has_depth || sig->has_stencil)
++        len = vkd3d_fex_report_append(buf, size, len, " ds%u", sig->ds_dxgi);
++    if (sig->kind == VKD3D_FEX_PASS_KIND_RESUMED)
++        len = vkd3d_fex_report_append(buf, size, len, " resumed");
++    return len;
++}
++
++/* VKD3D fex21: the 'gpu draw changes' lines; flips VKD3D_FEX_ROOT_DEDUPE in its on/off mode. */
++static size_t fex_chg_publish(struct vkd3d_fex_pass_meter *meter, char *text, size_t size, size_t len)
++{
++    static const char *const class_names[FEX_CHG_CLASSES] =
++    {
++        "new PS", "new pipeline", "PS data", "VS data only", "re-sent only", "dyn/buffers only", "nothing",
++    };
++    static const char *const type_names[] = { "table", "const", "CBV", "SRV", "UAV" };
++    static const char *const vis_names[] = { "all", "VS", "HS", "DS", "GS", "PS", "AS", "MS" };
++    uint64_t draws = 0, sent_set = 0, sent_consts = 0, same = 0, pixel_any = 0;
++    uint32_t top[FEX_CHG_TOP_KINDS], top_count = 0;
++    uint32_t i, j, k, sig_count;
++    bool dedupe_on;
++
++    dedupe_on = vkd3d_fex_root_dedupe_on();
++    if (fex_root_dedupe_alt)
++        vkd3d_atomic_uint32_store_explicit(&vkd3d_fex_root_dedupe_now, dedupe_on ? 0u : 1u, vkd3d_memory_order_relaxed);
++
++    sig_count = vkd3d_atomic_uint32_load_explicit(&meter->sig_count, vkd3d_memory_order_acquire);
++    if (sig_count > FEX_CHG_SIGS)
++        sig_count = FEX_CHG_SIGS;
++    for (i = 0; i < sig_count; i++)
++    {
++        struct fex_chg_sig *c = &meter->chg[i], *t = &meter->chg_snap[i];
++
++        t->draws = vkd3d_atomic_uint32_exchange_explicit(&c->draws, 0, vkd3d_memory_order_relaxed);
++        if (!t->draws)
++            continue;
++        for (k = 0; k < FEX_CHG_CLASSES; k++)
++            t->cls[k] = vkd3d_atomic_uint32_exchange_explicit(&c->cls[k], 0, vkd3d_memory_order_relaxed);
++        t->pixel_any = vkd3d_atomic_uint32_exchange_explicit(&c->pixel_any, 0, vkd3d_memory_order_relaxed);
++        t->sent_set = vkd3d_atomic_uint32_exchange_explicit(&c->sent_set, 0, vkd3d_memory_order_relaxed);
++        t->sent_consts = vkd3d_atomic_uint32_exchange_explicit(&c->sent_consts, 0, vkd3d_memory_order_relaxed);
++        t->same = vkd3d_atomic_uint32_exchange_explicit(&c->same, 0, vkd3d_memory_order_relaxed);
++        t->unknown = vkd3d_atomic_uint32_exchange_explicit(&c->unknown, 0, vkd3d_memory_order_relaxed);
++        for (k = 0; k < FEX_CHG_PARAMS; k++)
++        {
++            t->param[k] = c->param[k] ? vkd3d_atomic_uint32_exchange_explicit(&c->param[k], 0,
++                    vkd3d_memory_order_relaxed) : 0;
++            t->param_ps[k] = c->param_ps[k] ? vkd3d_atomic_uint32_exchange_explicit(&c->param_ps[k], 0,
++                    vkd3d_memory_order_relaxed) : 0;
++            t->ptype[k] = c->ptype[k];
++        }
++
++        draws += t->draws;
++        sent_set += t->sent_set;
++        sent_consts += t->sent_consts;
++        same += t->same;
++        pixel_any += t->pixel_any;
++        for (j = top_count; j > 0 && meter->chg_snap[top[j - 1]].draws < t->draws; j--)
++        {
++            if (j < ARRAY_SIZE(top))
++                top[j] = top[j - 1];
++        }
++        if (j < ARRAY_SIZE(top))
++        {
++            top[j] = i;
++            if (top_count < ARRAY_SIZE(top))
++                top_count++;
++        }
++    }
++
++    if (meter->gpu_publishes > FEX_DRAW_FIRST_PUBLISH && meter->gpu_publishes <= 2 * FEX_DRAW_FIRST_PUBLISH)
++        len = vkd3d_fex_report_append(text, size, len,
++                "# gpu draw changes (VKD3D fex21), measured frames only, per kind of pass (size, c = color formats, ds ="
++                " depth format): the draws after the first of a pass by what changed since the draw before (the first"
++                " that applies): 'new PS' = a pipeline with another pixel shader, 'new pipeline' = same pixel shader,"
++                " 'PS data' = a root parameter the pixel shader reads (found in its SPIR-V) set to another value, 'VS"
++                " data only' = only root parameters it doesn't read, 're-sent only' = no other value but vkd3d sent a"
++                " push descriptor set or push constants anyway, 'dyn/buffers only' = only dynamic state (viewport,"
++                " stencil reference, ...) or vertex/index buffers set; 'PS data any' = PS data whatever else changed;"
++                " 'sent set/consts' = draws vkd3d sent a push descriptor set / push constants for (the driver then"
++                " writes the shader state of every stage anew); 'same' = Set*Root* calls with the value already set,"
++                " not sent again while 'skip same' is on (VKD3D_FEX_ROOT_DEDUPE: unset = on and off by turns every"
++                " second); params: #root parameter type/visibility, %% of the draws that changed it, 'read' = the"
++                " pixel shader reads it\n");
++
++    if (!draws)
++        return len;
++    len = vkd3d_fex_report_append(text, size, len,
++            "  gpu draw changes: skip same %s | draws=%"PRIu64" PS data any %.0f%% | sent set %.0f%% consts %.0f%% |"
++            " same %.2f/draw\n", dedupe_on ? "on" : "off", draws, 100.0 * pixel_any / draws,
++            100.0 * sent_set / draws, 100.0 * sent_consts / draws, (double)same / draws);
++
++    for (i = 0; i < top_count; i++)
++    {
++        const struct fex_chg_sig *t = &meter->chg_snap[top[i]];
++        uint32_t ptop[FEX_CHG_TOP_PARAMS], ptop_count = 0;
++        double d = t->draws;
++
++        len = vkd3d_fex_report_append(text, size, len, "  gpu draw changes ");
++        len = fex_chg_describe_sig(&meter->sigs[top[i]], text, size, len);
++        len = vkd3d_fex_report_append(text, size, len, ": draws=%u |", t->draws);
++        for (k = 0; k < FEX_CHG_CLASSES; k++)
++        {
++            if (t->cls[k])
++                len = vkd3d_fex_report_append(text, size, len, " %s %.0f%%", class_names[k], 100.0 * t->cls[k] / d);
++        }
++        len = vkd3d_fex_report_append(text, size, len, " | PS data any %.0f%% | sent set %.0f%% consts %.0f%% | same"
++                " %.2f/draw", 100.0 * t->pixel_any / d, 100.0 * t->sent_set / d, 100.0 * t->sent_consts / d,
++                t->same / d);
++        if (t->unknown)
++            len = vkd3d_fex_report_append(text, size, len, " | PS reads unknown %.0f%%", 100.0 * t->unknown / d);
++
++        for (k = 0; k < FEX_CHG_PARAMS; k++)
++        {
++            if (!t->param[k])
++                continue;
++            for (j = ptop_count; j > 0 && t->param[ptop[j - 1]] < t->param[k]; j--)
++            {
++                if (j < ARRAY_SIZE(ptop))
++                    ptop[j] = ptop[j - 1];
++            }
++            if (j < ARRAY_SIZE(ptop))
++            {
++                ptop[j] = k;
++                if (ptop_count < ARRAY_SIZE(ptop))
++                    ptop_count++;
++            }
++        }
++        if (ptop_count)
++            len = vkd3d_fex_report_append(text, size, len, " | params");
++        for (j = 0; j < ptop_count; j++)
++        {
++            uint32_t p = ptop[j], type = t->ptype[p] >> 4, vis = t->ptype[p] & 0xfu;
++
++            len = vkd3d_fex_report_append(text, size, len, "%s #%u %s/%s %.0f%%", j ? "," : "", p,
++                    type < ARRAY_SIZE(type_names) ? type_names[type] : "?",
++                    vis < ARRAY_SIZE(vis_names) ? vis_names[vis] : "other", 100.0 * t->param[p] / d);
++            if (t->param_ps[p] == t->param[p])
++                len = vkd3d_fex_report_append(text, size, len, " read");
++            else if (t->param_ps[p])
++                len = vkd3d_fex_report_append(text, size, len, " (read %.0f%%)", 100.0 * t->param_ps[p] / d);
++        }
++        len = vkd3d_fex_report_append(text, size, len, "\n");
++    }
++    return len;
++}
++
+ /* VKD3D fex11: the gpu report (memory, vkd3d's transfers, GPU time outside render passes), once a second. */
+ static void fex_gpu_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+ {
+@@ -1855,6 +2165,8 @@ static void fex_gpu_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+         len = vkd3d_fex_report_append(text, sizeof(text), len, "\n");
+     }
+ 
++    len = fex_chg_publish(meter, text, sizeof(text), len);
++
+     vkd3d_fex_report_publish(&vkd3d_fex_gpu_report, text, len);
+ 
+     memset(&meter->xfer, 0, sizeof(meter->xfer));
+@@ -2286,3 +2598,295 @@ void vkd3d_fex_pass_meter_deinit(struct vkd3d_fex_pass_meter *meter)
+     vkd3d_free(meter->pending);
+     vkd3d_free(meter);
+ }
++
++/* VKD3D fex21: VKD3D_FEX_ROOT_DEDUPE. */
++void vkd3d_fex_root_dedupe_init(void)
++{
++    uint32_t mode = 2;
++    char env[16];
++
++    if (vkd3d_get_env_var("VKD3D_FEX_ROOT_DEDUPE", env, sizeof(env)))
++    {
++        if (!strcmp(env, "0"))
++            mode = 0;
++        else if (!strcmp(env, "1"))
++            mode = 1;
++    }
++    fex_root_dedupe_alt = mode == 2;
++    vkd3d_atomic_uint32_store_explicit(&vkd3d_fex_root_dedupe_now, mode ? 1u : 0u, vkd3d_memory_order_relaxed);
++    INFO("FEX: root parameters set again with the same value are %s.\n",
++            mode == 0 ? "sent again" : mode == 1 ? "not sent again" :
++            "not sent again (with the pass meter: on and off by turns every second)");
++}
++
++/* VKD3D fex21: which root parameters a pixel shader reads, from its SPIR-V. */
++#define FEX_SPV_OP_TYPE_POINTER 32u
++#define FEX_SPV_OP_CONSTANT 43u
++#define FEX_SPV_OP_FUNCTION_CALL 57u
++#define FEX_SPV_OP_VARIABLE 59u
++#define FEX_SPV_OP_IMAGE_TEXEL_POINTER 60u
++#define FEX_SPV_OP_LOAD 61u
++#define FEX_SPV_OP_ACCESS_CHAIN 65u
++#define FEX_SPV_OP_IN_BOUNDS_ACCESS_CHAIN 66u
++#define FEX_SPV_OP_PTR_ACCESS_CHAIN 67u
++#define FEX_SPV_OP_ARRAY_LENGTH 68u
++#define FEX_SPV_OP_IN_BOUNDS_PTR_ACCESS_CHAIN 70u
++#define FEX_SPV_OP_DECORATE 71u
++#define FEX_SPV_OP_MEMBER_DECORATE 72u
++#define FEX_SPV_OP_COPY_OBJECT 83u
++#define FEX_SPV_DECORATION_BINDING 33u
++#define FEX_SPV_DECORATION_DESCRIPTOR_SET 34u
++#define FEX_SPV_DECORATION_OFFSET 35u
++#define FEX_SPV_STORAGE_PUSH_CONSTANT 9u
++#define FEX_SPV_MAX_MEMBERS 64u
++
++/* Root parameters whose push constant bytes overlap [begin, end). */
++static uint64_t fex_spv_push_params(const struct d3d12_root_signature *rs, uint32_t begin, uint32_t end)
++{
++    uint64_t mask = 0;
++    uint32_t pb, pe;
++    unsigned int i;
++
++    for (i = 0; i < rs->parameter_count && i < 64; i++)
++    {
++        const struct vkd3d_shader_root_parameter *p = &rs->parameters[i];
++
++        if (p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++        {
++            pb = rs->descriptor_table_offset + 4 * p->descriptor_table.table_index;
++            pe = pb + 4;
++        }
++        else if (p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++        {
++            pb = 4 * p->constant.constant_index;
++            pe = pb + 4 * p->constant.constant_count;
++        }
++        else if (rs->root_descriptor_raw_va_mask & (1ull << i))
++        {
++            pb = 8 * p->descriptor.raw_va_root_descriptor_index;
++            pe = pb + 8;
++        }
++        else
++            continue;
++        if (pb < end && begin < pe)
++            mask |= 1ull << i;
++    }
++    return mask;
++}
++
++/* Variables count as read when an access chain, load, function call (or a few more) uses them; push constant bytes by
++ * the constant member index of their access chains (anything else: all of them). */
++static bool fex_spv_root_reads(const uint32_t *code, size_t words, const struct d3d12_root_signature *rs,
++        uint64_t *reads)
++{
++    uint32_t member_offset[FEX_SPV_MAX_MEMBERS], member_count = 0;
++    uint32_t *set_of, *binding_of, *pointee, *const_val;
++    uint32_t bound, push_var = 0, push_struct = 0;
++    uint64_t members_read = 0;
++    bool push_all = false, ok = true;
++    uint8_t *used, *const_ok;
++    uint32_t i, j, k, n, op;
++    size_t pos;
++
++    *reads = 0;
++    if (words < 5 || code[0] != 0x07230203u)
++        return false;
++    bound = code[3];
++    if (!bound || bound > (1u << 22))
++        return false;
++
++    set_of = vkd3d_malloc(bound * sizeof(*set_of));
++    binding_of = vkd3d_malloc(bound * sizeof(*binding_of));
++    pointee = vkd3d_calloc(bound, sizeof(*pointee));
++    const_val = vkd3d_calloc(bound, sizeof(*const_val));
++    used = vkd3d_calloc(bound, 1);
++    const_ok = vkd3d_calloc(bound, 1);
++    if (!set_of || !binding_of || !pointee || !const_val || !used || !const_ok)
++    {
++        ok = false;
++        goto done;
++    }
++    memset(set_of, 0xff, bound * sizeof(*set_of));
++    memset(binding_of, 0xff, bound * sizeof(*binding_of));
++
++#define FEX_SPV_ID(x) ((x) < bound)
++#define FEX_SPV_USE(x) do { if (FEX_SPV_ID(x)) { used[x] = 1; if ((x) == push_var && push_var) push_all = true; } } while (0)
++    for (pos = 5; pos < words; pos += n)
++    {
++        n = code[pos] >> 16;
++        op = code[pos] & 0xffffu;
++        if (!n || pos + n > words)
++        {
++            ok = false;
++            goto done;
++        }
++        switch (op)
++        {
++            case FEX_SPV_OP_DECORATE:
++                if (n >= 4 && FEX_SPV_ID(code[pos + 1]))
++                {
++                    if (code[pos + 2] == FEX_SPV_DECORATION_BINDING)
++                        binding_of[code[pos + 1]] = code[pos + 3];
++                    else if (code[pos + 2] == FEX_SPV_DECORATION_DESCRIPTOR_SET)
++                        set_of[code[pos + 1]] = code[pos + 3];
++                }
++                break;
++            case FEX_SPV_OP_TYPE_POINTER:
++                if (n >= 4 && FEX_SPV_ID(code[pos + 1]))
++                    pointee[code[pos + 1]] = code[pos + 3];
++                break;
++            case FEX_SPV_OP_CONSTANT:
++                if (n >= 4 && FEX_SPV_ID(code[pos + 2]))
++                {
++                    const_val[code[pos + 2]] = code[pos + 3];
++                    const_ok[code[pos + 2]] = 1;
++                }
++                break;
++            case FEX_SPV_OP_VARIABLE:
++                if (n >= 4 && code[pos + 3] == FEX_SPV_STORAGE_PUSH_CONSTANT && !push_var &&
++                        FEX_SPV_ID(code[pos + 1]) && FEX_SPV_ID(code[pos + 2]))
++                {
++                    push_var = code[pos + 2];
++                    push_struct = pointee[code[pos + 1]];
++                }
++                break;
++            case FEX_SPV_OP_LOAD:
++            case FEX_SPV_OP_COPY_OBJECT:
++            case FEX_SPV_OP_IMAGE_TEXEL_POINTER:
++            case FEX_SPV_OP_ARRAY_LENGTH:
++                if (n >= 4)
++                    FEX_SPV_USE(code[pos + 3]);
++                break;
++            case FEX_SPV_OP_ACCESS_CHAIN:
++            case FEX_SPV_OP_IN_BOUNDS_ACCESS_CHAIN:
++                if (n >= 4 && FEX_SPV_ID(code[pos + 3]))
++                {
++                    j = code[pos + 3];
++                    used[j] = 1;
++                    if (push_var && j == push_var)
++                    {
++                        if (n >= 5 && FEX_SPV_ID(code[pos + 4]) && const_ok[code[pos + 4]] &&
++                                const_val[code[pos + 4]] < FEX_SPV_MAX_MEMBERS)
++                            members_read |= 1ull << const_val[code[pos + 4]];
++                        else
++                            push_all = true;
++                    }
++                }
++                break;
++            case FEX_SPV_OP_PTR_ACCESS_CHAIN:
++            case FEX_SPV_OP_IN_BOUNDS_PTR_ACCESS_CHAIN:
++                if (n >= 4)
++                    FEX_SPV_USE(code[pos + 3]);
++                break;
++            case FEX_SPV_OP_FUNCTION_CALL:
++                for (k = 4; k < n; k++)
++                    FEX_SPV_USE(code[pos + k]);
++                break;
++            default:
++                break;
++        }
++    }
++#undef FEX_SPV_USE
++#undef FEX_SPV_ID
++
++    /* The push constant block's member offsets (decorations come before the variable, so a second look). */
++    if (push_var && push_struct && (members_read || push_all))
++    {
++        for (i = 0; i < FEX_SPV_MAX_MEMBERS; i++)
++            member_offset[i] = UINT32_MAX;
++        for (pos = 5; pos < words; pos += n)
++        {
++            n = code[pos] >> 16;
++            op = code[pos] & 0xffffu;
++            if (op == FEX_SPV_OP_MEMBER_DECORATE && n >= 5 && code[pos + 1] == push_struct &&
++                    code[pos + 3] == FEX_SPV_DECORATION_OFFSET && code[pos + 2] < FEX_SPV_MAX_MEMBERS)
++            {
++                member_offset[code[pos + 2]] = code[pos + 4];
++                if (code[pos + 2] + 1 > member_count)
++                    member_count = code[pos + 2] + 1;
++            }
++        }
++        if (push_all)
++            *reads |= fex_spv_push_params(rs, 0, UINT32_MAX);
++        for (i = 0; i < member_count && !push_all; i++)
++        {
++            uint32_t end = UINT32_MAX;
++
++            if (!(members_read & (1ull << i)))
++                continue;
++            if (member_offset[i] == UINT32_MAX)
++            {
++                *reads |= fex_spv_push_params(rs, 0, UINT32_MAX);
++                break;
++            }
++            /* A member reaches up to the next member's offset. */
++            for (j = 0; j < member_count; j++)
++            {
++                if (member_offset[j] != UINT32_MAX && member_offset[j] > member_offset[i] && member_offset[j] < end)
++                    end = member_offset[j];
++            }
++            *reads |= fex_spv_push_params(rs, member_offset[i], end);
++        }
++    }
++
++    /* Root descriptors (push descriptors) by descriptor set and binding; the push UBO stands for all push data. */
++    for (i = 0; i < bound; i++)
++    {
++        if (!used[i] || set_of[i] == UINT32_MAX || binding_of[i] == UINT32_MAX)
++            continue;
++        if ((rs->graphics.flags & VKD3D_ROOT_SIGNATURE_USE_PUSH_CONSTANT_UNIFORM_BLOCK) &&
++                set_of[i] == rs->push_constant_ubo_binding.set && binding_of[i] == rs->push_constant_ubo_binding.binding)
++            *reads |= fex_spv_push_params(rs, 0, UINT32_MAX);
++        for (j = 0; j < rs->parameter_count && j < 64; j++)
++        {
++            const struct vkd3d_shader_root_parameter *p = &rs->parameters[j];
++
++            if (p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
++                    p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
++                    (rs->root_descriptor_raw_va_mask & (1ull << j)) || !p->descriptor.binding)
++                continue;
++            if (p->descriptor.binding->binding.set == set_of[i] &&
++                    p->descriptor.binding->binding.binding == binding_of[i])
++                *reads |= 1ull << j;
++        }
++    }
++
++done:
++    vkd3d_free(set_of);
++    vkd3d_free(binding_of);
++    vkd3d_free(pointee);
++    vkd3d_free(const_val);
++    vkd3d_free(used);
++    vkd3d_free(const_ok);
++    return ok;
++}
++
++void vkd3d_fex_pso_root_reads(struct d3d12_pipeline_state *state)
++{
++    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
++    const struct vkd3d_shader_code *code = NULL;
++    unsigned int i;
++
++    graphics->fex_ps_root_reads = 0;
++    graphics->fex_ps_hash = 0;
++    graphics->fex_ps_reads_known = false;
++    if (!state->device->fex_pass_meter)
++        return;
++
++    for (i = 0; i < graphics->stage_count; i++)
++    {
++        if (graphics->cached_desc.bytecode_stages[i] == VK_SHADER_STAGE_FRAGMENT_BIT)
++            code = &graphics->code[i];
++    }
++    if (!code)
++    {
++        /* No pixel shader: nothing to read. */
++        graphics->fex_ps_reads_known = true;
++        return;
++    }
++    graphics->fex_ps_hash = code->meta.hash ? code->meta.hash : 1;
++    if (!state->root_signature || !code->code || code->size < 20)
++        return;
++    graphics->fex_ps_reads_known = fex_spv_root_reads(code->code, code->size / sizeof(uint32_t),
++            state->root_signature, &graphics->fex_ps_root_reads);
++}
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 8cccb0b..0026014 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -4464,6 +4464,7 @@ static HRESULT d3d12_pipeline_state_graphics_create_shader_stages(
+             return hr;
+     }
+ 
++    vkd3d_fex_pso_root_reads(state);
+     vkd3d_fex_shader_copy_pso(state, desc);
+     return S_OK;
+ }
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index ddfd902..8761488 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2226,6 +2226,12 @@ struct d3d12_graphics_pipeline_state
+     unsigned int xfb_buffer_count;
+ 
+     bool disable_optimization;
++
++    /* VKD3D fex21: the root parameters the pixel shader reads (from its SPIR-V, vkd3d_fex_pso_root_reads), valid when
++     * fex_ps_reads_known; the pixel shader's hash (0 = none). */
++    uint64_t fex_ps_root_reads;
++    uint64_t fex_ps_hash;
++    bool fex_ps_reads_known;
+ };
+ 
+ static inline unsigned int dsv_attachment_mask(const struct d3d12_graphics_pipeline_state *graphics)
+@@ -3466,6 +3472,12 @@ struct d3d12_command_list
+          * submitted), NULL otherwise; draw_open while its pass still runs. */
+         struct vkd3d_fex_draw_sample *draw;
+         bool draw_open;
++        /* VKD3D fex21: what changed for the next draw since the draw before it, in the graphics bindings. Noted in
++         * every frame, counted at the draws of measured passes (vkd3d_fex_pass_meter_draw). */
++        uint64_t chg_params;   /* root parameters set to another value */
++        uint32_t chg_flags;    /* VKD3D_FEX_CHG_* */
++        uint32_t chg_same;     /* Set*Root* calls with the value already set */
++        uint64_t last_ps_hash; /* pixel shader of the last pipeline bound */
+     } fex_pass;
+ 
+     struct
+@@ -3499,6 +3511,25 @@ void vkd3d_fex_pass_meter_vertices(struct d3d12_command_list *list, uint64_t ver
+ void vkd3d_fex_pass_meter_pipeline_bind(struct d3d12_command_list *list);
+ void vkd3d_fex_pass_meter_game_query_heap(struct d3d12_device *device, D3D12_QUERY_HEAP_TYPE type);
+ void vkd3d_fex_pass_meter_end_pass(struct d3d12_command_list *list, unsigned int line);
++/* VKD3D fex21: what a draw changed since the draw before it (fex_pass.chg_flags). */
++#define VKD3D_FEX_CHG_PIPELINE 0x1u     /* another VkPipeline bound */
++#define VKD3D_FEX_CHG_NEW_PS 0x2u       /* ... with another pixel shader */
++#define VKD3D_FEX_CHG_DYNAMIC 0x4u      /* dynamic state set: viewport, scissor, stencil reference, depth bias, ... */
++#define VKD3D_FEX_CHG_BUFFERS 0x8u      /* vertex or index buffers bound */
++#define VKD3D_FEX_CHG_SENT_SET 0x10u    /* vkCmdPushDescriptorSetKHR: root descriptors sent */
++#define VKD3D_FEX_CHG_SENT_CONSTS 0x20u /* vkCmdPushConstants: descriptor table offsets or root constants sent */
++/* VKD3D fex21, VKD3D_FEX_ROOT_DEDUPE: a Set*Root* call with the value already set doesn't mark the parameter to be sent
++ * again (each push descriptor set or push constants update makes the driver write the next draw's shader state anew,
++ * for the pixel stage too). 0 = off, 1 = on, unset/2 = on and off by turns every second while the pass meter runs
++ * (on without it). */
++extern uint32_t vkd3d_fex_root_dedupe_now;
++static inline bool vkd3d_fex_root_dedupe_on(void)
++{
++    return vkd3d_atomic_uint32_load_explicit(&vkd3d_fex_root_dedupe_now, vkd3d_memory_order_relaxed) != 0;
++}
++void vkd3d_fex_root_dedupe_init(void);
++/* After a graphics PSO's shaders are compiled: which root parameters its pixel shader reads. */
++void vkd3d_fex_pso_root_reads(struct d3d12_pipeline_state *state);
+ void vkd3d_fex_pass_meter_submit_list(struct d3d12_command_list *list);
+ void vkd3d_fex_pass_meter_free_list(struct d3d12_command_list *list);
+ void vkd3d_fex_pass_meter_count_clears(struct d3d12_device *device, uint32_t folded, uint32_t own_pass);
+-- 
+2.43.0
+
