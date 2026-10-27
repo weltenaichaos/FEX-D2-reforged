@@ -1,0 +1,2711 @@
+From 7e47f25508d581424b2d2bb225d3f1ed6f9ec695 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 23:24:33 +0000
+Subject: [PATCH] FEX: draw probe with D2R-sized draws, keeps its device
+
+fex26's 8-pixel triangles finish so fast that what changes between draws
+shows less than in the game (0.4-1.6 us a draw against 2-6 us in D2R's
+passes). Every test now draws 1000 meshes of 220 triangles (440 vertices,
+660 indices), one per cell of a 40 x 25 grid so they cover the target
+once: into 1280x720 R11G11B10F + RGBA8 + D24S8 with a lit pixel shader
+(2 texture reads from an array of 8, 8 lights; like D2R's main pass,
+~920 pixels a draw), and into a 2048x2048 D16 map with an alpha-test
+pixel shader (like its shadow passes, ~4,200 pixels a draw). Per kind:
+no changes, like D2R (new push constants and 2 new root constant buffers
+every draw), first instance and one multi-draw call (each draw finds its
+block in a buffer, material, lights and texture index read per pixel).
+
+With fex24 and fex26 the game died right after the last test, when the
+probe tore its device down. The probe now never destroys or frees
+anything it made; its objects (~35 MB of GPU memory) stay until the game
+ends.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WZVGoVEaHJ78mpf2D3MiER
+---
+ libs/vkd3d/fex_draw_probe.c     | 1256 +++++++++++++++++++------------
+ libs/vkd3d/fex_draw_probe_spv.h |  859 ++++++++++++++-------
+ libs/vkd3d/vkd3d_private.h      |    2 +-
+ 3 files changed, 1377 insertions(+), 740 deletions(-)
+
+diff --git a/libs/vkd3d/fex_draw_probe.c b/libs/vkd3d/fex_draw_probe.c
+index 2e333a8..ed64aff 100644
+--- a/libs/vkd3d/fex_draw_probe.c
++++ b/libs/vkd3d/fex_draw_probe.c
+@@ -1,75 +1,81 @@
+ /*
+- * FEX draw probe (VKD3D fex23-fex26): times on the GPU how long small draws take when they are recorded in different
+- * ways, and puts the result in a '#' note of the gpu report (FEX's stats log). It answers whether D2R's draws are slow
+- * on Adreno because of what changes before every draw (new push constants and new root constant buffers, which Turnip
+- * turns into new register values for every draw) or because of the draws themselves, and whether drawing many objects
+- * with one call (each finding its data by its draw index) avoids it.
++ * FEX draw probe (VKD3D fex23-fex27): times on the GPU how long draws take when they are recorded in different ways,
++ * and puts the result in a '#' note of the gpu report (FEX's stats log). It answers whether drawing D2R's objects in
++ * batches (each draw finding its data in a buffer, so nothing is set between draws) would make its busy passes
++ * cheaper than D2R's way (new push constants and new root constant buffers before every draw, which Turnip turns into
++ * new register values for every draw).
+  *
+- * Every test is one render pass of 1000 draws of an 8-pixel triangle into a 2048x2048 RGBA8 target (loaded and stored,
+- * so Turnip draws it straight to memory as it does D2R's big passes), timed by timestamps around the pass (the GPU
+- * finishes everything before each of them), 3 times in a row; per test the fastest round counts, less the empty pass's
+- * own time, divided by 1000.
++ * fex27: draws the size of D2R's. fex26 timed 8-pixel triangles, which the GPU finishes so fast that what happens
++ * between draws shows less than it would in the game (0.4-1.6 us a draw against 2-6 us in D2R's passes). Now every
++ * test is 1000 draws of a 220-triangle mesh (440 vertices, 660 indices: 10 x 11 quads, about the triangles and
++ * vertices of a D2R main pass draw), each in its own cell of a 40 x 25 grid, so the draws cover the target once:
++ * - main: 1280x720 R11G11B10F + RGBA8 + D24S8 (the formats of D2R's main pass), ~920 pixels a draw (D2R's main pass:
++ *   ~940 pixel shader runs a draw), a lit pixel shader (2 texture reads from an array of 8, 8 lights);
++ * - shadow: the same meshes into a 2048x2048 D16 map (~4,200 pixels a draw), depth only with an alpha-test pixel
++ *   shader (D2R's shadow passes have a pixel shader too).
++ * Every pass loads and stores its targets (Turnip then draws straight to memory as for D2R's big passes; covering the
++ * target only once keeps its autotuner on that choice). Ways of drawing, per kind:
++ * - no changes: nothing set between draws, only the index range moves (the lower bound);
++ * - like D2R: new push constants (13 dwords) and 2 new root constant buffers (push descriptors) before every draw;
++ * - first instance: nothing set between draws, each draw finds its block in a buffer by its instance index;
++ * - one multi-draw call: all 1000 in one vkCmdDrawIndexedIndirect, each finding its block by its draw index.
++ * The two batched ways read their material, lights and texture index per pixel from that buffer (a batched D2R
++ * would have to), the others get them from constant buffers and push constants the driver loads once per draw.
++ * Each test is one render pass per round, timed by timestamps around the pass (the GPU finishes everything before
++ * each of them), 3 rounds in a row; per test the fastest round counts, less its kind's empty pass, divided by 1000.
+  *
+- * fex24: fex23 ran the probe inside device creation, on the game's own Vulkan device, in one submission, and D2R
+- * crashed at start (the log ends a second after the probe recorded its draws). Now the probe runs on a thread of its
+- * own, 2 s after the device is made (VKD3D_FEX_DRAW_PROBE_DELAY, seconds), on a Vulkan device of its own (the same
+- * GPU, so a GPU fault in the probe loses only that device, not the game's), one test per submission, each named
+- * in the log 1.5 s before it is sent to the GPU (a '  draw probe:' line in the gpu report), so a crash shows which
+- * test it was. A test that fails stops the probe; the note then gives the tests done so far and where it stopped.
++ * fex24: the probe runs on a thread of its own, 2 s after the game's device is made (VKD3D_FEX_DRAW_PROBE_DELAY,
++ * seconds), on a Vulkan device of its own (the same GPU, so a GPU fault in the probe loses only that device), one test
++ * per submission, each named in the log 1.5 s before it is sent to the GPU (a '  draw probe:' line in the gpu report),
++ * so a crash shows which test it was. A test that fails stops the probe; the note then gives the tests done so far
++ * and where it stopped.
+  * fex25: the probe's device also enables VK_KHR_swapchain, which GameNative's frame cap layer needs from every device
+- * (see fex_probe_create_device); fex24 crashed the game's next present without it.
+- * fex26: off unless asked for (VKD3D_FEX_DRAW_PROBE=1), as with the layer off fex24 ran 11 tests and the game ended
+- * during the 12th ('lit, one multi-draw call'); that test runs only with VKD3D_FEX_DRAW_PROBE=2. The results so far go
+- * into the log after every test, so a crash in a later test keeps them.
+- * Runs only with VKD3D_FEX_DRAW_PROBE=1 or 2, and only while the pass meter runs (VKD3D_FEX_PASSES).
++ * (see fex_probe_create_device).
++ * fex26: off unless asked for (VKD3D_FEX_DRAW_PROBE=1); the results so far go into the log after every test.
++ * fex27: the probe never destroys anything it made, its device included: with fex24 and fex26 the game died right
++ * after the last test, when the probe tore its device down. Its objects (~35 MB of GPU memory) stay until the game
++ * ends.
++ * Runs only with VKD3D_FEX_DRAW_PROBE=1 (or higher), and only while the pass meter runs (VKD3D_FEX_PASSES).
+  *
+  * The shaders (fex_draw_probe_spv.h, glslangValidator -V --target-env vulkan1.1):
+  *
+- * simple.vert:
+- *   layout(set = 0, binding = 0) uniform Cam { vec4 scale; } cam;
+- *   layout(set = 0, binding = 1) uniform Obj { vec4 pos; } obj;
+- *   layout(push_constant) uniform PC { uint idx; uint pad[12]; } pc;
++ * real.vert (main and shadow, like D2R's draws: the object's data in root constant buffers):
++ *   layout(set = 0, binding = 0, std140) uniform Cam { mat4 viewproj; vec4 eye; } cam;
++ *   layout(set = 0, binding = 1, std140) uniform Obj { mat4 world; vec4 tint; } obj;
++ *   layout(push_constant) uniform PC { uint tex; float scale; uint pad[11]; } pc;
++ *   layout(location = 0) in vec3 in_pos; layout(location = 1) in vec2 in_uv; layout(location = 2) in vec4 in_nrm;
++ *   layout(location = 0) out vec2 o_uv; layout(location = 1) out vec3 o_wpos; layout(location = 2) out vec3 o_nrm;
++ *   layout(location = 3) out vec4 o_tint;
+  *   void main() {
+- *       vec2 v = vec2(gl_VertexIndex == 1 ? 1.0 : 0.0, gl_VertexIndex == 2 ? 1.0 : 0.0);
+- *       gl_Position = vec4(obj.pos.xy + v * cam.scale.xy + vec2(float(pc.idx) * cam.scale.z), 0.0, 1.0); }
+- * simple.frag:
+- *   layout(set = 0, binding = 2) uniform Mat { vec4 color; vec4 lights[32]; } mat;
+- *   layout(location = 0) out vec4 o;
+- *   void main() { o = mat.color; }
+- * lit.frag (a lit-like pixel shader; its 32 lights are the same for the whole draw, so Turnip loads them once per
+- * draw ahead of the pixels):
+- *   layout(set = 0, binding = 2) uniform Mat { vec4 color; vec4 lights[32]; } mat;
+- *   layout(location = 0) out vec4 o;
++ *       vec4 w = obj.world * vec4(in_pos, 1.0); gl_Position = cam.viewproj * w;
++ *       o_uv = in_uv; o_wpos = w.xyz; o_nrm = mat3(obj.world) * (in_nrm.xyz * 2.0 - 1.0); o_tint = obj.tint * pc.scale; }
++ * real.frag (main, lit):
++ *   layout(set = 0, binding = 2, std140) uniform Mat { vec4 color; vec4 params; vec4 lights[16]; vec4 lcolors[16]; } mat;
++ *   layout(set = 1, binding = 0) uniform sampler2D texs[8];
++ *   (pc as above; inputs as real.vert's outputs) layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1;
+  *   void main() {
+- *       vec4 c = mat.color; vec2 p = gl_FragCoord.xy * 0.001;
+- *       for (int i = 0; i < 32; i++) c += mat.lights[i] * max(0.0, dot(p, mat.lights[i].xy));
+- *       o = c; }
+- * batch.vert (GL_ARB_shader_draw_parameters; the draw's data by its draw index, or by its instance index):
++ *       vec4 a = texture(texs[pc.tex & 7u], uv); vec4 b = texture(texs[(pc.tex + 1u) & 7u], uv * 2.0);
++ *       vec3 n = normalize(nrm); vec3 c = mat.params.xyz;
++ *       for (int i = 0; i < 8; i++) {
++ *           vec3 l = mat.lights[i].xyz - wpos; float d = max(dot(l, l), 1e-4);
++ *           c += mat.lcolors[i].rgb * (max(dot(n, l), 0.0) * inversesqrt(d) / (1.0 + d * mat.lights[i].w)); }
++ *       o0 = vec4(c * a.rgb * mat.color.rgb * tint.rgb, 1.0); o1 = vec4(b.rgb * tint.a, a.a * mat.color.a); }
++ * depth.frag (shadow): if (texture(texs[pc.tex & 7u], uv).a * mat.color.a < 0.01) discard;
++ * batch.vert (GL_ARB_shader_draw_parameters; the draw's block by its draw index, or by its instance index):
+  *   layout(constant_id = 0) const int USE_INSTANCE = 0;
+- *   layout(set = 0, binding = 0) uniform Cam { vec4 scale; } cam;
+- *   layout(set = 0, binding = 3, std430) readonly buffer Objs { vec4 pos[]; } objs;
+- *   layout(set = 0, binding = 4, std430) readonly buffer Mats { vec4 color[]; } mats;
+- *   layout(location = 0) flat out vec4 col;
+- *   layout(location = 1) flat out uint id;
++ *   struct Block { mat4 world; vec4 tint; uvec4 meta; vec4 pad0[10];
++ *                  vec4 color; vec4 params; vec4 lights[16]; vec4 lcolors[16]; vec4 pad1[14]; };   (1024 bytes)
++ *   layout(set = 0, binding = 3, std430) readonly buffer Blocks { Block b[]; } blocks;
++ *   (outputs as real.vert's, plus) layout(location = 4) flat out uint o_id;
+  *   void main() {
+  *       uint i = USE_INSTANCE != 0 ? uint(gl_InstanceIndex) : uint(gl_DrawIDARB);
+- *       vec2 v = vec2(gl_VertexIndex == 1 ? 1.0 : 0.0, gl_VertexIndex == 2 ? 1.0 : 0.0);
+- *       gl_Position = vec4(objs.pos[i].xy + v * cam.scale.xy, 0.0, 1.0);
+- *       col = mats.color[i]; id = i; }
+- * batch.frag:
+- *   layout(location = 0) flat in vec4 col;
+- *   layout(location = 0) out vec4 o;
+- *   void main() { o = col; }
+- * lit_batch.frag (lit.frag for batched draws: the lights come from the draw's block, found by its index, so they are
+- * read by the pixels themselves):
+- *   struct Mat { vec4 color; vec4 lights[32]; vec4 pad[31]; };
+- *   layout(set = 0, binding = 5, std430) readonly buffer LitMats { Mat m[]; } mats;
+- *   layout(location = 1) flat in uint id;
+- *   layout(location = 0) out vec4 o;
+- *   void main() {
+- *       vec4 c = mats.m[id].color; vec2 p = gl_FragCoord.xy * 0.001;
+- *       for (int i = 0; i < 32; i++) c += mats.m[id].lights[i] * max(0.0, dot(p, mats.m[id].lights[i].xy));
+- *       o = c; }
++ *       mat4 world = blocks.b[i].world; vec4 w = world * vec4(in_pos, 1.0); gl_Position = cam.viewproj * w;
++ *       o_uv = in_uv; o_wpos = w.xyz; o_nrm = mat3(world) * (in_nrm.xyz * 2.0 - 1.0); o_tint = blocks.b[i].tint;
++ *       o_id = i; }
++ * batch.frag (main; GL_EXT_nonuniform_qualifier): real.frag with mat.x -> blocks.b[id].x and the texture index
++ *   t = blocks.b[id].meta.x read per pixel: texs[nonuniformEXT(t & 7u)], texs[nonuniformEXT((t + 1u) & 7u)].
++ * depth_batch.frag (shadow):
++ *   if (texture(texs[nonuniformEXT(blocks.b[id].meta.x & 7u)], uv).a * blocks.b[id].color.a < 0.01) discard;
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -90,85 +96,141 @@
+ 
+ #define FEX_PROBE_DRAWS 1000u
+ #define FEX_PROBE_ROUNDS 3u
+-#define FEX_PROBE_SIZE 2048u
+-#define FEX_PROBE_STRIDE 1024u      /* per-draw block: object position at 0, material (color + 32 lights) at 256 */
++#define FEX_PROBE_MAIN_W 1280u
++#define FEX_PROBE_MAIN_H 720u
++#define FEX_PROBE_SHADOW_SIZE 2048u
++#define FEX_PROBE_GRID_X 40u        /* 40 x 25 cells, one draw each */
++#define FEX_PROBE_GRID_Y 25u
++#define FEX_PROBE_QUADS_X 10u       /* a mesh: 10 x 11 quads of 4 vertices each */
++#define FEX_PROBE_QUADS_Y 11u
++#define FEX_PROBE_MESH_VERTICES (FEX_PROBE_QUADS_X * FEX_PROBE_QUADS_Y * 4u)
++#define FEX_PROBE_MESH_INDICES (FEX_PROBE_QUADS_X * FEX_PROBE_QUADS_Y * 6u)
++#define FEX_PROBE_VERTEX_SIZE 24u   /* position 3 floats, uv 2 floats, normal RGBA8 */
++#define FEX_PROBE_STRIDE 1024u      /* per-draw block: object at 0 (world, tint, meta), material at 256 */
++#define FEX_PROBE_OBJ_SIZE 80u
+ #define FEX_PROBE_MAT_OFFSET 256u
+-#define FEX_PROBE_MAT_SIZE (33u * 16u)
+-#define FEX_PROBE_PUSH_SIZE 52u     /* like a 13-dword root constant block */
++#define FEX_PROBE_MAT_SIZE 544u
++#define FEX_PROBE_PUSH_SIZE 52u     /* like D2R's 13-dword root constant block */
++#define FEX_PROBE_TEXTURES 8u
++#define FEX_PROBE_TEXTURE_SIZE 64u
+ #define FEX_PROBE_ALIGN(x) (((x) + 255u) & ~(VkDeviceSize)255u)
+-#define FEX_PROBE_BINDINGS 6u
++#define FEX_PROBE_PUSH_BINDINGS 4u
+ #define FEX_PROBE_GAP_MS 1500u      /* before each test: the log's once-a-second line names it before it runs */
+ #define FEX_PROBE_DEFAULT_DELAY_S 2u
+ #define FEX_PROBE_WAIT_NS 3000000000ull
+ 
+ /* Where things are in the one host-visible buffer. */
+ #define FEX_PROBE_CAM 0u
+-#define FEX_PROBE_DRAW_BLOCKS 1024u
+-#define FEX_PROBE_OBJS FEX_PROBE_ALIGN(FEX_PROBE_DRAW_BLOCKS + (VkDeviceSize)FEX_PROBE_DRAWS * FEX_PROBE_STRIDE)
+-#define FEX_PROBE_COLORS FEX_PROBE_ALIGN(FEX_PROBE_OBJS + FEX_PROBE_DRAWS * 16u)
+-#define FEX_PROBE_CMDS FEX_PROBE_ALIGN(FEX_PROBE_COLORS + FEX_PROBE_DRAWS * 16u)
+-#define FEX_PROBE_BUFFER_SIZE FEX_PROBE_ALIGN(FEX_PROBE_CMDS + FEX_PROBE_DRAWS * sizeof(VkDrawIndirectCommand))
++#define FEX_PROBE_BLOCKS 256u
++#define FEX_PROBE_CMDS FEX_PROBE_ALIGN(FEX_PROBE_BLOCKS + (VkDeviceSize)FEX_PROBE_DRAWS * FEX_PROBE_STRIDE)
++#define FEX_PROBE_INDICES FEX_PROBE_ALIGN(FEX_PROBE_CMDS + FEX_PROBE_DRAWS * sizeof(VkDrawIndexedIndirectCommand))
++#define FEX_PROBE_VERTICES FEX_PROBE_ALIGN(FEX_PROBE_INDICES + \
++        (VkDeviceSize)FEX_PROBE_DRAWS * FEX_PROBE_MESH_INDICES * sizeof(uint32_t))
++#define FEX_PROBE_BUFFER_SIZE FEX_PROBE_ALIGN(FEX_PROBE_VERTICES + \
++        (VkDeviceSize)FEX_PROBE_DRAWS * FEX_PROBE_MESH_VERTICES * FEX_PROBE_VERTEX_SIZE)
++
++enum fex_probe_target
++{
++    FEX_PROBE_C0,       /* main: R11G11B10F */
++    FEX_PROBE_C1,       /* main: RGBA8 */
++    FEX_PROBE_DS,       /* main: D24S8 */
++    FEX_PROBE_SHADOW,   /* shadow: D16 */
++    FEX_PROBE_TARGET_COUNT,
++};
++
++enum fex_probe_module
++{
++    FEX_PROBE_M_REAL_VERT,
++    FEX_PROBE_M_REAL_FRAG,
++    FEX_PROBE_M_BATCH_VERT,
++    FEX_PROBE_M_BATCH_FRAG,
++    FEX_PROBE_M_DEPTH_FRAG,
++    FEX_PROBE_M_DEPTH_BATCH_FRAG,
++    FEX_PROBE_M_COUNT,
++};
+ 
+ enum fex_probe_pipeline
+ {
+-    FEX_PROBE_P_SIMPLE,
+-    FEX_PROBE_P_SIMPLE2,    /* the same as FEX_PROBE_P_SIMPLE, another pipeline object */
+-    FEX_PROBE_P_LIT,
+-    FEX_PROBE_P_INSTANCE,
+-    FEX_PROBE_P_BATCH,
+-    FEX_PROBE_P_LIT_BATCH,
++    FEX_PROBE_P_MAIN,
++    FEX_PROBE_P_MAIN_INSTANCE,
++    FEX_PROBE_P_MAIN_BATCH,
++    FEX_PROBE_P_SHADOW,
++    FEX_PROBE_P_SHADOW_INSTANCE,
++    FEX_PROBE_P_SHADOW_BATCH,
+     FEX_PROBE_P_COUNT,
+ };
+ 
+-/* In the order they run: what D2R's draws do first, the less common ways of drawing last. */
++/* How a test draws (within its pass kind). */
++enum fex_probe_way
++{
++    FEX_PROBE_W_EMPTY,
++    FEX_PROBE_W_NONE,
++    FEX_PROBE_W_D2R,
++    FEX_PROBE_W_INSTANCE,
++    FEX_PROBE_W_MULTI_DRAW,
++    FEX_PROBE_W_COUNT,
++};
++
++/* In the order they run: main pass tests, then shadow pass tests. */
+ enum fex_probe_test
+ {
+     FEX_PROBE_T_EMPTY,
+     FEX_PROBE_T_NONE,
+-    FEX_PROBE_T_CONSTS,
+-    FEX_PROBE_T_CBVS,
+-    FEX_PROBE_T_BOTH,
+-    FEX_PROBE_T_LIT_NONE,
+-    FEX_PROBE_T_LIT_BOTH,
+-    FEX_PROBE_T_PIPELINE,
+-    FEX_PROBE_T_FIRST_INSTANCE,
+-    FEX_PROBE_T_INSTANCED,
++    FEX_PROBE_T_D2R,
++    FEX_PROBE_T_INSTANCE,
+     FEX_PROBE_T_MULTI_DRAW,
+-    FEX_PROBE_T_LIT_MULTI_DRAW,
++    FEX_PROBE_T_SHADOW_EMPTY,
++    FEX_PROBE_T_SHADOW_NONE,
++    FEX_PROBE_T_SHADOW_D2R,
++    FEX_PROBE_T_SHADOW_INSTANCE,
++    FEX_PROBE_T_SHADOW_MULTI_DRAW,
+     FEX_PROBE_T_COUNT,
+ };
+ 
+ static const char * const fex_probe_test_names[FEX_PROBE_T_COUNT] =
+ {
+-    "empty pass",
+-    "no changes",
+-    "push constants",
+-    "root CBVs",
+-    "both (like D2R)",
+-    "lit, no changes",
+-    "lit, both (like D2R)",
+-    "pipeline switch",
+-    "first instance",
+-    "one instanced draw",
+-    "one multi-draw call",
+-    "lit, one multi-draw call",
++    "main, empty pass",
++    "main, no changes",
++    "main, like D2R",
++    "main, first instance",
++    "main, one multi-draw call",
++    "shadow, empty pass",
++    "shadow, no changes",
++    "shadow, like D2R",
++    "shadow, first instance",
++    "shadow, one multi-draw call",
+ };
+ 
+-/* The device functions the probe uses, from its own device. */
++static bool fex_probe_test_shadow(uint32_t test)
++{
++    return test >= FEX_PROBE_T_SHADOW_EMPTY;
++}
++
++static enum fex_probe_way fex_probe_test_way(uint32_t test)
++{
++    return (enum fex_probe_way)(test - (fex_probe_test_shadow(test) ? FEX_PROBE_T_SHADOW_EMPTY : FEX_PROBE_T_EMPTY));
++}
++
++static uint32_t fex_probe_test_empty(uint32_t test)
++{
++    return fex_probe_test_shadow(test) ? FEX_PROBE_T_SHADOW_EMPTY : FEX_PROBE_T_EMPTY;
++}
++
++/* The device functions the probe uses, from its own device. No destroy or free functions: the probe keeps all it
++ * made (fex27). */
+ #define FEX_PROBE_FUNCS(X) \
+-    X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkDeviceWaitIdle) \
+-    X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
+-    X(vkCreateImageView) X(vkDestroyImageView) \
+-    X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) \
+-    X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkUnmapMemory) \
+-    X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) \
+-    X(vkDestroyPipelineLayout) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateGraphicsPipelines) \
+-    X(vkDestroyPipeline) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkGetQueryPoolResults) \
+-    X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer) \
+-    X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) \
+-    X(vkResetFences) X(vkQueueSubmit2) X(vkCmdResetQueryPool) X(vkCmdPipelineBarrier2) X(vkCmdWriteTimestamp2) \
++    X(vkGetDeviceQueue) \
++    X(vkCreateImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkCreateSampler) \
++    X(vkCreateBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkMapMemory) \
++    X(vkCreateDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets) \
++    X(vkUpdateDescriptorSets) X(vkCreateShaderModule) X(vkCreateGraphicsPipelines) \
++    X(vkCreateQueryPool) X(vkGetQueryPoolResults) \
++    X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer) X(vkBeginCommandBuffer) \
++    X(vkEndCommandBuffer) X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit2) \
++    X(vkCmdResetQueryPool) X(vkCmdPipelineBarrier2) X(vkCmdWriteTimestamp2) X(vkCmdClearColorImage) \
+     X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdSetViewport) X(vkCmdSetScissor) \
+-    X(vkCmdPushDescriptorSetKHR) X(vkCmdPushConstants) X(vkCmdDraw) X(vkCmdDrawIndirect)
++    X(vkCmdBindDescriptorSets) X(vkCmdPushDescriptorSetKHR) X(vkCmdPushConstants) X(vkCmdBindVertexBuffers) \
++    X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdDrawIndexedIndirect)
+ 
+ struct fex_probe_vk
+ {
+@@ -189,9 +251,8 @@ struct fex_probe_setup
+     uint32_t family_index;
+     uint32_t timestamp_bits;
+     double ns_per_tick;
+-    bool multi_draw;
++    bool batch;     /* multi-draw indirect, draw parameters and non-uniform texture indexing: the batched tests */
+     uint32_t delay_ms;
+-    uint32_t test_count;    /* tests to run: all but the lit multi-draw one unless VKD3D_FEX_DRAW_PROBE=2 */
+ };
+ 
+ struct fex_probe
+@@ -201,20 +262,23 @@ struct fex_probe
+     VkDevice vk_device;
+     VkQueue vk_queue;
+ 
+-    VkImage image;
+-    VkImageView view;
+-    VkDeviceMemory image_memory;
++    VkImage targets[FEX_PROBE_TARGET_COUNT];
++    VkImageView target_views[FEX_PROBE_TARGET_COUNT];
++    VkImage textures[FEX_PROBE_TEXTURES];
++    VkImageView texture_views[FEX_PROBE_TEXTURES];
++    VkSampler sampler;
+     VkBuffer buffer;
+-    VkDeviceMemory buffer_memory;
+-    VkDescriptorSetLayout set_layout;
++    VkDescriptorSetLayout push_set_layout;
++    VkDescriptorSetLayout texture_set_layout;
+     VkPipelineLayout layout;
+-    VkShaderModule modules[6];
++    VkDescriptorPool descriptor_pool;
++    VkDescriptorSet texture_set;
++    VkShaderModule modules[FEX_PROBE_M_COUNT];
+     VkPipeline pipelines[FEX_PROBE_P_COUNT];
+     VkQueryPool pool;
+     VkCommandPool cmd_pool;
+     VkCommandBuffer cmd;
+     VkFence fence;
+-    bool image_ready;
+ 
+     uint64_t ticks[FEX_PROBE_T_COUNT][FEX_PROBE_ROUNDS];
+     uint32_t tests_done;
+@@ -227,6 +291,7 @@ enum fex_probe_phase
+     FEX_PROBE_IDLE,
+     FEX_PROBE_WAITING,
+     FEX_PROBE_SETTING_UP,
++    FEX_PROBE_PREPARING,
+     FEX_PROBE_TESTING,
+     FEX_PROBE_DONE,
+ };
+@@ -235,7 +300,6 @@ static char fex_probe_text[2560];
+ static uint32_t fex_probe_started;  /* once per process */
+ static uint32_t fex_probe_progress; /* phase << 8 | test running */
+ static uint32_t fex_probe_published; /* result notes put in a report so far (meter thread only) */
+-static uint32_t fex_probe_test_count = FEX_PROBE_T_COUNT;
+ /* The results so far, for the progress line: the probe thread writes the slot not shown and then switches to it (a
+  * test takes over a second, the meter thread copies the text within its report). */
+ static char fex_probe_partial[2][1024];
+@@ -259,13 +323,16 @@ size_t vkd3d_fex_draw_probe_append(char *text, size_t size, size_t len, uint32_t
+             return vkd3d_fex_report_append(text, size, len, "  draw probe: waiting to start\n");
+         case FEX_PROBE_SETTING_UP:
+             return vkd3d_fex_report_append(text, size, len,
+-                    "  draw probe: making its own GPU device, target and pipelines\n");
++                    "  draw probe: making its own GPU device, targets, meshes and pipelines\n");
++        case FEX_PROBE_PREPARING:
++            return vkd3d_fex_report_append(text, size, len,
++                    "  draw probe: first GPU work (clearing its targets and textures)\n");
+         case FEX_PROBE_TESTING:
+         {
+             uint32_t slot = vkd3d_atomic_uint32_load_explicit(&fex_probe_partial_slot, vkd3d_memory_order_acquire);
+ 
+             return vkd3d_fex_report_append(text, size, len, "  draw probe: test %u of %u running (%s)%s%s\n",
+-                    test + 1, fex_probe_test_count, test < FEX_PROBE_T_COUNT ? fex_probe_test_names[test] : "?",
++                    test + 1, FEX_PROBE_T_COUNT, test < FEX_PROBE_T_COUNT ? fex_probe_test_names[test] : "?",
+                     slot ? " | done so far, GPU us per draw (slowest round): " : "",
+                     slot ? fex_probe_partial[(slot - 1) & 1] : "");
+         }
+@@ -345,6 +412,7 @@ static VkResult fex_probe_create_device(struct fex_probe *p)
+         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+     };
+     VkPhysicalDeviceVulkan13Features features13;
++    VkPhysicalDeviceVulkan12Features features12;
+     VkPhysicalDeviceVulkan11Features features11;
+     VkPhysicalDeviceFeatures2 features;
+     VkDeviceQueueCreateInfo queue_info;
+@@ -356,14 +424,19 @@ static VkResult fex_probe_create_device(struct fex_probe *p)
+     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+     features13.dynamicRendering = VK_TRUE;
+     features13.synchronization2 = VK_TRUE;
++    memset(&features12, 0, sizeof(features12));
++    features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
++    features12.pNext = &features13;
++    features12.shaderSampledImageArrayNonUniformIndexing = p->setup.batch;
+     memset(&features11, 0, sizeof(features11));
+     features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+-    features11.pNext = &features13;
+-    features11.shaderDrawParameters = p->setup.multi_draw;
++    features11.pNext = &features12;
++    features11.shaderDrawParameters = p->setup.batch;
+     memset(&features, 0, sizeof(features));
+     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+     features.pNext = &features11;
+-    /* The core features the game's device was made with (robust buffer access and the like as there). */
++    /* The core features the game's device was made with (robust buffer access, multi-draw indirect, dynamic indexing
++     * of sampled image arrays and the like as there). */
+     features.features = p->setup.features;
+ 
+     memset(&queue_info, 0, sizeof(queue_info));
+@@ -386,154 +459,240 @@ static VkResult fex_probe_create_device(struct fex_probe *p)
+         return vr;
+     }
+ 
++    /* A function missing: the device stays as it is (never destroyed), the probe stops. */
+ #define FEX_PROBE_LOAD(name) \
+     if (!(p->vk.name = (PFN_##name)p->setup.get_device_proc_addr(p->vk_device, #name))) \
+         vr = VK_ERROR_INCOMPATIBLE_DRIVER;
+     FEX_PROBE_FUNCS(FEX_PROBE_LOAD)
+ #undef FEX_PROBE_LOAD
+     if (vr != VK_SUCCESS)
+-    {
+-        if (p->vk.vkDestroyDevice)
+-            p->vk.vkDestroyDevice(p->vk_device, NULL);
+-        p->vk_device = VK_NULL_HANDLE;
+         return vr;
+-    }
+ 
+     PVK(vkGetDeviceQueue)(p->vk_device, p->setup.family_index, 0, &p->vk_queue);
+     return VK_SUCCESS;
+ }
+ 
+-static bool fex_probe_create_target(struct fex_probe *p)
++static bool fex_probe_create_image(struct fex_probe *p, VkFormat format, uint32_t width, uint32_t height,
++        VkImageUsageFlags usage, VkImageAspectFlags aspect, VkImage *image, VkImageView *view)
+ {
+     VkImageViewCreateInfo view_info;
+     VkImageCreateInfo image_info;
+     VkMemoryRequirements reqs;
++    VkDeviceMemory memory;
+ 
+     memset(&image_info, 0, sizeof(image_info));
+     image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+     image_info.imageType = VK_IMAGE_TYPE_2D;
+-    image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+-    image_info.extent.width = FEX_PROBE_SIZE;
+-    image_info.extent.height = FEX_PROBE_SIZE;
++    image_info.format = format;
++    image_info.extent.width = width;
++    image_info.extent.height = height;
+     image_info.extent.depth = 1;
+     image_info.mipLevels = 1;
+     image_info.arrayLayers = 1;
+     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+-    image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++    image_info.usage = usage;
+     image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+-    if (PVK(vkCreateImage)(p->vk_device, &image_info, NULL, &p->image) != VK_SUCCESS)
++    if (PVK(vkCreateImage)(p->vk_device, &image_info, NULL, image) != VK_SUCCESS)
+         return false;
+ 
+-    PVK(vkGetImageMemoryRequirements)(p->vk_device, p->image, &reqs);
+-    if (!fex_probe_alloc(p, &reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &p->image_memory))
++    PVK(vkGetImageMemoryRequirements)(p->vk_device, *image, &reqs);
++    if (!fex_probe_alloc(p, &reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory))
+         return false;
+-    if (PVK(vkBindImageMemory)(p->vk_device, p->image, p->image_memory, 0) != VK_SUCCESS)
++    if (PVK(vkBindImageMemory)(p->vk_device, *image, memory, 0) != VK_SUCCESS)
+         return false;
+ 
+     memset(&view_info, 0, sizeof(view_info));
+     view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+-    view_info.image = p->image;
++    view_info.image = *image;
+     view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+-    view_info.format = image_info.format;
+-    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    view_info.format = format;
++    view_info.subresourceRange.aspectMask = aspect;
+     view_info.subresourceRange.levelCount = 1;
+     view_info.subresourceRange.layerCount = 1;
+-    return PVK(vkCreateImageView)(p->vk_device, &view_info, NULL, &p->view) == VK_SUCCESS;
++    return PVK(vkCreateImageView)(p->vk_device, &view_info, NULL, view) == VK_SUCCESS;
++}
++
++static bool fex_probe_create_images(struct fex_probe *p)
++{
++    const VkImageUsageFlags ds = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
++    const VkImageUsageFlags color = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++    VkSamplerCreateInfo sampler_info;
++    uint32_t i;
++
++    if (!fex_probe_create_image(p, VK_FORMAT_B10G11R11_UFLOAT_PACK32, FEX_PROBE_MAIN_W, FEX_PROBE_MAIN_H, color,
++            VK_IMAGE_ASPECT_COLOR_BIT, &p->targets[FEX_PROBE_C0], &p->target_views[FEX_PROBE_C0]))
++        return false;
++    if (!fex_probe_create_image(p, VK_FORMAT_R8G8B8A8_UNORM, FEX_PROBE_MAIN_W, FEX_PROBE_MAIN_H, color,
++            VK_IMAGE_ASPECT_COLOR_BIT, &p->targets[FEX_PROBE_C1], &p->target_views[FEX_PROBE_C1]))
++        return false;
++    if (!fex_probe_create_image(p, VK_FORMAT_D24_UNORM_S8_UINT, FEX_PROBE_MAIN_W, FEX_PROBE_MAIN_H, ds,
++            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, &p->targets[FEX_PROBE_DS],
++            &p->target_views[FEX_PROBE_DS]))
++        return false;
++    if (!fex_probe_create_image(p, VK_FORMAT_D16_UNORM, FEX_PROBE_SHADOW_SIZE, FEX_PROBE_SHADOW_SIZE, ds,
++            VK_IMAGE_ASPECT_DEPTH_BIT, &p->targets[FEX_PROBE_SHADOW], &p->target_views[FEX_PROBE_SHADOW]))
++        return false;
++    for (i = 0; i < FEX_PROBE_TEXTURES; i++)
++    {
++        if (!fex_probe_create_image(p, VK_FORMAT_R8G8B8A8_UNORM, FEX_PROBE_TEXTURE_SIZE, FEX_PROBE_TEXTURE_SIZE,
++                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
++                &p->textures[i], &p->texture_views[i]))
++            return false;
++    }
++
++    memset(&sampler_info, 0, sizeof(sampler_info));
++    sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    sampler_info.magFilter = VK_FILTER_LINEAR;
++    sampler_info.minFilter = VK_FILTER_LINEAR;
++    sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    sampler_info.maxLod = 0.0f;
++    return PVK(vkCreateSampler)(p->vk_device, &sampler_info, NULL, &p->sampler) == VK_SUCCESS;
++}
++
++static void fex_probe_identity(float *m)
++{
++    uint32_t i;
++
++    for (i = 0; i < 16; i++)
++        m[i] = (i % 5u) ? 0.0f : 1.0f;
+ }
+ 
+ static bool fex_probe_create_buffer(struct fex_probe *p)
+ {
+-    VkDrawIndirectCommand *cmds;
++    const float cell_w = 2.0f / FEX_PROBE_GRID_X, cell_h = 2.0f / FEX_PROBE_GRID_Y;
++    const float quad_w = cell_w / FEX_PROBE_QUADS_X, quad_h = cell_h / FEX_PROBE_QUADS_Y;
++    VkDrawIndexedIndirectCommand *cmds;
+     VkBufferCreateInfo buffer_info;
++    uint32_t i, k, q, base, *indices;
+     VkMemoryRequirements reqs;
+-    float *f, x, y;
+-    uint8_t *data;
++    VkDeviceMemory memory;
++    float *f, x0, y0, x, y;
++    uint8_t *data, *v;
+     void *map;
+-    uint32_t i, k;
+ 
+     memset(&buffer_info, 0, sizeof(buffer_info));
+     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+     buffer_info.size = FEX_PROBE_BUFFER_SIZE;
+     buffer_info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+-            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
++            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+     if (PVK(vkCreateBuffer)(p->vk_device, &buffer_info, NULL, &p->buffer) != VK_SUCCESS)
+         return false;
+ 
++    /* Like vkd3d's upload heaps on this GPU: device local and host visible where there is such memory. */
+     PVK(vkGetBufferMemoryRequirements)(p->vk_device, p->buffer, &reqs);
+-    if (!fex_probe_alloc(p, &reqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+-            &p->buffer_memory))
++    if (!fex_probe_alloc(p, &reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &memory) &&
++            !fex_probe_alloc(p, &reqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++            &memory))
+         return false;
+-    if (PVK(vkBindBufferMemory)(p->vk_device, p->buffer, p->buffer_memory, 0) != VK_SUCCESS)
++    if (PVK(vkBindBufferMemory)(p->vk_device, p->buffer, memory, 0) != VK_SUCCESS)
+         return false;
+-    if (PVK(vkMapMemory)(p->vk_device, p->buffer_memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS)
++    if (PVK(vkMapMemory)(p->vk_device, memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS)
+         return false;
+ 
+     data = map;
+     memset(data, 0, FEX_PROBE_BUFFER_SIZE);
+ 
+-    /* 8-pixel triangles (2 clip space units = 2048 pixels); the push constant index moves one by a pixel. */
++    /* The camera: positions are made in clip space already. */
+     f = (float *)(data + FEX_PROBE_CAM);
+-    f[0] = 8.0f / 1024.0f;
+-    f[1] = 8.0f / 1024.0f;
+-    f[2] = 1.0f / 1024.0f;
++    fex_probe_identity(f);
++    f[18] = -1.0f;
+ 
++    cmds = (VkDrawIndexedIndirectCommand *)(data + FEX_PROBE_CMDS);
++    indices = (uint32_t *)(data + FEX_PROBE_INDICES);
+     for (i = 0; i < FEX_PROBE_DRAWS; i++)
+     {
+-        /* A 40 x 25 grid over the target, so the draws don't paint over each other. */
+-        x = -0.95f + (float)(i % 40u) * 0.0475f;
+-        y = -0.95f + (float)(i / 40u) * 0.075f;
+-
+-        f = (float *)(data + FEX_PROBE_DRAW_BLOCKS + (VkDeviceSize)i * FEX_PROBE_STRIDE);
+-        f[0] = x;
+-        f[1] = y;
+-        f = (float *)(data + FEX_PROBE_DRAW_BLOCKS + (VkDeviceSize)i * FEX_PROBE_STRIDE + FEX_PROBE_MAT_OFFSET);
+-        f[0] = (float)(i % 7u) / 7.0f;
+-        f[1] = (float)(i % 5u) / 5.0f;
+-        f[2] = (float)(i % 3u) / 3.0f;
++        /* The draw's block: object (world, tint, meta: texture index) and material (color, ambient, 16 lights). */
++        f = (float *)(data + FEX_PROBE_BLOCKS + (VkDeviceSize)i * FEX_PROBE_STRIDE);
++        fex_probe_identity(f);
++        f[16] = 0.6f + 0.1f * (float)(i % 4u);
++        f[17] = 0.6f + 0.1f * (float)(i % 3u);
++        f[18] = 0.6f + 0.1f * (float)(i % 5u);
++        f[19] = 1.0f;
++        ((uint32_t *)f)[20] = i & (FEX_PROBE_TEXTURES - 1);
++        f = (float *)(data + FEX_PROBE_BLOCKS + (VkDeviceSize)i * FEX_PROBE_STRIDE + FEX_PROBE_MAT_OFFSET);
++        f[0] = (float)(i % 7u + 1u) / 8.0f;
++        f[1] = (float)(i % 5u + 1u) / 6.0f;
++        f[2] = (float)(i % 3u + 1u) / 4.0f;
+         f[3] = 1.0f;
+-        for (k = 0; k < 32; k++)
++        f[4] = 0.05f;
++        f[5] = 0.05f;
++        f[6] = 0.06f;
++        x0 = -1.0f + (float)(i % FEX_PROBE_GRID_X) * cell_w;
++        y0 = -1.0f + (float)(i / FEX_PROBE_GRID_X) * cell_h;
++        for (k = 0; k < 16; k++)
+         {
+-            f[4 + 4 * k + 0] = 0.01f * (float)(k + 1);
+-            f[4 + 4 * k + 1] = 0.02f * (float)((k + i) % 9u);
+-            f[4 + 4 * k + 2] = 0.005f;
+-            f[4 + 4 * k + 3] = 0.0f;
++            /* Lights around the draw's cell, a little in front of it. */
++            f[8 + 4 * k + 0] = x0 + cell_w * (float)(k % 4u) / 3.0f;
++            f[8 + 4 * k + 1] = y0 + cell_h * (float)(k / 4u) / 3.0f;
++            f[8 + 4 * k + 2] = 0.4f;
++            f[8 + 4 * k + 3] = 2.0f + (float)k;
++            f[72 + 4 * k + 0] = 0.05f * (float)(k % 3u + 1u);
++            f[72 + 4 * k + 1] = 0.04f * (float)(k % 5u + 1u);
++            f[72 + 4 * k + 2] = 0.03f * (float)(k % 7u + 1u);
+         }
+ 
+-        f = (float *)(data + FEX_PROBE_OBJS + i * 16u);
+-        f[0] = x;
+-        f[1] = y;
+-        f = (float *)(data + FEX_PROBE_COLORS + i * 16u);
+-        f[0] = (float)(i % 7u) / 7.0f;
+-        f[1] = (float)(i % 5u) / 5.0f;
+-        f[2] = (float)(i % 3u) / 3.0f;
+-        f[3] = 1.0f;
+-    }
++        /* The draw's mesh in its cell: 10 x 11 quads, 4 vertices each. */
++        for (q = 0; q < FEX_PROBE_QUADS_X * FEX_PROBE_QUADS_Y; q++)
++        {
++            base = i * FEX_PROBE_MESH_VERTICES + q * 4u;
++            for (k = 0; k < 4; k++)
++            {
++                x = x0 + quad_w * (float)(q % FEX_PROBE_QUADS_X + (k & 1u));
++                y = y0 + quad_h * (float)(q / FEX_PROBE_QUADS_X + (k >> 1));
++                v = data + FEX_PROBE_VERTICES + (VkDeviceSize)(base + k) * FEX_PROBE_VERTEX_SIZE;
++                f = (float *)v;
++                f[0] = x;
++                f[1] = y;
++                f[2] = 0.5f;
++                f[3] = (x - x0) / cell_w;
++                f[4] = (y - y0) / cell_h;
++                v[20] = (uint8_t)(96u + (q * 7u + k * 13u) % 64u);
++                v[21] = (uint8_t)(96u + (q * 11u + k * 5u) % 64u);
++                v[22] = 230;
++                v[23] = 255;
++            }
++            indices[i * FEX_PROBE_MESH_INDICES + q * 6u + 0] = base + 0;
++            indices[i * FEX_PROBE_MESH_INDICES + q * 6u + 1] = base + 1;
++            indices[i * FEX_PROBE_MESH_INDICES + q * 6u + 2] = base + 2;
++            indices[i * FEX_PROBE_MESH_INDICES + q * 6u + 3] = base + 2;
++            indices[i * FEX_PROBE_MESH_INDICES + q * 6u + 4] = base + 1;
++            indices[i * FEX_PROBE_MESH_INDICES + q * 6u + 5] = base + 3;
++        }
+ 
+-    cmds = (VkDrawIndirectCommand *)(data + FEX_PROBE_CMDS);
+-    for (i = 0; i < FEX_PROBE_DRAWS; i++)
+-    {
+-        cmds[i].vertexCount = 3;
++        cmds[i].indexCount = FEX_PROBE_MESH_INDICES;
+         cmds[i].instanceCount = 1;
+-        cmds[i].firstVertex = 0;
++        cmds[i].firstIndex = i * FEX_PROBE_MESH_INDICES;
++        cmds[i].vertexOffset = 0;
+         cmds[i].firstInstance = 0;
+     }
+ 
+-    PVK(vkUnmapMemory)(p->vk_device, p->buffer_memory);
++    /* Mapped for good (the probe keeps its memory). */
+     return true;
+ }
+ 
+ static bool fex_probe_create_layout(struct fex_probe *p)
+ {
+-    VkDescriptorSetLayoutBinding bindings[FEX_PROBE_BINDINGS];
++    VkDescriptorImageInfo image_infos[FEX_PROBE_TEXTURES];
++    VkDescriptorSetLayoutBinding bindings[FEX_PROBE_PUSH_BINDINGS];
++    VkDescriptorSetLayout set_layouts[2];
+     VkDescriptorSetLayoutCreateInfo set_info;
++    VkDescriptorSetAllocateInfo alloc_info;
+     VkPipelineLayoutCreateInfo layout_info;
++    VkDescriptorPoolCreateInfo pool_info;
++    VkDescriptorPoolSize pool_size;
+     VkPushConstantRange push_range;
++    VkWriteDescriptorSet write;
+     uint32_t i;
+ 
+-    for (i = 0; i < FEX_PROBE_BINDINGS; i++)
++    /* Set 0: like vkd3d's root constant buffers, pushed (camera, object, material; the batched tests' blocks). */
++    for (i = 0; i < FEX_PROBE_PUSH_BINDINGS; i++)
+     {
+         bindings[i].binding = i;
+         bindings[i].descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+@@ -544,68 +703,119 @@ static bool fex_probe_create_layout(struct fex_probe *p)
+     memset(&set_info, 0, sizeof(set_info));
+     set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+     set_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+-    set_info.bindingCount = FEX_PROBE_BINDINGS;
++    set_info.bindingCount = FEX_PROBE_PUSH_BINDINGS;
+     set_info.pBindings = bindings;
+-    if (PVK(vkCreateDescriptorSetLayout)(p->vk_device, &set_info, NULL, &p->set_layout) != VK_SUCCESS)
++    if (PVK(vkCreateDescriptorSetLayout)(p->vk_device, &set_info, NULL, &p->push_set_layout) != VK_SUCCESS)
++        return false;
++
++    /* Set 1: 8 textures, bound once per pass (D2R's textures come from vkd3d's descriptor heap by an index). */
++    bindings[0].binding = 0;
++    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++    bindings[0].descriptorCount = FEX_PROBE_TEXTURES;
++    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++    bindings[0].pImmutableSamplers = NULL;
++    memset(&set_info, 0, sizeof(set_info));
++    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++    set_info.bindingCount = 1;
++    set_info.pBindings = bindings;
++    if (PVK(vkCreateDescriptorSetLayout)(p->vk_device, &set_info, NULL, &p->texture_set_layout) != VK_SUCCESS)
+         return false;
+ 
+     push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+     push_range.offset = 0;
+     push_range.size = FEX_PROBE_PUSH_SIZE;
++    set_layouts[0] = p->push_set_layout;
++    set_layouts[1] = p->texture_set_layout;
+     memset(&layout_info, 0, sizeof(layout_info));
+     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+-    layout_info.setLayoutCount = 1;
+-    layout_info.pSetLayouts = &p->set_layout;
++    layout_info.setLayoutCount = 2;
++    layout_info.pSetLayouts = set_layouts;
+     layout_info.pushConstantRangeCount = 1;
+     layout_info.pPushConstantRanges = &push_range;
+-    return PVK(vkCreatePipelineLayout)(p->vk_device, &layout_info, NULL, &p->layout) == VK_SUCCESS;
++    if (PVK(vkCreatePipelineLayout)(p->vk_device, &layout_info, NULL, &p->layout) != VK_SUCCESS)
++        return false;
++
++    pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++    pool_size.descriptorCount = FEX_PROBE_TEXTURES;
++    memset(&pool_info, 0, sizeof(pool_info));
++    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    pool_info.maxSets = 1;
++    pool_info.poolSizeCount = 1;
++    pool_info.pPoolSizes = &pool_size;
++    if (PVK(vkCreateDescriptorPool)(p->vk_device, &pool_info, NULL, &p->descriptor_pool) != VK_SUCCESS)
++        return false;
++    memset(&alloc_info, 0, sizeof(alloc_info));
++    alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++    alloc_info.descriptorPool = p->descriptor_pool;
++    alloc_info.descriptorSetCount = 1;
++    alloc_info.pSetLayouts = &p->texture_set_layout;
++    if (PVK(vkAllocateDescriptorSets)(p->vk_device, &alloc_info, &p->texture_set) != VK_SUCCESS)
++        return false;
++
++    for (i = 0; i < FEX_PROBE_TEXTURES; i++)
++    {
++        image_infos[i].sampler = p->sampler;
++        image_infos[i].imageView = p->texture_views[i];
++        image_infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++    }
++    memset(&write, 0, sizeof(write));
++    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    write.dstSet = p->texture_set;
++    write.dstBinding = 0;
++    write.descriptorCount = FEX_PROBE_TEXTURES;
++    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++    write.pImageInfo = image_infos;
++    PVK(vkUpdateDescriptorSets)(p->vk_device, 1, &write, 0, NULL);
++    return true;
+ }
+ 
+ static bool fex_probe_create_pipelines(struct fex_probe *p)
+ {
+-    static const struct { const uint32_t *code; size_t size; } spirv[6] =
++    static const struct { const uint32_t *code; size_t size; } spirv[FEX_PROBE_M_COUNT] =
+     {
+-        { fex_probe_simple_vert, sizeof(fex_probe_simple_vert) },
+-        { fex_probe_simple_frag, sizeof(fex_probe_simple_frag) },
+-        { fex_probe_lit_frag, sizeof(fex_probe_lit_frag) },
++        { fex_probe_real_vert, sizeof(fex_probe_real_vert) },
++        { fex_probe_real_frag, sizeof(fex_probe_real_frag) },
+         { fex_probe_batch_vert, sizeof(fex_probe_batch_vert) },
+         { fex_probe_batch_frag, sizeof(fex_probe_batch_frag) },
+-        { fex_probe_lit_batch_frag, sizeof(fex_probe_lit_batch_frag) },
++        { fex_probe_depth_frag, sizeof(fex_probe_depth_frag) },
++        { fex_probe_depth_batch_frag, sizeof(fex_probe_depth_batch_frag) },
+     };
+-    /* vertex module, fragment module, USE_INSTANCE */
+-    static const uint32_t shaders[FEX_PROBE_P_COUNT][3] =
++    /* vertex module, fragment module, USE_INSTANCE, shadow */
++    static const uint32_t shaders[FEX_PROBE_P_COUNT][4] =
+     {
+-        { 0, 1, 0 },    /* simple */
+-        { 0, 1, 0 },    /* simple, again */
+-        { 0, 2, 0 },    /* lit */
+-        { 3, 4, 1 },    /* by instance index */
+-        { 3, 4, 0 },    /* by draw index */
+-        { 3, 5, 0 },    /* lit, by draw index */
++        { FEX_PROBE_M_REAL_VERT, FEX_PROBE_M_REAL_FRAG, 0, 0 },
++        { FEX_PROBE_M_BATCH_VERT, FEX_PROBE_M_BATCH_FRAG, 1, 0 },
++        { FEX_PROBE_M_BATCH_VERT, FEX_PROBE_M_BATCH_FRAG, 0, 0 },
++        { FEX_PROBE_M_REAL_VERT, FEX_PROBE_M_DEPTH_FRAG, 0, 1 },
++        { FEX_PROBE_M_BATCH_VERT, FEX_PROBE_M_DEPTH_BATCH_FRAG, 1, 1 },
++        { FEX_PROBE_M_BATCH_VERT, FEX_PROBE_M_DEPTH_BATCH_FRAG, 0, 1 },
+     };
+     static const VkDynamicState dynamic_states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+-    VkPipelineColorBlendAttachmentState blend_attachment;
++    static const VkFormat main_formats[2] = { VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_R8G8B8A8_UNORM };
++    VkPipelineColorBlendAttachmentState blend_attachments[2];
++    VkVertexInputAttributeDescription attributes[3];
+     VkPipelineInputAssemblyStateCreateInfo input_assembly;
++    VkPipelineDepthStencilStateCreateInfo depth_stencil;
+     VkPipelineVertexInputStateCreateInfo vertex_input;
+     VkPipelineRasterizationStateCreateInfo raster;
+     VkPipelineMultisampleStateCreateInfo multisample;
+     VkPipelineDynamicStateCreateInfo dynamic_state;
++    VkVertexInputBindingDescription vertex_binding;
+     VkPipelineColorBlendStateCreateInfo blend;
+     VkPipelineViewportStateCreateInfo viewport;
+     VkPipelineShaderStageCreateInfo stages[2];
+     VkPipelineRenderingCreateInfo rendering;
+-    VkGraphicsPipelineCreateInfo info;
+     VkShaderModuleCreateInfo module_info;
+     VkSpecializationMapEntry spec_entry;
++    VkGraphicsPipelineCreateInfo info;
+     VkSpecializationInfo spec_info;
+-    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+     uint32_t i, use_instance;
+ 
+-    for (i = 0; i < ARRAY_SIZE(spirv); i++)
++    for (i = 0; i < FEX_PROBE_M_COUNT; i++)
+     {
+-        if ((i == 3 || i == 5) && !p->setup.multi_draw)
+-            continue;
+-        /* The lit multi-draw test's pixel shader only when that test runs. */
+-        if (i == 5 && p->setup.test_count <= FEX_PROBE_T_LIT_MULTI_DRAW)
++        /* The batched tests' shaders only where those tests can run. */
++        if ((i == FEX_PROBE_M_BATCH_VERT || i == FEX_PROBE_M_BATCH_FRAG || i == FEX_PROBE_M_DEPTH_BATCH_FRAG) &&
++                !p->setup.batch)
+             continue;
+         memset(&module_info, 0, sizeof(module_info));
+         module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+@@ -615,8 +825,27 @@ static bool fex_probe_create_pipelines(struct fex_probe *p)
+             return false;
+     }
+ 
++    vertex_binding.binding = 0;
++    vertex_binding.stride = FEX_PROBE_VERTEX_SIZE;
++    vertex_binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
++    attributes[0].location = 0;
++    attributes[0].binding = 0;
++    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
++    attributes[0].offset = 0;
++    attributes[1].location = 1;
++    attributes[1].binding = 0;
++    attributes[1].format = VK_FORMAT_R32G32_SFLOAT;
++    attributes[1].offset = 12;
++    attributes[2].location = 2;
++    attributes[2].binding = 0;
++    attributes[2].format = VK_FORMAT_R8G8B8A8_UNORM;
++    attributes[2].offset = 20;
+     memset(&vertex_input, 0, sizeof(vertex_input));
+     vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++    vertex_input.vertexBindingDescriptionCount = 1;
++    vertex_input.pVertexBindingDescriptions = &vertex_binding;
++    vertex_input.vertexAttributeDescriptionCount = ARRAY_SIZE(attributes);
++    vertex_input.pVertexAttributeDescriptions = attributes;
+     memset(&input_assembly, 0, sizeof(input_assembly));
+     input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+     input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+@@ -633,21 +862,24 @@ static bool fex_probe_create_pipelines(struct fex_probe *p)
+     memset(&multisample, 0, sizeof(multisample));
+     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+-    memset(&blend_attachment, 0, sizeof(blend_attachment));
+-    blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+-            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++    /* Depth test and write on; ALWAYS, so every round does the same pixel work whatever the map holds. */
++    memset(&depth_stencil, 0, sizeof(depth_stencil));
++    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
++    depth_stencil.depthTestEnable = VK_TRUE;
++    depth_stencil.depthWriteEnable = VK_TRUE;
++    depth_stencil.depthCompareOp = VK_COMPARE_OP_ALWAYS;
++    memset(blend_attachments, 0, sizeof(blend_attachments));
++    for (i = 0; i < ARRAY_SIZE(blend_attachments); i++)
++        blend_attachments[i].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+     memset(&blend, 0, sizeof(blend));
+     blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+-    blend.attachmentCount = 1;
+-    blend.pAttachments = &blend_attachment;
+     memset(&dynamic_state, 0, sizeof(dynamic_state));
+     dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+     dynamic_state.dynamicStateCount = ARRAY_SIZE(dynamic_states);
+     dynamic_state.pDynamicStates = dynamic_states;
+     memset(&rendering, 0, sizeof(rendering));
+     rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+-    rendering.colorAttachmentCount = 1;
+-    rendering.pColorAttachmentFormats = &format;
+ 
+     spec_entry.constantID = 0;
+     spec_entry.offset = 0;
+@@ -662,13 +894,33 @@ static bool fex_probe_create_pipelines(struct fex_probe *p)
+         if (!p->modules[shaders[i][0]] || !p->modules[shaders[i][1]])
+             continue;
+ 
++        if (shaders[i][3])
++        {
++            /* Shadow: depth only, D16. */
++            blend.attachmentCount = 0;
++            blend.pAttachments = NULL;
++            rendering.colorAttachmentCount = 0;
++            rendering.pColorAttachmentFormats = NULL;
++            rendering.depthAttachmentFormat = VK_FORMAT_D16_UNORM;
++            rendering.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
++        }
++        else
++        {
++            blend.attachmentCount = ARRAY_SIZE(blend_attachments);
++            blend.pAttachments = blend_attachments;
++            rendering.colorAttachmentCount = ARRAY_SIZE(main_formats);
++            rendering.pColorAttachmentFormats = main_formats;
++            rendering.depthAttachmentFormat = VK_FORMAT_D24_UNORM_S8_UINT;
++            rendering.stencilAttachmentFormat = VK_FORMAT_D24_UNORM_S8_UINT;
++        }
++
+         use_instance = shaders[i][2];
+         memset(stages, 0, sizeof(stages));
+         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+         stages[0].module = p->modules[shaders[i][0]];
+         stages[0].pName = "main";
+-        stages[0].pSpecializationInfo = shaders[i][0] == 3 ? &spec_info : NULL;
++        stages[0].pSpecializationInfo = shaders[i][0] == FEX_PROBE_M_BATCH_VERT ? &spec_info : NULL;
+         stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+         stages[1].module = p->modules[shaders[i][1]];
+@@ -684,6 +936,7 @@ static bool fex_probe_create_pipelines(struct fex_probe *p)
+         info.pViewportState = &viewport;
+         info.pRasterizationState = &raster;
+         info.pMultisampleState = &multisample;
++        info.pDepthStencilState = &depth_stencil;
+         info.pColorBlendState = &blend;
+         info.pDynamicState = &dynamic_state;
+         info.layout = p->layout;
+@@ -728,6 +981,182 @@ static bool fex_probe_create_commands(struct fex_probe *p)
+     return PVK(vkCreateFence)(p->vk_device, &fence_info, NULL, &p->fence) == VK_SUCCESS;
+ }
+ 
++static bool fex_probe_begin(struct fex_probe *p)
++{
++    VkCommandBufferBeginInfo begin_info;
++
++    if (PVK(vkResetCommandBuffer)(p->cmd, 0) != VK_SUCCESS)
++        return false;
++    memset(&begin_info, 0, sizeof(begin_info));
++    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    return PVK(vkBeginCommandBuffer)(p->cmd, &begin_info) == VK_SUCCESS;
++}
++
++/* Submits the recorded command buffer and waits for it. VK_TIMEOUT: the GPU may still be on it. */
++static VkResult fex_probe_submit(struct fex_probe *p, const char **call)
++{
++    VkCommandBufferSubmitInfo cmd_info;
++    VkSubmitInfo2 submit;
++    VkResult vr;
++
++    memset(&cmd_info, 0, sizeof(cmd_info));
++    cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
++    cmd_info.commandBuffer = p->cmd;
++    memset(&submit, 0, sizeof(submit));
++    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
++    submit.commandBufferInfoCount = 1;
++    submit.pCommandBufferInfos = &cmd_info;
++
++    *call = "vkQueueSubmit2";
++    if ((vr = PVK(vkQueueSubmit2)(p->vk_queue, 1, &submit, p->fence)) != VK_SUCCESS)
++        return vr;
++    *call = "vkWaitForFences";
++    if ((vr = PVK(vkWaitForFences)(p->vk_device, 1, &p->fence, VK_TRUE, FEX_PROBE_WAIT_NS)) != VK_SUCCESS)
++        return vr;
++    *call = "vkResetFences";
++    return PVK(vkResetFences)(p->vk_device, 1, &p->fence);
++}
++
++static void fex_probe_image_barrier(VkImageMemoryBarrier2 *barrier, VkImage image, VkImageAspectFlags aspect,
++        VkImageLayout old_layout, VkImageLayout new_layout, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
++        VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access)
++{
++    memset(barrier, 0, sizeof(*barrier));
++    barrier->sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++    barrier->srcStageMask = src_stage;
++    barrier->srcAccessMask = src_access;
++    barrier->dstStageMask = dst_stage;
++    barrier->dstAccessMask = dst_access;
++    barrier->oldLayout = old_layout;
++    barrier->newLayout = new_layout;
++    barrier->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier->image = image;
++    barrier->subresourceRange.aspectMask = aspect;
++    barrier->subresourceRange.levelCount = 1;
++    barrier->subresourceRange.layerCount = 1;
++}
++
++static void fex_probe_barriers(struct fex_probe *p, const VkImageMemoryBarrier2 *barriers, uint32_t count)
++{
++    VkDependencyInfo dep;
++
++    memset(&dep, 0, sizeof(dep));
++    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep.imageMemoryBarrierCount = count;
++    dep.pImageMemoryBarriers = barriers;
++    PVK(vkCmdPipelineBarrier2)(p->cmd, &dep);
++}
++
++static void fex_probe_rendering_info(struct fex_probe *p, bool shadow, VkAttachmentLoadOp load_op,
++        VkRenderingInfo *rendering, VkRenderingAttachmentInfo colors[2], VkRenderingAttachmentInfo *depth)
++{
++    uint32_t i;
++
++    memset(rendering, 0, sizeof(*rendering));
++    rendering->sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++    rendering->layerCount = 1;
++    memset(depth, 0, sizeof(*depth));
++    depth->sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++    depth->imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++    depth->loadOp = load_op;
++    depth->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    depth->clearValue.depthStencil.depth = 1.0f;
++    if (shadow)
++    {
++        rendering->renderArea.extent.width = FEX_PROBE_SHADOW_SIZE;
++        rendering->renderArea.extent.height = FEX_PROBE_SHADOW_SIZE;
++        depth->imageView = p->target_views[FEX_PROBE_SHADOW];
++        rendering->pDepthAttachment = depth;
++        return;
++    }
++
++    rendering->renderArea.extent.width = FEX_PROBE_MAIN_W;
++    rendering->renderArea.extent.height = FEX_PROBE_MAIN_H;
++    for (i = 0; i < 2; i++)
++    {
++        memset(&colors[i], 0, sizeof(colors[i]));
++        colors[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++        colors[i].imageView = p->target_views[i == 0 ? FEX_PROBE_C0 : FEX_PROBE_C1];
++        colors[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        colors[i].loadOp = load_op;
++        colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    }
++    rendering->colorAttachmentCount = 2;
++    rendering->pColorAttachments = colors;
++    /* D24S8: depth and stencil, as vkd3d binds a depth/stencil view with stencil. */
++    depth->imageView = p->target_views[FEX_PROBE_DS];
++    rendering->pDepthAttachment = depth;
++    rendering->pStencilAttachment = depth;
++}
++
++/* The first GPU work, before any test: textures filled, targets put in their layouts and cleared once. */
++static VkResult fex_probe_prepare(struct fex_probe *p, const char **call)
++{
++    VkImageMemoryBarrier2 barriers[FEX_PROBE_TEXTURES + FEX_PROBE_TARGET_COUNT];
++    VkRenderingAttachmentInfo colors[2], depth;
++    VkImageSubresourceRange range;
++    VkClearColorValue color;
++    VkRenderingInfo rendering;
++    uint32_t i, n = 0;
++
++    *call = "recording";
++    if (!fex_probe_begin(p))
++        return VK_ERROR_UNKNOWN;
++
++    for (i = 0; i < FEX_PROBE_TEXTURES; i++)
++        fex_probe_image_barrier(&barriers[i], p->textures[i], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT,
++                VK_ACCESS_2_TRANSFER_WRITE_BIT);
++    fex_probe_barriers(p, barriers, FEX_PROBE_TEXTURES);
++
++    memset(&range, 0, sizeof(range));
++    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    range.levelCount = 1;
++    range.layerCount = 1;
++    for (i = 0; i < FEX_PROBE_TEXTURES; i++)
++    {
++        color.float32[0] = 0.3f + 0.1f * (float)(i % 4u);
++        color.float32[1] = 0.3f + 0.1f * (float)(i % 3u);
++        color.float32[2] = 0.3f + 0.1f * (float)(i % 5u);
++        color.float32[3] = 1.0f;
++        PVK(vkCmdClearColorImage)(p->cmd, p->textures[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
++    }
++
++    for (i = 0; i < FEX_PROBE_TEXTURES; i++)
++        fex_probe_image_barrier(&barriers[n++], p->textures[i], VK_IMAGE_ASPECT_COLOR_BIT,
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
++                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++    for (i = FEX_PROBE_C0; i <= FEX_PROBE_C1; i++)
++        fex_probe_image_barrier(&barriers[n++], p->targets[i], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, 0,
++                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
++                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
++    fex_probe_image_barrier(&barriers[n++], p->targets[FEX_PROBE_DS],
++            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, 0,
++            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
++            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
++    fex_probe_image_barrier(&barriers[n++], p->targets[FEX_PROBE_SHADOW], VK_IMAGE_ASPECT_DEPTH_BIT,
++            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, 0,
++            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
++            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
++    fex_probe_barriers(p, barriers, n);
++
++    fex_probe_rendering_info(p, false, VK_ATTACHMENT_LOAD_OP_CLEAR, &rendering, colors, &depth);
++    PVK(vkCmdBeginRendering)(p->cmd, &rendering);
++    PVK(vkCmdEndRendering)(p->cmd);
++    fex_probe_rendering_info(p, true, VK_ATTACHMENT_LOAD_OP_CLEAR, &rendering, colors, &depth);
++    PVK(vkCmdBeginRendering)(p->cmd, &rendering);
++    PVK(vkCmdEndRendering)(p->cmd);
++
++    if (PVK(vkEndCommandBuffer)(p->cmd) != VK_SUCCESS)
++        return VK_ERROR_UNKNOWN;
++    return fex_probe_submit(p, call);
++}
++
+ static void fex_probe_buffer_write(VkWriteDescriptorSet *write, VkDescriptorBufferInfo *info, uint32_t binding,
+         VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range)
+ {
+@@ -742,38 +1171,31 @@ static void fex_probe_buffer_write(VkWriteDescriptorSet *write, VkDescriptorBuff
+     write->pBufferInfo = info;
+ }
+ 
+-/* Push bindings first..first+count-1 for draw 'draw' (bindings 1 and 2 are the draw's own blocks). */
++/* Push bindings first..first+count-1 for draw 'draw' (bindings 1 and 2 are the draw's own object and material). */
+ static void fex_probe_push_set(struct fex_probe *p, uint32_t first, uint32_t count, uint32_t draw)
+ {
+-    VkWriteDescriptorSet writes[FEX_PROBE_BINDINGS];
+-    VkDescriptorBufferInfo infos[FEX_PROBE_BINDINGS];
+-    VkDeviceSize block = FEX_PROBE_DRAW_BLOCKS + (VkDeviceSize)draw * FEX_PROBE_STRIDE;
++    VkWriteDescriptorSet writes[FEX_PROBE_PUSH_BINDINGS];
++    VkDescriptorBufferInfo infos[FEX_PROBE_PUSH_BINDINGS];
++    VkDeviceSize block = FEX_PROBE_BLOCKS + (VkDeviceSize)draw * FEX_PROBE_STRIDE;
+     uint32_t i, n = 0;
+ 
+-    for (i = first; i < first + count && n < FEX_PROBE_BINDINGS; i++, n++)
++    for (i = first; i < first + count && n < FEX_PROBE_PUSH_BINDINGS; i++, n++)
+     {
+         switch (i)
+         {
+             case 0:
+-                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, FEX_PROBE_CAM, 16);
++                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, FEX_PROBE_CAM, 80);
+                 break;
+             case 1:
+-                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, block, 16);
++                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, block, FEX_PROBE_OBJ_SIZE);
+                 break;
+             case 2:
+                 fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, block + FEX_PROBE_MAT_OFFSET,
+                         FEX_PROBE_MAT_SIZE);
+                 break;
+-            case 3:
+-                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, FEX_PROBE_OBJS, FEX_PROBE_DRAWS * 16u);
+-                break;
+-            case 4:
+-                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, FEX_PROBE_COLORS, FEX_PROBE_DRAWS * 16u);
+-                break;
+             default:
+-                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer,
+-                        FEX_PROBE_DRAW_BLOCKS + FEX_PROBE_MAT_OFFSET,
+-                        (VkDeviceSize)FEX_PROBE_DRAWS * FEX_PROBE_STRIDE - FEX_PROBE_MAT_OFFSET);
++                fex_probe_buffer_write(&writes[n], &infos[n], i, p->buffer, FEX_PROBE_BLOCKS,
++                        (VkDeviceSize)FEX_PROBE_DRAWS * FEX_PROBE_STRIDE);
+                 break;
+         }
+     }
+@@ -783,35 +1205,37 @@ static void fex_probe_push_set(struct fex_probe *p, uint32_t first, uint32_t cou
+ static void fex_probe_push_consts(struct fex_probe *p, uint32_t draw)
+ {
+     uint32_t consts[FEX_PROBE_PUSH_SIZE / 4];
++    float scale = 1.0f;
++    uint32_t i;
+ 
+-    memset(consts, 0, sizeof(consts));
+-    consts[0] = draw;
+-    consts[1] = draw * 3u;
++    for (i = 0; i < ARRAY_SIZE(consts); i++)
++        consts[i] = draw * 13u + i;
++    consts[0] = draw & (FEX_PROBE_TEXTURES - 1);
++    memcpy(&consts[1], &scale, sizeof(scale));
+     PVK(vkCmdPushConstants)(p->cmd, p->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+             0, sizeof(consts), consts);
+ }
+ 
+-static enum fex_probe_pipeline fex_probe_test_pipeline(enum fex_probe_test test)
++static enum fex_probe_pipeline fex_probe_test_pipeline(uint32_t test)
+ {
+-    switch (test)
++    bool shadow = fex_probe_test_shadow(test);
++
++    switch (fex_probe_test_way(test))
+     {
+-        case FEX_PROBE_T_FIRST_INSTANCE:
+-        case FEX_PROBE_T_INSTANCED:
+-            return FEX_PROBE_P_INSTANCE;
+-        case FEX_PROBE_T_MULTI_DRAW:
+-            return FEX_PROBE_P_BATCH;
+-        case FEX_PROBE_T_LIT_NONE:
+-        case FEX_PROBE_T_LIT_BOTH:
+-            return FEX_PROBE_P_LIT;
+-        case FEX_PROBE_T_LIT_MULTI_DRAW:
+-            return FEX_PROBE_P_LIT_BATCH;
++        case FEX_PROBE_W_INSTANCE:
++            return shadow ? FEX_PROBE_P_SHADOW_INSTANCE : FEX_PROBE_P_MAIN_INSTANCE;
++        case FEX_PROBE_W_MULTI_DRAW:
++            return shadow ? FEX_PROBE_P_SHADOW_BATCH : FEX_PROBE_P_MAIN_BATCH;
+         default:
+-            return FEX_PROBE_P_SIMPLE;
++            return shadow ? FEX_PROBE_P_SHADOW : FEX_PROBE_P_MAIN;
+     }
+ }
+ 
+-static void fex_probe_record_draws(struct fex_probe *p, enum fex_probe_test test)
++static void fex_probe_record_draws(struct fex_probe *p, uint32_t test)
+ {
++    const uint32_t width = fex_probe_test_shadow(test) ? FEX_PROBE_SHADOW_SIZE : FEX_PROBE_MAIN_W;
++    const uint32_t height = fex_probe_test_shadow(test) ? FEX_PROBE_SHADOW_SIZE : FEX_PROBE_MAIN_H;
++    const VkDeviceSize vertex_offset = FEX_PROBE_VERTICES;
+     VkViewport viewport;
+     VkRect2D scissor;
+     uint32_t i;
+@@ -819,67 +1243,43 @@ static void fex_probe_record_draws(struct fex_probe *p, enum fex_probe_test test
+     PVK(vkCmdBindPipeline)(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipelines[fex_probe_test_pipeline(test)]);
+     viewport.x = 0.0f;
+     viewport.y = 0.0f;
+-    viewport.width = (float)FEX_PROBE_SIZE;
+-    viewport.height = (float)FEX_PROBE_SIZE;
++    viewport.width = (float)width;
++    viewport.height = (float)height;
+     viewport.minDepth = 0.0f;
+     viewport.maxDepth = 1.0f;
+     PVK(vkCmdSetViewport)(p->cmd, 0, 1, &viewport);
+     scissor.offset.x = 0;
+     scissor.offset.y = 0;
+-    scissor.extent.width = FEX_PROBE_SIZE;
+-    scissor.extent.height = FEX_PROBE_SIZE;
++    scissor.extent.width = width;
++    scissor.extent.height = height;
+     PVK(vkCmdSetScissor)(p->cmd, 0, 1, &scissor);
+-    fex_probe_push_set(p, 0, FEX_PROBE_BINDINGS, 0);
++    PVK(vkCmdBindVertexBuffers)(p->cmd, 0, 1, &p->buffer, &vertex_offset);
++    PVK(vkCmdBindIndexBuffer)(p->cmd, p->buffer, FEX_PROBE_INDICES, VK_INDEX_TYPE_UINT32);
++    PVK(vkCmdBindDescriptorSets)(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 1, 1, &p->texture_set, 0, NULL);
++    fex_probe_push_set(p, 0, FEX_PROBE_PUSH_BINDINGS, 0);
+     fex_probe_push_consts(p, 0);
+ 
+-    switch (test)
++    switch (fex_probe_test_way(test))
+     {
+-        case FEX_PROBE_T_NONE:
+-        case FEX_PROBE_T_LIT_NONE:
++        case FEX_PROBE_W_NONE:
+             for (i = 0; i < FEX_PROBE_DRAWS; i++)
+-                PVK(vkCmdDraw)(p->cmd, 3, 1, 0, 0);
++                PVK(vkCmdDrawIndexed)(p->cmd, FEX_PROBE_MESH_INDICES, 1, i * FEX_PROBE_MESH_INDICES, 0, 0);
+             break;
+-        case FEX_PROBE_T_CONSTS:
+-            for (i = 0; i < FEX_PROBE_DRAWS; i++)
+-            {
+-                fex_probe_push_consts(p, i);
+-                PVK(vkCmdDraw)(p->cmd, 3, 1, 0, 0);
+-            }
+-            break;
+-        case FEX_PROBE_T_CBVS:
+-            for (i = 0; i < FEX_PROBE_DRAWS; i++)
+-            {
+-                fex_probe_push_set(p, 1, 2, i);
+-                PVK(vkCmdDraw)(p->cmd, 3, 1, 0, 0);
+-            }
+-            break;
+-        case FEX_PROBE_T_BOTH:
+-        case FEX_PROBE_T_LIT_BOTH:
++        case FEX_PROBE_W_D2R:
+             for (i = 0; i < FEX_PROBE_DRAWS; i++)
+             {
+                 fex_probe_push_set(p, 1, 2, i);
+                 fex_probe_push_consts(p, i);
+-                PVK(vkCmdDraw)(p->cmd, 3, 1, 0, 0);
++                PVK(vkCmdDrawIndexed)(p->cmd, FEX_PROBE_MESH_INDICES, 1, i * FEX_PROBE_MESH_INDICES, 0, 0);
+             }
+             break;
+-        case FEX_PROBE_T_PIPELINE:
++        case FEX_PROBE_W_INSTANCE:
+             for (i = 0; i < FEX_PROBE_DRAWS; i++)
+-            {
+-                PVK(vkCmdBindPipeline)(p->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+-                        p->pipelines[(i & 1) ? FEX_PROBE_P_SIMPLE2 : FEX_PROBE_P_SIMPLE]);
+-                PVK(vkCmdDraw)(p->cmd, 3, 1, 0, 0);
+-            }
++                PVK(vkCmdDrawIndexed)(p->cmd, FEX_PROBE_MESH_INDICES, 1, i * FEX_PROBE_MESH_INDICES, 0, i);
+             break;
+-        case FEX_PROBE_T_FIRST_INSTANCE:
+-            for (i = 0; i < FEX_PROBE_DRAWS; i++)
+-                PVK(vkCmdDraw)(p->cmd, 3, 1, 0, i);
+-            break;
+-        case FEX_PROBE_T_INSTANCED:
+-            PVK(vkCmdDraw)(p->cmd, 3, FEX_PROBE_DRAWS, 0, 0);
+-            break;
+-        case FEX_PROBE_T_MULTI_DRAW:
+-        case FEX_PROBE_T_LIT_MULTI_DRAW:
+-            PVK(vkCmdDrawIndirect)(p->cmd, p->buffer, FEX_PROBE_CMDS, FEX_PROBE_DRAWS, sizeof(VkDrawIndirectCommand));
++        case FEX_PROBE_W_MULTI_DRAW:
++            PVK(vkCmdDrawIndexedIndirect)(p->cmd, p->buffer, FEX_PROBE_CMDS, FEX_PROBE_DRAWS,
++                    sizeof(VkDrawIndexedIndirectCommand));
+             break;
+         default:
+             break;
+@@ -887,70 +1287,32 @@ static void fex_probe_record_draws(struct fex_probe *p, enum fex_probe_test test
+ }
+ 
+ /* One test: its 3 rounds, one render pass each between two timestamps. */
+-static bool fex_probe_record_test(struct fex_probe *p, enum fex_probe_test test)
++static bool fex_probe_record_test(struct fex_probe *p, uint32_t test)
+ {
+-    VkRenderingAttachmentInfo attachment;
+-    VkCommandBufferBeginInfo begin_info;
+-    VkImageMemoryBarrier2 image_barrier;
++    const bool shadow = fex_probe_test_shadow(test);
++    VkRenderingAttachmentInfo colors[2], depth;
+     VkMemoryBarrier2 memory_barrier;
+     VkRenderingInfo rendering;
+     VkDependencyInfo dep;
+     uint32_t round;
+ 
+-    if (PVK(vkResetCommandBuffer)(p->cmd, 0) != VK_SUCCESS)
+-        return false;
+-    memset(&begin_info, 0, sizeof(begin_info));
+-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+-    if (PVK(vkBeginCommandBuffer)(p->cmd, &begin_info) != VK_SUCCESS)
++    if (!fex_probe_begin(p))
+         return false;
+ 
+     PVK(vkCmdResetQueryPool)(p->cmd, p->pool, 0, 2 * FEX_PROBE_ROUNDS);
+ 
+-    if (!p->image_ready)
+-    {
+-        memset(&image_barrier, 0, sizeof(image_barrier));
+-        image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+-        image_barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+-        image_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+-        image_barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+-        image_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+-        image_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+-        image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-        image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-        image_barrier.image = p->image;
+-        image_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+-        image_barrier.subresourceRange.levelCount = 1;
+-        image_barrier.subresourceRange.layerCount = 1;
+-        memset(&dep, 0, sizeof(dep));
+-        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+-        dep.imageMemoryBarrierCount = 1;
+-        dep.pImageMemoryBarriers = &image_barrier;
+-        PVK(vkCmdPipelineBarrier2)(p->cmd, &dep);
+-        p->image_ready = true;
+-    }
+-
+     /* Between the passes (outside the timed span): each pass loads what the one before stored. */
+     memset(&memory_barrier, 0, sizeof(memory_barrier));
+     memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+-    memory_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+-    memory_barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+-    memory_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+-    memory_barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+-
+-    memset(&attachment, 0, sizeof(attachment));
+-    attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+-    attachment.imageView = p->view;
+-    attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+-    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+-    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+-    memset(&rendering, 0, sizeof(rendering));
+-    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+-    rendering.renderArea.extent.width = FEX_PROBE_SIZE;
+-    rendering.renderArea.extent.height = FEX_PROBE_SIZE;
+-    rendering.layerCount = 1;
+-    rendering.colorAttachmentCount = 1;
+-    rendering.pColorAttachments = &attachment;
++    memory_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
++            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
++    memory_barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
++            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    memory_barrier.dstStageMask = memory_barrier.srcStageMask;
++    memory_barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
++            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++
++    fex_probe_rendering_info(p, shadow, VK_ATTACHMENT_LOAD_OP_LOAD, &rendering, colors, &depth);
+ 
+     for (round = 0; round < FEX_PROBE_ROUNDS; round++)
+     {
+@@ -962,7 +1324,7 @@ static bool fex_probe_record_test(struct fex_probe *p, enum fex_probe_test test)
+ 
+         PVK(vkCmdWriteTimestamp2)(p->cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, p->pool, 2 * round);
+         PVK(vkCmdBeginRendering)(p->cmd, &rendering);
+-        if (test != FEX_PROBE_T_EMPTY)
++        if (fex_probe_test_way(test) != FEX_PROBE_W_EMPTY)
+             fex_probe_record_draws(p, test);
+         PVK(vkCmdEndRendering)(p->cmd);
+         PVK(vkCmdWriteTimestamp2)(p->cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, p->pool, 2 * round + 1);
+@@ -971,33 +1333,16 @@ static bool fex_probe_record_test(struct fex_probe *p, enum fex_probe_test test)
+     return PVK(vkEndCommandBuffer)(p->cmd) == VK_SUCCESS;
+ }
+ 
+-/* Runs one recorded test. VK_TIMEOUT: the GPU may still be on it, so nothing may be destroyed. */
+-static VkResult fex_probe_run_test(struct fex_probe *p, enum fex_probe_test test, const char **call)
++/* Runs one recorded test. VK_TIMEOUT: the GPU may still be on it. */
++static VkResult fex_probe_run_test(struct fex_probe *p, uint32_t test, const char **call)
+ {
+     const uint64_t mask = p->setup.timestamp_bits >= 64 ? ~(uint64_t)0 :
+             ((uint64_t)1 << p->setup.timestamp_bits) - 1;
+     uint64_t results[2 * FEX_PROBE_ROUNDS];
+-    VkCommandBufferSubmitInfo cmd_info;
+-    VkSubmitInfo2 submit;
+     uint32_t round;
+     VkResult vr;
+ 
+-    memset(&cmd_info, 0, sizeof(cmd_info));
+-    cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+-    cmd_info.commandBuffer = p->cmd;
+-    memset(&submit, 0, sizeof(submit));
+-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+-    submit.commandBufferInfoCount = 1;
+-    submit.pCommandBufferInfos = &cmd_info;
+-
+-    *call = "vkQueueSubmit2";
+-    if ((vr = PVK(vkQueueSubmit2)(p->vk_queue, 1, &submit, p->fence)) != VK_SUCCESS)
+-        return vr;
+-    *call = "vkWaitForFences";
+-    if ((vr = PVK(vkWaitForFences)(p->vk_device, 1, &p->fence, VK_TRUE, FEX_PROBE_WAIT_NS)) != VK_SUCCESS)
+-        return vr;
+-    *call = "vkResetFences";
+-    if ((vr = PVK(vkResetFences)(p->vk_device, 1, &p->fence)) != VK_SUCCESS)
++    if ((vr = fex_probe_submit(p, call)) != VK_SUCCESS)
+         return vr;
+     *call = "vkGetQueryPoolResults";
+     if ((vr = PVK(vkGetQueryPoolResults)(p->vk_device, p->pool, 0, 2 * FEX_PROBE_ROUNDS, sizeof(results), results,
+@@ -1009,75 +1354,66 @@ static VkResult fex_probe_run_test(struct fex_probe *p, enum fex_probe_test test
+     return VK_SUCCESS;
+ }
+ 
+-static void fex_probe_destroy(struct fex_probe *p)
++static uint64_t fex_probe_best(const struct fex_probe *p, uint32_t test)
+ {
+-    uint32_t i;
++    uint64_t best = UINT64_MAX;
++    uint32_t round;
+ 
+-    if (!p->vk_device)
+-        return;
+-    PVK(vkDestroyFence)(p->vk_device, p->fence, NULL);
+-    PVK(vkDestroyCommandPool)(p->vk_device, p->cmd_pool, NULL);
+-    PVK(vkDestroyQueryPool)(p->vk_device, p->pool, NULL);
+-    for (i = 0; i < FEX_PROBE_P_COUNT; i++)
+-        PVK(vkDestroyPipeline)(p->vk_device, p->pipelines[i], NULL);
+-    for (i = 0; i < ARRAY_SIZE(p->modules); i++)
+-        PVK(vkDestroyShaderModule)(p->vk_device, p->modules[i], NULL);
+-    PVK(vkDestroyPipelineLayout)(p->vk_device, p->layout, NULL);
+-    PVK(vkDestroyDescriptorSetLayout)(p->vk_device, p->set_layout, NULL);
+-    PVK(vkDestroyImageView)(p->vk_device, p->view, NULL);
+-    PVK(vkDestroyImage)(p->vk_device, p->image, NULL);
+-    PVK(vkFreeMemory)(p->vk_device, p->image_memory, NULL);
+-    PVK(vkDestroyBuffer)(p->vk_device, p->buffer, NULL);
+-    PVK(vkFreeMemory)(p->vk_device, p->buffer_memory, NULL);
+-    PVK(vkDestroyDevice)(p->vk_device, NULL);
+-    p->vk_device = VK_NULL_HANDLE;
++    for (round = 0; round < FEX_PROBE_ROUNDS; round++)
++    {
++        if (p->ticks[test][round] < best)
++            best = p->ticks[test][round];
++    }
++    return best;
+ }
+ 
+-/* Each test's GPU time per draw into buf at len: the tests done, and with 'all' also the ones not run ('-') or left
+- * out ('off'). */
+-static size_t fex_probe_values(const struct fex_probe *p, char *buf, size_t size, size_t len, bool all)
++static uint64_t fex_probe_worst(const struct fex_probe *p, uint32_t test)
+ {
+-    uint64_t best[FEX_PROBE_T_COUNT], worst[FEX_PROBE_T_COUNT];
+-    const double us_per_tick = p->setup.ns_per_tick / 1000.0;
+-    uint32_t round, test, shown = 0;
+-    const char *sep;
++    uint64_t worst = 0;
++    uint32_t round;
+ 
+-    for (test = 0; test < p->tests_done; test++)
++    for (round = 0; round < FEX_PROBE_ROUNDS; round++)
+     {
+-        best[test] = UINT64_MAX;
+-        worst[test] = 0;
+-        for (round = 0; round < FEX_PROBE_ROUNDS; round++)
+-        {
+-            if (p->ticks[test][round] < best[test])
+-                best[test] = p->ticks[test][round];
+-            if (p->ticks[test][round] > worst[test])
+-                worst[test] = p->ticks[test][round];
+-        }
++        if (p->ticks[test][round] > worst)
++            worst = p->ticks[test][round];
+     }
++    return worst;
++}
++
++/* Each test's GPU time per draw into buf at len: the tests done, and with 'all' also the ones not run ('-'). */
++static size_t fex_probe_values(const struct fex_probe *p, char *buf, size_t size, size_t len, bool all)
++{
++    const double us_per_tick = p->setup.ns_per_tick / 1000.0;
++    uint32_t test, empty, shown = 0;
++    const char *sep;
++    double base;
+ 
+-    for (test = FEX_PROBE_T_EMPTY + 1; test < FEX_PROBE_T_COUNT; test++)
++    for (test = 0; test < FEX_PROBE_T_COUNT; test++)
+     {
++        if (fex_probe_test_way(test) == FEX_PROBE_W_EMPTY)
++            continue;
+         if (!all && test >= p->tests_done)
+             break;
+         sep = shown++ ? " | " : "";
+-        if (test >= p->setup.test_count)
+-            len = fex_probe_len_in(size, len, snprintf(buf + len, size - len, "%s%s off (VKD3D_FEX_DRAW_PROBE=2"
+-                    " runs it)", sep, fex_probe_test_names[test]));
+-        else if (test >= p->tests_done)
++        empty = fex_probe_test_empty(test);
++        if (test >= p->tests_done)
+             len = fex_probe_len_in(size, len, snprintf(buf + len, size - len, "%s%s -", sep,
+                     fex_probe_test_names[test]));
+         else if (!p->pipelines[fex_probe_test_pipeline(test)])
+-            len = fex_probe_len_in(size, len, snprintf(buf + len, size - len, "%s%s n/a (no multi-draw)", sep,
+-                    fex_probe_test_names[test]));
++            len = fex_probe_len_in(size, len, snprintf(buf + len, size - len, "%s%s n/a (no multi-draw or"
++                    " non-uniform texture indexing)", sep, fex_probe_test_names[test]));
+         else
++        {
++            base = (double)fex_probe_best(p, empty);
+             len = fex_probe_len_in(size, len, snprintf(buf + len, size - len, "%s%s %.2f us (%.2f)", sep,
+                     fex_probe_test_names[test],
+-                    ((double)best[test] - (double)best[FEX_PROBE_T_EMPTY]) * us_per_tick / FEX_PROBE_DRAWS,
+-                    ((double)worst[test] - (double)best[FEX_PROBE_T_EMPTY]) * us_per_tick / FEX_PROBE_DRAWS));
++                    ((double)fex_probe_best(p, test) - base) * us_per_tick / FEX_PROBE_DRAWS,
++                    ((double)fex_probe_worst(p, test) - base) * us_per_tick / FEX_PROBE_DRAWS));
++        }
+     }
+     if (!shown && p->tests_done)
+-        len = fex_probe_len_in(size, len, snprintf(buf + len, size - len, "empty pass %.0f us",
+-                best[FEX_PROBE_T_EMPTY] * us_per_tick));
++        len = fex_probe_len_in(size, len, snprintf(buf + len, size - len, "main empty pass %.0f us",
++                fex_probe_best(p, FEX_PROBE_T_EMPTY) * us_per_tick));
+     return len;
+ }
+ 
+@@ -1096,38 +1432,33 @@ static void fex_probe_publish_partial(const struct fex_probe *p)
+ /* The result note: 'status' says how the probe ended when it didn't finish. */
+ static void fex_probe_report(struct fex_probe *p, uint64_t cpu_ns, const char *status)
+ {
+-    double empty_us = 0.0;
+-    uint64_t best;
+-    uint32_t round;
++    const double us_per_tick = p->setup.ns_per_tick / 1000.0;
++    double main_us = 0.0, shadow_us = 0.0;
+     size_t len;
+ 
+-    if (p->tests_done)
+-    {
+-        best = UINT64_MAX;
+-        for (round = 0; round < FEX_PROBE_ROUNDS; round++)
+-        {
+-            if (p->ticks[FEX_PROBE_T_EMPTY][round] < best)
+-                best = p->ticks[FEX_PROBE_T_EMPTY][round];
+-        }
+-        empty_us = best * p->setup.ns_per_tick / 1000.0;
+-    }
++    if (p->tests_done > FEX_PROBE_T_EMPTY)
++        main_us = fex_probe_best(p, FEX_PROBE_T_EMPTY) * us_per_tick;
++    if (p->tests_done > FEX_PROBE_T_SHADOW_EMPTY)
++        shadow_us = fex_probe_best(p, FEX_PROBE_T_SHADOW_EMPTY) * us_per_tick;
+ 
+     len = fex_probe_len(0, snprintf(fex_probe_text, sizeof(fex_probe_text),
+-            "# draw probe (VKD3D fex26): GPU time per draw, 1000 small draws per test (8-pixel triangles into a"
+-            " 2048x2048 target, one render pass per round, best of %u rounds, slowest round in brackets, the empty"
+-            " pass's own %.0f us taken off; on a GPU device of its own, %.1f s after the game's was made, took %.1f s;"
+-            " runs with VKD3D_FEX_DRAW_PROBE=1)%s%s: ", FEX_PROBE_ROUNDS, empty_us, p->setup.delay_ms / 1000.0,
++            "# draw probe (VKD3D fex27): GPU time per draw, 1000 D2R-sized draws per test (220 triangles each; main ="
++            " 1280x720 R11G11B10F + RGBA8 + D24S8 like D2R's main pass, ~920 lit pixels a draw; shadow = 2048x2048"
++            " D16, ~4,200 pixels a draw, alpha-test pixel shader; one render pass per round, best of %u rounds,"
++            " slowest round in brackets, the empty pass's own time taken off: main %.0f us, shadow %.0f us; on a GPU"
++            " device of its own, kept to the end, %.1f s after the game's was made, took %.1f s; runs with"
++            " VKD3D_FEX_DRAW_PROBE=1)%s%s: ", FEX_PROBE_ROUNDS, main_us, shadow_us, p->setup.delay_ms / 1000.0,
+             cpu_ns / 1e9, status ? " " : "", status ? status : ""));
+     len = fex_probe_values(p, fex_probe_text, sizeof(fex_probe_text), len, true);
+     len = fex_probe_len(len, snprintf(fex_probe_text + len, sizeof(fex_probe_text) - len, "\n"));
+ 
+     len = fex_probe_len(len, snprintf(fex_probe_text + len, sizeof(fex_probe_text) - len,
+-            "# draw probe tests: 'both (like D2R)' = new push constants and new root constant buffers (push"
+-            " descriptors) before every draw, as D2R does; 'push constants' / 'root CBVs' = only that one; 'lit' = a"
+-            " pixel shader with 32 lights (loaded once per draw ahead of the pixels); 'pipeline switch' = another"
+-            " pipeline object every draw; 'first instance' = every draw its own instance index; 'one instanced draw' ="
+-            " 1000 instances in one draw; 'one multi-draw call' = all 1000 in one vkCmdDrawIndirect, each finding its"
+-            " data by its draw index (the lit one: its pixels read the lights by the draw index); '-' = not run\n"));
++            "# draw probe tests: 'no changes' = nothing set between draws, only the index range moves; 'like D2R' ="
++            " new push constants (13 dwords) and 2 new root constant buffers (push descriptors) before every draw,"
++            " as vkd3d records D2R's draws; 'first instance' = nothing set between draws, each draw finds its"
++            " object, material, lights and texture index in a buffer by its instance index; 'one multi-draw call' ="
++            " all 1000 in one vkCmdDrawIndexedIndirect, each finding them by its draw index; the batched ways read"
++            " material, lights and texture index per pixel; '-' = not run\n"));
+     fex_probe_text[len] = 0;
+ }
+ 
+@@ -1139,7 +1470,6 @@ static void *fex_probe_thread(void *arg)
+     uint64_t start_ns;
+     VkResult vr = VK_SUCCESS;
+     uint32_t test;
+-    bool keep = false;
+ 
+     vkd3d_set_thread_name("vkd3d-fex-probe");
+     fex_probe_set_progress(FEX_PROBE_WAITING, 0);
+@@ -1153,8 +1483,8 @@ static void *fex_probe_thread(void *arg)
+     step = "device";
+     if ((vr = fex_probe_create_device(p)) != VK_SUCCESS)
+         goto fail;
+-    step = "target";
+-    if (!fex_probe_create_target(p))
++    step = "targets and textures";
++    if (!fex_probe_create_images(p))
+         goto fail;
+     step = "buffer";
+     if (!fex_probe_create_buffer(p))
+@@ -1169,7 +1499,16 @@ static void *fex_probe_thread(void *arg)
+     if (!fex_probe_create_commands(p))
+         goto fail;
+ 
+-    for (test = 0; test < p->setup.test_count; test++)
++    fex_probe_set_progress(FEX_PROBE_PREPARING, 0);
++    fex_probe_sleep_ms(FEX_PROBE_GAP_MS);
++    if ((vr = fex_probe_prepare(p, &call)) != VK_SUCCESS)
++    {
++        snprintf(status, sizeof(status), "(stopped at its first GPU work: %s returned %d%s)", call, vr,
++                vr == VK_TIMEOUT ? ", the GPU didn't finish within 3 s" :
++                vr == VK_ERROR_DEVICE_LOST ? ", the probe's GPU device was lost" : "");
++    }
++
++    for (test = 0; !status[0] && test < FEX_PROBE_T_COUNT; test++)
+     {
+         if (!p->pipelines[fex_probe_test_pipeline(test)])
+         {
+@@ -1190,7 +1529,6 @@ static void *fex_probe_thread(void *arg)
+             snprintf(status, sizeof(status), "(stopped at test %u, %s: %s returned %d%s)", test + 1,
+                     fex_probe_test_names[test], call, vr, vr == VK_TIMEOUT ? ", the GPU didn't finish within 3 s" :
+                     vr == VK_ERROR_DEVICE_LOST ? ", the probe's GPU device was lost" : "");
+-            keep = vr == VK_TIMEOUT;
+             break;
+         }
+         p->tests_done = test + 1;
+@@ -1199,15 +1537,9 @@ static void *fex_probe_thread(void *arg)
+ 
+     fex_probe_report(p, vkd3d_get_current_time_ns() - start_ns, status[0] ? status : NULL);
+     INFO("%s", fex_probe_text);
+-    /* A test the GPU may still be running keeps everything alive (a few MB, once). */
+-    if (!keep)
+-        fex_probe_destroy(p);
++    /* fex27: nothing is destroyed or freed, the device, its objects, this struct and the instance reference stay
++     * until the game ends (tearing the device down ended the game with fex24 and fex26). */
+     fex_probe_set_progress(FEX_PROBE_DONE, 0);
+-    if (!keep)
+-    {
+-        vkd3d_instance_decref(p->setup.instance);
+-        vkd3d_free(p);
+-    }
+     return NULL;
+ 
+ fail:
+@@ -1216,10 +1548,7 @@ fail:
+     p->tests_done = 0;
+     fex_probe_report(p, vkd3d_get_current_time_ns() - start_ns, status);
+     INFO("%s", fex_probe_text);
+-    fex_probe_destroy(p);
+     fex_probe_set_progress(FEX_PROBE_DONE, 0);
+-    vkd3d_instance_decref(p->setup.instance);
+-    vkd3d_free(p);
+     return NULL;
+ }
+ 
+@@ -1233,7 +1562,7 @@ void vkd3d_fex_draw_probe(struct d3d12_device *device)
+     long delay, level;
+     char env[16];
+ 
+-    /* fex26: only when asked for (1 = all tests but the lit multi-draw one, 2 = all). */
++    /* fex26: only when asked for. */
+     if (!vkd3d_get_env_var("VKD3D_FEX_DRAW_PROBE", env, sizeof(env)))
+         return;
+     level = strtol(env, NULL, 10);
+@@ -1268,13 +1597,12 @@ void vkd3d_fex_draw_probe(struct d3d12_device *device)
+     p->setup.family_index = family->vk_family_index;
+     p->setup.timestamp_bits = family->timestamp_bits;
+     p->setup.ns_per_tick = device->device_info.properties2.properties.limits.timestampPeriod;
+-    p->setup.multi_draw = device->device_info.features2.features.multiDrawIndirect &&
+-            device->device_info.vulkan_1_1_features.shaderDrawParameters;
++    p->setup.batch = device->device_info.features2.features.multiDrawIndirect &&
++            device->device_info.vulkan_1_1_features.shaderDrawParameters &&
++            device->device_info.vulkan_1_2_features.shaderSampledImageArrayNonUniformIndexing;
+     p->setup.delay_ms = (uint32_t)delay * 1000u;
+-    p->setup.test_count = level >= 2 ? FEX_PROBE_T_COUNT : FEX_PROBE_T_LIT_MULTI_DRAW;
+-    fex_probe_test_count = p->setup.test_count;
+ 
+-    /* The probe's device is made from the game's VkInstance: keep it alive while the probe runs. */
++    /* The probe's device is made from the game's VkInstance: a reference the probe keeps (fex27). */
+     vkd3d_instance_incref(instance);
+     if (pthread_create(&thread, NULL, fex_probe_thread, p))
+     {
+diff --git a/libs/vkd3d/fex_draw_probe_spv.h b/libs/vkd3d/fex_draw_probe_spv.h
+index 6f678a3..455d429 100644
+--- a/libs/vkd3d/fex_draw_probe_spv.h
++++ b/libs/vkd3d/fex_draw_probe_spv.h
+@@ -1,300 +1,609 @@
+ /* SPIR-V of the FEX draw probe shaders (fex_draw_probe.c), compiled with glslangValidator -V --target-env vulkan1.1
+  * from the GLSL in the comments of fex_draw_probe.c. */
+-static const uint32_t fex_probe_simple_vert[] =
++static const uint32_t fex_probe_real_vert[] =
+ {
+-    0x07230203, 0x00010300, 0x0008000b, 0x00000046, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
++    0x07230203, 0x00010300, 0x0008000b, 0x00000058, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+-    0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000c, 0x0000001f, 0x00030003,
+-    0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000009,
+-    0x00000076, 0x00060005, 0x0000000c, 0x565f6c67, 0x65747265, 0x646e4978, 0x00007865, 0x00060005,
+-    0x0000001d, 0x505f6c67, 0x65567265, 0x78657472, 0x00000000, 0x00060006, 0x0000001d, 0x00000000,
+-    0x505f6c67, 0x7469736f, 0x006e6f69, 0x00070006, 0x0000001d, 0x00000001, 0x505f6c67, 0x746e696f,
+-    0x657a6953, 0x00000000, 0x00070006, 0x0000001d, 0x00000002, 0x435f6c67, 0x4470696c, 0x61747369,
+-    0x0065636e, 0x00070006, 0x0000001d, 0x00000003, 0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e,
+-    0x00030005, 0x0000001f, 0x00000000, 0x00030005, 0x00000021, 0x006a624f, 0x00040006, 0x00000021,
+-    0x00000000, 0x00736f70, 0x00030005, 0x00000023, 0x006a626f, 0x00030005, 0x00000029, 0x006d6143,
+-    0x00050006, 0x00000029, 0x00000000, 0x6c616373, 0x00000065, 0x00030005, 0x0000002b, 0x006d6163,
+-    0x00030005, 0x00000033, 0x00004350, 0x00040006, 0x00000033, 0x00000000, 0x00786469, 0x00040006,
+-    0x00000033, 0x00000001, 0x00646170, 0x00030005, 0x00000035, 0x00006370, 0x00040047, 0x0000000c,
+-    0x0000000b, 0x0000002a, 0x00030047, 0x0000001d, 0x00000002, 0x00050048, 0x0000001d, 0x00000000,
+-    0x0000000b, 0x00000000, 0x00050048, 0x0000001d, 0x00000001, 0x0000000b, 0x00000001, 0x00050048,
+-    0x0000001d, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000001d, 0x00000003, 0x0000000b,
+-    0x00000004, 0x00030047, 0x00000021, 0x00000002, 0x00050048, 0x00000021, 0x00000000, 0x00000023,
+-    0x00000000, 0x00040047, 0x00000023, 0x00000021, 0x00000001, 0x00040047, 0x00000023, 0x00000022,
+-    0x00000000, 0x00030047, 0x00000029, 0x00000002, 0x00050048, 0x00000029, 0x00000000, 0x00000023,
+-    0x00000000, 0x00040047, 0x0000002b, 0x00000021, 0x00000000, 0x00040047, 0x0000002b, 0x00000022,
+-    0x00000000, 0x00040047, 0x00000032, 0x00000006, 0x00000004, 0x00030047, 0x00000033, 0x00000002,
+-    0x00050048, 0x00000033, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000033, 0x00000001,
+-    0x00000023, 0x00000004, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+-    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020, 0x00000008,
+-    0x00000007, 0x00000007, 0x00040015, 0x0000000a, 0x00000020, 0x00000001, 0x00040020, 0x0000000b,
+-    0x00000001, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c, 0x00000001, 0x0004002b, 0x0000000a,
+-    0x0000000e, 0x00000001, 0x00020014, 0x0000000f, 0x0004002b, 0x00000006, 0x00000011, 0x3f800000,
+-    0x0004002b, 0x00000006, 0x00000012, 0x00000000, 0x0004002b, 0x0000000a, 0x00000015, 0x00000002,
+-    0x00040017, 0x00000019, 0x00000006, 0x00000004, 0x00040015, 0x0000001a, 0x00000020, 0x00000000,
+-    0x0004002b, 0x0000001a, 0x0000001b, 0x00000001, 0x0004001c, 0x0000001c, 0x00000006, 0x0000001b,
+-    0x0006001e, 0x0000001d, 0x00000019, 0x00000006, 0x0000001c, 0x0000001c, 0x00040020, 0x0000001e,
+-    0x00000003, 0x0000001d, 0x0004003b, 0x0000001e, 0x0000001f, 0x00000003, 0x0004002b, 0x0000000a,
+-    0x00000020, 0x00000000, 0x0003001e, 0x00000021, 0x00000019, 0x00040020, 0x00000022, 0x00000002,
+-    0x00000021, 0x0004003b, 0x00000022, 0x00000023, 0x00000002, 0x00040020, 0x00000024, 0x00000002,
+-    0x00000019, 0x0003001e, 0x00000029, 0x00000019, 0x00040020, 0x0000002a, 0x00000002, 0x00000029,
+-    0x0004003b, 0x0000002a, 0x0000002b, 0x00000002, 0x0004002b, 0x0000001a, 0x00000031, 0x0000000c,
+-    0x0004001c, 0x00000032, 0x0000001a, 0x00000031, 0x0004001e, 0x00000033, 0x0000001a, 0x00000032,
+-    0x00040020, 0x00000034, 0x00000009, 0x00000033, 0x0004003b, 0x00000034, 0x00000035, 0x00000009,
+-    0x00040020, 0x00000036, 0x00000009, 0x0000001a, 0x0004002b, 0x0000001a, 0x0000003a, 0x00000002,
+-    0x00040020, 0x0000003b, 0x00000002, 0x00000006, 0x00040020, 0x00000044, 0x00000003, 0x00000019,
+-    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b,
+-    0x00000008, 0x00000009, 0x00000007, 0x0004003d, 0x0000000a, 0x0000000d, 0x0000000c, 0x000500aa,
+-    0x0000000f, 0x00000010, 0x0000000d, 0x0000000e, 0x000600a9, 0x00000006, 0x00000013, 0x00000010,
+-    0x00000011, 0x00000012, 0x0004003d, 0x0000000a, 0x00000014, 0x0000000c, 0x000500aa, 0x0000000f,
+-    0x00000016, 0x00000014, 0x00000015, 0x000600a9, 0x00000006, 0x00000017, 0x00000016, 0x00000011,
+-    0x00000012, 0x00050050, 0x00000007, 0x00000018, 0x00000013, 0x00000017, 0x0003003e, 0x00000009,
+-    0x00000018, 0x00050041, 0x00000024, 0x00000025, 0x00000023, 0x00000020, 0x0004003d, 0x00000019,
+-    0x00000026, 0x00000025, 0x0007004f, 0x00000007, 0x00000027, 0x00000026, 0x00000026, 0x00000000,
+-    0x00000001, 0x0004003d, 0x00000007, 0x00000028, 0x00000009, 0x00050041, 0x00000024, 0x0000002c,
+-    0x0000002b, 0x00000020, 0x0004003d, 0x00000019, 0x0000002d, 0x0000002c, 0x0007004f, 0x00000007,
+-    0x0000002e, 0x0000002d, 0x0000002d, 0x00000000, 0x00000001, 0x00050085, 0x00000007, 0x0000002f,
+-    0x00000028, 0x0000002e, 0x00050081, 0x00000007, 0x00000030, 0x00000027, 0x0000002f, 0x00050041,
+-    0x00000036, 0x00000037, 0x00000035, 0x00000020, 0x0004003d, 0x0000001a, 0x00000038, 0x00000037,
+-    0x00040070, 0x00000006, 0x00000039, 0x00000038, 0x00060041, 0x0000003b, 0x0000003c, 0x0000002b,
+-    0x00000020, 0x0000003a, 0x0004003d, 0x00000006, 0x0000003d, 0x0000003c, 0x00050085, 0x00000006,
+-    0x0000003e, 0x00000039, 0x0000003d, 0x00050050, 0x00000007, 0x0000003f, 0x0000003e, 0x0000003e,
+-    0x00050081, 0x00000007, 0x00000040, 0x00000030, 0x0000003f, 0x00050051, 0x00000006, 0x00000041,
+-    0x00000040, 0x00000000, 0x00050051, 0x00000006, 0x00000042, 0x00000040, 0x00000001, 0x00070050,
+-    0x00000019, 0x00000043, 0x00000041, 0x00000042, 0x00000012, 0x00000011, 0x00050041, 0x00000044,
+-    0x00000045, 0x0000001f, 0x00000020, 0x0003003e, 0x00000045, 0x00000043, 0x000100fd, 0x00010038,
+-};
+-static const uint32_t fex_probe_simple_frag[] =
+-{
+-    0x07230203, 0x00010300, 0x0008000b, 0x00000015, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+-    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+-    0x0006000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00030010, 0x00000004,
+-    0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
+-    0x00030005, 0x00000009, 0x0000006f, 0x00030005, 0x0000000d, 0x0074614d, 0x00050006, 0x0000000d,
+-    0x00000000, 0x6f6c6f63, 0x00000072, 0x00050006, 0x0000000d, 0x00000001, 0x6867696c, 0x00007374,
+-    0x00030005, 0x0000000f, 0x0074616d, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00040047,
+-    0x0000000c, 0x00000006, 0x00000010, 0x00030047, 0x0000000d, 0x00000002, 0x00050048, 0x0000000d,
+-    0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000d, 0x00000001, 0x00000023, 0x00000010,
+-    0x00040047, 0x0000000f, 0x00000021, 0x00000002, 0x00040047, 0x0000000f, 0x00000022, 0x00000000,
+-    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020,
+-    0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007,
+-    0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00040015, 0x0000000a, 0x00000020, 0x00000000,
+-    0x0004002b, 0x0000000a, 0x0000000b, 0x00000020, 0x0004001c, 0x0000000c, 0x00000007, 0x0000000b,
+-    0x0004001e, 0x0000000d, 0x00000007, 0x0000000c, 0x00040020, 0x0000000e, 0x00000002, 0x0000000d,
+-    0x0004003b, 0x0000000e, 0x0000000f, 0x00000002, 0x00040015, 0x00000010, 0x00000020, 0x00000001,
+-    0x0004002b, 0x00000010, 0x00000011, 0x00000000, 0x00040020, 0x00000012, 0x00000002, 0x00000007,
+-    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x00050041,
+-    0x00000012, 0x00000013, 0x0000000f, 0x00000011, 0x0004003d, 0x00000007, 0x00000014, 0x00000013,
+-    0x0003003e, 0x00000009, 0x00000014, 0x000100fd, 0x00010038,
++    0x000d000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x00000015, 0x00000022, 0x0000002e,
++    0x00000030, 0x00000033, 0x00000036, 0x00000042, 0x0000004a, 0x00030003, 0x00000002, 0x000001c2,
++    0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000009, 0x00000077, 0x00030005,
++    0x0000000b, 0x006a624f, 0x00050006, 0x0000000b, 0x00000000, 0x6c726f77, 0x00000064, 0x00050006,
++    0x0000000b, 0x00000001, 0x746e6974, 0x00000000, 0x00030005, 0x0000000d, 0x006a626f, 0x00040005,
++    0x00000015, 0x705f6e69, 0x0000736f, 0x00060005, 0x00000020, 0x505f6c67, 0x65567265, 0x78657472,
++    0x00000000, 0x00060006, 0x00000020, 0x00000000, 0x505f6c67, 0x7469736f, 0x006e6f69, 0x00070006,
++    0x00000020, 0x00000001, 0x505f6c67, 0x746e696f, 0x657a6953, 0x00000000, 0x00070006, 0x00000020,
++    0x00000002, 0x435f6c67, 0x4470696c, 0x61747369, 0x0065636e, 0x00070006, 0x00000020, 0x00000003,
++    0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x00000022, 0x00000000, 0x00030005,
++    0x00000023, 0x006d6143, 0x00060006, 0x00000023, 0x00000000, 0x77656976, 0x6a6f7270, 0x00000000,
++    0x00040006, 0x00000023, 0x00000001, 0x00657965, 0x00030005, 0x00000025, 0x006d6163, 0x00040005,
++    0x0000002e, 0x76755f6f, 0x00000000, 0x00040005, 0x00000030, 0x755f6e69, 0x00000076, 0x00040005,
++    0x00000033, 0x70775f6f, 0x0000736f, 0x00040005, 0x00000036, 0x726e5f6f, 0x0000006d, 0x00040005,
++    0x00000042, 0x6e5f6e69, 0x00006d72, 0x00040005, 0x0000004a, 0x69745f6f, 0x0000746e, 0x00030005,
++    0x00000051, 0x00004350, 0x00040006, 0x00000051, 0x00000000, 0x00786574, 0x00050006, 0x00000051,
++    0x00000001, 0x6c616373, 0x00000065, 0x00040006, 0x00000051, 0x00000002, 0x00646170, 0x00030005,
++    0x00000053, 0x00006370, 0x00030047, 0x0000000b, 0x00000002, 0x00040048, 0x0000000b, 0x00000000,
++    0x00000005, 0x00050048, 0x0000000b, 0x00000000, 0x00000007, 0x00000010, 0x00050048, 0x0000000b,
++    0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x00000023, 0x00000040,
++    0x00040047, 0x0000000d, 0x00000021, 0x00000001, 0x00040047, 0x0000000d, 0x00000022, 0x00000000,
++    0x00040047, 0x00000015, 0x0000001e, 0x00000000, 0x00030047, 0x00000020, 0x00000002, 0x00050048,
++    0x00000020, 0x00000000, 0x0000000b, 0x00000000, 0x00050048, 0x00000020, 0x00000001, 0x0000000b,
++    0x00000001, 0x00050048, 0x00000020, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x00000020,
++    0x00000003, 0x0000000b, 0x00000004, 0x00030047, 0x00000023, 0x00000002, 0x00040048, 0x00000023,
++    0x00000000, 0x00000005, 0x00050048, 0x00000023, 0x00000000, 0x00000007, 0x00000010, 0x00050048,
++    0x00000023, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000023, 0x00000001, 0x00000023,
++    0x00000040, 0x00040047, 0x00000025, 0x00000021, 0x00000000, 0x00040047, 0x00000025, 0x00000022,
++    0x00000000, 0x00040047, 0x0000002e, 0x0000001e, 0x00000000, 0x00040047, 0x00000030, 0x0000001e,
++    0x00000001, 0x00040047, 0x00000033, 0x0000001e, 0x00000001, 0x00040047, 0x00000036, 0x0000001e,
++    0x00000002, 0x00040047, 0x00000042, 0x0000001e, 0x00000002, 0x00040047, 0x0000004a, 0x0000001e,
++    0x00000003, 0x00040047, 0x00000050, 0x00000006, 0x00000004, 0x00030047, 0x00000051, 0x00000002,
++    0x00050048, 0x00000051, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000051, 0x00000001,
++    0x00000023, 0x00000004, 0x00050048, 0x00000051, 0x00000002, 0x00000023, 0x00000008, 0x00020013,
++    0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017,
++    0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00040018,
++    0x0000000a, 0x00000007, 0x00000004, 0x0004001e, 0x0000000b, 0x0000000a, 0x00000007, 0x00040020,
++    0x0000000c, 0x00000002, 0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000002, 0x00040015,
++    0x0000000e, 0x00000020, 0x00000001, 0x0004002b, 0x0000000e, 0x0000000f, 0x00000000, 0x00040020,
++    0x00000010, 0x00000002, 0x0000000a, 0x00040017, 0x00000013, 0x00000006, 0x00000003, 0x00040020,
++    0x00000014, 0x00000001, 0x00000013, 0x0004003b, 0x00000014, 0x00000015, 0x00000001, 0x0004002b,
++    0x00000006, 0x00000017, 0x3f800000, 0x00040015, 0x0000001d, 0x00000020, 0x00000000, 0x0004002b,
++    0x0000001d, 0x0000001e, 0x00000001, 0x0004001c, 0x0000001f, 0x00000006, 0x0000001e, 0x0006001e,
++    0x00000020, 0x00000007, 0x00000006, 0x0000001f, 0x0000001f, 0x00040020, 0x00000021, 0x00000003,
++    0x00000020, 0x0004003b, 0x00000021, 0x00000022, 0x00000003, 0x0004001e, 0x00000023, 0x0000000a,
++    0x00000007, 0x00040020, 0x00000024, 0x00000002, 0x00000023, 0x0004003b, 0x00000024, 0x00000025,
++    0x00000002, 0x00040020, 0x0000002a, 0x00000003, 0x00000007, 0x00040017, 0x0000002c, 0x00000006,
++    0x00000002, 0x00040020, 0x0000002d, 0x00000003, 0x0000002c, 0x0004003b, 0x0000002d, 0x0000002e,
++    0x00000003, 0x00040020, 0x0000002f, 0x00000001, 0x0000002c, 0x0004003b, 0x0000002f, 0x00000030,
++    0x00000001, 0x00040020, 0x00000032, 0x00000003, 0x00000013, 0x0004003b, 0x00000032, 0x00000033,
++    0x00000003, 0x0004003b, 0x00000032, 0x00000036, 0x00000003, 0x00040018, 0x00000039, 0x00000013,
++    0x00000003, 0x00040020, 0x00000041, 0x00000001, 0x00000007, 0x0004003b, 0x00000041, 0x00000042,
++    0x00000001, 0x0004002b, 0x00000006, 0x00000045, 0x40000000, 0x0004003b, 0x0000002a, 0x0000004a,
++    0x00000003, 0x0004002b, 0x0000000e, 0x0000004b, 0x00000001, 0x00040020, 0x0000004c, 0x00000002,
++    0x00000007, 0x0004002b, 0x0000001d, 0x0000004f, 0x0000000b, 0x0004001c, 0x00000050, 0x0000001d,
++    0x0000004f, 0x0005001e, 0x00000051, 0x0000001d, 0x00000006, 0x00000050, 0x00040020, 0x00000052,
++    0x00000009, 0x00000051, 0x0004003b, 0x00000052, 0x00000053, 0x00000009, 0x00040020, 0x00000054,
++    0x00000009, 0x00000006, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
++    0x00000005, 0x0004003b, 0x00000008, 0x00000009, 0x00000007, 0x00050041, 0x00000010, 0x00000011,
++    0x0000000d, 0x0000000f, 0x0004003d, 0x0000000a, 0x00000012, 0x00000011, 0x0004003d, 0x00000013,
++    0x00000016, 0x00000015, 0x00050051, 0x00000006, 0x00000018, 0x00000016, 0x00000000, 0x00050051,
++    0x00000006, 0x00000019, 0x00000016, 0x00000001, 0x00050051, 0x00000006, 0x0000001a, 0x00000016,
++    0x00000002, 0x00070050, 0x00000007, 0x0000001b, 0x00000018, 0x00000019, 0x0000001a, 0x00000017,
++    0x00050091, 0x00000007, 0x0000001c, 0x00000012, 0x0000001b, 0x0003003e, 0x00000009, 0x0000001c,
++    0x00050041, 0x00000010, 0x00000026, 0x00000025, 0x0000000f, 0x0004003d, 0x0000000a, 0x00000027,
++    0x00000026, 0x0004003d, 0x00000007, 0x00000028, 0x00000009, 0x00050091, 0x00000007, 0x00000029,
++    0x00000027, 0x00000028, 0x00050041, 0x0000002a, 0x0000002b, 0x00000022, 0x0000000f, 0x0003003e,
++    0x0000002b, 0x00000029, 0x0004003d, 0x0000002c, 0x00000031, 0x00000030, 0x0003003e, 0x0000002e,
++    0x00000031, 0x0004003d, 0x00000007, 0x00000034, 0x00000009, 0x0008004f, 0x00000013, 0x00000035,
++    0x00000034, 0x00000034, 0x00000000, 0x00000001, 0x00000002, 0x0003003e, 0x00000033, 0x00000035,
++    0x00050041, 0x00000010, 0x00000037, 0x0000000d, 0x0000000f, 0x0004003d, 0x0000000a, 0x00000038,
++    0x00000037, 0x00050051, 0x00000007, 0x0000003a, 0x00000038, 0x00000000, 0x0008004f, 0x00000013,
++    0x0000003b, 0x0000003a, 0x0000003a, 0x00000000, 0x00000001, 0x00000002, 0x00050051, 0x00000007,
++    0x0000003c, 0x00000038, 0x00000001, 0x0008004f, 0x00000013, 0x0000003d, 0x0000003c, 0x0000003c,
++    0x00000000, 0x00000001, 0x00000002, 0x00050051, 0x00000007, 0x0000003e, 0x00000038, 0x00000002,
++    0x0008004f, 0x00000013, 0x0000003f, 0x0000003e, 0x0000003e, 0x00000000, 0x00000001, 0x00000002,
++    0x00060050, 0x00000039, 0x00000040, 0x0000003b, 0x0000003d, 0x0000003f, 0x0004003d, 0x00000007,
++    0x00000043, 0x00000042, 0x0008004f, 0x00000013, 0x00000044, 0x00000043, 0x00000043, 0x00000000,
++    0x00000001, 0x00000002, 0x0005008e, 0x00000013, 0x00000046, 0x00000044, 0x00000045, 0x00060050,
++    0x00000013, 0x00000047, 0x00000017, 0x00000017, 0x00000017, 0x00050083, 0x00000013, 0x00000048,
++    0x00000046, 0x00000047, 0x00050091, 0x00000013, 0x00000049, 0x00000040, 0x00000048, 0x0003003e,
++    0x00000036, 0x00000049, 0x00050041, 0x0000004c, 0x0000004d, 0x0000000d, 0x0000004b, 0x0004003d,
++    0x00000007, 0x0000004e, 0x0000004d, 0x00050041, 0x00000054, 0x00000055, 0x00000053, 0x0000004b,
++    0x0004003d, 0x00000006, 0x00000056, 0x00000055, 0x0005008e, 0x00000007, 0x00000057, 0x0000004e,
++    0x00000056, 0x0003003e, 0x0000004a, 0x00000057, 0x000100fd, 0x00010038,
+ };
+-static const uint32_t fex_probe_lit_frag[] =
++static const uint32_t fex_probe_real_frag[] =
+ {
+-    0x07230203, 0x00010300, 0x0008000b, 0x0000003d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
++    0x07230203, 0x00010300, 0x0008000b, 0x0000009e, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+-    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000019, 0x0000003b, 0x00030010,
+-    0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
+-    0x00000000, 0x00030005, 0x00000009, 0x00000063, 0x00030005, 0x0000000d, 0x0074614d, 0x00050006,
+-    0x0000000d, 0x00000000, 0x6f6c6f63, 0x00000072, 0x00050006, 0x0000000d, 0x00000001, 0x6867696c,
+-    0x00007374, 0x00030005, 0x0000000f, 0x0074616d, 0x00030005, 0x00000017, 0x00000070, 0x00060005,
+-    0x00000019, 0x465f6c67, 0x43676172, 0x64726f6f, 0x00000000, 0x00030005, 0x0000001f, 0x00000069,
+-    0x00030005, 0x0000003b, 0x0000006f, 0x00040047, 0x0000000c, 0x00000006, 0x00000010, 0x00030047,
+-    0x0000000d, 0x00000002, 0x00050048, 0x0000000d, 0x00000000, 0x00000023, 0x00000000, 0x00050048,
+-    0x0000000d, 0x00000001, 0x00000023, 0x00000010, 0x00040047, 0x0000000f, 0x00000021, 0x00000002,
+-    0x00040047, 0x0000000f, 0x00000022, 0x00000000, 0x00040047, 0x00000019, 0x0000000b, 0x0000000f,
+-    0x00040047, 0x0000003b, 0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
++    0x000b000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000022, 0x00000035, 0x00000055,
++    0x0000007c, 0x00000086, 0x0000008e, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002,
++    0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000009, 0x00000061,
++    0x00040005, 0x00000010, 0x73786574, 0x00000000, 0x00030005, 0x00000013, 0x00004350, 0x00040006,
++    0x00000013, 0x00000000, 0x00786574, 0x00050006, 0x00000013, 0x00000001, 0x6c616373, 0x00000065,
++    0x00040006, 0x00000013, 0x00000002, 0x00646170, 0x00030005, 0x00000015, 0x00006370, 0x00030005,
++    0x00000022, 0x00007675, 0x00030005, 0x00000025, 0x00000062, 0x00030005, 0x00000033, 0x0000006e,
++    0x00030005, 0x00000035, 0x006d726e, 0x00030005, 0x00000038, 0x00000063, 0x00030005, 0x0000003c,
++    0x0074614d, 0x00050006, 0x0000003c, 0x00000000, 0x6f6c6f63, 0x00000072, 0x00050006, 0x0000003c,
++    0x00000001, 0x61726170, 0x0000736d, 0x00050006, 0x0000003c, 0x00000002, 0x6867696c, 0x00007374,
++    0x00050006, 0x0000003c, 0x00000003, 0x6c6f636c, 0x0073726f, 0x00030005, 0x0000003e, 0x0074616d,
++    0x00030005, 0x00000045, 0x00000069, 0x00030005, 0x0000004f, 0x0000006c, 0x00040005, 0x00000055,
++    0x736f7077, 0x00000000, 0x00030005, 0x00000059, 0x00000064, 0x00030005, 0x0000007c, 0x0000306f,
++    0x00040005, 0x00000086, 0x746e6974, 0x00000000, 0x00030005, 0x0000008e, 0x0000316f, 0x00040047,
++    0x00000010, 0x00000021, 0x00000000, 0x00040047, 0x00000010, 0x00000022, 0x00000001, 0x00040047,
++    0x00000012, 0x00000006, 0x00000004, 0x00030047, 0x00000013, 0x00000002, 0x00050048, 0x00000013,
++    0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000013, 0x00000001, 0x00000023, 0x00000004,
++    0x00050048, 0x00000013, 0x00000002, 0x00000023, 0x00000008, 0x00040047, 0x00000022, 0x0000001e,
++    0x00000000, 0x00040047, 0x00000035, 0x0000001e, 0x00000002, 0x00040047, 0x0000003a, 0x00000006,
++    0x00000010, 0x00040047, 0x0000003b, 0x00000006, 0x00000010, 0x00030047, 0x0000003c, 0x00000002,
++    0x00050048, 0x0000003c, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000003c, 0x00000001,
++    0x00000023, 0x00000010, 0x00050048, 0x0000003c, 0x00000002, 0x00000023, 0x00000020, 0x00050048,
++    0x0000003c, 0x00000003, 0x00000023, 0x00000120, 0x00040047, 0x0000003e, 0x00000021, 0x00000002,
++    0x00040047, 0x0000003e, 0x00000022, 0x00000000, 0x00040047, 0x00000055, 0x0000001e, 0x00000001,
++    0x00040047, 0x0000007c, 0x0000001e, 0x00000000, 0x00040047, 0x00000086, 0x0000001e, 0x00000003,
++    0x00040047, 0x0000008e, 0x0000001e, 0x00000001, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+     0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004,
+-    0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00040015, 0x0000000a, 0x00000020, 0x00000000,
+-    0x0004002b, 0x0000000a, 0x0000000b, 0x00000020, 0x0004001c, 0x0000000c, 0x00000007, 0x0000000b,
+-    0x0004001e, 0x0000000d, 0x00000007, 0x0000000c, 0x00040020, 0x0000000e, 0x00000002, 0x0000000d,
+-    0x0004003b, 0x0000000e, 0x0000000f, 0x00000002, 0x00040015, 0x00000010, 0x00000020, 0x00000001,
+-    0x0004002b, 0x00000010, 0x00000011, 0x00000000, 0x00040020, 0x00000012, 0x00000002, 0x00000007,
+-    0x00040017, 0x00000015, 0x00000006, 0x00000002, 0x00040020, 0x00000016, 0x00000007, 0x00000015,
+-    0x00040020, 0x00000018, 0x00000001, 0x00000007, 0x0004003b, 0x00000018, 0x00000019, 0x00000001,
+-    0x0004002b, 0x00000006, 0x0000001c, 0x3a83126f, 0x00040020, 0x0000001e, 0x00000007, 0x00000010,
+-    0x0004002b, 0x00000010, 0x00000026, 0x00000020, 0x00020014, 0x00000027, 0x0004002b, 0x00000010,
+-    0x00000029, 0x00000001, 0x0004002b, 0x00000006, 0x0000002d, 0x00000000, 0x00040020, 0x0000003a,
+-    0x00000003, 0x00000007, 0x0004003b, 0x0000003a, 0x0000003b, 0x00000003, 0x00050036, 0x00000002,
+-    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009,
+-    0x00000007, 0x0004003b, 0x00000016, 0x00000017, 0x00000007, 0x0004003b, 0x0000001e, 0x0000001f,
+-    0x00000007, 0x00050041, 0x00000012, 0x00000013, 0x0000000f, 0x00000011, 0x0004003d, 0x00000007,
+-    0x00000014, 0x00000013, 0x0003003e, 0x00000009, 0x00000014, 0x0004003d, 0x00000007, 0x0000001a,
+-    0x00000019, 0x0007004f, 0x00000015, 0x0000001b, 0x0000001a, 0x0000001a, 0x00000000, 0x00000001,
+-    0x0005008e, 0x00000015, 0x0000001d, 0x0000001b, 0x0000001c, 0x0003003e, 0x00000017, 0x0000001d,
+-    0x0003003e, 0x0000001f, 0x00000011, 0x000200f9, 0x00000020, 0x000200f8, 0x00000020, 0x000400f6,
+-    0x00000022, 0x00000023, 0x00000000, 0x000200f9, 0x00000024, 0x000200f8, 0x00000024, 0x0004003d,
+-    0x00000010, 0x00000025, 0x0000001f, 0x000500b1, 0x00000027, 0x00000028, 0x00000025, 0x00000026,
+-    0x000400fa, 0x00000028, 0x00000021, 0x00000022, 0x000200f8, 0x00000021, 0x0004003d, 0x00000010,
+-    0x0000002a, 0x0000001f, 0x00060041, 0x00000012, 0x0000002b, 0x0000000f, 0x00000029, 0x0000002a,
+-    0x0004003d, 0x00000007, 0x0000002c, 0x0000002b, 0x0004003d, 0x00000015, 0x0000002e, 0x00000017,
+-    0x0004003d, 0x00000010, 0x0000002f, 0x0000001f, 0x00060041, 0x00000012, 0x00000030, 0x0000000f,
+-    0x00000029, 0x0000002f, 0x0004003d, 0x00000007, 0x00000031, 0x00000030, 0x0007004f, 0x00000015,
+-    0x00000032, 0x00000031, 0x00000031, 0x00000000, 0x00000001, 0x00050094, 0x00000006, 0x00000033,
+-    0x0000002e, 0x00000032, 0x0007000c, 0x00000006, 0x00000034, 0x00000001, 0x00000028, 0x0000002d,
+-    0x00000033, 0x0005008e, 0x00000007, 0x00000035, 0x0000002c, 0x00000034, 0x0004003d, 0x00000007,
+-    0x00000036, 0x00000009, 0x00050081, 0x00000007, 0x00000037, 0x00000036, 0x00000035, 0x0003003e,
+-    0x00000009, 0x00000037, 0x000200f9, 0x00000023, 0x000200f8, 0x00000023, 0x0004003d, 0x00000010,
+-    0x00000038, 0x0000001f, 0x00050080, 0x00000010, 0x00000039, 0x00000038, 0x00000029, 0x0003003e,
+-    0x0000001f, 0x00000039, 0x000200f9, 0x00000020, 0x000200f8, 0x00000022, 0x0004003d, 0x00000007,
+-    0x0000003c, 0x00000009, 0x0003003e, 0x0000003b, 0x0000003c, 0x000100fd, 0x00010038,
++    0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00090019, 0x0000000a, 0x00000006, 0x00000001,
++    0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x0000000b, 0x0000000a,
++    0x00040015, 0x0000000c, 0x00000020, 0x00000000, 0x0004002b, 0x0000000c, 0x0000000d, 0x00000008,
++    0x0004001c, 0x0000000e, 0x0000000b, 0x0000000d, 0x00040020, 0x0000000f, 0x00000000, 0x0000000e,
++    0x0004003b, 0x0000000f, 0x00000010, 0x00000000, 0x0004002b, 0x0000000c, 0x00000011, 0x0000000b,
++    0x0004001c, 0x00000012, 0x0000000c, 0x00000011, 0x0005001e, 0x00000013, 0x0000000c, 0x00000006,
++    0x00000012, 0x00040020, 0x00000014, 0x00000009, 0x00000013, 0x0004003b, 0x00000014, 0x00000015,
++    0x00000009, 0x00040015, 0x00000016, 0x00000020, 0x00000001, 0x0004002b, 0x00000016, 0x00000017,
++    0x00000000, 0x00040020, 0x00000018, 0x00000009, 0x0000000c, 0x0004002b, 0x0000000c, 0x0000001b,
++    0x00000007, 0x00040020, 0x0000001d, 0x00000000, 0x0000000b, 0x00040017, 0x00000020, 0x00000006,
++    0x00000002, 0x00040020, 0x00000021, 0x00000001, 0x00000020, 0x0004003b, 0x00000021, 0x00000022,
++    0x00000001, 0x0004002b, 0x0000000c, 0x00000028, 0x00000001, 0x0004002b, 0x00000006, 0x0000002e,
++    0x40000000, 0x00040017, 0x00000031, 0x00000006, 0x00000003, 0x00040020, 0x00000032, 0x00000007,
++    0x00000031, 0x00040020, 0x00000034, 0x00000001, 0x00000031, 0x0004003b, 0x00000034, 0x00000035,
++    0x00000001, 0x0004002b, 0x0000000c, 0x00000039, 0x00000010, 0x0004001c, 0x0000003a, 0x00000007,
++    0x00000039, 0x0004001c, 0x0000003b, 0x00000007, 0x00000039, 0x0006001e, 0x0000003c, 0x00000007,
++    0x00000007, 0x0000003a, 0x0000003b, 0x00040020, 0x0000003d, 0x00000002, 0x0000003c, 0x0004003b,
++    0x0000003d, 0x0000003e, 0x00000002, 0x0004002b, 0x00000016, 0x0000003f, 0x00000001, 0x00040020,
++    0x00000040, 0x00000002, 0x00000007, 0x00040020, 0x00000044, 0x00000007, 0x00000016, 0x0004002b,
++    0x00000016, 0x0000004c, 0x00000008, 0x00020014, 0x0000004d, 0x0004002b, 0x00000016, 0x00000050,
++    0x00000002, 0x0004003b, 0x00000034, 0x00000055, 0x00000001, 0x00040020, 0x00000058, 0x00000007,
++    0x00000006, 0x0004002b, 0x00000006, 0x0000005d, 0x38d1b717, 0x0004002b, 0x00000016, 0x0000005f,
++    0x00000003, 0x0004002b, 0x00000006, 0x00000067, 0x00000000, 0x0004002b, 0x00000006, 0x0000006c,
++    0x3f800000, 0x0004002b, 0x0000000c, 0x0000006f, 0x00000003, 0x00040020, 0x00000070, 0x00000002,
++    0x00000006, 0x00040020, 0x0000007b, 0x00000003, 0x00000007, 0x0004003b, 0x0000007b, 0x0000007c,
++    0x00000003, 0x00040020, 0x00000085, 0x00000001, 0x00000007, 0x0004003b, 0x00000085, 0x00000086,
++    0x00000001, 0x0004003b, 0x0000007b, 0x0000008e, 0x00000003, 0x00040020, 0x00000091, 0x00000001,
++    0x00000006, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
++    0x0004003b, 0x00000008, 0x00000009, 0x00000007, 0x0004003b, 0x00000008, 0x00000025, 0x00000007,
++    0x0004003b, 0x00000032, 0x00000033, 0x00000007, 0x0004003b, 0x00000032, 0x00000038, 0x00000007,
++    0x0004003b, 0x00000044, 0x00000045, 0x00000007, 0x0004003b, 0x00000032, 0x0000004f, 0x00000007,
++    0x0004003b, 0x00000058, 0x00000059, 0x00000007, 0x00050041, 0x00000018, 0x00000019, 0x00000015,
++    0x00000017, 0x0004003d, 0x0000000c, 0x0000001a, 0x00000019, 0x000500c7, 0x0000000c, 0x0000001c,
++    0x0000001a, 0x0000001b, 0x00050041, 0x0000001d, 0x0000001e, 0x00000010, 0x0000001c, 0x0004003d,
++    0x0000000b, 0x0000001f, 0x0000001e, 0x0004003d, 0x00000020, 0x00000023, 0x00000022, 0x00050057,
++    0x00000007, 0x00000024, 0x0000001f, 0x00000023, 0x0003003e, 0x00000009, 0x00000024, 0x00050041,
++    0x00000018, 0x00000026, 0x00000015, 0x00000017, 0x0004003d, 0x0000000c, 0x00000027, 0x00000026,
++    0x00050080, 0x0000000c, 0x00000029, 0x00000027, 0x00000028, 0x000500c7, 0x0000000c, 0x0000002a,
++    0x00000029, 0x0000001b, 0x00050041, 0x0000001d, 0x0000002b, 0x00000010, 0x0000002a, 0x0004003d,
++    0x0000000b, 0x0000002c, 0x0000002b, 0x0004003d, 0x00000020, 0x0000002d, 0x00000022, 0x0005008e,
++    0x00000020, 0x0000002f, 0x0000002d, 0x0000002e, 0x00050057, 0x00000007, 0x00000030, 0x0000002c,
++    0x0000002f, 0x0003003e, 0x00000025, 0x00000030, 0x0004003d, 0x00000031, 0x00000036, 0x00000035,
++    0x0006000c, 0x00000031, 0x00000037, 0x00000001, 0x00000045, 0x00000036, 0x0003003e, 0x00000033,
++    0x00000037, 0x00050041, 0x00000040, 0x00000041, 0x0000003e, 0x0000003f, 0x0004003d, 0x00000007,
++    0x00000042, 0x00000041, 0x0008004f, 0x00000031, 0x00000043, 0x00000042, 0x00000042, 0x00000000,
++    0x00000001, 0x00000002, 0x0003003e, 0x00000038, 0x00000043, 0x0003003e, 0x00000045, 0x00000017,
++    0x000200f9, 0x00000046, 0x000200f8, 0x00000046, 0x000400f6, 0x00000048, 0x00000049, 0x00000000,
++    0x000200f9, 0x0000004a, 0x000200f8, 0x0000004a, 0x0004003d, 0x00000016, 0x0000004b, 0x00000045,
++    0x000500b1, 0x0000004d, 0x0000004e, 0x0000004b, 0x0000004c, 0x000400fa, 0x0000004e, 0x00000047,
++    0x00000048, 0x000200f8, 0x00000047, 0x0004003d, 0x00000016, 0x00000051, 0x00000045, 0x00060041,
++    0x00000040, 0x00000052, 0x0000003e, 0x00000050, 0x00000051, 0x0004003d, 0x00000007, 0x00000053,
++    0x00000052, 0x0008004f, 0x00000031, 0x00000054, 0x00000053, 0x00000053, 0x00000000, 0x00000001,
++    0x00000002, 0x0004003d, 0x00000031, 0x00000056, 0x00000055, 0x00050083, 0x00000031, 0x00000057,
++    0x00000054, 0x00000056, 0x0003003e, 0x0000004f, 0x00000057, 0x0004003d, 0x00000031, 0x0000005a,
++    0x0000004f, 0x0004003d, 0x00000031, 0x0000005b, 0x0000004f, 0x00050094, 0x00000006, 0x0000005c,
++    0x0000005a, 0x0000005b, 0x0007000c, 0x00000006, 0x0000005e, 0x00000001, 0x00000028, 0x0000005c,
++    0x0000005d, 0x0003003e, 0x00000059, 0x0000005e, 0x0004003d, 0x00000016, 0x00000060, 0x00000045,
++    0x00060041, 0x00000040, 0x00000061, 0x0000003e, 0x0000005f, 0x00000060, 0x0004003d, 0x00000007,
++    0x00000062, 0x00000061, 0x0008004f, 0x00000031, 0x00000063, 0x00000062, 0x00000062, 0x00000000,
++    0x00000001, 0x00000002, 0x0004003d, 0x00000031, 0x00000064, 0x00000033, 0x0004003d, 0x00000031,
++    0x00000065, 0x0000004f, 0x00050094, 0x00000006, 0x00000066, 0x00000064, 0x00000065, 0x0007000c,
++    0x00000006, 0x00000068, 0x00000001, 0x00000028, 0x00000066, 0x00000067, 0x0004003d, 0x00000006,
++    0x00000069, 0x00000059, 0x0006000c, 0x00000006, 0x0000006a, 0x00000001, 0x00000020, 0x00000069,
++    0x00050085, 0x00000006, 0x0000006b, 0x00000068, 0x0000006a, 0x0004003d, 0x00000006, 0x0000006d,
++    0x00000059, 0x0004003d, 0x00000016, 0x0000006e, 0x00000045, 0x00070041, 0x00000070, 0x00000071,
++    0x0000003e, 0x00000050, 0x0000006e, 0x0000006f, 0x0004003d, 0x00000006, 0x00000072, 0x00000071,
++    0x00050085, 0x00000006, 0x00000073, 0x0000006d, 0x00000072, 0x00050081, 0x00000006, 0x00000074,
++    0x0000006c, 0x00000073, 0x00050088, 0x00000006, 0x00000075, 0x0000006b, 0x00000074, 0x0005008e,
++    0x00000031, 0x00000076, 0x00000063, 0x00000075, 0x0004003d, 0x00000031, 0x00000077, 0x00000038,
++    0x00050081, 0x00000031, 0x00000078, 0x00000077, 0x00000076, 0x0003003e, 0x00000038, 0x00000078,
++    0x000200f9, 0x00000049, 0x000200f8, 0x00000049, 0x0004003d, 0x00000016, 0x00000079, 0x00000045,
++    0x00050080, 0x00000016, 0x0000007a, 0x00000079, 0x0000003f, 0x0003003e, 0x00000045, 0x0000007a,
++    0x000200f9, 0x00000046, 0x000200f8, 0x00000048, 0x0004003d, 0x00000031, 0x0000007d, 0x00000038,
++    0x0004003d, 0x00000007, 0x0000007e, 0x00000009, 0x0008004f, 0x00000031, 0x0000007f, 0x0000007e,
++    0x0000007e, 0x00000000, 0x00000001, 0x00000002, 0x00050085, 0x00000031, 0x00000080, 0x0000007d,
++    0x0000007f, 0x00050041, 0x00000040, 0x00000081, 0x0000003e, 0x00000017, 0x0004003d, 0x00000007,
++    0x00000082, 0x00000081, 0x0008004f, 0x00000031, 0x00000083, 0x00000082, 0x00000082, 0x00000000,
++    0x00000001, 0x00000002, 0x00050085, 0x00000031, 0x00000084, 0x00000080, 0x00000083, 0x0004003d,
++    0x00000007, 0x00000087, 0x00000086, 0x0008004f, 0x00000031, 0x00000088, 0x00000087, 0x00000087,
++    0x00000000, 0x00000001, 0x00000002, 0x00050085, 0x00000031, 0x00000089, 0x00000084, 0x00000088,
++    0x00050051, 0x00000006, 0x0000008a, 0x00000089, 0x00000000, 0x00050051, 0x00000006, 0x0000008b,
++    0x00000089, 0x00000001, 0x00050051, 0x00000006, 0x0000008c, 0x00000089, 0x00000002, 0x00070050,
++    0x00000007, 0x0000008d, 0x0000008a, 0x0000008b, 0x0000008c, 0x0000006c, 0x0003003e, 0x0000007c,
++    0x0000008d, 0x0004003d, 0x00000007, 0x0000008f, 0x00000025, 0x0008004f, 0x00000031, 0x00000090,
++    0x0000008f, 0x0000008f, 0x00000000, 0x00000001, 0x00000002, 0x00050041, 0x00000091, 0x00000092,
++    0x00000086, 0x0000006f, 0x0004003d, 0x00000006, 0x00000093, 0x00000092, 0x0005008e, 0x00000031,
++    0x00000094, 0x00000090, 0x00000093, 0x00050041, 0x00000058, 0x00000095, 0x00000009, 0x0000006f,
++    0x0004003d, 0x00000006, 0x00000096, 0x00000095, 0x00060041, 0x00000070, 0x00000097, 0x0000003e,
++    0x00000017, 0x0000006f, 0x0004003d, 0x00000006, 0x00000098, 0x00000097, 0x00050085, 0x00000006,
++    0x00000099, 0x00000096, 0x00000098, 0x00050051, 0x00000006, 0x0000009a, 0x00000094, 0x00000000,
++    0x00050051, 0x00000006, 0x0000009b, 0x00000094, 0x00000001, 0x00050051, 0x00000006, 0x0000009c,
++    0x00000094, 0x00000002, 0x00070050, 0x00000007, 0x0000009d, 0x0000009a, 0x0000009b, 0x0000009c,
++    0x00000099, 0x0003003e, 0x0000008e, 0x0000009d, 0x000100fd, 0x00010038,
+ };
+ static const uint32_t fex_probe_batch_vert[] =
+ {
+-    0x07230203, 0x00010300, 0x0008000b, 0x00000053, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
++    0x07230203, 0x00010300, 0x0008000b, 0x00000072, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
+     0x0000114b, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
+-    0x00000000, 0x00000001, 0x000b000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x00000012,
+-    0x00000016, 0x0000001e, 0x0000002f, 0x00000048, 0x00000051, 0x00030003, 0x00000002, 0x000001c2,
+-    0x00090004, 0x415f4c47, 0x735f4252, 0x65646168, 0x72645f72, 0x705f7761, 0x6d617261, 0x72657465,
+-    0x00000073, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000008, 0x00000069,
+-    0x00060005, 0x0000000a, 0x5f455355, 0x54534e49, 0x45434e41, 0x00000000, 0x00070005, 0x00000012,
+-    0x495f6c67, 0x6174736e, 0x4965636e, 0x7865646e, 0x00000000, 0x00060005, 0x00000016, 0x445f6c67,
+-    0x49776172, 0x42524144, 0x00000000, 0x00030005, 0x0000001d, 0x00000076, 0x00060005, 0x0000001e,
+-    0x565f6c67, 0x65747265, 0x646e4978, 0x00007865, 0x00060005, 0x0000002d, 0x505f6c67, 0x65567265,
+-    0x78657472, 0x00000000, 0x00060006, 0x0000002d, 0x00000000, 0x505f6c67, 0x7469736f, 0x006e6f69,
+-    0x00070006, 0x0000002d, 0x00000001, 0x505f6c67, 0x746e696f, 0x657a6953, 0x00000000, 0x00070006,
+-    0x0000002d, 0x00000002, 0x435f6c67, 0x4470696c, 0x61747369, 0x0065636e, 0x00070006, 0x0000002d,
+-    0x00000003, 0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000002f, 0x00000000,
+-    0x00040005, 0x00000031, 0x736a624f, 0x00000000, 0x00040006, 0x00000031, 0x00000000, 0x00736f70,
+-    0x00040005, 0x00000033, 0x736a626f, 0x00000000, 0x00030005, 0x0000003a, 0x006d6143, 0x00050006,
+-    0x0000003a, 0x00000000, 0x6c616373, 0x00000065, 0x00030005, 0x0000003c, 0x006d6163, 0x00030005,
+-    0x00000048, 0x006c6f63, 0x00040005, 0x0000004a, 0x7374614d, 0x00000000, 0x00050006, 0x0000004a,
+-    0x00000000, 0x6f6c6f63, 0x00000072, 0x00040005, 0x0000004c, 0x7374616d, 0x00000000, 0x00030005,
+-    0x00000051, 0x00006469, 0x00040047, 0x0000000a, 0x00000001, 0x00000000, 0x00040047, 0x00000012,
+-    0x0000000b, 0x0000002b, 0x00040047, 0x00000016, 0x0000000b, 0x0000114a, 0x00040047, 0x0000001e,
+-    0x0000000b, 0x0000002a, 0x00030047, 0x0000002d, 0x00000002, 0x00050048, 0x0000002d, 0x00000000,
+-    0x0000000b, 0x00000000, 0x00050048, 0x0000002d, 0x00000001, 0x0000000b, 0x00000001, 0x00050048,
+-    0x0000002d, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000002d, 0x00000003, 0x0000000b,
+-    0x00000004, 0x00040047, 0x00000030, 0x00000006, 0x00000010, 0x00030047, 0x00000031, 0x00000002,
+-    0x00040048, 0x00000031, 0x00000000, 0x00000018, 0x00050048, 0x00000031, 0x00000000, 0x00000023,
+-    0x00000000, 0x00030047, 0x00000033, 0x00000018, 0x00040047, 0x00000033, 0x00000021, 0x00000003,
+-    0x00040047, 0x00000033, 0x00000022, 0x00000000, 0x00030047, 0x0000003a, 0x00000002, 0x00050048,
+-    0x0000003a, 0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x0000003c, 0x00000021, 0x00000000,
+-    0x00040047, 0x0000003c, 0x00000022, 0x00000000, 0x00030047, 0x00000048, 0x0000000e, 0x00040047,
+-    0x00000048, 0x0000001e, 0x00000000, 0x00040047, 0x00000049, 0x00000006, 0x00000010, 0x00030047,
+-    0x0000004a, 0x00000002, 0x00040048, 0x0000004a, 0x00000000, 0x00000018, 0x00050048, 0x0000004a,
+-    0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x0000004c, 0x00000018, 0x00040047, 0x0000004c,
+-    0x00000021, 0x00000004, 0x00040047, 0x0000004c, 0x00000022, 0x00000000, 0x00030047, 0x00000051,
+-    0x0000000e, 0x00040047, 0x00000051, 0x0000001e, 0x00000001, 0x00020013, 0x00000002, 0x00030021,
++    0x00000000, 0x00000001, 0x0010000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x00000012,
++    0x00000016, 0x00000035, 0x00000041, 0x0000004e, 0x00000050, 0x00000053, 0x00000056, 0x00000061,
++    0x00000069, 0x00000070, 0x00030003, 0x00000002, 0x000001c2, 0x00090004, 0x415f4c47, 0x735f4252,
++    0x65646168, 0x72645f72, 0x705f7761, 0x6d617261, 0x72657465, 0x00000073, 0x00040005, 0x00000004,
++    0x6e69616d, 0x00000000, 0x00030005, 0x00000008, 0x00000069, 0x00060005, 0x0000000a, 0x5f455355,
++    0x54534e49, 0x45434e41, 0x00000000, 0x00070005, 0x00000012, 0x495f6c67, 0x6174736e, 0x4965636e,
++    0x7865646e, 0x00000000, 0x00060005, 0x00000016, 0x445f6c67, 0x49776172, 0x42524144, 0x00000000,
++    0x00040005, 0x0000001e, 0x6c726f77, 0x00000064, 0x00040005, 0x00000027, 0x636f6c42, 0x0000006b,
++    0x00050006, 0x00000027, 0x00000000, 0x6c726f77, 0x00000064, 0x00050006, 0x00000027, 0x00000001,
++    0x746e6974, 0x00000000, 0x00050006, 0x00000027, 0x00000002, 0x6174656d, 0x00000000, 0x00050006,
++    0x00000027, 0x00000003, 0x30646170, 0x00000000, 0x00050006, 0x00000027, 0x00000004, 0x6f6c6f63,
++    0x00000072, 0x00050006, 0x00000027, 0x00000005, 0x61726170, 0x0000736d, 0x00050006, 0x00000027,
++    0x00000006, 0x6867696c, 0x00007374, 0x00050006, 0x00000027, 0x00000007, 0x6c6f636c, 0x0073726f,
++    0x00050006, 0x00000027, 0x00000008, 0x31646170, 0x00000000, 0x00040005, 0x00000029, 0x636f6c42,
++    0x0000736b, 0x00040006, 0x00000029, 0x00000000, 0x00000062, 0x00040005, 0x0000002b, 0x636f6c62,
++    0x0000736b, 0x00030005, 0x00000031, 0x00000077, 0x00040005, 0x00000035, 0x705f6e69, 0x0000736f,
++    0x00060005, 0x0000003f, 0x505f6c67, 0x65567265, 0x78657472, 0x00000000, 0x00060006, 0x0000003f,
++    0x00000000, 0x505f6c67, 0x7469736f, 0x006e6f69, 0x00070006, 0x0000003f, 0x00000001, 0x505f6c67,
++    0x746e696f, 0x657a6953, 0x00000000, 0x00070006, 0x0000003f, 0x00000002, 0x435f6c67, 0x4470696c,
++    0x61747369, 0x0065636e, 0x00070006, 0x0000003f, 0x00000003, 0x435f6c67, 0x446c6c75, 0x61747369,
++    0x0065636e, 0x00030005, 0x00000041, 0x00000000, 0x00030005, 0x00000042, 0x006d6143, 0x00060006,
++    0x00000042, 0x00000000, 0x77656976, 0x6a6f7270, 0x00000000, 0x00040006, 0x00000042, 0x00000001,
++    0x00657965, 0x00030005, 0x00000044, 0x006d6163, 0x00040005, 0x0000004e, 0x76755f6f, 0x00000000,
++    0x00040005, 0x00000050, 0x755f6e69, 0x00000076, 0x00040005, 0x00000053, 0x70775f6f, 0x0000736f,
++    0x00040005, 0x00000056, 0x726e5f6f, 0x0000006d, 0x00040005, 0x00000061, 0x6e5f6e69, 0x00006d72,
++    0x00040005, 0x00000069, 0x69745f6f, 0x0000746e, 0x00040005, 0x00000070, 0x64695f6f, 0x00000000,
++    0x00040047, 0x0000000a, 0x00000001, 0x00000000, 0x00040047, 0x00000012, 0x0000000b, 0x0000002b,
++    0x00040047, 0x00000016, 0x0000000b, 0x0000114a, 0x00040047, 0x00000021, 0x00000006, 0x00000010,
++    0x00040047, 0x00000023, 0x00000006, 0x00000010, 0x00040047, 0x00000024, 0x00000006, 0x00000010,
++    0x00040047, 0x00000026, 0x00000006, 0x00000010, 0x00040048, 0x00000027, 0x00000000, 0x00000005,
++    0x00050048, 0x00000027, 0x00000000, 0x00000007, 0x00000010, 0x00050048, 0x00000027, 0x00000000,
++    0x00000023, 0x00000000, 0x00050048, 0x00000027, 0x00000001, 0x00000023, 0x00000040, 0x00050048,
++    0x00000027, 0x00000002, 0x00000023, 0x00000050, 0x00050048, 0x00000027, 0x00000003, 0x00000023,
++    0x00000060, 0x00050048, 0x00000027, 0x00000004, 0x00000023, 0x00000100, 0x00050048, 0x00000027,
++    0x00000005, 0x00000023, 0x00000110, 0x00050048, 0x00000027, 0x00000006, 0x00000023, 0x00000120,
++    0x00050048, 0x00000027, 0x00000007, 0x00000023, 0x00000220, 0x00050048, 0x00000027, 0x00000008,
++    0x00000023, 0x00000320, 0x00040047, 0x00000028, 0x00000006, 0x00000400, 0x00030047, 0x00000029,
++    0x00000002, 0x00040048, 0x00000029, 0x00000000, 0x00000018, 0x00050048, 0x00000029, 0x00000000,
++    0x00000023, 0x00000000, 0x00030047, 0x0000002b, 0x00000018, 0x00040047, 0x0000002b, 0x00000021,
++    0x00000003, 0x00040047, 0x0000002b, 0x00000022, 0x00000000, 0x00040047, 0x00000035, 0x0000001e,
++    0x00000000, 0x00030047, 0x0000003f, 0x00000002, 0x00050048, 0x0000003f, 0x00000000, 0x0000000b,
++    0x00000000, 0x00050048, 0x0000003f, 0x00000001, 0x0000000b, 0x00000001, 0x00050048, 0x0000003f,
++    0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000003f, 0x00000003, 0x0000000b, 0x00000004,
++    0x00030047, 0x00000042, 0x00000002, 0x00040048, 0x00000042, 0x00000000, 0x00000005, 0x00050048,
++    0x00000042, 0x00000000, 0x00000007, 0x00000010, 0x00050048, 0x00000042, 0x00000000, 0x00000023,
++    0x00000000, 0x00050048, 0x00000042, 0x00000001, 0x00000023, 0x00000040, 0x00040047, 0x00000044,
++    0x00000021, 0x00000000, 0x00040047, 0x00000044, 0x00000022, 0x00000000, 0x00040047, 0x0000004e,
++    0x0000001e, 0x00000000, 0x00040047, 0x00000050, 0x0000001e, 0x00000001, 0x00040047, 0x00000053,
++    0x0000001e, 0x00000001, 0x00040047, 0x00000056, 0x0000001e, 0x00000002, 0x00040047, 0x00000061,
++    0x0000001e, 0x00000002, 0x00040047, 0x00000069, 0x0000001e, 0x00000003, 0x00030047, 0x00000070,
++    0x0000000e, 0x00040047, 0x00000070, 0x0000001e, 0x00000004, 0x00020013, 0x00000002, 0x00030021,
+     0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020, 0x00000000, 0x00040020, 0x00000007,
+     0x00000007, 0x00000006, 0x00040015, 0x00000009, 0x00000020, 0x00000001, 0x00040032, 0x00000009,
+     0x0000000a, 0x00000000, 0x0004002b, 0x00000009, 0x0000000b, 0x00000000, 0x00020014, 0x0000000c,
+     0x00060034, 0x0000000c, 0x0000000d, 0x000000ab, 0x0000000a, 0x0000000b, 0x00040020, 0x00000011,
+     0x00000001, 0x00000009, 0x0004003b, 0x00000011, 0x00000012, 0x00000001, 0x0004003b, 0x00000011,
+     0x00000016, 0x00000001, 0x00030016, 0x0000001a, 0x00000020, 0x00040017, 0x0000001b, 0x0000001a,
+-    0x00000002, 0x00040020, 0x0000001c, 0x00000007, 0x0000001b, 0x0004003b, 0x00000011, 0x0000001e,
+-    0x00000001, 0x0004002b, 0x00000009, 0x00000020, 0x00000001, 0x0004002b, 0x0000001a, 0x00000022,
+-    0x3f800000, 0x0004002b, 0x0000001a, 0x00000023, 0x00000000, 0x0004002b, 0x00000009, 0x00000026,
+-    0x00000002, 0x00040017, 0x0000002a, 0x0000001a, 0x00000004, 0x0004002b, 0x00000006, 0x0000002b,
+-    0x00000001, 0x0004001c, 0x0000002c, 0x0000001a, 0x0000002b, 0x0006001e, 0x0000002d, 0x0000002a,
+-    0x0000001a, 0x0000002c, 0x0000002c, 0x00040020, 0x0000002e, 0x00000003, 0x0000002d, 0x0004003b,
+-    0x0000002e, 0x0000002f, 0x00000003, 0x0003001d, 0x00000030, 0x0000002a, 0x0003001e, 0x00000031,
+-    0x00000030, 0x00040020, 0x00000032, 0x0000000c, 0x00000031, 0x0004003b, 0x00000032, 0x00000033,
+-    0x0000000c, 0x00040020, 0x00000035, 0x0000000c, 0x0000002a, 0x0003001e, 0x0000003a, 0x0000002a,
+-    0x00040020, 0x0000003b, 0x00000002, 0x0000003a, 0x0004003b, 0x0000003b, 0x0000003c, 0x00000002,
+-    0x00040020, 0x0000003d, 0x00000002, 0x0000002a, 0x00040020, 0x00000046, 0x00000003, 0x0000002a,
+-    0x0004003b, 0x00000046, 0x00000048, 0x00000003, 0x0003001d, 0x00000049, 0x0000002a, 0x0003001e,
+-    0x0000004a, 0x00000049, 0x00040020, 0x0000004b, 0x0000000c, 0x0000004a, 0x0004003b, 0x0000004b,
+-    0x0000004c, 0x0000000c, 0x00040020, 0x00000050, 0x00000003, 0x00000006, 0x0004003b, 0x00000050,
+-    0x00000051, 0x00000003, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
+-    0x00000005, 0x0004003b, 0x00000007, 0x00000008, 0x00000007, 0x0004003b, 0x00000007, 0x0000000e,
+-    0x00000007, 0x0004003b, 0x0000001c, 0x0000001d, 0x00000007, 0x000300f7, 0x00000010, 0x00000000,
+-    0x000400fa, 0x0000000d, 0x0000000f, 0x00000015, 0x000200f8, 0x0000000f, 0x0004003d, 0x00000009,
+-    0x00000013, 0x00000012, 0x0004007c, 0x00000006, 0x00000014, 0x00000013, 0x0003003e, 0x0000000e,
+-    0x00000014, 0x000200f9, 0x00000010, 0x000200f8, 0x00000015, 0x0004003d, 0x00000009, 0x00000017,
+-    0x00000016, 0x0004007c, 0x00000006, 0x00000018, 0x00000017, 0x0003003e, 0x0000000e, 0x00000018,
+-    0x000200f9, 0x00000010, 0x000200f8, 0x00000010, 0x0004003d, 0x00000006, 0x00000019, 0x0000000e,
+-    0x0003003e, 0x00000008, 0x00000019, 0x0004003d, 0x00000009, 0x0000001f, 0x0000001e, 0x000500aa,
+-    0x0000000c, 0x00000021, 0x0000001f, 0x00000020, 0x000600a9, 0x0000001a, 0x00000024, 0x00000021,
+-    0x00000022, 0x00000023, 0x0004003d, 0x00000009, 0x00000025, 0x0000001e, 0x000500aa, 0x0000000c,
+-    0x00000027, 0x00000025, 0x00000026, 0x000600a9, 0x0000001a, 0x00000028, 0x00000027, 0x00000022,
+-    0x00000023, 0x00050050, 0x0000001b, 0x00000029, 0x00000024, 0x00000028, 0x0003003e, 0x0000001d,
+-    0x00000029, 0x0004003d, 0x00000006, 0x00000034, 0x00000008, 0x00060041, 0x00000035, 0x00000036,
+-    0x00000033, 0x0000000b, 0x00000034, 0x0004003d, 0x0000002a, 0x00000037, 0x00000036, 0x0007004f,
+-    0x0000001b, 0x00000038, 0x00000037, 0x00000037, 0x00000000, 0x00000001, 0x0004003d, 0x0000001b,
+-    0x00000039, 0x0000001d, 0x00050041, 0x0000003d, 0x0000003e, 0x0000003c, 0x0000000b, 0x0004003d,
+-    0x0000002a, 0x0000003f, 0x0000003e, 0x0007004f, 0x0000001b, 0x00000040, 0x0000003f, 0x0000003f,
+-    0x00000000, 0x00000001, 0x00050085, 0x0000001b, 0x00000041, 0x00000039, 0x00000040, 0x00050081,
+-    0x0000001b, 0x00000042, 0x00000038, 0x00000041, 0x00050051, 0x0000001a, 0x00000043, 0x00000042,
+-    0x00000000, 0x00050051, 0x0000001a, 0x00000044, 0x00000042, 0x00000001, 0x00070050, 0x0000002a,
+-    0x00000045, 0x00000043, 0x00000044, 0x00000023, 0x00000022, 0x00050041, 0x00000046, 0x00000047,
+-    0x0000002f, 0x0000000b, 0x0003003e, 0x00000047, 0x00000045, 0x0004003d, 0x00000006, 0x0000004d,
+-    0x00000008, 0x00060041, 0x00000035, 0x0000004e, 0x0000004c, 0x0000000b, 0x0000004d, 0x0004003d,
+-    0x0000002a, 0x0000004f, 0x0000004e, 0x0003003e, 0x00000048, 0x0000004f, 0x0004003d, 0x00000006,
+-    0x00000052, 0x00000008, 0x0003003e, 0x00000051, 0x00000052, 0x000100fd, 0x00010038,
++    0x00000004, 0x00040018, 0x0000001c, 0x0000001b, 0x00000004, 0x00040020, 0x0000001d, 0x00000007,
++    0x0000001c, 0x00040017, 0x0000001f, 0x00000006, 0x00000004, 0x0004002b, 0x00000006, 0x00000020,
++    0x0000000a, 0x0004001c, 0x00000021, 0x0000001b, 0x00000020, 0x0004002b, 0x00000006, 0x00000022,
++    0x00000010, 0x0004001c, 0x00000023, 0x0000001b, 0x00000022, 0x0004001c, 0x00000024, 0x0000001b,
++    0x00000022, 0x0004002b, 0x00000006, 0x00000025, 0x0000000e, 0x0004001c, 0x00000026, 0x0000001b,
++    0x00000025, 0x000b001e, 0x00000027, 0x0000001c, 0x0000001b, 0x0000001f, 0x00000021, 0x0000001b,
++    0x0000001b, 0x00000023, 0x00000024, 0x00000026, 0x0003001d, 0x00000028, 0x00000027, 0x0003001e,
++    0x00000029, 0x00000028, 0x00040020, 0x0000002a, 0x0000000c, 0x00000029, 0x0004003b, 0x0000002a,
++    0x0000002b, 0x0000000c, 0x00040020, 0x0000002d, 0x0000000c, 0x0000001c, 0x00040020, 0x00000030,
++    0x00000007, 0x0000001b, 0x00040017, 0x00000033, 0x0000001a, 0x00000003, 0x00040020, 0x00000034,
++    0x00000001, 0x00000033, 0x0004003b, 0x00000034, 0x00000035, 0x00000001, 0x0004002b, 0x0000001a,
++    0x00000037, 0x3f800000, 0x0004002b, 0x00000006, 0x0000003d, 0x00000001, 0x0004001c, 0x0000003e,
++    0x0000001a, 0x0000003d, 0x0006001e, 0x0000003f, 0x0000001b, 0x0000001a, 0x0000003e, 0x0000003e,
++    0x00040020, 0x00000040, 0x00000003, 0x0000003f, 0x0004003b, 0x00000040, 0x00000041, 0x00000003,
++    0x0004001e, 0x00000042, 0x0000001c, 0x0000001b, 0x00040020, 0x00000043, 0x00000002, 0x00000042,
++    0x0004003b, 0x00000043, 0x00000044, 0x00000002, 0x00040020, 0x00000045, 0x00000002, 0x0000001c,
++    0x00040020, 0x0000004a, 0x00000003, 0x0000001b, 0x00040017, 0x0000004c, 0x0000001a, 0x00000002,
++    0x00040020, 0x0000004d, 0x00000003, 0x0000004c, 0x0004003b, 0x0000004d, 0x0000004e, 0x00000003,
++    0x00040020, 0x0000004f, 0x00000001, 0x0000004c, 0x0004003b, 0x0000004f, 0x00000050, 0x00000001,
++    0x00040020, 0x00000052, 0x00000003, 0x00000033, 0x0004003b, 0x00000052, 0x00000053, 0x00000003,
++    0x0004003b, 0x00000052, 0x00000056, 0x00000003, 0x00040018, 0x00000058, 0x00000033, 0x00000003,
++    0x00040020, 0x00000060, 0x00000001, 0x0000001b, 0x0004003b, 0x00000060, 0x00000061, 0x00000001,
++    0x0004002b, 0x0000001a, 0x00000064, 0x40000000, 0x0004003b, 0x0000004a, 0x00000069, 0x00000003,
++    0x0004002b, 0x00000009, 0x0000006b, 0x00000001, 0x00040020, 0x0000006c, 0x0000000c, 0x0000001b,
++    0x00040020, 0x0000006f, 0x00000003, 0x00000006, 0x0004003b, 0x0000006f, 0x00000070, 0x00000003,
++    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b,
++    0x00000007, 0x00000008, 0x00000007, 0x0004003b, 0x00000007, 0x0000000e, 0x00000007, 0x0004003b,
++    0x0000001d, 0x0000001e, 0x00000007, 0x0004003b, 0x00000030, 0x00000031, 0x00000007, 0x000300f7,
++    0x00000010, 0x00000000, 0x000400fa, 0x0000000d, 0x0000000f, 0x00000015, 0x000200f8, 0x0000000f,
++    0x0004003d, 0x00000009, 0x00000013, 0x00000012, 0x0004007c, 0x00000006, 0x00000014, 0x00000013,
++    0x0003003e, 0x0000000e, 0x00000014, 0x000200f9, 0x00000010, 0x000200f8, 0x00000015, 0x0004003d,
++    0x00000009, 0x00000017, 0x00000016, 0x0004007c, 0x00000006, 0x00000018, 0x00000017, 0x0003003e,
++    0x0000000e, 0x00000018, 0x000200f9, 0x00000010, 0x000200f8, 0x00000010, 0x0004003d, 0x00000006,
++    0x00000019, 0x0000000e, 0x0003003e, 0x00000008, 0x00000019, 0x0004003d, 0x00000006, 0x0000002c,
++    0x00000008, 0x00070041, 0x0000002d, 0x0000002e, 0x0000002b, 0x0000000b, 0x0000002c, 0x0000000b,
++    0x0004003d, 0x0000001c, 0x0000002f, 0x0000002e, 0x0003003e, 0x0000001e, 0x0000002f, 0x0004003d,
++    0x0000001c, 0x00000032, 0x0000001e, 0x0004003d, 0x00000033, 0x00000036, 0x00000035, 0x00050051,
++    0x0000001a, 0x00000038, 0x00000036, 0x00000000, 0x00050051, 0x0000001a, 0x00000039, 0x00000036,
++    0x00000001, 0x00050051, 0x0000001a, 0x0000003a, 0x00000036, 0x00000002, 0x00070050, 0x0000001b,
++    0x0000003b, 0x00000038, 0x00000039, 0x0000003a, 0x00000037, 0x00050091, 0x0000001b, 0x0000003c,
++    0x00000032, 0x0000003b, 0x0003003e, 0x00000031, 0x0000003c, 0x00050041, 0x00000045, 0x00000046,
++    0x00000044, 0x0000000b, 0x0004003d, 0x0000001c, 0x00000047, 0x00000046, 0x0004003d, 0x0000001b,
++    0x00000048, 0x00000031, 0x00050091, 0x0000001b, 0x00000049, 0x00000047, 0x00000048, 0x00050041,
++    0x0000004a, 0x0000004b, 0x00000041, 0x0000000b, 0x0003003e, 0x0000004b, 0x00000049, 0x0004003d,
++    0x0000004c, 0x00000051, 0x00000050, 0x0003003e, 0x0000004e, 0x00000051, 0x0004003d, 0x0000001b,
++    0x00000054, 0x00000031, 0x0008004f, 0x00000033, 0x00000055, 0x00000054, 0x00000054, 0x00000000,
++    0x00000001, 0x00000002, 0x0003003e, 0x00000053, 0x00000055, 0x0004003d, 0x0000001c, 0x00000057,
++    0x0000001e, 0x00050051, 0x0000001b, 0x00000059, 0x00000057, 0x00000000, 0x0008004f, 0x00000033,
++    0x0000005a, 0x00000059, 0x00000059, 0x00000000, 0x00000001, 0x00000002, 0x00050051, 0x0000001b,
++    0x0000005b, 0x00000057, 0x00000001, 0x0008004f, 0x00000033, 0x0000005c, 0x0000005b, 0x0000005b,
++    0x00000000, 0x00000001, 0x00000002, 0x00050051, 0x0000001b, 0x0000005d, 0x00000057, 0x00000002,
++    0x0008004f, 0x00000033, 0x0000005e, 0x0000005d, 0x0000005d, 0x00000000, 0x00000001, 0x00000002,
++    0x00060050, 0x00000058, 0x0000005f, 0x0000005a, 0x0000005c, 0x0000005e, 0x0004003d, 0x0000001b,
++    0x00000062, 0x00000061, 0x0008004f, 0x00000033, 0x00000063, 0x00000062, 0x00000062, 0x00000000,
++    0x00000001, 0x00000002, 0x0005008e, 0x00000033, 0x00000065, 0x00000063, 0x00000064, 0x00060050,
++    0x00000033, 0x00000066, 0x00000037, 0x00000037, 0x00000037, 0x00050083, 0x00000033, 0x00000067,
++    0x00000065, 0x00000066, 0x00050091, 0x00000033, 0x00000068, 0x0000005f, 0x00000067, 0x0003003e,
++    0x00000056, 0x00000068, 0x0004003d, 0x00000006, 0x0000006a, 0x00000008, 0x00070041, 0x0000006c,
++    0x0000006d, 0x0000002b, 0x0000000b, 0x0000006a, 0x0000006b, 0x0004003d, 0x0000001b, 0x0000006e,
++    0x0000006d, 0x0003003e, 0x00000069, 0x0000006e, 0x0004003d, 0x00000006, 0x00000071, 0x00000008,
++    0x0003003e, 0x00000070, 0x00000071, 0x000100fd, 0x00010038,
+ };
+ static const uint32_t fex_probe_batch_frag[] =
+ {
+-    0x07230203, 0x00010300, 0x0008000b, 0x0000000d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+-    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+-    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000000b, 0x00030010,
+-    0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
+-    0x00000000, 0x00030005, 0x00000009, 0x0000006f, 0x00030005, 0x0000000b, 0x006c6f63, 0x00040047,
+-    0x00000009, 0x0000001e, 0x00000000, 0x00030047, 0x0000000b, 0x0000000e, 0x00040047, 0x0000000b,
+-    0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+-    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
+-    0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00040020, 0x0000000a,
+-    0x00000001, 0x00000007, 0x0004003b, 0x0000000a, 0x0000000b, 0x00000001, 0x00050036, 0x00000002,
+-    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000007, 0x0000000c,
+-    0x0000000b, 0x0003003e, 0x00000009, 0x0000000c, 0x000100fd, 0x00010038,
++    0x07230203, 0x00010300, 0x0008000b, 0x000000b2, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
++    0x000014b5, 0x00020011, 0x000014bb, 0x0008000a, 0x5f565053, 0x5f545845, 0x63736564, 0x74706972,
++    0x695f726f, 0x7865646e, 0x00676e69, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
++    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x000c000f, 0x00000004, 0x00000004, 0x6e69616d,
++    0x00000000, 0x0000001c, 0x00000034, 0x00000047, 0x00000063, 0x0000008d, 0x00000099, 0x000000a1,
++    0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00080004, 0x455f4c47,
++    0x6e5f5458, 0x6e756e6f, 0x726f6669, 0x75715f6d, 0x66696c61, 0x00726569, 0x00040005, 0x00000004,
++    0x6e69616d, 0x00000000, 0x00030005, 0x00000008, 0x00000074, 0x00040005, 0x00000014, 0x636f6c42,
++    0x0000006b, 0x00050006, 0x00000014, 0x00000000, 0x6c726f77, 0x00000064, 0x00050006, 0x00000014,
++    0x00000001, 0x746e6974, 0x00000000, 0x00050006, 0x00000014, 0x00000002, 0x6174656d, 0x00000000,
++    0x00050006, 0x00000014, 0x00000003, 0x30646170, 0x00000000, 0x00050006, 0x00000014, 0x00000004,
++    0x6f6c6f63, 0x00000072, 0x00050006, 0x00000014, 0x00000005, 0x61726170, 0x0000736d, 0x00050006,
++    0x00000014, 0x00000006, 0x6867696c, 0x00007374, 0x00050006, 0x00000014, 0x00000007, 0x6c6f636c,
++    0x0073726f, 0x00050006, 0x00000014, 0x00000008, 0x31646170, 0x00000000, 0x00040005, 0x00000016,
++    0x636f6c42, 0x0000736b, 0x00040006, 0x00000016, 0x00000000, 0x00000062, 0x00040005, 0x00000018,
++    0x636f6c62, 0x0000736b, 0x00030005, 0x0000001c, 0x00006469, 0x00030005, 0x00000024, 0x00000061,
++    0x00040005, 0x0000002a, 0x73786574, 0x00000000, 0x00030005, 0x00000034, 0x00007675, 0x00030005,
++    0x00000037, 0x00000062, 0x00030005, 0x00000045, 0x0000006e, 0x00030005, 0x00000047, 0x006d726e,
++    0x00030005, 0x0000004a, 0x00000063, 0x00030005, 0x00000052, 0x00000069, 0x00030005, 0x0000005c,
++    0x0000006c, 0x00040005, 0x00000063, 0x736f7077, 0x00000000, 0x00030005, 0x00000067, 0x00000064,
++    0x00030005, 0x0000008d, 0x0000306f, 0x00040005, 0x00000099, 0x746e6974, 0x00000000, 0x00030005,
++    0x000000a1, 0x0000316f, 0x00040047, 0x0000000e, 0x00000006, 0x00000010, 0x00040047, 0x00000010,
++    0x00000006, 0x00000010, 0x00040047, 0x00000011, 0x00000006, 0x00000010, 0x00040047, 0x00000013,
++    0x00000006, 0x00000010, 0x00040048, 0x00000014, 0x00000000, 0x00000005, 0x00050048, 0x00000014,
++    0x00000000, 0x00000007, 0x00000010, 0x00050048, 0x00000014, 0x00000000, 0x00000023, 0x00000000,
++    0x00050048, 0x00000014, 0x00000001, 0x00000023, 0x00000040, 0x00050048, 0x00000014, 0x00000002,
++    0x00000023, 0x00000050, 0x00050048, 0x00000014, 0x00000003, 0x00000023, 0x00000060, 0x00050048,
++    0x00000014, 0x00000004, 0x00000023, 0x00000100, 0x00050048, 0x00000014, 0x00000005, 0x00000023,
++    0x00000110, 0x00050048, 0x00000014, 0x00000006, 0x00000023, 0x00000120, 0x00050048, 0x00000014,
++    0x00000007, 0x00000023, 0x00000220, 0x00050048, 0x00000014, 0x00000008, 0x00000023, 0x00000320,
++    0x00040047, 0x00000015, 0x00000006, 0x00000400, 0x00030047, 0x00000016, 0x00000002, 0x00040048,
++    0x00000016, 0x00000000, 0x00000018, 0x00050048, 0x00000016, 0x00000000, 0x00000023, 0x00000000,
++    0x00030047, 0x00000018, 0x00000018, 0x00040047, 0x00000018, 0x00000021, 0x00000003, 0x00040047,
++    0x00000018, 0x00000022, 0x00000000, 0x00030047, 0x0000001c, 0x0000000e, 0x00040047, 0x0000001c,
++    0x0000001e, 0x00000004, 0x00040047, 0x0000002a, 0x00000021, 0x00000000, 0x00040047, 0x0000002a,
++    0x00000022, 0x00000001, 0x00030047, 0x0000002e, 0x000014b4, 0x00030047, 0x00000030, 0x000014b4,
++    0x00030047, 0x00000031, 0x000014b4, 0x00040047, 0x00000034, 0x0000001e, 0x00000000, 0x00030047,
++    0x0000003c, 0x000014b4, 0x00030047, 0x0000003d, 0x000014b4, 0x00030047, 0x0000003e, 0x000014b4,
++    0x00040047, 0x00000047, 0x0000001e, 0x00000002, 0x00040047, 0x00000063, 0x0000001e, 0x00000001,
++    0x00040047, 0x0000008d, 0x0000001e, 0x00000000, 0x00040047, 0x00000099, 0x0000001e, 0x00000003,
++    0x00040047, 0x000000a1, 0x0000001e, 0x00000001, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
++    0x00000002, 0x00040015, 0x00000006, 0x00000020, 0x00000000, 0x00040020, 0x00000007, 0x00000007,
++    0x00000006, 0x00030016, 0x00000009, 0x00000020, 0x00040017, 0x0000000a, 0x00000009, 0x00000004,
++    0x00040018, 0x0000000b, 0x0000000a, 0x00000004, 0x00040017, 0x0000000c, 0x00000006, 0x00000004,
++    0x0004002b, 0x00000006, 0x0000000d, 0x0000000a, 0x0004001c, 0x0000000e, 0x0000000a, 0x0000000d,
++    0x0004002b, 0x00000006, 0x0000000f, 0x00000010, 0x0004001c, 0x00000010, 0x0000000a, 0x0000000f,
++    0x0004001c, 0x00000011, 0x0000000a, 0x0000000f, 0x0004002b, 0x00000006, 0x00000012, 0x0000000e,
++    0x0004001c, 0x00000013, 0x0000000a, 0x00000012, 0x000b001e, 0x00000014, 0x0000000b, 0x0000000a,
++    0x0000000c, 0x0000000e, 0x0000000a, 0x0000000a, 0x00000010, 0x00000011, 0x00000013, 0x0003001d,
++    0x00000015, 0x00000014, 0x0003001e, 0x00000016, 0x00000015, 0x00040020, 0x00000017, 0x0000000c,
++    0x00000016, 0x0004003b, 0x00000017, 0x00000018, 0x0000000c, 0x00040015, 0x00000019, 0x00000020,
++    0x00000001, 0x0004002b, 0x00000019, 0x0000001a, 0x00000000, 0x00040020, 0x0000001b, 0x00000001,
++    0x00000006, 0x0004003b, 0x0000001b, 0x0000001c, 0x00000001, 0x0004002b, 0x00000019, 0x0000001e,
++    0x00000002, 0x0004002b, 0x00000006, 0x0000001f, 0x00000000, 0x00040020, 0x00000020, 0x0000000c,
++    0x00000006, 0x00040020, 0x00000023, 0x00000007, 0x0000000a, 0x00090019, 0x00000025, 0x00000009,
++    0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x00000026,
++    0x00000025, 0x0004002b, 0x00000006, 0x00000027, 0x00000008, 0x0004001c, 0x00000028, 0x00000026,
++    0x00000027, 0x00040020, 0x00000029, 0x00000000, 0x00000028, 0x0004003b, 0x00000029, 0x0000002a,
++    0x00000000, 0x0004002b, 0x00000006, 0x0000002c, 0x00000007, 0x00040020, 0x0000002f, 0x00000000,
++    0x00000026, 0x00040017, 0x00000032, 0x00000009, 0x00000002, 0x00040020, 0x00000033, 0x00000001,
++    0x00000032, 0x0004003b, 0x00000033, 0x00000034, 0x00000001, 0x0004002b, 0x00000006, 0x00000039,
++    0x00000001, 0x0004002b, 0x00000009, 0x00000040, 0x40000000, 0x00040017, 0x00000043, 0x00000009,
++    0x00000003, 0x00040020, 0x00000044, 0x00000007, 0x00000043, 0x00040020, 0x00000046, 0x00000001,
++    0x00000043, 0x0004003b, 0x00000046, 0x00000047, 0x00000001, 0x0004002b, 0x00000019, 0x0000004c,
++    0x00000005, 0x00040020, 0x0000004d, 0x0000000c, 0x0000000a, 0x00040020, 0x00000051, 0x00000007,
++    0x00000019, 0x0004002b, 0x00000019, 0x00000059, 0x00000008, 0x00020014, 0x0000005a, 0x0004002b,
++    0x00000019, 0x0000005e, 0x00000006, 0x0004003b, 0x00000046, 0x00000063, 0x00000001, 0x00040020,
++    0x00000066, 0x00000007, 0x00000009, 0x0004002b, 0x00000009, 0x0000006b, 0x38d1b717, 0x0004002b,
++    0x00000019, 0x0000006e, 0x00000007, 0x0004002b, 0x00000009, 0x00000076, 0x00000000, 0x0004002b,
++    0x00000009, 0x0000007b, 0x3f800000, 0x0004002b, 0x00000006, 0x0000007f, 0x00000003, 0x00040020,
++    0x00000080, 0x0000000c, 0x00000009, 0x0004002b, 0x00000019, 0x0000008a, 0x00000001, 0x00040020,
++    0x0000008c, 0x00000003, 0x0000000a, 0x0004003b, 0x0000008c, 0x0000008d, 0x00000003, 0x0004002b,
++    0x00000019, 0x00000093, 0x00000004, 0x00040020, 0x00000098, 0x00000001, 0x0000000a, 0x0004003b,
++    0x00000098, 0x00000099, 0x00000001, 0x0004003b, 0x0000008c, 0x000000a1, 0x00000003, 0x00040020,
++    0x000000a4, 0x00000001, 0x00000009, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
++    0x000200f8, 0x00000005, 0x0004003b, 0x00000007, 0x00000008, 0x00000007, 0x0004003b, 0x00000023,
++    0x00000024, 0x00000007, 0x0004003b, 0x00000023, 0x00000037, 0x00000007, 0x0004003b, 0x00000044,
++    0x00000045, 0x00000007, 0x0004003b, 0x00000044, 0x0000004a, 0x00000007, 0x0004003b, 0x00000051,
++    0x00000052, 0x00000007, 0x0004003b, 0x00000044, 0x0000005c, 0x00000007, 0x0004003b, 0x00000066,
++    0x00000067, 0x00000007, 0x0004003d, 0x00000006, 0x0000001d, 0x0000001c, 0x00080041, 0x00000020,
++    0x00000021, 0x00000018, 0x0000001a, 0x0000001d, 0x0000001e, 0x0000001f, 0x0004003d, 0x00000006,
++    0x00000022, 0x00000021, 0x0003003e, 0x00000008, 0x00000022, 0x0004003d, 0x00000006, 0x0000002b,
++    0x00000008, 0x000500c7, 0x00000006, 0x0000002d, 0x0000002b, 0x0000002c, 0x00040053, 0x00000006,
++    0x0000002e, 0x0000002d, 0x00050041, 0x0000002f, 0x00000030, 0x0000002a, 0x0000002e, 0x0004003d,
++    0x00000026, 0x00000031, 0x00000030, 0x0004003d, 0x00000032, 0x00000035, 0x00000034, 0x00050057,
++    0x0000000a, 0x00000036, 0x00000031, 0x00000035, 0x0003003e, 0x00000024, 0x00000036, 0x0004003d,
++    0x00000006, 0x00000038, 0x00000008, 0x00050080, 0x00000006, 0x0000003a, 0x00000038, 0x00000039,
++    0x000500c7, 0x00000006, 0x0000003b, 0x0000003a, 0x0000002c, 0x00040053, 0x00000006, 0x0000003c,
++    0x0000003b, 0x00050041, 0x0000002f, 0x0000003d, 0x0000002a, 0x0000003c, 0x0004003d, 0x00000026,
++    0x0000003e, 0x0000003d, 0x0004003d, 0x00000032, 0x0000003f, 0x00000034, 0x0005008e, 0x00000032,
++    0x00000041, 0x0000003f, 0x00000040, 0x00050057, 0x0000000a, 0x00000042, 0x0000003e, 0x00000041,
++    0x0003003e, 0x00000037, 0x00000042, 0x0004003d, 0x00000043, 0x00000048, 0x00000047, 0x0006000c,
++    0x00000043, 0x00000049, 0x00000001, 0x00000045, 0x00000048, 0x0003003e, 0x00000045, 0x00000049,
++    0x0004003d, 0x00000006, 0x0000004b, 0x0000001c, 0x00070041, 0x0000004d, 0x0000004e, 0x00000018,
++    0x0000001a, 0x0000004b, 0x0000004c, 0x0004003d, 0x0000000a, 0x0000004f, 0x0000004e, 0x0008004f,
++    0x00000043, 0x00000050, 0x0000004f, 0x0000004f, 0x00000000, 0x00000001, 0x00000002, 0x0003003e,
++    0x0000004a, 0x00000050, 0x0003003e, 0x00000052, 0x0000001a, 0x000200f9, 0x00000053, 0x000200f8,
++    0x00000053, 0x000400f6, 0x00000055, 0x00000056, 0x00000000, 0x000200f9, 0x00000057, 0x000200f8,
++    0x00000057, 0x0004003d, 0x00000019, 0x00000058, 0x00000052, 0x000500b1, 0x0000005a, 0x0000005b,
++    0x00000058, 0x00000059, 0x000400fa, 0x0000005b, 0x00000054, 0x00000055, 0x000200f8, 0x00000054,
++    0x0004003d, 0x00000006, 0x0000005d, 0x0000001c, 0x0004003d, 0x00000019, 0x0000005f, 0x00000052,
++    0x00080041, 0x0000004d, 0x00000060, 0x00000018, 0x0000001a, 0x0000005d, 0x0000005e, 0x0000005f,
++    0x0004003d, 0x0000000a, 0x00000061, 0x00000060, 0x0008004f, 0x00000043, 0x00000062, 0x00000061,
++    0x00000061, 0x00000000, 0x00000001, 0x00000002, 0x0004003d, 0x00000043, 0x00000064, 0x00000063,
++    0x00050083, 0x00000043, 0x00000065, 0x00000062, 0x00000064, 0x0003003e, 0x0000005c, 0x00000065,
++    0x0004003d, 0x00000043, 0x00000068, 0x0000005c, 0x0004003d, 0x00000043, 0x00000069, 0x0000005c,
++    0x00050094, 0x00000009, 0x0000006a, 0x00000068, 0x00000069, 0x0007000c, 0x00000009, 0x0000006c,
++    0x00000001, 0x00000028, 0x0000006a, 0x0000006b, 0x0003003e, 0x00000067, 0x0000006c, 0x0004003d,
++    0x00000006, 0x0000006d, 0x0000001c, 0x0004003d, 0x00000019, 0x0000006f, 0x00000052, 0x00080041,
++    0x0000004d, 0x00000070, 0x00000018, 0x0000001a, 0x0000006d, 0x0000006e, 0x0000006f, 0x0004003d,
++    0x0000000a, 0x00000071, 0x00000070, 0x0008004f, 0x00000043, 0x00000072, 0x00000071, 0x00000071,
++    0x00000000, 0x00000001, 0x00000002, 0x0004003d, 0x00000043, 0x00000073, 0x00000045, 0x0004003d,
++    0x00000043, 0x00000074, 0x0000005c, 0x00050094, 0x00000009, 0x00000075, 0x00000073, 0x00000074,
++    0x0007000c, 0x00000009, 0x00000077, 0x00000001, 0x00000028, 0x00000075, 0x00000076, 0x0004003d,
++    0x00000009, 0x00000078, 0x00000067, 0x0006000c, 0x00000009, 0x00000079, 0x00000001, 0x00000020,
++    0x00000078, 0x00050085, 0x00000009, 0x0000007a, 0x00000077, 0x00000079, 0x0004003d, 0x00000009,
++    0x0000007c, 0x00000067, 0x0004003d, 0x00000006, 0x0000007d, 0x0000001c, 0x0004003d, 0x00000019,
++    0x0000007e, 0x00000052, 0x00090041, 0x00000080, 0x00000081, 0x00000018, 0x0000001a, 0x0000007d,
++    0x0000005e, 0x0000007e, 0x0000007f, 0x0004003d, 0x00000009, 0x00000082, 0x00000081, 0x00050085,
++    0x00000009, 0x00000083, 0x0000007c, 0x00000082, 0x00050081, 0x00000009, 0x00000084, 0x0000007b,
++    0x00000083, 0x00050088, 0x00000009, 0x00000085, 0x0000007a, 0x00000084, 0x0005008e, 0x00000043,
++    0x00000086, 0x00000072, 0x00000085, 0x0004003d, 0x00000043, 0x00000087, 0x0000004a, 0x00050081,
++    0x00000043, 0x00000088, 0x00000087, 0x00000086, 0x0003003e, 0x0000004a, 0x00000088, 0x000200f9,
++    0x00000056, 0x000200f8, 0x00000056, 0x0004003d, 0x00000019, 0x00000089, 0x00000052, 0x00050080,
++    0x00000019, 0x0000008b, 0x00000089, 0x0000008a, 0x0003003e, 0x00000052, 0x0000008b, 0x000200f9,
++    0x00000053, 0x000200f8, 0x00000055, 0x0004003d, 0x00000043, 0x0000008e, 0x0000004a, 0x0004003d,
++    0x0000000a, 0x0000008f, 0x00000024, 0x0008004f, 0x00000043, 0x00000090, 0x0000008f, 0x0000008f,
++    0x00000000, 0x00000001, 0x00000002, 0x00050085, 0x00000043, 0x00000091, 0x0000008e, 0x00000090,
++    0x0004003d, 0x00000006, 0x00000092, 0x0000001c, 0x00070041, 0x0000004d, 0x00000094, 0x00000018,
++    0x0000001a, 0x00000092, 0x00000093, 0x0004003d, 0x0000000a, 0x00000095, 0x00000094, 0x0008004f,
++    0x00000043, 0x00000096, 0x00000095, 0x00000095, 0x00000000, 0x00000001, 0x00000002, 0x00050085,
++    0x00000043, 0x00000097, 0x00000091, 0x00000096, 0x0004003d, 0x0000000a, 0x0000009a, 0x00000099,
++    0x0008004f, 0x00000043, 0x0000009b, 0x0000009a, 0x0000009a, 0x00000000, 0x00000001, 0x00000002,
++    0x00050085, 0x00000043, 0x0000009c, 0x00000097, 0x0000009b, 0x00050051, 0x00000009, 0x0000009d,
++    0x0000009c, 0x00000000, 0x00050051, 0x00000009, 0x0000009e, 0x0000009c, 0x00000001, 0x00050051,
++    0x00000009, 0x0000009f, 0x0000009c, 0x00000002, 0x00070050, 0x0000000a, 0x000000a0, 0x0000009d,
++    0x0000009e, 0x0000009f, 0x0000007b, 0x0003003e, 0x0000008d, 0x000000a0, 0x0004003d, 0x0000000a,
++    0x000000a2, 0x00000037, 0x0008004f, 0x00000043, 0x000000a3, 0x000000a2, 0x000000a2, 0x00000000,
++    0x00000001, 0x00000002, 0x00050041, 0x000000a4, 0x000000a5, 0x00000099, 0x0000007f, 0x0004003d,
++    0x00000009, 0x000000a6, 0x000000a5, 0x0005008e, 0x00000043, 0x000000a7, 0x000000a3, 0x000000a6,
++    0x00050041, 0x00000066, 0x000000a8, 0x00000024, 0x0000007f, 0x0004003d, 0x00000009, 0x000000a9,
++    0x000000a8, 0x0004003d, 0x00000006, 0x000000aa, 0x0000001c, 0x00080041, 0x00000080, 0x000000ab,
++    0x00000018, 0x0000001a, 0x000000aa, 0x00000093, 0x0000007f, 0x0004003d, 0x00000009, 0x000000ac,
++    0x000000ab, 0x00050085, 0x00000009, 0x000000ad, 0x000000a9, 0x000000ac, 0x00050051, 0x00000009,
++    0x000000ae, 0x000000a7, 0x00000000, 0x00050051, 0x00000009, 0x000000af, 0x000000a7, 0x00000001,
++    0x00050051, 0x00000009, 0x000000b0, 0x000000a7, 0x00000002, 0x00070050, 0x0000000a, 0x000000b1,
++    0x000000ae, 0x000000af, 0x000000b0, 0x000000ad, 0x0003003e, 0x000000a1, 0x000000b1, 0x000100fd,
++    0x00010038,
+ };
+-static const uint32_t fex_probe_lit_batch_frag[] =
++static const uint32_t fex_probe_depth_frag[] =
+ {
+-    0x07230203, 0x00010300, 0x0008000b, 0x00000046, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
++    0x07230203, 0x00010300, 0x0008000b, 0x00000035, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+-    0x0008000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000017, 0x00000020, 0x00000044,
+-    0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+-    0x6e69616d, 0x00000000, 0x00030005, 0x00000009, 0x00000063, 0x00030005, 0x0000000f, 0x0074614d,
+-    0x00050006, 0x0000000f, 0x00000000, 0x6f6c6f63, 0x00000072, 0x00050006, 0x0000000f, 0x00000001,
+-    0x6867696c, 0x00007374, 0x00040006, 0x0000000f, 0x00000002, 0x00646170, 0x00040005, 0x00000011,
+-    0x4d74694c, 0x00737461, 0x00040006, 0x00000011, 0x00000000, 0x0000006d, 0x00040005, 0x00000013,
+-    0x7374616d, 0x00000000, 0x00030005, 0x00000017, 0x00006469, 0x00030005, 0x0000001e, 0x00000070,
+-    0x00060005, 0x00000020, 0x465f6c67, 0x43676172, 0x64726f6f, 0x00000000, 0x00030005, 0x00000026,
+-    0x00000069, 0x00030005, 0x00000044, 0x0000006f, 0x00040047, 0x0000000c, 0x00000006, 0x00000010,
+-    0x00040047, 0x0000000e, 0x00000006, 0x00000010, 0x00050048, 0x0000000f, 0x00000000, 0x00000023,
+-    0x00000000, 0x00050048, 0x0000000f, 0x00000001, 0x00000023, 0x00000010, 0x00050048, 0x0000000f,
+-    0x00000002, 0x00000023, 0x00000210, 0x00040047, 0x00000010, 0x00000006, 0x00000400, 0x00030047,
+-    0x00000011, 0x00000002, 0x00040048, 0x00000011, 0x00000000, 0x00000018, 0x00050048, 0x00000011,
+-    0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000013, 0x00000018, 0x00040047, 0x00000013,
+-    0x00000021, 0x00000005, 0x00040047, 0x00000013, 0x00000022, 0x00000000, 0x00030047, 0x00000017,
+-    0x0000000e, 0x00040047, 0x00000017, 0x0000001e, 0x00000001, 0x00040047, 0x00000020, 0x0000000b,
+-    0x0000000f, 0x00040047, 0x00000044, 0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021,
+-    0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
+-    0x00000004, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00040015, 0x0000000a, 0x00000020,
+-    0x00000000, 0x0004002b, 0x0000000a, 0x0000000b, 0x00000020, 0x0004001c, 0x0000000c, 0x00000007,
+-    0x0000000b, 0x0004002b, 0x0000000a, 0x0000000d, 0x0000001f, 0x0004001c, 0x0000000e, 0x00000007,
+-    0x0000000d, 0x0005001e, 0x0000000f, 0x00000007, 0x0000000c, 0x0000000e, 0x0003001d, 0x00000010,
+-    0x0000000f, 0x0003001e, 0x00000011, 0x00000010, 0x00040020, 0x00000012, 0x0000000c, 0x00000011,
+-    0x0004003b, 0x00000012, 0x00000013, 0x0000000c, 0x00040015, 0x00000014, 0x00000020, 0x00000001,
+-    0x0004002b, 0x00000014, 0x00000015, 0x00000000, 0x00040020, 0x00000016, 0x00000001, 0x0000000a,
+-    0x0004003b, 0x00000016, 0x00000017, 0x00000001, 0x00040020, 0x00000019, 0x0000000c, 0x00000007,
+-    0x00040017, 0x0000001c, 0x00000006, 0x00000002, 0x00040020, 0x0000001d, 0x00000007, 0x0000001c,
+-    0x00040020, 0x0000001f, 0x00000001, 0x00000007, 0x0004003b, 0x0000001f, 0x00000020, 0x00000001,
+-    0x0004002b, 0x00000006, 0x00000023, 0x3a83126f, 0x00040020, 0x00000025, 0x00000007, 0x00000014,
+-    0x0004002b, 0x00000014, 0x0000002d, 0x00000020, 0x00020014, 0x0000002e, 0x0004002b, 0x00000014,
+-    0x00000031, 0x00000001, 0x0004002b, 0x00000006, 0x00000035, 0x00000000, 0x00040020, 0x00000043,
+-    0x00000003, 0x00000007, 0x0004003b, 0x00000043, 0x00000044, 0x00000003, 0x00050036, 0x00000002,
+-    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009,
+-    0x00000007, 0x0004003b, 0x0000001d, 0x0000001e, 0x00000007, 0x0004003b, 0x00000025, 0x00000026,
+-    0x00000007, 0x0004003d, 0x0000000a, 0x00000018, 0x00000017, 0x00070041, 0x00000019, 0x0000001a,
+-    0x00000013, 0x00000015, 0x00000018, 0x00000015, 0x0004003d, 0x00000007, 0x0000001b, 0x0000001a,
+-    0x0003003e, 0x00000009, 0x0000001b, 0x0004003d, 0x00000007, 0x00000021, 0x00000020, 0x0007004f,
+-    0x0000001c, 0x00000022, 0x00000021, 0x00000021, 0x00000000, 0x00000001, 0x0005008e, 0x0000001c,
+-    0x00000024, 0x00000022, 0x00000023, 0x0003003e, 0x0000001e, 0x00000024, 0x0003003e, 0x00000026,
+-    0x00000015, 0x000200f9, 0x00000027, 0x000200f8, 0x00000027, 0x000400f6, 0x00000029, 0x0000002a,
+-    0x00000000, 0x000200f9, 0x0000002b, 0x000200f8, 0x0000002b, 0x0004003d, 0x00000014, 0x0000002c,
+-    0x00000026, 0x000500b1, 0x0000002e, 0x0000002f, 0x0000002c, 0x0000002d, 0x000400fa, 0x0000002f,
+-    0x00000028, 0x00000029, 0x000200f8, 0x00000028, 0x0004003d, 0x0000000a, 0x00000030, 0x00000017,
+-    0x0004003d, 0x00000014, 0x00000032, 0x00000026, 0x00080041, 0x00000019, 0x00000033, 0x00000013,
+-    0x00000015, 0x00000030, 0x00000031, 0x00000032, 0x0004003d, 0x00000007, 0x00000034, 0x00000033,
+-    0x0004003d, 0x0000001c, 0x00000036, 0x0000001e, 0x0004003d, 0x0000000a, 0x00000037, 0x00000017,
+-    0x0004003d, 0x00000014, 0x00000038, 0x00000026, 0x00080041, 0x00000019, 0x00000039, 0x00000013,
+-    0x00000015, 0x00000037, 0x00000031, 0x00000038, 0x0004003d, 0x00000007, 0x0000003a, 0x00000039,
+-    0x0007004f, 0x0000001c, 0x0000003b, 0x0000003a, 0x0000003a, 0x00000000, 0x00000001, 0x00050094,
+-    0x00000006, 0x0000003c, 0x00000036, 0x0000003b, 0x0007000c, 0x00000006, 0x0000003d, 0x00000001,
+-    0x00000028, 0x00000035, 0x0000003c, 0x0005008e, 0x00000007, 0x0000003e, 0x00000034, 0x0000003d,
+-    0x0004003d, 0x00000007, 0x0000003f, 0x00000009, 0x00050081, 0x00000007, 0x00000040, 0x0000003f,
+-    0x0000003e, 0x0003003e, 0x00000009, 0x00000040, 0x000200f9, 0x0000002a, 0x000200f8, 0x0000002a,
+-    0x0004003d, 0x00000014, 0x00000041, 0x00000026, 0x00050080, 0x00000014, 0x00000042, 0x00000041,
+-    0x00000031, 0x0003003e, 0x00000026, 0x00000042, 0x000200f9, 0x00000027, 0x000200f8, 0x00000029,
+-    0x0004003d, 0x00000007, 0x00000045, 0x00000009, 0x0003003e, 0x00000044, 0x00000045, 0x000100fd,
+-    0x00010038,
++    0x0006000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x0000001f, 0x00030010, 0x00000004,
++    0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
++    0x00040005, 0x0000000d, 0x73786574, 0x00000000, 0x00030005, 0x00000010, 0x00004350, 0x00040006,
++    0x00000010, 0x00000000, 0x00786574, 0x00050006, 0x00000010, 0x00000001, 0x6c616373, 0x00000065,
++    0x00040006, 0x00000010, 0x00000002, 0x00646170, 0x00030005, 0x00000012, 0x00006370, 0x00030005,
++    0x0000001f, 0x00007675, 0x00030005, 0x00000028, 0x0074614d, 0x00050006, 0x00000028, 0x00000000,
++    0x6f6c6f63, 0x00000072, 0x00050006, 0x00000028, 0x00000001, 0x61726170, 0x0000736d, 0x00050006,
++    0x00000028, 0x00000002, 0x6867696c, 0x00007374, 0x00050006, 0x00000028, 0x00000003, 0x6c6f636c,
++    0x0073726f, 0x00030005, 0x0000002a, 0x0074616d, 0x00040047, 0x0000000d, 0x00000021, 0x00000000,
++    0x00040047, 0x0000000d, 0x00000022, 0x00000001, 0x00040047, 0x0000000f, 0x00000006, 0x00000004,
++    0x00030047, 0x00000010, 0x00000002, 0x00050048, 0x00000010, 0x00000000, 0x00000023, 0x00000000,
++    0x00050048, 0x00000010, 0x00000001, 0x00000023, 0x00000004, 0x00050048, 0x00000010, 0x00000002,
++    0x00000023, 0x00000008, 0x00040047, 0x0000001f, 0x0000001e, 0x00000000, 0x00040047, 0x00000026,
++    0x00000006, 0x00000010, 0x00040047, 0x00000027, 0x00000006, 0x00000010, 0x00030047, 0x00000028,
++    0x00000002, 0x00050048, 0x00000028, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000028,
++    0x00000001, 0x00000023, 0x00000010, 0x00050048, 0x00000028, 0x00000002, 0x00000023, 0x00000020,
++    0x00050048, 0x00000028, 0x00000003, 0x00000023, 0x00000120, 0x00040047, 0x0000002a, 0x00000021,
++    0x00000002, 0x00040047, 0x0000002a, 0x00000022, 0x00000000, 0x00020013, 0x00000002, 0x00030021,
++    0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00090019, 0x00000007, 0x00000006,
++    0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x00000008,
++    0x00000007, 0x00040015, 0x00000009, 0x00000020, 0x00000000, 0x0004002b, 0x00000009, 0x0000000a,
++    0x00000008, 0x0004001c, 0x0000000b, 0x00000008, 0x0000000a, 0x00040020, 0x0000000c, 0x00000000,
++    0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000000, 0x0004002b, 0x00000009, 0x0000000e,
++    0x0000000b, 0x0004001c, 0x0000000f, 0x00000009, 0x0000000e, 0x0005001e, 0x00000010, 0x00000009,
++    0x00000006, 0x0000000f, 0x00040020, 0x00000011, 0x00000009, 0x00000010, 0x0004003b, 0x00000011,
++    0x00000012, 0x00000009, 0x00040015, 0x00000013, 0x00000020, 0x00000001, 0x0004002b, 0x00000013,
++    0x00000014, 0x00000000, 0x00040020, 0x00000015, 0x00000009, 0x00000009, 0x0004002b, 0x00000009,
++    0x00000018, 0x00000007, 0x00040020, 0x0000001a, 0x00000000, 0x00000008, 0x00040017, 0x0000001d,
++    0x00000006, 0x00000002, 0x00040020, 0x0000001e, 0x00000001, 0x0000001d, 0x0004003b, 0x0000001e,
++    0x0000001f, 0x00000001, 0x00040017, 0x00000021, 0x00000006, 0x00000004, 0x0004002b, 0x00000009,
++    0x00000023, 0x00000003, 0x0004002b, 0x00000009, 0x00000025, 0x00000010, 0x0004001c, 0x00000026,
++    0x00000021, 0x00000025, 0x0004001c, 0x00000027, 0x00000021, 0x00000025, 0x0006001e, 0x00000028,
++    0x00000021, 0x00000021, 0x00000026, 0x00000027, 0x00040020, 0x00000029, 0x00000002, 0x00000028,
++    0x0004003b, 0x00000029, 0x0000002a, 0x00000002, 0x00040020, 0x0000002b, 0x00000002, 0x00000006,
++    0x0004002b, 0x00000006, 0x0000002f, 0x3c23d70a, 0x00020014, 0x00000030, 0x00050036, 0x00000002,
++    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x00050041, 0x00000015, 0x00000016,
++    0x00000012, 0x00000014, 0x0004003d, 0x00000009, 0x00000017, 0x00000016, 0x000500c7, 0x00000009,
++    0x00000019, 0x00000017, 0x00000018, 0x00050041, 0x0000001a, 0x0000001b, 0x0000000d, 0x00000019,
++    0x0004003d, 0x00000008, 0x0000001c, 0x0000001b, 0x0004003d, 0x0000001d, 0x00000020, 0x0000001f,
++    0x00050057, 0x00000021, 0x00000022, 0x0000001c, 0x00000020, 0x00050051, 0x00000006, 0x00000024,
++    0x00000022, 0x00000003, 0x00060041, 0x0000002b, 0x0000002c, 0x0000002a, 0x00000014, 0x00000023,
++    0x0004003d, 0x00000006, 0x0000002d, 0x0000002c, 0x00050085, 0x00000006, 0x0000002e, 0x00000024,
++    0x0000002d, 0x000500b8, 0x00000030, 0x00000031, 0x0000002e, 0x0000002f, 0x000300f7, 0x00000033,
++    0x00000000, 0x000400fa, 0x00000031, 0x00000032, 0x00000033, 0x000200f8, 0x00000032, 0x000100fc,
++    0x000200f8, 0x00000033, 0x000100fd, 0x00010038,
++};
++static const uint32_t fex_probe_depth_batch_frag[] =
++{
++    0x07230203, 0x00010300, 0x0008000b, 0x00000040, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
++    0x000014b5, 0x00020011, 0x000014bb, 0x0008000a, 0x5f565053, 0x5f545845, 0x63736564, 0x74706972,
++    0x695f726f, 0x7865646e, 0x00676e69, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
++    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004, 0x00000004, 0x6e69616d,
++    0x00000000, 0x00000020, 0x0000002f, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002,
++    0x000001c2, 0x00080004, 0x455f4c47, 0x6e5f5458, 0x6e756e6f, 0x726f6669, 0x75715f6d, 0x66696c61,
++    0x00726569, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00040005, 0x0000000d, 0x73786574,
++    0x00000000, 0x00040005, 0x00000018, 0x636f6c42, 0x0000006b, 0x00050006, 0x00000018, 0x00000000,
++    0x6c726f77, 0x00000064, 0x00050006, 0x00000018, 0x00000001, 0x746e6974, 0x00000000, 0x00050006,
++    0x00000018, 0x00000002, 0x6174656d, 0x00000000, 0x00050006, 0x00000018, 0x00000003, 0x30646170,
++    0x00000000, 0x00050006, 0x00000018, 0x00000004, 0x6f6c6f63, 0x00000072, 0x00050006, 0x00000018,
++    0x00000005, 0x61726170, 0x0000736d, 0x00050006, 0x00000018, 0x00000006, 0x6867696c, 0x00007374,
++    0x00050006, 0x00000018, 0x00000007, 0x6c6f636c, 0x0073726f, 0x00050006, 0x00000018, 0x00000008,
++    0x31646170, 0x00000000, 0x00040005, 0x0000001a, 0x636f6c42, 0x0000736b, 0x00040006, 0x0000001a,
++    0x00000000, 0x00000062, 0x00040005, 0x0000001c, 0x636f6c62, 0x0000736b, 0x00030005, 0x00000020,
++    0x00006469, 0x00030005, 0x0000002f, 0x00007675, 0x00040047, 0x0000000d, 0x00000021, 0x00000000,
++    0x00040047, 0x0000000d, 0x00000022, 0x00000001, 0x00040047, 0x00000012, 0x00000006, 0x00000010,
++    0x00040047, 0x00000014, 0x00000006, 0x00000010, 0x00040047, 0x00000015, 0x00000006, 0x00000010,
++    0x00040047, 0x00000017, 0x00000006, 0x00000010, 0x00040048, 0x00000018, 0x00000000, 0x00000005,
++    0x00050048, 0x00000018, 0x00000000, 0x00000007, 0x00000010, 0x00050048, 0x00000018, 0x00000000,
++    0x00000023, 0x00000000, 0x00050048, 0x00000018, 0x00000001, 0x00000023, 0x00000040, 0x00050048,
++    0x00000018, 0x00000002, 0x00000023, 0x00000050, 0x00050048, 0x00000018, 0x00000003, 0x00000023,
++    0x00000060, 0x00050048, 0x00000018, 0x00000004, 0x00000023, 0x00000100, 0x00050048, 0x00000018,
++    0x00000005, 0x00000023, 0x00000110, 0x00050048, 0x00000018, 0x00000006, 0x00000023, 0x00000120,
++    0x00050048, 0x00000018, 0x00000007, 0x00000023, 0x00000220, 0x00050048, 0x00000018, 0x00000008,
++    0x00000023, 0x00000320, 0x00040047, 0x00000019, 0x00000006, 0x00000400, 0x00030047, 0x0000001a,
++    0x00000002, 0x00040048, 0x0000001a, 0x00000000, 0x00000018, 0x00050048, 0x0000001a, 0x00000000,
++    0x00000023, 0x00000000, 0x00030047, 0x0000001c, 0x00000018, 0x00040047, 0x0000001c, 0x00000021,
++    0x00000003, 0x00040047, 0x0000001c, 0x00000022, 0x00000000, 0x00030047, 0x00000020, 0x0000000e,
++    0x00040047, 0x00000020, 0x0000001e, 0x00000004, 0x00030047, 0x00000029, 0x000014b4, 0x00030047,
++    0x0000002b, 0x000014b4, 0x00030047, 0x0000002c, 0x000014b4, 0x00040047, 0x0000002f, 0x0000001e,
++    0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
++    0x00000020, 0x00090019, 0x00000007, 0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000,
++    0x00000001, 0x00000000, 0x0003001b, 0x00000008, 0x00000007, 0x00040015, 0x00000009, 0x00000020,
++    0x00000000, 0x0004002b, 0x00000009, 0x0000000a, 0x00000008, 0x0004001c, 0x0000000b, 0x00000008,
++    0x0000000a, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d,
++    0x00000000, 0x00040017, 0x0000000e, 0x00000006, 0x00000004, 0x00040018, 0x0000000f, 0x0000000e,
++    0x00000004, 0x00040017, 0x00000010, 0x00000009, 0x00000004, 0x0004002b, 0x00000009, 0x00000011,
++    0x0000000a, 0x0004001c, 0x00000012, 0x0000000e, 0x00000011, 0x0004002b, 0x00000009, 0x00000013,
++    0x00000010, 0x0004001c, 0x00000014, 0x0000000e, 0x00000013, 0x0004001c, 0x00000015, 0x0000000e,
++    0x00000013, 0x0004002b, 0x00000009, 0x00000016, 0x0000000e, 0x0004001c, 0x00000017, 0x0000000e,
++    0x00000016, 0x000b001e, 0x00000018, 0x0000000f, 0x0000000e, 0x00000010, 0x00000012, 0x0000000e,
++    0x0000000e, 0x00000014, 0x00000015, 0x00000017, 0x0003001d, 0x00000019, 0x00000018, 0x0003001e,
++    0x0000001a, 0x00000019, 0x00040020, 0x0000001b, 0x0000000c, 0x0000001a, 0x0004003b, 0x0000001b,
++    0x0000001c, 0x0000000c, 0x00040015, 0x0000001d, 0x00000020, 0x00000001, 0x0004002b, 0x0000001d,
++    0x0000001e, 0x00000000, 0x00040020, 0x0000001f, 0x00000001, 0x00000009, 0x0004003b, 0x0000001f,
++    0x00000020, 0x00000001, 0x0004002b, 0x0000001d, 0x00000022, 0x00000002, 0x0004002b, 0x00000009,
++    0x00000023, 0x00000000, 0x00040020, 0x00000024, 0x0000000c, 0x00000009, 0x0004002b, 0x00000009,
++    0x00000027, 0x00000007, 0x00040020, 0x0000002a, 0x00000000, 0x00000008, 0x00040017, 0x0000002d,
++    0x00000006, 0x00000002, 0x00040020, 0x0000002e, 0x00000001, 0x0000002d, 0x0004003b, 0x0000002e,
++    0x0000002f, 0x00000001, 0x0004002b, 0x00000009, 0x00000032, 0x00000003, 0x0004002b, 0x0000001d,
++    0x00000035, 0x00000004, 0x00040020, 0x00000036, 0x0000000c, 0x00000006, 0x0004002b, 0x00000006,
++    0x0000003a, 0x3c23d70a, 0x00020014, 0x0000003b, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
++    0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000009, 0x00000021, 0x00000020, 0x00080041,
++    0x00000024, 0x00000025, 0x0000001c, 0x0000001e, 0x00000021, 0x00000022, 0x00000023, 0x0004003d,
++    0x00000009, 0x00000026, 0x00000025, 0x000500c7, 0x00000009, 0x00000028, 0x00000026, 0x00000027,
++    0x00040053, 0x00000009, 0x00000029, 0x00000028, 0x00050041, 0x0000002a, 0x0000002b, 0x0000000d,
++    0x00000029, 0x0004003d, 0x00000008, 0x0000002c, 0x0000002b, 0x0004003d, 0x0000002d, 0x00000030,
++    0x0000002f, 0x00050057, 0x0000000e, 0x00000031, 0x0000002c, 0x00000030, 0x00050051, 0x00000006,
++    0x00000033, 0x00000031, 0x00000003, 0x0004003d, 0x00000009, 0x00000034, 0x00000020, 0x00080041,
++    0x00000036, 0x00000037, 0x0000001c, 0x0000001e, 0x00000034, 0x00000035, 0x00000032, 0x0004003d,
++    0x00000006, 0x00000038, 0x00000037, 0x00050085, 0x00000006, 0x00000039, 0x00000033, 0x00000038,
++    0x000500b8, 0x0000003b, 0x0000003c, 0x00000039, 0x0000003a, 0x000300f7, 0x0000003e, 0x00000000,
++    0x000400fa, 0x0000003c, 0x0000003d, 0x0000003e, 0x000200f8, 0x0000003d, 0x000100fc, 0x000200f8,
++    0x0000003e, 0x000100fd, 0x00010038,
+ };
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 050bca7..7e548c1 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3624,7 +3624,7 @@ bool vkd3d_fex_ds_store_none_enabled(void);
+  * DXBC -> SPIR-V compile (or SPIR-V cache load), and around the driver compile of a PSO's static pipeline. */
+ /* Reads VKD3D_FEX_SHADER_COPY (once), so the table's flags are set before FEX sees the device. */
+ void vkd3d_fex_shader_copy_init(void);
+-/* VKD3D fex23, fex24: the draw probe (fex_draw_probe.c), on a thread and a GPU device of its own; its progress and
++/* VKD3D fex23-fex27: the draw probe (fex_draw_probe.c), on a thread and a GPU device of its own; its progress and
+  * result go into the gpu report. */
+ void vkd3d_fex_draw_probe(struct d3d12_device *device);
+ size_t vkd3d_fex_draw_probe_append(char *text, size_t size, size_t len, uint32_t gpu_publishes);
+-- 
+2.43.0
+

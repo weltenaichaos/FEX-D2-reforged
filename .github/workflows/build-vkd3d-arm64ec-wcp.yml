@@ -22,8 +22,8 @@ on:
 env:
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
   VKD3D_TAG: v3.0b
-  WCP_VERSION: 3.0b-arm64ec-fex26
-  WCP_VERSION_CODE: 27
+  WCP_VERSION: 3.0b-arm64ec-fex27
+  WCP_VERSION_CODE: 28
 
 jobs:
   build:
@@ -247,6 +247,13 @@ jobs:
             From fex26 on, the draw probe runs only when asked for (VKD3D_FEX_DRAW_PROBE=1; 2 adds
             the 'lit, one multi-draw call' test, during which D2R ended in a fex24 run with the
             layer off), and the progress line carries the results so far after every test.
+            From fex27 on, the draw probe draws meshes the size of D2R's (220 triangles each, 1000
+            per test) into targets like D2R's main pass (1280x720 R11G11B10F + RGBA8 + D24S8, lit
+            pixel shader) and shadow passes (2048x2048 D16, alpha-test pixel shader), each drawn with
+            no changes between draws, like D2R (new push constants and root constant buffers every
+            draw), and batched (data found by instance index, or one multi-draw call). It never
+            destroys its GPU device or anything it made (the game died when fex24 and fex26 tore
+            the device down after their last test); ~35 MB of GPU memory stay until the game ends.
             Install in GameNative as a VKD3D
             content profile; it appears as `${{ env.WCP_VERSION }}`.
         env:
