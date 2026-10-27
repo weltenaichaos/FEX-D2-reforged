@@ -64,6 +64,18 @@ $end_info$
 // a lookup of a learned stream not in read-ahead memory takes it from the file cache without waiting for storage
 // (preadv2 RWF_NOWAIT), on any thread; when it isn't there, the rules above apply. Ranges not used in 30 sessions are
 // forgotten, past the budget the ones used longest ago go first, and the list starts over with data.bin.
+//
+// Written data in batches (FEX_UNPACK_CACHE_FLUSH, from build 91): up to build 90 the writer dropped every new stream from
+// the file cache right after writing it. A drop can't take pages that aren't on storage yet, it only starts writing
+// them, so the data stayed in memory, and with streams 64 bytes apart every stream's first page was the page the stream
+// before it had just sent to storage: f2fs makes a write to a page that is being written wait for that write, so each
+// stream waited for a storage round trip. In the build 90 run, while the game streamed in new areas (t=58-65), the
+// writer stored ~150 MB/s in ~2,400 streams a second, took a whole second of every second doing it (0.42 ms a stream),
+// its buffer overflowed (up to 510 streams a second not stored), and the main thread's core ran other work 5,000-14,000
+// times a second (3,000 in calm play) while the main thread waited 270-375 ms a second for it. Now streams start on a
+// page of their own, the writer doesn't drop each one, and every FlushBatch it starts writing the batch to storage and
+// waits for the batch before (normally done by then), then drops it from the file cache, which now takes all of it; an
+// idle writer does the same with what is left after FlushIdleMs. FEX_UNPACK_CACHE_FLUSH=0 is build 90's way.
 
 #include "NativeUnpackCache.h"
 #include "GameFiles.h"
@@ -88,6 +100,7 @@ $end_info$
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -116,6 +129,9 @@ constexpr size_t RecentDiskChunks = 16;   // chunks of recent hits read from dis
 constexpr uint64_t NoChunk = ~0ull;
 constexpr uint64_t DefaultReadAheadMB = 64;
 constexpr uint64_t PageSize = 4096; // direct reads need buffer, offset and size in multiples of the storage block size
+// Build 91, written data in batches (see above).
+constexpr uint64_t FlushBatch = 8ull << 20;
+constexpr uint64_t FlushIdleMs = 250;
 constexpr uint64_t PlayWindowMs = 250;
 constexpr uint32_t PlayMaxLookups = 125; // per PlayWindowMs; loads have 1000-5500 lookups a second, play 0-500
 constexpr uint64_t PlayAheadChunks = 2;
@@ -209,6 +225,13 @@ struct Cache {
   size_t RecentDiskNext {};
 
   bool AheadRamp {}; // FEX_UNPACK_CACHE_AHEAD, see above
+
+  // Build 91, written data in batches (FEX_UNPACK_CACHE_FLUSH): streams start on a page of their own, and the writer thread
+  // sends what it wrote to storage in batches, then drops it. Offsets of data.bin, the writer thread's own.
+  bool Flush {};
+  uint64_t WrittenTo {}; // end of the last stream the writer wrote (streams are written in order)
+  uint64_t StartedTo {}; // writing to storage started up to here
+  uint64_t FlushedTo {}; // on storage and dropped up to here
 
   // Telling play from loads by the lookup rate, see FEX_UNPACK_CACHE_PLAY above.
   bool PlayGate {};
@@ -1293,7 +1316,9 @@ bool Reserve(Cache* C, const uint64_t Key[2], uint32_t Produced, uint32_t Traile
       return false;
     }
   }
-  if (C->DataEnd + Produced > C->MaxDataBytes) {
+  // Build 91: a stream starts on a page of its own, so writing it never waits for the stream before it (see above).
+  const uint64_t Offset = C->Flush ? AlignUp(C->DataEnd, PageSize) : C->DataEnd;
+  if (Offset + Produced > C->MaxDataBytes) {
     C->Full = true;
     FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: full at {} MB, not storing more", C->DataEnd >> 20));
     return false;
@@ -1303,9 +1328,9 @@ bool Reserve(Cache* C, const uint64_t Key[2], uint32_t Produced, uint32_t Traile
   New.R.Key[1] = Key[1];
   New.R.Produced = Produced;
   New.R.Trailer = Trailer;
-  New.R.Offset = C->DataEnd;
+  New.R.Offset = Offset;
   New.RecordOffset = C->IndexEnd;
-  C->DataEnd = AlignUp(C->DataEnd + Produced, DataAlignment);
+  C->DataEnd = AlignUp(Offset + Produced, DataAlignment);
   C->DataEndHint.store(C->DataEnd, std::memory_order_relaxed);
   C->IndexEnd += sizeof(Record);
   C->Entries.emplace(std::pair {Key[0], Key[1]}, Entry {New.R.Offset, 0, Produced, Trailer, false});
@@ -1323,14 +1348,17 @@ bool Reserve(Cache* C, const uint64_t Key[2], uint32_t Produced, uint32_t Traile
   return true;
 }
 
-// Hashes and writes a reserved stream's data and record, then makes it findable.
-void Write(Cache* C, Job& J, const uint8_t* Data) {
+// Hashes and writes a reserved stream's data and record, then makes it findable. Batched: the writer thread drops it from
+// the file cache later, with its batch (build 91); otherwise it is dropped now.
+void Write(Cache* C, Job& J, const uint8_t* Data, bool Batched) {
   const uint64_t Start = ReadTicks();
   J.R.OutputHash = XXH3_64bits(Data, J.R.Produced);
   J.R.Check = RecordCheck(J.R);
   const bool Written = WriteExact(C->Data, Data, J.R.Produced, J.R.Offset) && WriteExact(C->Index, &J.R, sizeof(J.R), J.RecordOffset);
   ForgetChunks(C, J.R.Offset, J.R.Produced);
-  DropRange(C, J.R.Offset, J.R.Produced);
+  if (!Batched) {
+    DropRange(C, J.R.Offset, J.R.Produced);
+  }
   {
     std::scoped_lock Guard {C->Lock};
     if (Written) {
@@ -1346,6 +1374,40 @@ void Write(Cache* C, Job& J, const uint8_t* Data) {
     __atomic_fetch_add(&FEXUnpackCacheStats.Failures, 1, __ATOMIC_RELAXED);
   }
   __atomic_fetch_add(&FEXUnpackCacheStats.WriteTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
+}
+
+// Build 91: starts sending data.bin's written data up to Upto to storage (writer thread only).
+void StartWriteOut(Cache* C, uint64_t Upto) {
+  if (Upto <= C->StartedTo) {
+    return;
+  }
+  const uint64_t From = C->StartedTo & ~(PageSize - 1);
+  const uint64_t Start = ReadTicks();
+  if (FEX::Windows::Linux::WriteOut(C->LinuxRead, From, Upto - From, false) < 0) {
+    __atomic_fetch_add(&FEXUnpackCacheStats.FlushFailures, 1, __ATOMIC_RELAXED);
+  }
+  __atomic_fetch_add(&FEXUnpackCacheStats.FlushStartTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
+  C->StartedTo = Upto;
+}
+
+// Build 91: waits until data.bin's written data up to Upto is on storage, then drops it from the file cache (learned
+// blocks stay, see DropRange). Writer thread only.
+void FlushWritten(Cache* C, uint64_t Upto) {
+  if (Upto <= C->FlushedTo) {
+    return;
+  }
+  const uint64_t From = C->FlushedTo & ~(PageSize - 1);
+  const uint64_t Start = ReadTicks();
+  if (FEX::Windows::Linux::WriteOut(C->LinuxRead, From, Upto - From, true) < 0) {
+    __atomic_fetch_add(&FEXUnpackCacheStats.FlushFailures, 1, __ATOMIC_RELAXED);
+  }
+  const uint64_t Written = ReadTicks();
+  DropRange(C, From, Upto - From);
+  __atomic_fetch_add(&FEXUnpackCacheStats.Flushes, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&FEXUnpackCacheStats.FlushBytes, Upto - C->FlushedTo, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&FEXUnpackCacheStats.FlushWaitTicks, Written - Start, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&FEXUnpackCacheStats.FlushDropTicks, ReadTicks() - Written, __ATOMIC_RELAXED);
+  C->FlushedTo = Upto;
 }
 
 // The writer thread is started with the process (NativeUnpackCache::StartWriter) and waits for the cache to open.
@@ -1374,15 +1436,38 @@ void* WriterThread(void*) {
   WriterState.store(2, std::memory_order_release);
   FEX::Windows::StatsLogNote(fextl::fmt::format("unpack cache: write buffer ready ({} MB in {} ms)", RingSize >> 20,
                                                 (ReadTicks() - Start) * 1000 / TickFrequency));
+  const bool Batched = C->Flush && C->LinuxRead >= 0;
   for (;;) {
     Job J;
     {
       std::unique_lock Guard {C->Lock};
-      C->QueueWake.wait(Guard, [C] { return !C->Queue.empty() && C->Queue.front().Ready; });
+      const auto Ready = [C] {
+        return !C->Queue.empty() && C->Queue.front().Ready;
+      };
+      if (Batched && C->FlushedTo < C->WrittenTo) {
+        // Something written isn't dropped yet: don't wait for the next stream longer than FlushIdleMs.
+        if (!C->QueueWake.wait_for(Guard, std::chrono::milliseconds(FlushIdleMs), Ready)) {
+          Guard.unlock();
+          StartWriteOut(C, C->WrittenTo);
+          FlushWritten(C, C->WrittenTo);
+          continue;
+        }
+      } else {
+        C->QueueWake.wait(Guard, Ready);
+      }
       J = C->Queue.front();
       C->Queue.pop_front();
     }
-    Write(C, J, C->Ring + J.RingStart % RingSize);
+    Write(C, J, C->Ring + J.RingStart % RingSize, Batched);
+    if (Batched) {
+      C->WrittenTo = std::max(C->WrittenTo, J.R.Offset + J.R.Produced);
+      if (C->WrittenTo - C->StartedTo >= FlushBatch) {
+        // Start this batch, then finish the one before it, which has had a whole batch's time to get to storage.
+        const uint64_t Before = C->StartedTo;
+        StartWriteOut(C, C->WrittenTo);
+        FlushWritten(C, Before);
+      }
+    }
     std::scoped_lock Guard {C->Lock};
     C->RingTail = J.RingEnd;
   }
@@ -1430,7 +1515,7 @@ extern "C" void FEXUnpackCachePut(const uint64_t Key[2], const uint8_t* Out, uin
     }
     C->QueueWake.notify_one();
   } else {
-    Write(C, *J, Out);
+    Write(C, *J, Out, false);
   }
   __atomic_fetch_add(&FEXUnpackCacheStats.StoreTicks, ReadTicks() - Start, __ATOMIC_RELAXED);
 }
@@ -1656,6 +1741,10 @@ bool Init(bool MD5Cache) {
   }
   const char* AheadMode = FEX::Windows::Switch("FEX_UNPACK_CACHE_AHEAD");
   C->AheadRamp = !(AheadMode && AheadMode[0] == 'f');
+  // Build 91, see the top of this file. Needs data.bin's Linux file (FEX_UNPACK_CACHE_DIRECT=1).
+  const char* FlushEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_FLUSH");
+  C->Flush = FlushEnv && FlushEnv[0] == '1' && C->LinuxRead >= 0;
+  C->WrittenTo = C->StartedTo = C->FlushedTo = C->DataEnd;
   const char* PlayEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_PLAY");
   C->PlayGate = PlayEnv && PlayEnv[0] == '1';
   C->WindowTicks = std::max<uint64_t>(TickFrequency * PlayWindowMs / 1000, 1);
@@ -1707,6 +1796,14 @@ bool Init(bool MD5Cache) {
     GameFiles::SetPassHook(Learned::Pass);
   }
   FEX::Windows::StatsLogNote(LinuxNote);
+  FEX::Windows::StatsLogNote(
+    C->Flush ? fextl::fmt::format("unpack cache: new streams start on a page of their own and are written to storage in {} MB batches, then "
+                                  "dropped from the file cache (also after {} ms without new streams; FEX_UNPACK_CACHE_FLUSH=0 drops each "
+                                  "one right after writing it, as build 90)",
+                                  FlushBatch >> 20, FlushIdleMs) :
+               fextl::fmt::format("unpack cache: new streams are dropped from the file cache one by one right after writing ({})",
+                                  C->LinuxRead >= 0 ? "FEX_UNPACK_CACHE_FLUSH=1 writes them in batches" :
+                                                      "batches need data.bin's Linux file, FEX_UNPACK_CACHE_DIRECT=1"));
   FEX::Windows::StatsLogNote(LearnNote);
   FEX::Windows::StatsLogNote(C->MainPlay ? "unpack cache: the main thread never reads a hit from disk while frames are coming (the last began under "
                                            "250 ms ago): it is left to the game to unpack (FEX_UNPACK_CACHE_MAIN_PLAY=0 turns it off)" :
@@ -1761,7 +1858,7 @@ fextl::string StatsLine() {
   const auto MB = [](uint64_t Bytes) {
     return static_cast<double>(Bytes) / (1024.0 * 1024.0);
   };
-  if (!D.Lookups && !D.Stores && !D.Written && !D.Dropped && !D.Failures && !D.AheadChunks && !D.AdlerSkips && !D.MD5Lookups && !D.PlaySkips) {
+  if (!D.Lookups && !D.Stores && !D.Written && !D.Dropped && !D.Failures && !D.AheadChunks && !D.AdlerSkips && !D.MD5Lookups && !D.PlaySkips && !D.Flushes) {
     return Learned::Line();
   }
   uint64_t Size, Waiting;
@@ -1774,14 +1871,22 @@ fextl::string StatsLine() {
   // hashing all of them. ahead = chunks the read-ahead thread read (direct = of those, read past the file cache; wasted =
   // dropped unused). uncached = reads and writes dropped from the file cache. adler = checks of a hit's output answered
   // without computing them. play = lookups while playing / of those left to the game (not in read-ahead memory) / their MB.
+  // flushed (build 91, FEX_UNPACK_CACHE_FLUSH) = batches of written data sent to storage and dropped / MB / ms starting the
+  // writes + waiting for them + dropping.
   fextl::string Out = fextl::fmt::format("  ucache lookups={} play={}/{}/{:.1f}MB key={:.1f}ms hit={}/{:.1f}MB/{:.1f}ms ram={}/{:.1f}ms disk={:.1f}ms verify={:.1f}ms "
                             "ahead={}/{:.1f}MB/{:.1f}ms direct={} wasted={} uncached={} adler={}/{:.1f}MB stored={}/{:.1f}MB/{:.1f}ms "
-                            "written={}/{:.1f}ms "
+                            "written={}/{:.1f}ms {}"
                             "waiting={:.1f}MB dropped={} failed={} size={}MB writer={}{} md5cache={}/{}/{:.1f}MB/{:.1f}ms stored={}\n",
                             D.Lookups, D.PlayLookups, D.PlaySkips, MB(D.PlaySkipBytes), Ms(D.KeyTicks), D.Hits, MB(D.HitBytes), Ms(D.HitTicks), D.RamHits, Ms(D.RamTicks), Ms(D.DiskTicks),
                             Ms(D.VerifyTicks), D.AheadChunks, MB(D.AheadBytes), Ms(D.AheadTicks), D.AheadDirect, D.AheadWasted,
                             D.CacheDrops, D.AdlerSkips, MB(D.AdlerSkipBytes), D.Stores, MB(D.StoreBytes), Ms(D.StoreTicks), D.Written,
-                            Ms(D.WriteTicks), MB(Waiting), D.Dropped, D.Failures, Size >> 20, WriterState.load(std::memory_order_relaxed),
+                            Ms(D.WriteTicks),
+                            D.Flushes || D.FlushStartTicks || D.FlushFailures ?
+                              fextl::fmt::format("flushed={}/{:.1f}MB/{:.1f}+{:.1f}+{:.1f}ms{} ", D.Flushes, MB(D.FlushBytes), Ms(D.FlushStartTicks),
+                                                 Ms(D.FlushWaitTicks), Ms(D.FlushDropTicks),
+                                                 D.FlushFailures ? fextl::fmt::format(" ({} failed)", D.FlushFailures) : fextl::string {}) :
+                              fextl::string {},
+                            MB(Waiting), D.Dropped, D.Failures, Size >> 20, WriterState.load(std::memory_order_relaxed),
                             TheCache->Full ? " full" : "", D.MD5Hits, D.MD5Lookups, MB(D.MD5HitBytes), Ms(D.MD5Ticks), D.MD5Stores);
   if (D.MainPlaySkips || D.LearnedHits || D.LearnedNotCached) {
     Out += fextl::fmt::format("  ucache main thread in play: left to the game {}/{:.1f}MB | learned streams: from the file cache {}/{:.1f}ms, "

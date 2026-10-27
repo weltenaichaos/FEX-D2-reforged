@@ -52,6 +52,12 @@ struct FEXUnpackCacheCounters {
   uint64_t LearnedTicks;
   uint64_t LearnedNotCached;  // learned streams that weren't there (then handled like any other hit)
   uint64_t LearnedNotCachedTicks;
+  uint64_t Flushes;         // build 91: batches of written data waited for and dropped (FEX_UNPACK_CACHE_FLUSH)
+  uint64_t FlushBytes;
+  uint64_t FlushStartTicks; // starting the writes to storage
+  uint64_t FlushWaitTicks;  // waiting for them
+  uint64_t FlushDropTicks;  // dropping the batch afterwards
+  uint64_t FlushFailures;
 };
 extern struct FEXUnpackCacheCounters FEXUnpackCacheStats;
 

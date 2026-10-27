@@ -15,6 +15,7 @@ namespace {
   constexpr int64_t NR_statfs = 43;
   constexpr int64_t NR_getdents64 = 61;
   constexpr int64_t NR_pread64 = 67;
+  constexpr int64_t NR_sync_file_range = 84;
   constexpr int64_t NR_readlinkat = 78;
   constexpr int64_t NR_newfstatat = 79;
   constexpr int64_t NR_sched_setaffinity = 122;
@@ -149,6 +150,12 @@ int OpenRead(const char* Path, bool Direct) {
 
 int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size) {
   return static_cast<int>(Syscall(NR_fadvise64, Fd, static_cast<int64_t>(Offset), static_cast<int64_t>(Size), POSIX_FADV_DONTNEED));
+}
+
+int WriteOut(int Fd, uint64_t Offset, uint64_t Size, bool Wait) {
+  // sync_file_range flags: WAIT_BEFORE 1, WRITE 2, WAIT_AFTER 4 (all three: the kernel writes with WB_SYNC_ALL, so no dirty
+  // page in the range is skipped).
+  return static_cast<int>(Syscall(NR_sync_file_range, Fd, static_cast<int64_t>(Offset), static_cast<int64_t>(Size), Wait ? 7 : 2));
 }
 
 int ReadAhead(int Fd, uint64_t Offset, uint64_t Size) {

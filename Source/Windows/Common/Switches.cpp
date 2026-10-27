@@ -111,6 +111,13 @@ namespace {
     // file cache at the start and at every loading screen (budget in MB). The same 105 ms frame unpacked 7.6 MB of
     // stored streams itself (20.9 ms) because they weren't in memory.
     {"FEX_UNPACK_CACHE_LEARN", "256"},
+    // Build 91: new unpack cache streams start on a page of their own and are written to storage in 8 MB batches, then
+    // dropped from the file cache. In the build 90 run the writer dropped each ~60 KB stream right after writing it,
+    // which only started its write, and the next stream's first page (shared, streams were 64 bytes apart) waited for
+    // that write: while a new area streamed in, ~2,400 streams a second took the writer a whole second of every second,
+    // up to 510 a second weren't stored, and the main thread's core ran other work up to 14,000 times a second (see
+    // ARM64EC/NativeUnpackCache.cpp).
+    {"FEX_UNPACK_CACHE_FLUSH", "1"},
     // Build 84: FEX's translated-code buffer starts at its full 128 MB, and is renewed at a loading screen once half used
     // (10% at the first three: start-up, menus, entering the game), rather than filling (and dropping all code) in play.
     // In the build 83 log every thread reloaded its code at once at 6:21, 5,301 blocks on the main thread in one second,
@@ -235,6 +242,7 @@ namespace {
     "FEX_UNPACK_CACHE_AHEAD",
     "FEX_UNPACK_CACHE_MAIN_PLAY",
     "FEX_UNPACK_CACHE_LEARN",
+    "FEX_UNPACK_CACHE_FLUSH",
     "FEX_CODE_BUFFER_START",
     "FEX_CODE_BUFFER_RENEW",
     "FEX_CODE_BUFFER_RENEW_EARLY",

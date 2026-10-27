@@ -22,6 +22,10 @@ int OpenRead(const char* Path, bool Direct);
 // Drops a range of a file from the kernel's file cache (posix_fadvise DONTNEED; pages not yet written are only queued
 // for writing). 0 or a negative errno.
 int DropFromFileCache(int Fd, uint64_t Offset, uint64_t Size);
+// Writes a range of a file's changed pages to storage (sync_file_range; any open file of it will do). Wait: also waits
+// for pages already being written and for these writes to finish, after which a drop takes the whole range; otherwise
+// the writes are only started. 0 or a negative errno.
+int WriteOut(int Fd, uint64_t Offset, uint64_t Size, bool Wait);
 // Asks storage for a range of a file now (posix_fadvise WILLNEED): the reads are queued and the call returns without
 // waiting for them. The kernel takes at most its read-ahead size per call (the device's read_ahead_kb, or its largest
 // request size), so a bigger range needs several calls. 0 or a negative errno.
