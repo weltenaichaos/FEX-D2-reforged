@@ -151,6 +151,7 @@ namespace {
   uint64_t Last[9][2] {};
   uint64_t BudgetLast[2] {}; // BudgetQueries, BudgetNs at the last report
   uint32_t BudgetLastReads {};
+  uint32_t LoopPrefetchLast[2] {}; // LoopPrefetchLoads, LoopPrefetchShaders at the last report
 
   bool ReadSlot(uint64_t RingCpu, uint32_t Index, uint32_t SlotSize, uint8_t* Out) {
     SIZE_T Read = 0;
@@ -175,6 +176,10 @@ namespace {
                                 !(Chan->Compile & T::CompilePreambleLoads) ? "off (FEX_TU_PREAMBLE_LOADS=0)" :
                                 Chan->Patch < 6                            ? "NOT available (driver older than fex6)" :
                                                                              "NOT honored";
+    const char* LoopPrefetch = (Status & T::StatusLoopPrefetch)               ? "ON" :
+                               !(Chan->Compile & T::CompileLoopPrefetch) ? "off (FEX_TU_LOOP_PREFETCH=0)" :
+                               Chan->Patch < 7                           ? "NOT available (driver older than fex7)" :
+                                                                           "NOT honored";
     const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
                              Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
@@ -192,10 +197,11 @@ namespace {
                                                                      "read at most every 250 ms (FEX_TU_BUDGET_CACHE=1)";
     FEX::Windows::StatsLogNote(fextl::fmt::format(
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
-      "preamble loads first {}, depth clears at the start of direct passes {}, available memory for the memory budget {}, {} of "
-      "{} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
+      "preamble loads first {}, list loops read ahead {}, depth clears at the start of direct passes {}, available memory for the "
+      "memory budget {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, DepthClear, Budget, Chan->CountersReserved,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, DepthClear, Budget,
+      Chan->CountersReserved,
       Chan->CounterCount,
       (Status & T::StatusNotKgsl) ? " (not KGSL)" : "", (Status & T::StatusRingFailed) ? ", ring allocation FAILED" : "",
       Chan->RingCount, Chan->SlotSize, Counters.empty() ? "-" : Counters));
@@ -466,6 +472,18 @@ namespace {
         Out += fextl::fmt::format("  turnip: memory budget queries {} | /proc/meminfo reads {} | {:.1f} us a query, {:.2f} ms this second\n",
                                   DQueries, DReads, static_cast<double>(DNs) / 1e3 / static_cast<double>(DQueries),
                                   static_cast<double>(DNs) / 1e6);
+      }
+    }
+
+    // List loops read ahead (fex7 and later): shaders compiled this second whose list reads moved one iteration ahead.
+    // Shaders from a cache are not counted, so a run after the first may show none.
+    if (Chan->Patch >= 7) {
+      const uint32_t Loads = Chan->LoopPrefetchLoads, Shaders = Chan->LoopPrefetchShaders;
+      if (Shaders != LoopPrefetchLast[1]) {
+        Out += fextl::fmt::format("  turnip: list loops read ahead in {} new shaders ({} list reads) | this run {} shaders ({} reads)\n",
+                                  Shaders - LoopPrefetchLast[1], Loads - LoopPrefetchLast[0], Shaders, Loads);
+        LoopPrefetchLast[0] = Loads;
+        LoopPrefetchLast[1] = Shaders;
       }
     }
 

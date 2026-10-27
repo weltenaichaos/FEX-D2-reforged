@@ -8,8 +8,9 @@
 # FEX's stats log, (fex2) early preambles for loads through push descriptor sets, (fex3)
 # start-of-pass depth clears as 3D draws in direct passes, (fex4) those draws without
 # fragment shader (fast Z), (fex5) a memory budget query that reads /proc/meminfo at most
-# every 250 ms and (fex6) shader preambles that issue their memory loads first and store each
-# value once. Without FEX's link the driver behaves like stock Turnip.
+# every 250 ms, (fex6) shader preambles that issue their memory loads first and store each
+# value once and (fex7) fragment shader list loops that read the next entry one iteration
+# ahead. Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
 name: Build Turnip (FEX)
@@ -23,7 +24,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex6
+  FEX_PATCH: fex7
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -129,7 +130,9 @@ jobs:
           strings "$so" | grep -q "fex pass ring"
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_depth_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 6" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 7" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "ir3_nir_fex_loop_prefetch" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir.c"
+          grep -q "tu_fex_count_loop_prefetch" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_shader.cc"
           grep -q "fex_preamble_loads_first" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_postsched.c"
           grep -q "ir3_nir_fex_dedupe_preamble_stores" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir.c"
           grep -q "tu_fex_available_memory" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_device.cc"
@@ -143,7 +146,7 @@ jobs:
           {
             "schemaVersion": 1,
             "name": "Turnip ${MESA_VERSION} FEX ${FEX_PATCH} (build ${{ github.run_number }})",
-            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets, preamble loads first, 3D (fast Z) depth clears and a cached memory budget via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
+            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets, preamble loads first, list loops read ahead, 3D (fast Z) depth clears and a cached memory budget via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
             "author": "FEX-D2-reforged",
             "packageVersion": "${{ github.run_number }}",
             "vendor": "Mesa",
@@ -200,6 +203,10 @@ jobs:
             fex6 (FEX build 92 and later, FEX_TU_PREAMBLE_LOADS=1): shader preambles issue their memory loads
             first and the constant buffer copies (ldc.k) right after them, so their waits overlap, and store
             each value once (D2R's lighting shaders: 5 waits -> 2, 243-253 -> 174-184 preamble instructions).
+            fex7 (FEX build 96 and later, FEX_TU_LOOP_PREFETCH=1): fragment shader loops that walk a list
+            (entry = list[i], then data at entry) read the next entry while the current one is worked on, so
+            the data reads and the next entry's read share one memory wait (D2R's lighting shaders: 4 light
+            and decal list loops each, same registers and waves); the driver counts the reads moved.
             Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

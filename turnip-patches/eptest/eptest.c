@@ -164,6 +164,6 @@ int main(int argc, char **argv) {
          }
       }
    }
-   if (getenv("EPTEST_FEX")) printf("fex link: status 0x%x patch %u driver '%s'\n", chan[0x1b0 / 4], chan[0x1b4 / 4], (char *)&chan[0x1c0 / 4]);
+   if (getenv("EPTEST_FEX")) printf("fex link: status 0x%x patch %u driver '%s' loop prefetch loads %u shaders %u\n", chan[0x1b0 / 4], chan[0x1b4 / 4], (char *)&chan[0x1c0 / 4], chan[0x1a8 / 4], chan[0x1ac / 4]);
    return 0;
 }

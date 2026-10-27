@@ -148,6 +148,14 @@ namespace FEX::Windows {
 //                          instructions. Register reads are only moved up when all of a preamble's reads fit in the
 //                          registers at once (else as stock). Read once at device creation and part of the shader
 //                          keys, so shaders are compiled anew once. 0 = stock order.
+//   FEX_TU_LOOP_PREFETCH=1  (the D2R default from build 96, driver fex7 and later) fragment shader loops that walk a
+//                          list (for each light: entry = list[i], then the light's data at entry) read the next entry
+//                          while the current one is worked on, carried to the next iteration, so the data reads and
+//                          the next entry's read share one memory wait instead of two waits one after the other. The
+//                          read before the loop is skipped when the loop doesn't run; the one read past the last entry
+//                          is bounds-checked by the descriptor and never used. Only read-only buffer loads whose
+//                          address is made from the loop counter and values from outside the loop. Read once at
+//                          device creation and part of the shader keys, so shaders are compiled anew once. 0 = stock.
 //   FEX_TU_DEPTH_CLEAR=alt (the D2R default in build 72, driver fex3 and later) a depth/stencil attachment cleared at the
 //                          start of a direct (sysmem) pass is cleared by one 3D draw through the depth unit (depth
 //                          test ALWAYS, like vkCmdClearAttachments inside a pass) instead of the 2D engine, in every

@@ -222,6 +222,16 @@ namespace {
     // value once: the 4 lighting shaders go from 5 waits and 243-253 preamble instructions to 2 waits and 174-184,
     // still early (checked on the PC with the game's shaders; each moved value checked to be the same).
     {"FEX_TU_PREAMBLE_LOADS", "1"},
+    // Build 96: in fights the main pass's lighting draws cost ~8 us each (build 95: 1,427 draws, 11.35 ms of the ~28 ms
+    // GPU frame), and the GPU only keeps about two draws' pixel work in flight, so each draw's cost is how long its
+    // pixels' shader runs. In the 4 lighting shaders that time is set by the light and decal list loops: per light the
+    // shader waits for the list entry (which light), then for the light's data at that entry, two memory round trips
+    // one after the other, before ~100 math instructions. More lights in a fight, more of these waits per pixel. FEX's
+    // Turnip fex7 reads the next light's list entry while the current light is worked on, so the light data and the
+    // next entry go out together and share one wait (one round trip per light instead of two). An empty list reads
+    // nothing (the first read is skipped when the loop doesn't run). Checked on the PC with the game's 4 shaders: 4
+    // list loops each, same registers (24) and waves per core (8), early preamble kept.
+    {"FEX_TU_LOOP_PREFETCH", "1"},
     // Build 72: in fights each frame draws two 4096x4096 shadow maps (and one 2048x2048), and each starts with a depth
     // clear that Turnip does with the GPU's 2D engine: ~1.1 ms per 4096 map at ~25 pixels per clock (the 'last tile
     // began' times of the pass meter), ~2.6 ms of the ~26 ms GPU frame. FEX's Turnip fex3 can clear them with one 3D draw
@@ -323,6 +333,7 @@ namespace {
     "FEX_TU_SAMPLE_DRAWS",
     "FEX_TU_EARLY_PREAMBLE",
     "FEX_TU_PREAMBLE_LOADS",
+    "FEX_TU_LOOP_PREFETCH",
     "FEX_TU_DEPTH_CLEAR",
     "FEX_TU_BUDGET_CACHE",
   };

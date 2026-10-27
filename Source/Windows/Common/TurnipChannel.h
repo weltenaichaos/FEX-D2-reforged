@@ -21,6 +21,9 @@
 //  - (fex6 and later) with CompilePreambleLoads in 'Compile', shader preambles issue their memory loads first (the
 //    ldc.k copies of constant buffer ranges included) and store each value once, so the preamble that runs ahead of
 //    every draw waits for memory fewer times.
+//  - (fex7 and later) with CompileLoopPrefetch in 'Compile', fragment shader loops that walk a list read the next
+//    entry while the current one is worked on (one memory wait per entry instead of two), and count the reads moved
+//    and the shaders that had any in 'LoopPrefetchLoads' / 'LoopPrefetchShaders'.
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -41,6 +44,7 @@ constexpr uint8_t SlotDepthClear = 0x80;
 
 constexpr uint32_t CompilePushSpeculate = 0x1;
 constexpr uint32_t CompilePreambleLoads = 0x2; // fex6 and later: preamble loads first, each value stored once
+constexpr uint32_t CompileLoopPrefetch = 0x4;  // fex7 and later: list loops read the next entry one iteration ahead
 
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
@@ -54,6 +58,7 @@ constexpr uint32_t StatusDepthClear3d = 0x100;  // fex3 and later: ModeDepthClea
 constexpr uint32_t StatusDepthClearFastZ = 0x200; // fex4 and later: ModeDepthClearFastZ honored (a7xx)
 constexpr uint32_t StatusBudgetCache = 0x400;     // fex5 and later: ModeBudgetCache honored
 constexpr uint32_t StatusPreambleLoads = 0x800;   // fex6 and later: CompilePreambleLoads honored
+constexpr uint32_t StatusLoopPrefetch = 0x1000;   // fex7 and later: CompileLoopPrefetch honored
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -88,7 +93,10 @@ struct Channel {
   // 0x1a0: written by FEX while the game runs
   volatile uint32_t Mode;
   volatile uint32_t BudgetReads; // 0x1a4 (fex5 and later, driver): /proc/meminfo reads by the memory budget query
-  uint32_t Reserved1[2];
+  // 0x1a8 (fex7 and later, driver): list reads moved one loop iteration ahead by this run's shader compiles (shaders
+  // from a cache are not counted), and the fragment shaders that had any
+  volatile uint32_t LoopPrefetchLoads;
+  volatile uint32_t LoopPrefetchShaders;
   // 0x1b0: written by the driver
   volatile uint32_t Status;
   uint32_t Patch;
@@ -146,6 +154,7 @@ static_assert(offsetof(Channel, CmdBufs) == 0x208);
 static_assert(offsetof(Channel, DepthClears) == 0x268);
 static_assert(offsetof(Channel, DepthClearsFastZ) == 0x288);
 static_assert(offsetof(Channel, BudgetReads) == 0x1a4);
+static_assert(offsetof(Channel, LoopPrefetchLoads) == 0x1a8);
 static_assert(offsetof(Channel, BudgetQueries) == 0x298);
 static_assert(sizeof(Channel) == 0x2a8);
 static_assert(sizeof(Slot) == 48);

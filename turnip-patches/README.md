@@ -114,3 +114,35 @@ Host check (fex6): `eptest/` with `EPTEST_FEX=1` (fex2 only) and `EPTEST_FEX=3` 
 the preamble const slots it reads, and every merged slot was stored from the same register in the
 fex2 build. A preamble-heavy test vertex shader (matrix products, not early) compiles the same as
 without fex6.
+
+- `0007-fex7-loop-prefetch.patch` (fex7, build 96): compile bit `TU_FEX_COMPILE_LOOP_PREFETCH` (0x4),
+  read once per device into `ir3_compiler_options::fex_loop_prefetch` and carried in
+  `tu_shader_key::fex_loop_prefetch` so shader hashes change with it.
+  - `ir3_nir_fex_loop_prefetch` (new file, run in `ir3_nir_lower_variant` before the cleanup
+    optimize loop that precedes `ir3_nir_opt_preamble`, fragment shaders only): in a loop with one
+    back edge and no continue construct, a scalar 32-bit `load_ssbo` that is read-only and
+    reorderable (not volatile/coherent), in one of the loop's own top-level blocks, whose address is
+    made only of this loop's header phis, values from outside the loop, ALU and descriptor handles
+    (`bindless_resource_ir3`), is read one iteration ahead: a copy with the phis' entry values goes
+    before the loop, a copy with the phis' next values (their back-edge sources, which must be made
+    the same way) goes where the load was, and a new header phi carries the value. Loads whose value
+    is used after the loop are left alone. When the loop starts with `if (c) break` and `c` is made
+    the same way, the copy before the loop is inside `if (!c)` (empty lists read nothing). The copy
+    in the last iteration reads one entry past the list; the descriptor's bounds check makes a read
+    past the buffer return 0, and the value is never used.
+  - Why: D2R's lighting shaders walk light and decal lists (`idx = list[(cluster << 8) + i]`, then 3-4
+    texel buffer fetches at `idx`): two dependent memory round trips per light, and the GPU keeps
+    about two draws' pixel work in flight, so the waves' latency sets the cost of each of the ~1,400
+    main pass draws in fights (build 95: 7.95 us a draw). Now the next entry's read goes out with the
+    light data's reads and shares their (sy) wait.
+  - Statistics: `loop_prefetch_loads` / `loop_prefetch_shaders` at 0x1a8 (were `reserved1`), counted
+    by fresh compiles only (`ir3_shader_variant::fex_loop_prefetches`). Status bit 0x1000.
+
+Host check (fex7): `eptest/` with `EPTEST_FEX=3` (fex2 + fex6) and `EPTEST_FEX=7` (+ fex7) on the 4
+lighting shaders: 4 loops each moved, Registers used 24 and Max Waves 8 unchanged, early preamble
+kept, NIR validation on (debugoptimized build); in the ir3 code the light loop's data fetches and the
+next entry's `isam` are issued together before one (sy) (stock: `isam` entry, (sy), data fetches,
+(sy)). `eptest/looptests/*.frag` (glslangValidator -V) are loop shapes for the pass: t1 for-loop
+(moved, guarded), t2 do-while whose entry is used after the loop (left), t3 do-while (moved, no guard),
+t4 nested lists (both moved), t5 conditional step (left), t6 continue (NIR folds it: moved), t7 break
+in the body (moved).

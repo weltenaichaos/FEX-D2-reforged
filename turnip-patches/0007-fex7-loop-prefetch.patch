@@ -1,0 +1,654 @@
+diff --git a/src/freedreno/ir3/ir3_compiler.h b/src/freedreno/ir3/ir3_compiler.h
+index 6411a28..d35fd26 100644
+--- a/src/freedreno/ir3/ir3_compiler.h
++++ b/src/freedreno/ir3/ir3_compiler.h
+@@ -36,6 +36,11 @@ struct ir3_compiler_options {
+     */
+    bool fex_preamble_loads_first;
+ 
++   /* FEX (fex7): in fragment shader loops, read list entries one iteration
++    * ahead (ir3_nir_fex_loop_prefetch.c).
++    */
++   bool fex_loop_prefetch;
++
+    /* If true, disable the shader cache. The driver is then responsible for
+     * caching.
+     */
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index a2de701..15c10e1 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1615,6 +1615,10 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
+ 
+    progress |= OPT(s, nir_opt_uub, &optimize_options.opt_uub_options);
+ 
++   /* FEX (fex7): before the cleanup, which merges the copies it makes. */
++   if (so->compiler->options.fex_loop_prefetch)
++      progress |= OPT(s, ir3_nir_fex_loop_prefetch, so);
++
+    /* Cleanup code leftover from lowering passes before opt_preamble */
+    if (progress) {
+       ir3_optimize_loop(so->compiler, &optimize_options, s);
+diff --git a/src/freedreno/ir3/ir3_nir.h b/src/freedreno/ir3/ir3_nir.h
+index b6a0cd3..d21da19 100644
+--- a/src/freedreno/ir3/ir3_nir.h
++++ b/src/freedreno/ir3/ir3_nir.h
+@@ -110,6 +110,7 @@ bool ir3_nir_can_lower_to_ldg_k(nir_intrinsic_instr *intrin);
+ bool ir3_nir_fixup_load_const_ir3(nir_shader *nir);
+ bool ir3_nir_opt_preamble(nir_shader *nir, struct ir3_shader_variant *v);
+ bool ir3_nir_fex_dedupe_preamble_stores(nir_shader *nir);
++bool ir3_nir_fex_loop_prefetch(nir_shader *nir, struct ir3_shader_variant *v);
+ bool ir3_nir_opt_prefetch_descriptors(nir_shader *nir, struct ir3_shader_variant *v);
+ bool ir3_nir_lower_preamble(nir_shader *nir, struct ir3_shader_variant *v);
+ 
+diff --git a/src/freedreno/ir3/ir3_nir_fex_loop_prefetch.c b/src/freedreno/ir3/ir3_nir_fex_loop_prefetch.c
+new file mode 100644
+index 0000000..ac0a4bb
+--- /dev/null
++++ b/src/freedreno/ir3/ir3_nir_fex_loop_prefetch.c
+@@ -0,0 +1,425 @@
++/*
++ * Copyright © 2026 FEX D2R project
++ * SPDX-License-Identifier: MIT
++ */
++
++/* FEX (fex7): read list entries one loop iteration ahead.
++ *
++ * D2R's lighting shaders walk per-cluster light and decal lists:
++ *
++ *    for (i = first; i < end; i++) {
++ *       idx  = list[cluster * 256 + i];          memory round trip 1
++ *       data = lights[idx], lights[idx + 1], ... memory round trip 2
++ *       ... about 100 ALU instructions ...
++ *    }
++ *
++ * Each light costs two memory round trips one after the other. Adreno keeps
++ * about two draws in flight per stage, so in scenes with many lights the
++ * waves' memory waits set the cost of every draw. This pass moves the list
++ * read one iteration ahead: the entry for the first iteration is read before
++ * the loop, and each iteration reads the entry for the next one, carried in
++ * a new loop header phi. The data reads and the next entry's read then go out
++ * together and share one wait.
++ *
++ * When the loop starts with "if (cond) break", the read before the loop runs
++ * only if the first iteration does, so empty lists read nothing. The read in
++ * the last iteration (for the iteration that never comes) is speculative:
++ * buffer loads on Adreno go through descriptors with bounds checks, so an
++ * index past the end reads zero instead of faulting, and the value is not
++ * used because the loop exits. It shares the wait of that iteration's data
++ * reads.
++ *
++ * Only loads whose address depends on nothing but this loop's header phis,
++ * values from outside the loop and plain arithmetic are moved, and only when
++ * the header phis' next values are made the same way, so both copies can be
++ * computed anywhere in the loop.
++ */
++
++#include "ir3_nir.h"
++
++#define LP_MAX_INSTRS 32
++#define LP_MAX_PHIS 8
++#define LP_MAX_DEPTH 24
++
++struct lp_loop {
++   nir_shader *shader;
++   nir_function_impl *impl;
++   nir_loop *loop;
++   nir_block *header;
++   nir_block *preheader;
++   nir_block *latch;
++   unsigned first_index, last_index;
++   /* "if (break_cond) break" (or its else form) right after the header,
++    * NULL if the loop does not start that way. */
++   nir_def *break_cond;
++   bool break_on_true;
++};
++
++/* In-loop instructions a value is made of, sources first. */
++struct lp_tree {
++   nir_instr *instrs[LP_MAX_INSTRS];
++   unsigned num_instrs;
++   nir_phi_instr *phis[LP_MAX_PHIS];
++   unsigned num_phis;
++};
++
++struct lp_collect_state {
++   const struct lp_loop *lp;
++   struct lp_tree *tree;
++   unsigned depth;
++};
++
++static bool lp_collect(const struct lp_loop *lp, nir_def *def,
++                       struct lp_tree *tree, unsigned depth);
++
++static bool
++lp_in_loop(const struct lp_loop *lp, nir_block *block)
++{
++   return block->index >= lp->first_index && block->index <= lp->last_index;
++}
++
++static bool
++lp_collect_src(nir_src *src, void *data)
++{
++   struct lp_collect_state *state = data;
++   return lp_collect(state->lp, src->ssa, state->tree, state->depth + 1);
++}
++
++/* Instructions that may be computed again anywhere in the loop: no memory
++ * access, no derivatives or subgroup operations. */
++static bool
++lp_can_copy(nir_instr *instr)
++{
++   switch (instr->type) {
++   case nir_instr_type_load_const:
++   case nir_instr_type_undef:
++   case nir_instr_type_alu:
++      return true;
++   case nir_instr_type_intrinsic: {
++      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++      /* Descriptor handle arithmetic, no memory access. */
++      if (intr->intrinsic == nir_intrinsic_bindless_resource_ir3)
++         return true;
++      if (nir_intrinsic_has_access(intr))
++         return false;
++      return nir_instr_can_speculate(instr);
++   }
++   default:
++      return false;
++   }
++}
++
++static bool
++lp_collect(const struct lp_loop *lp, nir_def *def, struct lp_tree *tree,
++           unsigned depth)
++{
++   nir_instr *instr = nir_def_instr(def);
++   if (!lp_in_loop(lp, instr->block))
++      return true;
++
++   if (instr->type == nir_instr_type_phi) {
++      if (instr->block != lp->header)
++         return false;
++      nir_phi_instr *phi = nir_instr_as_phi(instr);
++      for (unsigned i = 0; i < tree->num_phis; i++) {
++         if (tree->phis[i] == phi)
++            return true;
++      }
++      if (tree->num_phis == LP_MAX_PHIS)
++         return false;
++      tree->phis[tree->num_phis++] = phi;
++      return true;
++   }
++
++   for (unsigned i = 0; i < tree->num_instrs; i++) {
++      if (tree->instrs[i] == instr)
++         return true;
++   }
++
++   if (depth > LP_MAX_DEPTH || !lp_can_copy(instr))
++      return false;
++
++   struct lp_collect_state state = { lp, tree, depth };
++   if (!nir_foreach_src(instr, lp_collect_src, &state))
++      return false;
++
++   if (tree->num_instrs == LP_MAX_INSTRS)
++      return false;
++   tree->instrs[tree->num_instrs++] = instr;
++   return true;
++}
++
++/* Loads that read memory nothing in the shader writes, through a descriptor
++ * with bounds checks: read-only reorderable SSBO loads. Single 32-bit values
++ * only (list entries), so the value carried across the loop costs one
++ * register. */
++static bool
++lp_is_candidate(nir_instr *instr)
++{
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++
++   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++   if (intr->intrinsic != nir_intrinsic_load_ssbo ||
++       intr->def.num_components != 1 || intr->def.bit_size != 32)
++      return false;
++
++   enum gl_access_qualifier access = nir_intrinsic_access(intr);
++   if (access & (ACCESS_VOLATILE | ACCESS_COHERENT))
++      return false;
++   return (access & ACCESS_NON_WRITEABLE) && (access & ACCESS_CAN_REORDER);
++}
++
++static bool
++lp_uses_inside(const struct lp_loop *lp, nir_def *def)
++{
++   nir_foreach_use_including_if (src, def) {
++      nir_block *block;
++      if (nir_src_is_if(src)) {
++         nir_if *nif = nir_src_use_if(src);
++         block = nir_cf_node_as_block(nir_cf_node_prev(&nif->cf_node));
++      } else {
++         block = nir_src_use_instr(src)->block;
++      }
++      if (!lp_in_loop(lp, block))
++         return false;
++   }
++   return true;
++}
++
++static bool
++lp_is_break_block(nir_block *block)
++{
++   return exec_list_length(&block->instr_list) == 1 &&
++          nir_block_ends_in_break(block);
++}
++
++/* The loop's first test, if it starts with "if (c) break" or
++ * "if (c) {} else break" right after the header block. */
++static void
++lp_find_break(struct lp_loop *lp)
++{
++   nir_cf_node *next = nir_cf_node_next(&lp->header->cf_node);
++   if (!next || next->type != nir_cf_node_if)
++      return;
++
++   nir_if *nif = nir_cf_node_as_if(next);
++   nir_block *then_first = nir_if_first_then_block(nif);
++   nir_block *else_first = nir_if_first_else_block(nif);
++   bool then_break = then_first == nir_if_last_then_block(nif) &&
++                     lp_is_break_block(then_first);
++   bool else_break = else_first == nir_if_last_else_block(nif) &&
++                     lp_is_break_block(else_first);
++   if (then_break == else_break)
++      return;
++
++   lp->break_cond = nif->condition.ssa;
++   lp->break_on_true = then_break;
++}
++
++static nir_def *
++lp_copy(nir_builder *b, const struct lp_loop *lp, nir_instr *instr,
++        struct hash_table *map)
++{
++   nir_instr *copy = nir_instr_clone_deep(lp->shader, instr, map);
++   nir_builder_instr_insert(b, copy);
++   return nir_instr_def(copy);
++}
++
++static nir_def *
++lp_mapped(struct hash_table *map, nir_def *def)
++{
++   struct hash_entry *entry = _mesa_hash_table_search(map, def);
++   return entry ? entry->data : def;
++}
++
++/* After adding control flow: block indices again, the loop's range and its
++ * predecessor (the block after the new if). */
++static void
++lp_reindex(struct lp_loop *lp)
++{
++   nir_progress(true, lp->impl, nir_metadata_none);
++   nir_index_blocks(lp->impl);
++   lp->preheader = nir_loop_predecessor_block(lp->loop);
++   lp->first_index = lp->header->index;
++   lp->last_index = nir_loop_last_block(lp->loop)->index;
++}
++
++static bool
++lp_prefetch(struct lp_loop *lp, nir_instr *load)
++{
++   nir_def *def = nir_instr_def(load);
++
++   struct lp_tree tree = { 0 };
++   struct lp_collect_state state = { lp, &tree, 0 };
++   if (!nir_foreach_src(load, lp_collect_src, &state))
++      return false;
++
++   /* Loop invariant loads are not this pass's business. */
++   if (tree.num_phis == 0)
++      return false;
++
++   /* The next value of each header phi the address reads. */
++   struct lp_tree next[LP_MAX_PHIS];
++   for (unsigned i = 0; i < tree.num_phis; i++) {
++      memset(&next[i], 0, sizeof(next[i]));
++      nir_def *latch_src =
++         nir_phi_get_src_from_block(tree.phis[i], lp->latch)->src.ssa;
++      if (!lp_collect(lp, latch_src, &next[i], 0))
++         return false;
++   }
++
++   /* After the loop the original would hold the last iteration's value, the
++    * header phi the next one's. */
++   if (!lp_uses_inside(lp, def))
++      return false;
++
++   /* The first test, to skip the read before the loop for empty lists. */
++   struct lp_tree test = { 0 };
++   bool guard = lp->break_cond && lp_collect(lp, lp->break_cond, &test, 0);
++
++   /* First iteration: before the loop, with the phis' values on entry. */
++   nir_builder b = nir_builder_at(nir_after_block(lp->preheader));
++   struct hash_table *map = _mesa_pointer_hash_table_create(NULL);
++   nir_foreach_phi (phi, lp->header) {
++      _mesa_hash_table_insert(map, &phi->def,
++         nir_phi_get_src_from_block(phi, lp->preheader)->src.ssa);
++   }
++   nir_if *nif = NULL;
++   if (guard) {
++      for (unsigned i = 0; i < test.num_instrs; i++)
++         lp_copy(&b, lp, test.instrs[i], map);
++      nir_def *cond = lp_mapped(map, lp->break_cond);
++      nif = nir_push_if(&b, lp->break_on_true ? nir_inot(&b, cond) : cond);
++   }
++   for (unsigned i = 0; i < tree.num_instrs; i++)
++      lp_copy(&b, lp, tree.instrs[i], map);
++   nir_def *first = lp_copy(&b, lp, load, map);
++   _mesa_hash_table_destroy(map, NULL);
++   if (guard) {
++      nir_pop_if(&b, nif);
++      first = nir_if_phi(&b, first,
++                         nir_undef(&b, def->num_components, def->bit_size));
++      lp_reindex(lp);
++   }
++
++   /* Next iteration: where the load was, with the phis' next values. */
++   b.cursor = nir_before_instr(load);
++   struct hash_table *cur = _mesa_pointer_hash_table_create(NULL);
++   struct hash_table *next_map = _mesa_pointer_hash_table_create(NULL);
++   for (unsigned i = 0; i < tree.num_phis; i++) {
++      for (unsigned j = 0; j < next[i].num_instrs; j++) {
++         if (!_mesa_hash_table_search(cur, nir_instr_def(next[i].instrs[j])))
++            lp_copy(&b, lp, next[i].instrs[j], cur);
++      }
++      nir_def *latch_src =
++         nir_phi_get_src_from_block(tree.phis[i], lp->latch)->src.ssa;
++      _mesa_hash_table_insert(next_map, &tree.phis[i]->def,
++                              lp_mapped(cur, latch_src));
++   }
++   for (unsigned i = 0; i < tree.num_instrs; i++)
++      lp_copy(&b, lp, tree.instrs[i], next_map);
++   nir_def *ahead = lp_copy(&b, lp, load, next_map);
++   _mesa_hash_table_destroy(cur, NULL);
++   _mesa_hash_table_destroy(next_map, NULL);
++
++   nir_phi_instr *phi = nir_phi_instr_create(lp->shader);
++   nir_def_init(&phi->instr, &phi->def, def->num_components, def->bit_size);
++   nir_phi_instr_add_src(phi, lp->preheader, first);
++   nir_phi_instr_add_src(phi, lp->latch, ahead);
++   nir_instr_insert(nir_before_block(lp->header), &phi->instr);
++
++   nir_def_rewrite_uses(def, &phi->def);
++   nir_instr_remove(load);
++   return true;
++}
++
++static unsigned
++lp_loop(nir_function_impl *impl, nir_loop *loop)
++{
++   unsigned count = 0;
++
++   if (nir_loop_has_continue_construct(loop))
++      return 0;
++
++   struct lp_loop lp = {
++      .shader = impl->function->shader,
++      .impl = impl,
++      .loop = loop,
++      .header = nir_loop_first_block(loop),
++      .preheader = nir_loop_predecessor_block(loop),
++   };
++   lp.first_index = lp.header->index;
++   lp.last_index = nir_loop_last_block(loop)->index;
++
++   /* One back edge: the end of the body. */
++   if (nir_block_num_preds(lp.header) != 2)
++      return 0;
++   nir_foreach_pred (pred, lp.header) {
++      if (pred != lp.preheader)
++         lp.latch = pred;
++   }
++   if (!lp.latch || lp.latch != nir_loop_last_block(loop))
++      return 0;
++
++   lp_find_break(&lp);
++
++   /* Loads in the loop's own top-level blocks run in every iteration that
++    * gets that far, and dominate the back edge. */
++   foreach_list_typed (nir_cf_node, node, node, &loop->body) {
++      if (node->type != nir_cf_node_block)
++         continue;
++      nir_block *block = nir_cf_node_as_block(node);
++      nir_foreach_instr_safe (instr, block) {
++         if (lp_is_candidate(instr) && lp_prefetch(&lp, instr))
++            count++;
++      }
++   }
++
++   return count;
++}
++
++static unsigned
++lp_cf_list(nir_function_impl *impl, struct exec_list *list)
++{
++   unsigned count = 0;
++
++   foreach_list_typed (nir_cf_node, node, node, list) {
++      switch (node->type) {
++      case nir_cf_node_if: {
++         nir_if *nif = nir_cf_node_as_if(node);
++         count += lp_cf_list(impl, &nif->then_list);
++         count += lp_cf_list(impl, &nif->else_list);
++         break;
++      }
++      case nir_cf_node_loop: {
++         nir_loop *loop = nir_cf_node_as_loop(node);
++         count += lp_cf_list(impl, &loop->body);
++         count += lp_loop(impl, loop);
++         break;
++      }
++      default:
++         break;
++      }
++   }
++
++   return count;
++}
++
++bool
++ir3_nir_fex_loop_prefetch(nir_shader *shader, struct ir3_shader_variant *v)
++{
++   if (shader->info.stage != MESA_SHADER_FRAGMENT)
++      return false;
++
++   unsigned count = 0;
++   nir_foreach_function_impl (impl, shader) {
++      nir_index_blocks(impl);
++      unsigned n = lp_cf_list(impl, &impl->body);
++      count += n;
++      nir_progress(n > 0, impl, nir_metadata_none);
++   }
++
++   v->fex_loop_prefetches += count;
++   return count > 0;
++}
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index 70bdda3..72d6137 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -756,6 +756,11 @@ struct ir3_shader_variant {
+    /* Whether early preamble is enabled. */
+    bool early_preamble;
+ 
++   /* FEX (fex7): loads ir3_nir_fex_loop_prefetch moved one loop iteration
++    * ahead (not kept in the shader cache).
++    */
++   unsigned fex_loop_prefetches;
++
+    /* Size in bytes of required shared memory */
+    unsigned shared_size;
+ 
+diff --git a/src/freedreno/ir3/meson.build b/src/freedreno/ir3/meson.build
+index 6e94d2c..716864f 100644
+--- a/src/freedreno/ir3/meson.build
++++ b/src/freedreno/ir3/meson.build
+@@ -111,6 +111,7 @@ libfreedreno_ir3_files = files(
+   'ir3_nir_lower_tex_prefetch.c',
+   'ir3_nir_lower_layer_id.c',
+   'ir3_nir_opt_preamble.c',
++  'ir3_nir_fex_loop_prefetch.c',
+   'ir3_opt_predicates.c',
+   'ir3_postsched.c',
+   'ir3_preamble.c',
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 937bb84..00ad9a6 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3301,6 +3301,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+    /* fex6: read once with the FEX link; shader keys carry it (tu_pipeline.cc). */
+    device->compiler->options.fex_preamble_loads_first =
+       !!(tu_fex_compile(device->fex) & TU_FEX_COMPILE_PREAMBLE_LOADS);
++   device->compiler->options.fex_loop_prefetch =
++      !!(tu_fex_compile(device->fex) & TU_FEX_COMPILE_LOOP_PREFETCH);
+ 
+    *pDevice = tu_device_to_handle(device);
+    return VK_SUCCESS;
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index 1780d3c..7059a87 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -109,6 +109,8 @@ tu_fex_device_init(struct tu_device *dev)
+       status |= TU_FEX_STATUS_PUSH_SPECULATE;
+    if (fex->compile & TU_FEX_COMPILE_PREAMBLE_LOADS)
+       status |= TU_FEX_STATUS_PREAMBLE_LOADS;
++   if (fex->compile & TU_FEX_COMPILE_LOOP_PREFETCH)
++      status |= TU_FEX_STATUS_LOOP_PREFETCH;
+ 
+    chan->patch = TU_FEX_PATCH;
+    snprintf(chan->driver, sizeof(chan->driver), "Mesa " PACKAGE_VERSION " fex%d",
+@@ -345,6 +347,16 @@ tu_fex_count_depth_clear(struct tu_device *dev, bool draw, bool fastz, uint64_t
+    }
+ }
+ 
++void
++tu_fex_count_loop_prefetch(struct tu_device *dev, unsigned loads)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !loads)
++      return;
++   __atomic_fetch_add(&fex->chan->loop_prefetch_loads, loads, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&fex->chan->loop_prefetch_shaders, 1, __ATOMIC_RELAXED);
++}
++
+ static void
+ tu_fex_emit_read(struct tu_device *dev, struct tu_cs *cs, uint32_t reg,
+                  uint32_t reg_hi, uint64_t iova)
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 69210c1..c2ac11d 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -37,7 +37,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 6
++#define TU_FEX_PATCH 7
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -85,7 +85,13 @@
+  * lighting shaders 5 waits and 122 stores became 2 and 58 (249 -> 180
+  * instructions). Part of the shader keys (tu_shader_key::fex_preamble_loads). */
+ #define TU_FEX_COMPILE_PREAMBLE_LOADS 0x2u
+-#define TU_FEX_COMPILE_MASK 0x3u
++/* fex7: fragment shader loops read list entries one iteration ahead
++ * (ir3_nir_fex_loop_prefetch.c): in D2R's lighting shaders each light waited
++ * for its list entry and then for the light data, two memory round trips one
++ * after the other; now the entry for the next light is read while the current
++ * one is worked on. Part of the shader keys (tu_shader_key::fex_loop_prefetch). */
++#define TU_FEX_COMPILE_LOOP_PREFETCH 0x4u
++#define TU_FEX_COMPILE_MASK 0x7u
+ 
+ /* tu_fex_channel::status bits (driver) */
+ #define TU_FEX_STATUS_ATTACHED 0x1u      /* a device read the channel */
+@@ -100,6 +106,7 @@
+ #define TU_FEX_STATUS_DEPTH_CLEAR_FASTZ 0x200u /* TU_FEX_MODE_DEPTH_CLEAR_FASTZ honored (fex4, a7xx) */
+ #define TU_FEX_STATUS_BUDGET_CACHE 0x400u /* TU_FEX_MODE_BUDGET_CACHE honored (fex5) */
+ #define TU_FEX_STATUS_PREAMBLE_LOADS 0x800u /* TU_FEX_COMPILE_PREAMBLE_LOADS honored (fex6) */
++#define TU_FEX_STATUS_LOOP_PREFETCH 0x1000u /* TU_FEX_COMPILE_LOOP_PREFETCH honored (fex7) */
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -124,7 +131,11 @@ struct tu_fex_channel {
+    volatile uint32_t mode; /* TU_FEX_MODE_* for command buffers begun from now on */
+    /* 0x1a4 (fex5, driver): /proc/meminfo reads by the memory budget query */
+    volatile uint32_t budget_reads;
+-   uint32_t reserved1[2];
++   /* 0x1a8 (fex7, driver): loads moved one loop iteration ahead by shader
++    * compiles of this run (not counted for shaders from a cache), and the
++    * fragment shaders that had any */
++   volatile uint32_t loop_prefetch_loads;
++   volatile uint32_t loop_prefetch_shaders;
+    /* 0x1b0: written by the driver */
+    volatile uint32_t status; /* TU_FEX_STATUS_* */
+    uint32_t patch;           /* TU_FEX_PATCH */
+@@ -194,6 +205,7 @@ static_assert(__builtin_offsetof(struct tu_fex_channel, cmdbufs) == 0x208, "layo
+ static_assert(__builtin_offsetof(struct tu_fex_channel, depth_clears) == 0x268, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, depth_clears_fastz) == 0x288, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, budget_reads) == 0x1a4, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, loop_prefetch_loads) == 0x1a8, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, budget_queries) == 0x298, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_channel) == 0x2a8, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
+@@ -255,6 +267,7 @@ uint32_t tu_fex_begin_cmdbuf(struct tu_device *dev);
+ void tu_fex_count_desc(struct tu_device *dev, uint32_t mode, uint32_t sets_flushed);
+ void tu_fex_count_push(struct tu_device *dev, uint32_t mode, bool reused);
+ void tu_fex_count_depth_clear(struct tu_device *dev, bool draw, bool fastz, uint64_t pixels);
++void tu_fex_count_loop_prefetch(struct tu_device *dev, unsigned loads);
+ 
+ /* fex5: the available system memory for the memory budget (bytes), as
+  * os_get_available_system_memory, but read at most every 250 ms while FEX's
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index a15b9e6..794fa0e 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -21,6 +21,7 @@
+ #include "ir3/ir3_nir.h"
+ #include "tu_descriptor_set.h"
+ #include "tu_device.h"
++#include "tu_fex.h"
+ #include "tu_lrz.h"
+ #include "tu_pipeline.h"
+ #include "tu_rmv.h"
+@@ -3740,6 +3741,8 @@ tu_shader_create(struct tu_device *dev,
+ 
+    shader->variant =
+       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
++   if (shader->variant)
++      tu_fex_count_loop_prefetch(dev, shader->variant->fex_loop_prefetches);
+ 
+    if (ir3_exceeds_safe_constlen(shader->variant)) {
+       struct ir3_shader_key safe_constlen_key = *ir3_key;
+@@ -4111,6 +4114,7 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
+ 
+    /* fex6: every pipeline key is made here (graphics and compute). */
+    key->fex_preamble_loads = dev->compiler->options.fex_preamble_loads_first;
++   key->fex_loop_prefetch = dev->compiler->options.fex_loop_prefetch;
+ }
+ 
+ void
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 6aa2410..b1acb9f 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -143,7 +143,9 @@ struct tu_shader_key {
+    bool emulate_alpha_to_coverage : 1;
+    /* fex6: TU_FEX_COMPILE_PREAMBLE_LOADS, so the shader hash changes with it. */
+    bool fex_preamble_loads : 1;
+-   uint32_t padding : 22;
++   /* fex7: TU_FEX_COMPILE_LOOP_PREFETCH, likewise. */
++   bool fex_loop_prefetch : 1;
++   uint32_t padding : 21;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 
