@@ -171,6 +171,10 @@ namespace {
                                 !(Chan->Compile & T::CompilePushSpeculate) ? "off (FEX_TU_EARLY_PREAMBLE=0)" :
                                 Chan->Patch < 2                            ? "NOT available (driver older than fex2)" :
                                                                              "NOT honored";
+    const char* PreambleLoads = (Status & T::StatusPreambleLoads)              ? "ON" :
+                                !(Chan->Compile & T::CompilePreambleLoads) ? "off (FEX_TU_PREAMBLE_LOADS=0)" :
+                                Chan->Patch < 6                            ? "NOT available (driver older than fex6)" :
+                                                                             "NOT honored";
     const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
                              Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
@@ -188,10 +192,11 @@ namespace {
                                                                      "read at most every 250 ms (FEX_TU_BUDGET_CACHE=1)";
     FEX::Windows::StatsLogNote(fextl::fmt::format(
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
-      "depth clears at the start of direct passes {}, available memory for the memory budget {}, {} of {} GPU counters "
-      "reserved{}{}; ring {}x{} bytes; counters: {}",
+      "preamble loads first {}, depth clears at the start of direct passes {}, available memory for the memory budget {}, {} of "
+      "{} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, DepthClear, Budget, Chan->CountersReserved, Chan->CounterCount,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, DepthClear, Budget, Chan->CountersReserved,
+      Chan->CounterCount,
       (Status & T::StatusNotKgsl) ? " (not KGSL)" : "", (Status & T::StatusRingFailed) ? ", ring allocation FAILED" : "",
       Chan->RingCount, Chan->SlotSize, Counters.empty() ? "-" : Counters));
   }

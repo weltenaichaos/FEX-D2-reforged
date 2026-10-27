@@ -139,6 +139,15 @@ namespace FEX::Windows {
 //                          copies); bindings not pushed since the push set's layout changed read as empty (null
 //                          descriptors). The driver reads it once at device creation; it is part of the shaders' cache
 //                          key, so shaders are compiled anew once. 0 = stock.
+//   FEX_TU_PREAMBLE_LOADS=1  (the D2R default from build 92, driver fex6 and later) shader preambles issue their memory
+//                          reads first, the constant buffer copies (ldc.k) right after them, and store each value
+//                          once. The early preamble runs as one thread ahead of each draw's pixels, so nothing hides
+//                          its waits: stock Turnip gave the lighting shaders 5 separate waits (the 11 copies last, an
+//                          ordering rule kept them behind every constant store) and stored 24 values up to four
+//                          times (122 stores for 58 values); fex6 makes it 2 waits and 174-184 instead of 243-253
+//                          instructions. Register reads are only moved up when all of a preamble's reads fit in the
+//                          registers at once (else as stock). Read once at device creation and part of the shader
+//                          keys, so shaders are compiled anew once. 0 = stock order.
 //   FEX_TU_DEPTH_CLEAR=alt (the D2R default in build 72, driver fex3 and later) a depth/stencil attachment cleared at the
 //                          start of a direct (sysmem) pass is cleared by one 3D draw through the depth unit (depth
 //                          test ALWAYS, like vkCmdClearAttachments inside a pass) instead of the 2D engine, in every

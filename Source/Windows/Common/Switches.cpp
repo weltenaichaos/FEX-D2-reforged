@@ -203,6 +203,15 @@ namespace {
     // FEX's Turnip fex2 treats push sets as written (unpushed slots read as empty), and the preamble shrinks to ~250
     // branch-free instructions that run early (checked on the PC with the game's 4 lighting shaders).
     {"FEX_TU_EARLY_PREAMBLE", "1"},
+    // Build 92: in fights the main pass's lighting draws are ~41% of the GPU frame (10.7 ms for ~1,200 draws), and each
+    // draw first waits for its early preamble, which runs as one thread ahead of the draw's pixels. Turnip's compiler
+    // placed that preamble's memory reads in 5 separate waits, with its 11 constant buffer copies (ldc.k) last, because
+    // an ordering rule keeps them after every constant store and its scheduler issues reads only when nothing else is
+    // left; it also stored 24 values up to four times (122 stores for 58 values). FEX's Turnip fex6 issues the reads
+    // first and the copies right after (they overlap the math instead of adding a wait at the end), and stores each
+    // value once: the 4 lighting shaders go from 5 waits and 243-253 preamble instructions to 2 waits and 174-184,
+    // still early (checked on the PC with the game's shaders; each moved value checked to be the same).
+    {"FEX_TU_PREAMBLE_LOADS", "1"},
     // Build 72: in fights each frame draws two 4096x4096 shadow maps (and one 2048x2048), and each starts with a depth
     // clear that Turnip does with the GPU's 2D engine: ~1.1 ms per 4096 map at ~25 pixels per clock (the 'last tile
     // began' times of the pass meter), ~2.6 ms of the ~26 ms GPU frame. FEX's Turnip fex3 can clear them with one 3D draw
@@ -300,6 +309,7 @@ namespace {
     "FEX_TU_COUNTERS",
     "FEX_TU_SAMPLE_DRAWS",
     "FEX_TU_EARLY_PREAMBLE",
+    "FEX_TU_PREAMBLE_LOADS",
     "FEX_TU_DEPTH_CLEAR",
     "FEX_TU_BUDGET_CACHE",
   };

@@ -87,3 +87,30 @@ decode the dump with `cffdump`.
   - Statistics: `budget_reads` at 0x1a4 (was `reserved1[0]`), `budget_queries` and `budget_ns`
     (time spent getting the available memory, file reads included) at 0x298 (were `reserved2`);
     status bit 0x400. Host check (noop drm shim): 10 us per query reading the file, 0.05 us cached.
+
+- `0006-fex6-preamble-loads-first.patch` (fex6, build 92): compile bit `TU_FEX_COMPILE_PREAMBLE_LOADS`
+  (0x2), read once per device into `ir3_compiler_options::fex_preamble_loads_first` and carried in
+  `tu_shader_key::fex_preamble_loads` so shader hashes change with it.
+  - `copy_ubo_to_uniform` puts the ldc.k copies of UBO ranges at the start of the preamble (stock:
+    the end). `ir3_sched_add_deps` orders every ldc.k after all earlier stc (both write consts), so
+    at the end they could only go last.
+  - `ir3_sched` (pre-RA), preamble blocks: ldc.k/ldg.k and their a1.x writes first; register loads
+    first only when all of the block's register loads fit in 28 components at once and the running
+    estimate of live values stays within 32 (the early preamble may only use the 32 shared
+    registers; a preamble short of registers anyway keeps the stock order).
+  - `ir3_postsched`, preamble blocks: ready register loads first (same budget, only when they need
+    no nops or sync of their own), then, once the first (sy) consumer is placed, the ldc.k chain
+    with at least 3 other instructions between a1.x writes and reads when there are any.
+  - `ir3_nir_fex_dedupe_preamble_stores` (before `ir3_nir_lower_preamble`): after CSE, a second
+    `store_preamble` of the same 32-bit or 1-bit def is dropped and the main shader's
+    `load_preamble` of its slot reads the first slot.
+  - Why: the a7xx early preamble runs as one wave ahead of each draw's pixel waves. In D2R's 4
+    lighting shaders it had 5 (sy) waits (the 11 ldc.k last, then a final wait) and 122 stc for 58
+    values; with fex6 2 waits and 58 stc, 243-253 -> 174-184 preamble instructions, still early.
+  - Status bit 0x800.
+
+Host check (fex6): `eptest/` with `EPTEST_FEX=1` (fex2 only) and `EPTEST_FEX=3` (fex2 + fex6) on the
+4 lighting shaders: (sy) count, stc count, 'Early preamble'; the main shader's code differs only in
+the preamble const slots it reads, and every merged slot was stored from the same register in the
+fex2 build. A preamble-heavy test vertex shader (matrix products, not early) compiles the same as
+without fex6.

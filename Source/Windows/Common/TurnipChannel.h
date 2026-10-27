@@ -18,6 +18,9 @@
 //  - (fex5 and later) with ModeBudgetCache, the memory budget query (vkGetPhysicalDeviceMemoryProperties2 with
 //    VK_EXT_memory_budget) reads /proc/meminfo at most every 250 ms instead of on every call, and counts the queries,
 //    the file reads and their time.
+//  - (fex6 and later) with CompilePreambleLoads in 'Compile', shader preambles issue their memory loads first (the
+//    ldc.k copies of constant buffer ranges included) and store each value once, so the preamble that runs ahead of
+//    every draw waits for memory fewer times.
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -37,6 +40,7 @@ constexpr uint32_t ModeBudgetCache = 0x10;    // fex5 and later: /proc/meminfo r
 constexpr uint8_t SlotDepthClear = 0x80;
 
 constexpr uint32_t CompilePushSpeculate = 0x1;
+constexpr uint32_t CompilePreambleLoads = 0x2; // fex6 and later: preamble loads first, each value stored once
 
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
@@ -49,6 +53,7 @@ constexpr uint32_t StatusPushSpeculate = 0x80; // fex2 and later: CompilePushSpe
 constexpr uint32_t StatusDepthClear3d = 0x100;  // fex3 and later: ModeDepthClear3d honored (a7xx)
 constexpr uint32_t StatusDepthClearFastZ = 0x200; // fex4 and later: ModeDepthClearFastZ honored (a7xx)
 constexpr uint32_t StatusBudgetCache = 0x400;     // fex5 and later: ModeBudgetCache honored
+constexpr uint32_t StatusPreambleLoads = 0x800;   // fex6 and later: CompilePreambleLoads honored
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;

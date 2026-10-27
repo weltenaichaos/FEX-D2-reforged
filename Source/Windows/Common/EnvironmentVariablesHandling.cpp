@@ -355,6 +355,11 @@ namespace {
     // FEX_TU_EARLY_PREAMBLE: 1 (default) = loads through push descriptor sets (vkd3d's root constant buffers) may run
     // in the early preamble, ahead of the draw (driver fex2 and later); 0 = stock.
     Chan->Compile = SwitchOff(Switch("FEX_TU_EARLY_PREAMBLE")) ? 0 : Turnip::CompilePushSpeculate;
+    // FEX_TU_PREAMBLE_LOADS: 1 (default) = preambles issue their memory loads first and store each value once (driver
+    // fex6 and later); 0 = stock order.
+    if (!SwitchOff(Switch("FEX_TU_PREAMBLE_LOADS"))) {
+      Chan->Compile |= Turnip::CompilePreambleLoads;
+    }
 
     const auto Text = fextl::fmt::format("{:x}", reinterpret_cast<uintptr_t>(Chan));
     auto WineSetEnv = reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv);
@@ -366,11 +371,14 @@ namespace {
     }
     TurnipChannelPtr = Chan;
     StatsLogNote(fextl::fmt::format("turnip: FEX link TU_FEX_CHANNEL={} set: descriptor fix {}, early preamble for root constant "
-                                    "buffers {}, depth clears at pass start {}, memory budget {}, {} GPU counters asked for, passes "
-                                    "with {}+ draws timed and counted; only FEX's Turnip build (fex1 and later) answers, a '# turnip: "
-                                    "driver' note follows once it did",
+                                    "buffers {}, preamble loads first {}, depth clears at pass start {}, memory budget {}, {} GPU "
+                                    "counters asked for, passes with {}+ draws timed and counted; only FEX's Turnip build (fex1 and "
+                                    "later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
-                                    Chan->Compile ? "asked for (FEX_TU_EARLY_PREAMBLE=1, driver fex2 and later)" : "off (FEX_TU_EARLY_PREAMBLE=0)",
+                                    (Chan->Compile & Turnip::CompilePushSpeculate) ? "asked for (FEX_TU_EARLY_PREAMBLE=1, driver fex2 and later)" :
+                                                                                     "off (FEX_TU_EARLY_PREAMBLE=0)",
+                                    (Chan->Compile & Turnip::CompilePreambleLoads) ? "asked for (FEX_TU_PREAMBLE_LOADS=1, driver fex6 and later)" :
+                                                                                     "off (FEX_TU_PREAMBLE_LOADS=0)",
                                     TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
                                                             "in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
                                     TurnipDepthClear == 3 ? "by a 3D draw without fragment shader (fast Z, FEX_TU_DEPTH_CLEAR=fastz, "

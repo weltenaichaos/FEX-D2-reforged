@@ -1,0 +1,619 @@
+diff --git a/src/freedreno/ir3/ir3_compiler.h b/src/freedreno/ir3/ir3_compiler.h
+index d274335..6411a28 100644
+--- a/src/freedreno/ir3/ir3_compiler.h
++++ b/src/freedreno/ir3/ir3_compiler.h
+@@ -31,6 +31,11 @@ struct ir3_compiler_options {
+     */
+    bool push_ubo_with_preamble;
+ 
++   /* FEX (fex6): schedule preamble loads (ldc, ldc.k) as early as the
++    * preamble's registers allow, so their waits overlap.
++    */
++   bool fex_preamble_loads_first;
++
+    /* If true, disable the shader cache. The driver is then responsible for
+     * caching.
+     */
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index ac29692..a2de701 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1660,6 +1660,10 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
+    if (so->shader_options.push_consts_type == IR3_PUSH_CONSTS_SHARED_PREAMBLE)
+       progress |= OPT(s, ir3_nir_lower_push_consts_to_preamble, so);
+ 
++   /* FEX (fex6): before lowering, while loads and stores still name slots. */
++   if (so->compiler->options.fex_preamble_loads_first)
++      progress |= OPT(s, ir3_nir_fex_dedupe_preamble_stores);
++
+    progress |= OPT(s, ir3_nir_lower_preamble, so);
+ 
+    progress |= OPT(s, nir_lower_amul, ir3_glsl_type_size);
+diff --git a/src/freedreno/ir3/ir3_nir.h b/src/freedreno/ir3/ir3_nir.h
+index 4e9cff9..b6a0cd3 100644
+--- a/src/freedreno/ir3/ir3_nir.h
++++ b/src/freedreno/ir3/ir3_nir.h
+@@ -109,6 +109,7 @@ bool ir3_nir_lower_const_global_loads(nir_shader *nir, struct ir3_shader_variant
+ bool ir3_nir_can_lower_to_ldg_k(nir_intrinsic_instr *intrin);
+ bool ir3_nir_fixup_load_const_ir3(nir_shader *nir);
+ bool ir3_nir_opt_preamble(nir_shader *nir, struct ir3_shader_variant *v);
++bool ir3_nir_fex_dedupe_preamble_stores(nir_shader *nir);
+ bool ir3_nir_opt_prefetch_descriptors(nir_shader *nir, struct ir3_shader_variant *v);
+ bool ir3_nir_lower_preamble(nir_shader *nir, struct ir3_shader_variant *v);
+ 
+diff --git a/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c b/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
+index 3a1a41d..0c43e7c 100644
+--- a/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
++++ b/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
+@@ -428,7 +428,8 @@ copy_global_to_uniform(nir_shader *nir, struct ir3_ubo_analysis_state *state)
+ }
+ 
+ static bool
+-copy_ubo_to_uniform(nir_shader *nir, const struct ir3_const_state *const_state)
++copy_ubo_to_uniform(nir_shader *nir, const struct ir3_const_state *const_state,
++                    bool loads_first)
+ {
+    const struct ir3_ubo_analysis_state *state = &const_state->ubo_state;
+ 
+@@ -436,7 +437,12 @@ copy_ubo_to_uniform(nir_shader *nir, const struct ir3_const_state *const_state)
+       return false;
+ 
+    nir_function_impl *preamble = nir_shader_get_preamble(nir);
+-   nir_builder _b = nir_builder_at(nir_after_impl(preamble));
++   /* FEX (fex6): with loads first, put the copies at the start of the
++    * preamble. ir3_sched keeps an ldc.k after every stc that comes before it
++    * (both write consts), so copies placed at the end can only go last.
++    */
++   nir_builder _b = nir_builder_at(loads_first ? nir_before_impl(preamble)
++                                               : nir_after_impl(preamble));
+    nir_builder *b = &_b;
+ 
+    for (unsigned i = 0; i < state->num_enabled; i++) {
+@@ -741,7 +747,8 @@ ir3_nir_lower_ubo_loads(nir_shader *nir, struct ir3_shader_variant *v)
+    }
+ 
+    if (compiler->has_preamble && push_ubos)
+-      progress |= copy_ubo_to_uniform(nir, const_state);
++      progress |= copy_ubo_to_uniform(
++         nir, const_state, compiler->options.fex_preamble_loads_first);
+ 
+    return progress;
+ }
+diff --git a/src/freedreno/ir3/ir3_nir_opt_preamble.c b/src/freedreno/ir3/ir3_nir_opt_preamble.c
+index 53bce13..57266e2 100644
+--- a/src/freedreno/ir3/ir3_nir_opt_preamble.c
++++ b/src/freedreno/ir3/ir3_nir_opt_preamble.c
+@@ -320,6 +320,100 @@ ir3_nir_opt_preamble(nir_shader *nir, struct ir3_shader_variant *v)
+    return progress;
+ }
+ 
++/* FEX (fex6): store each preamble value once.
++ *
++ * nir_opt_preamble gives every moved definition its own const slot. When the
++ * main shader computes the same uniform value in several places that do not
++ * dominate each other (for example once per unrolled light), the preamble
++ * ends up storing one value to several slots: the D2R lighting shader writes
++ * many values four times. After CSE those stores share a source, so keep the
++ * first store and point the other slots' loads at it. Only 32-bit and 1-bit
++ * values: 16-bit slots may be promoted to float per slot when lowered.
++ */
++bool
++ir3_nir_fex_dedupe_preamble_stores(nir_shader *nir)
++{
++   nir_function_impl *main = nir_shader_get_entrypoint(nir);
++   if (!main->preamble)
++      return false;
++
++   nir_function_impl *preamble = main->preamble->impl;
++
++   /* Equal values must share a definition. */
++   nir_opt_cse(nir);
++
++   unsigned slots = 0;
++   nir_foreach_block (block, preamble) {
++      nir_foreach_instr (instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++         if (intrin->intrinsic != nir_intrinsic_store_preamble)
++            continue;
++         slots = MAX2(slots, nir_intrinsic_base(intrin) +
++                                intrin->src[0].ssa->num_components *
++                                   DIV_ROUND_UP(intrin->src[0].ssa->bit_size, 32));
++      }
++   }
++   if (slots == 0)
++      return false;
++
++   int *remap = malloc(slots * sizeof(int));
++   if (!remap)
++      return false;
++   for (unsigned i = 0; i < slots; i++)
++      remap[i] = -1;
++
++   struct hash_table *first = _mesa_pointer_hash_table_create(NULL);
++   bool progress = false;
++
++   nir_foreach_block (block, preamble) {
++      nir_foreach_instr_safe (instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++         if (intrin->intrinsic != nir_intrinsic_store_preamble)
++            continue;
++
++         nir_def *src = intrin->src[0].ssa;
++         if (src->bit_size != 32 && src->bit_size != 1)
++            continue;
++
++         struct hash_entry *entry = _mesa_hash_table_search(first, src);
++         if (!entry) {
++            _mesa_hash_table_insert(first, src, intrin);
++            continue;
++         }
++
++         nir_intrinsic_instr *kept = entry->data;
++         remap[nir_intrinsic_base(intrin)] = nir_intrinsic_base(kept);
++         nir_instr_remove(instr);
++         progress = true;
++      }
++   }
++
++   if (progress) {
++      nir_foreach_block (block, main) {
++         nir_foreach_instr (instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++            if (intrin->intrinsic != nir_intrinsic_load_preamble)
++               continue;
++            unsigned base = nir_intrinsic_base(intrin);
++            if (base < slots && remap[base] >= 0)
++               nir_intrinsic_set_base(intrin, remap[base]);
++         }
++      }
++   }
++
++   _mesa_hash_table_destroy(first, NULL);
++   free(remap);
++
++   nir_progress(progress, preamble, nir_metadata_control_flow);
++   return nir_progress(progress, main, nir_metadata_control_flow);
++}
++
+ /* This isn't nearly as comprehensive as what's done in nir_opt_preamble, but in
+  * various use-cases we need to hoist definitions into preambles outside of
+  * opt_preamble. Currently we only handle a few uncomplicated intrinsics.
+diff --git a/src/freedreno/ir3/ir3_postsched.c b/src/freedreno/ir3/ir3_postsched.c
+index f46dddf..1c587bf 100644
+--- a/src/freedreno/ir3/ir3_postsched.c
++++ b/src/freedreno/ir3/ir3_postsched.c
+@@ -51,6 +51,14 @@ struct ir3_postsched_ctx {
+    struct dag *dag;
+ 
+    struct list_head unscheduled_list; /* unscheduled instructions */
++
++   /* FEX (fex6): the current block is part of the preamble and loads go
++    * first there (see choose_instr_preamble_load).
++    */
++   bool preamble_loads_first;
++   bool preamble_hoist_regs;  /* all register loads of the block fit at once */
++   bool preamble_waited;      /* an instruction with (sy) was scheduled */
++   unsigned since_a1;         /* instructions since the last a1.x write/read */
+ };
+ 
+ struct ir3_postsched_node {
+@@ -114,6 +122,15 @@ schedule(struct ir3_postsched_ctx *ctx, struct ir3_instruction *instr)
+ 
+    di(instr, "schedule");
+ 
++   if (ctx->preamble_loads_first && !is_meta(instr)) {
++      if (instr->flags & IR3_INSTR_SY)
++         ctx->preamble_waited = true;
++      if (writes_addr1(instr) || reads_addr1(instr))
++         ctx->since_a1 = 0;
++      else
++         ctx->since_a1++;
++   }
++
+    struct ir3_postsched_node *n = instr->data;
+ 
+    list_addtail(&instr->node, &instr->block->instr_list);
+@@ -197,6 +214,91 @@ dump_state(struct ir3_postsched_ctx *ctx)
+    }
+ }
+ 
++static bool
++is_const_push(struct ir3_instruction *instr)
++{
++   return instr->opc == OPC_LDC_K || instr->opc == OPC_LDG_K;
++}
++
++/* FEX (fex6): in the preamble, loads go first.
++ *
++ * The preamble runs once per draw as a single wave and the draw's pixel
++ * waves wait for it, so nothing hides its memory latency. First every load
++ * into a register (they only depend on immediates), so the first (sy) wait
++ * covers all of them; only when all of the block's register loads fit at
++ * once (as in ir3_sched) and the load needs no nops or sync of its own.
++ * Then, once that wait has been scheduled, the ldc.k
++ * const pushes with their a1.x writes, early enough that their memory time
++ * overlaps the ALU work instead of adding a wait at the end. In the early
++ * preamble each a1.x write and read needs an (ss) sync, so a few other
++ * instructions are placed between them when there are any.
++ */
++#define FEX_PREAMBLE_A1_GAP 3
++#define FEX_PREAMBLE_LOAD_REGS 28
++
++static struct ir3_postsched_node *
++choose_instr_preamble_load(struct ir3_postsched_ctx *ctx)
++{
++   struct ir3_postsched_node *chosen = NULL;
++
++   if (!ctx->preamble_loads_first)
++      return NULL;
++
++   bool loads_left = false;
++   foreach_sched_node (n, &ctx->dag->heads) {
++      if (!is_sy_producer(n->instr))
++         continue;
++      loads_left = true;
++      /* Not when it would cost nops or a sync of its own here. */
++      if (!ctx->preamble_hoist_regs || n->delay ||
++          (n->instr->flags & (IR3_INSTR_SS | IR3_INSTR_SY)))
++         continue;
++      if (!chosen || chosen->max_delay < n->max_delay)
++         chosen = n;
++   }
++   if (chosen)
++      return chosen;
++
++   /* Register loads still waiting on something: let them come first. */
++   if (!loads_left) {
++      foreach_instr (instr, &ctx->unscheduled_list) {
++         if (is_sy_producer(instr)) {
++            loads_left = true;
++            break;
++         }
++      }
++   }
++
++   if (loads_left || !ctx->preamble_waited) {
++      /* With no register loads at all there is no wait to come first. */
++      bool any_load = loads_left;
++      foreach_instr (instr, &ctx->block->instr_list) {
++         if (is_sy_producer(instr)) {
++            any_load = true;
++            break;
++         }
++      }
++      if (any_load)
++         return NULL;
++   }
++
++   bool others = false;
++   foreach_sched_node (n, &ctx->dag->heads) {
++      struct ir3_instruction *instr = n->instr;
++      if (!is_const_push(instr) && !writes_addr1(instr)) {
++         others = true;
++         continue;
++      }
++      if (!chosen || chosen->max_delay < n->max_delay)
++         chosen = n;
++   }
++
++   if (chosen && others && ctx->since_a1 < FEX_PREAMBLE_A1_GAP)
++      return NULL;
++
++   return chosen;
++}
++
+ /* find instruction to schedule: */
+ static struct ir3_instruction *
+ choose_instr(struct ir3_postsched_ctx *ctx)
+@@ -249,6 +351,12 @@ choose_instr(struct ir3_postsched_ctx *ctx)
+       return chosen->instr;
+    }
+ 
++   chosen = choose_instr_preamble_load(ctx);
++   if (chosen) {
++      di(chosen->instr, "fex: chose (preamble load)");
++      return chosen->instr;
++   }
++
+    /* Next prioritize discards: */
+    foreach_sched_node (n, &ctx->dag->heads) {
+       unsigned d = node_delay(ctx, n);
+@@ -753,6 +861,20 @@ sched_block(struct ir3_postsched_ctx *ctx, struct ir3_block *block)
+ 
+    sched_dag_init(ctx);
+ 
++   /* FEX (fex6): see choose_instr_preamble_load. */
++   if (ctx->preamble_loads_first) {
++      unsigned load_regs = 0;
++      foreach_instr (instr, &ctx->unscheduled_list) {
++         if (!is_sy_producer(instr))
++            continue;
++         foreach_dst (dst, instr) {
++            if (!(dst->flags & IR3_REG_DUMMY))
++               load_regs += reg_elems(dst);
++         }
++      }
++      ctx->preamble_hoist_regs = load_regs <= FEX_PREAMBLE_LOAD_REGS;
++   }
++
+    /* First schedule all meta:input instructions, followed by
+     * tex-prefetch.  We want all of the instructions that load
+     * values into registers before the shader starts to go
+@@ -856,8 +978,24 @@ ir3_postsched(struct ir3 *ir, struct ir3_shader_variant *v)
+       block->data = NULL;
+    }
+ 
++   /* FEX (fex6): blocks between the start block and the first block after
++    * the preamble are the preamble.
++    */
++   bool loads_first = ir->compiler->options.fex_preamble_loads_first &&
++                      ir3_has_preamble(ir);
++   struct ir3_block *start = ir3_start_block(ir);
++   struct ir3_block *after = ir3_after_preamble(ir);
++   bool in_preamble = false;
++
+    foreach_block (block, &ir->block_list) {
++      if (block == after)
++         in_preamble = false;
++      ctx.preamble_loads_first = loads_first && in_preamble;
++      ctx.preamble_waited = false;
++      ctx.since_a1 = FEX_PREAMBLE_A1_GAP;
+       sched_block(&ctx, block);
++      if (block == start)
++         in_preamble = true;
+    }
+ 
+    ralloc_free(ctx.mem_ctx);
+diff --git a/src/freedreno/ir3/ir3_sched.c b/src/freedreno/ir3/ir3_sched.c
+index 3f7bb6f..0f1c74f 100644
+--- a/src/freedreno/ir3/ir3_sched.c
++++ b/src/freedreno/ir3/ir3_sched.c
+@@ -102,6 +102,14 @@ struct ir3_sched_ctx {
+     */
+    int sy_index, first_outstanding_sy_index;
+    int ss_index, first_outstanding_ss_index;
++
++   /* FEX (fex6): the current block is part of the preamble and loads go
++    * first there; live_regs is a running estimate of the values the
++    * preamble holds in registers (scalar components).
++    */
++   bool preamble_loads_first;
++   bool preamble_hoist_regs; /* all register loads fit at once */
++   int live_regs;
+ };
+ 
+ struct ir3_sched_node {
+@@ -246,6 +254,9 @@ cycle_count(struct ir3_instruction *instr)
+    }
+ }
+ 
++static int live_effect(struct ir3_instruction *instr);
++static unsigned new_regs(struct ir3_instruction *instr);
++
+ static void
+ schedule(struct ir3_sched_ctx *ctx, struct ir3_instruction *instr)
+ {
+@@ -303,6 +314,9 @@ schedule(struct ir3_sched_ctx *ctx, struct ir3_instruction *instr)
+       }
+    }
+ 
++   if (ctx->preamble_loads_first)
++      ctx->live_regs += live_effect(instr);
++
+    instr->flags |= IR3_INSTR_MARK;
+ 
+    di(instr, "schedule");
+@@ -889,6 +903,60 @@ choose_instr_prio(struct ir3_sched_ctx *ctx, struct ir3_sched_notes *notes)
+    return NULL;
+ }
+ 
++/* FEX (fex6): in the preamble, issue loads as early as possible.
++ *
++ * The preamble runs once per draw as a single wave, ahead of the draw's
++ * pixel waves, so nothing hides its memory latency: every (sy) wait is a
++ * full round trip the whole draw waits for. The usual heuristics place
++ * loads late (they add live values) and the ldc.k UBO pushes last (no
++ * consumers), which gives a chain of separate waits. Here the ldc.k pushes
++ * and the a1.x writes they need go first. Loads into registers go first
++ * only when all of the block's register loads fit at once in a budget the
++ * preamble's registers can hold (the early preamble may only use the 32
++ * shared registers): hoisting the loads of a preamble that is short of
++ * registers anyway (matrix products) only adds spills and waits.
++ */
++#define FEX_PREAMBLE_LOAD_BUDGET 28
++#define FEX_PREAMBLE_LIVE_BUDGET 32
++
++static struct ir3_sched_node *
++choose_instr_preamble_load(struct ir3_sched_ctx *ctx,
++                           struct ir3_sched_notes *notes)
++{
++   struct ir3_sched_node *chosen = NULL;
++
++   if (!ctx->preamble_loads_first)
++      return NULL;
++
++   foreach_sched_node (n, &ctx->dag->heads) {
++      struct ir3_instruction *instr = n->instr;
++
++      /* ldc.k/ldg.k write consts, not registers: no sy producers. */
++      bool push = instr->opc == OPC_LDC_K || instr->opc == OPC_LDG_K;
++      if (!push && !is_sy_producer(instr) && !writes_addr1(instr))
++         continue;
++
++      if (is_sy_producer(instr)) {
++         if (!ctx->preamble_hoist_regs)
++            continue;
++         int live = live_effect(instr);
++         if (live > 0 && ctx->live_regs + live > FEX_PREAMBLE_LIVE_BUDGET)
++            continue;
++      }
++
++      if (!check_instr(ctx, notes, instr))
++         continue;
++
++      if (!chosen || chosen->max_delay < n->max_delay)
++         chosen = n;
++   }
++
++   if (chosen)
++      di(chosen->instr, "fex: chose (preamble load)");
++
++   return chosen;
++}
++
+ static void
+ dump_state(struct ir3_sched_ctx *ctx)
+ {
+@@ -919,6 +987,10 @@ choose_instr(struct ir3_sched_ctx *ctx, struct ir3_sched_notes *notes)
+    if (chosen)
+       return chosen->instr;
+ 
++   chosen = choose_instr_preamble_load(ctx, notes);
++   if (chosen)
++      return chosen->instr;
++
+    chosen = choose_instr_dec(ctx, notes, true);
+    if (chosen)
+       return chosen->instr;
+@@ -1194,12 +1266,17 @@ sched_block(struct ir3_sched_ctx *ctx, struct ir3_block *block)
+ 
+    ctx->remaining_kills = 0;
+    ctx->remaining_tex = 0;
++   unsigned load_regs = 0;
+    foreach_instr_safe (instr, &ctx->unscheduled_list) {
+       if (is_kill_or_demote(instr))
+          ctx->remaining_kills++;
+-      if (is_sy_producer(instr))
++      if (is_sy_producer(instr)) {
+          ctx->remaining_tex++;
++         load_regs += new_regs(instr);
++      }
+    }
++   ctx->preamble_hoist_regs = ctx->preamble_loads_first &&
++                              load_regs <= FEX_PREAMBLE_LOAD_BUDGET;
+ 
+    /* First schedule all meta:input and meta:phi instructions, followed by
+     * tex-prefetch.  We want all of the instructions that load values into
+@@ -1300,8 +1377,23 @@ ir3_sched(struct ir3 *ir)
+    ir3_clear_mark(ir);
+    ir3_find_ssa_uses(ir, ctx, false);
+ 
++   /* FEX (fex6): blocks between the start block and the first block after
++    * the preamble are the preamble.
++    */
++   bool loads_first = ir->compiler->options.fex_preamble_loads_first &&
++                      ir3_has_preamble(ir);
++   struct ir3_block *start = ir3_start_block(ir);
++   struct ir3_block *after = ir3_after_preamble(ir);
++   bool in_preamble = false;
++
+    foreach_block (block, &ir->block_list) {
++      if (block == after)
++         in_preamble = false;
++      ctx->preamble_loads_first = loads_first && in_preamble;
++      ctx->live_regs = 0;
+       sched_block(ctx, block);
++      if (block == start)
++         in_preamble = true;
+    }
+ 
+    int ret = ctx->error ? -1 : 0;
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index e5c5a4d..937bb84 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3298,6 +3298,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+    device->vis_stream_count = 0;
+ 
+    tu_fex_device_init(device);
++   /* fex6: read once with the FEX link; shader keys carry it (tu_pipeline.cc). */
++   device->compiler->options.fex_preamble_loads_first =
++      !!(tu_fex_compile(device->fex) & TU_FEX_COMPILE_PREAMBLE_LOADS);
+ 
+    *pDevice = tu_device_to_handle(device);
+    return VK_SUCCESS;
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index b0bb344..1780d3c 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -107,6 +107,8 @@ tu_fex_device_init(struct tu_device *dev)
+    fex->compile = chan->compile & TU_FEX_COMPILE_MASK;
+    if (fex->compile & TU_FEX_COMPILE_PUSH_SPECULATE)
+       status |= TU_FEX_STATUS_PUSH_SPECULATE;
++   if (fex->compile & TU_FEX_COMPILE_PREAMBLE_LOADS)
++      status |= TU_FEX_STATUS_PREAMBLE_LOADS;
+ 
+    chan->patch = TU_FEX_PATCH;
+    snprintf(chan->driver, sizeof(chan->driver), "Mesa " PACKAGE_VERSION " fex%d",
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index f8d179e..69210c1 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -37,7 +37,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 5
++#define TU_FEX_PATCH 6
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -78,7 +78,14 @@
+  * vkd3d root constant buffers of D3D12 games need. Bindings never pushed since
+  * the set's layout changed are null descriptors (zeroed), so such a load reads 0. */
+ #define TU_FEX_COMPILE_PUSH_SPECULATE 0x1u
+-#define TU_FEX_COMPILE_MASK 0x1u
++/* fex6: shader preambles issue their memory loads first (ir3_sched and
++ * ir3_postsched), the ldc.k pushes of UBO ranges included, and store each
++ * value once (ir3_nir_fex_dedupe_preamble_stores). The early preamble runs as
++ * one wave ahead of each draw, so its memory waits are not hidden: in D2R's
++ * lighting shaders 5 waits and 122 stores became 2 and 58 (249 -> 180
++ * instructions). Part of the shader keys (tu_shader_key::fex_preamble_loads). */
++#define TU_FEX_COMPILE_PREAMBLE_LOADS 0x2u
++#define TU_FEX_COMPILE_MASK 0x3u
+ 
+ /* tu_fex_channel::status bits (driver) */
+ #define TU_FEX_STATUS_ATTACHED 0x1u      /* a device read the channel */
+@@ -92,6 +99,7 @@
+ #define TU_FEX_STATUS_DEPTH_CLEAR_3D 0x100u /* TU_FEX_MODE_DEPTH_CLEAR_3D honored (fex3, a7xx) */
+ #define TU_FEX_STATUS_DEPTH_CLEAR_FASTZ 0x200u /* TU_FEX_MODE_DEPTH_CLEAR_FASTZ honored (fex4, a7xx) */
+ #define TU_FEX_STATUS_BUDGET_CACHE 0x400u /* TU_FEX_MODE_BUDGET_CACHE honored (fex5) */
++#define TU_FEX_STATUS_PREAMBLE_LOADS 0x800u /* TU_FEX_COMPILE_PREAMBLE_LOADS honored (fex6) */
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 0c79d5d..a15b9e6 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -4108,6 +4108,9 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
+ 
+    key->api_wavesize = api_wavesize;
+    key->real_wavesize = real_wavesize;
++
++   /* fex6: every pipeline key is made here (graphics and compute). */
++   key->fex_preamble_loads = dev->compiler->options.fex_preamble_loads_first;
+ }
+ 
+ void
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index e729d44..6aa2410 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -141,7 +141,9 @@ struct tu_shader_key {
+    bool lower_view_index_to_device_index : 1;
+    bool custom_resolve : 1;
+    bool emulate_alpha_to_coverage : 1;
+-   uint32_t padding : 23;
++   /* fex6: TU_FEX_COMPILE_PREAMBLE_LOADS, so the shader hash changes with it. */
++   bool fex_preamble_loads : 1;
++   uint32_t padding : 22;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 
