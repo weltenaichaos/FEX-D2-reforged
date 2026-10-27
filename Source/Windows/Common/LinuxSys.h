@@ -85,6 +85,19 @@ struct SchedStat {
 bool ReadSchedStat(const char* Path, SchedStat& Out);
 // The same from a schedstat file kept open (read again from its start).
 bool PreadSchedStat(int Fd, SchedStat& Out);
+// The calling thread's own use so far (getrusage RUSAGE_THREAD): CPU time in user and kernel mode, page faults (major =
+// read from storage), 512-byte blocks it had read from storage (its own reads and readahead it started), and how many
+// times it went to sleep (voluntary) or lost its CPU (involuntary).
+struct ThreadUsage {
+  uint64_t UserUs;
+  uint64_t SystemUs;
+  uint64_t MinorFaults;
+  uint64_t MajorFaults;
+  uint64_t InBlocks;
+  uint64_t Voluntary;
+  uint64_t Involuntary;
+};
+bool GetThreadUsage(ThreadUsage& Out);
 // How many times a thread gave up its CPU to wait (voluntary_ctxt_switches) and how many times another task took it while it
 // could run (nonvoluntary_ctxt_switches), from its status file ("/proc/self/task/<tid>/status").
 bool ReadContextSwitches(const char* StatusPath, uint64_t& Voluntary, uint64_t& Involuntary);

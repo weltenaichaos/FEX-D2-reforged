@@ -46,7 +46,10 @@ namespace {
     // PriorityGuard.h). In the build 86 log busy scenes had the main thread polling for their jobs ~12 ms a frame while
     // each of the 4 workers waited 85-150 ms a second for a CPU. D2R asks for HIGHEST for them (nice -5); FEX_PRIO=normal
     // put them at 0.
-    {"FEX_WORKER_NICE", "alt"},
+    // Build 88: at -10 all the time. Over 23 windows of each half in the build 87 run the raised workers waited 158 ms a
+    // second for a CPU against 271, lost their CPU 498 times a second against 2,438, the main thread polled for their jobs
+    // 35 ms a second against 44 (38 against 82 in the busiest stretch), and play had 98 slow game frames against 130.
+    {"FEX_WORKER_NICE", "-10"},
     // Build 51: the main thread may leave its core while it waits 40 ms a second or more for it (see PriorityGuard.h).
     {"FEX_MAINCORE_WAIT", "40"},
     // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
@@ -116,7 +119,9 @@ namespace {
     // requests at once instead of one read-ahead window after another). In the build 82-86 logs the main thread's cold
     // reads went at ~180 MB/s, and one 3968 KB read at an area's entry took 18-23 ms in every run (see
     // ARM64EC/GameFiles.cpp).
-    {"FEX_GAME_FILES_AHEAD", "256"},
+    // Build 88: off. In the build 87 log the same read took 17.4 ms (25.1 at another spot), still ~230 MB/s, and asking
+    // cost ~1 ms each time. Build 88 times what those reads do instead ('slow main' details, 'storage clock' lines).
+    {"FEX_GAME_FILES_AHEAD", "0"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the

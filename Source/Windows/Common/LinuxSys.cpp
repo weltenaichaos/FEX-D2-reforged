@@ -23,6 +23,8 @@ namespace {
   constexpr int64_t NR_getpid = 172;
   constexpr int64_t NR_getuid = 174;
   constexpr int64_t NR_gettid = 178;
+  constexpr int64_t NR_getrusage = 165;
+  constexpr int64_t RUSAGE_THREAD = 1;
   constexpr int64_t NR_fadvise64 = 223;
 
   constexpr int64_t AT_FDCWD = -100;
@@ -365,6 +367,23 @@ bool PreadSchedStat(int Fd, SchedStat& Out) {
   Buffer[Len] = 0;
   const char* P = Buffer;
   return ParseU64(P, Out.RunNs) && ParseU64(P, Out.WaitNs) && ParseU64(P, Out.Slices);
+}
+
+bool GetThreadUsage(ThreadUsage& Out) {
+  // struct rusage of arm64 Linux: ru_utime and ru_stime (timeval: seconds, microseconds), then 14 longs: maxrss, ixrss,
+  // idrss, isrss, minflt, majflt, nswap, inblock, oublock, msgsnd, msgrcv, nsignals, nvcsw, nivcsw.
+  int64_t Buffer[18] {};
+  if (Syscall(NR_getrusage, RUSAGE_THREAD, reinterpret_cast<intptr_t>(Buffer)) != 0) {
+    return false;
+  }
+  Out.UserUs = static_cast<uint64_t>(Buffer[0] * 1'000'000 + Buffer[1]);
+  Out.SystemUs = static_cast<uint64_t>(Buffer[2] * 1'000'000 + Buffer[3]);
+  Out.MinorFaults = static_cast<uint64_t>(Buffer[8]);
+  Out.MajorFaults = static_cast<uint64_t>(Buffer[9]);
+  Out.InBlocks = static_cast<uint64_t>(Buffer[11]);
+  Out.Voluntary = static_cast<uint64_t>(Buffer[16]);
+  Out.Involuntary = static_cast<uint64_t>(Buffer[17]);
+  return true;
 }
 
 bool ReadContextSwitches(const char* StatusPath, uint64_t& Voluntary, uint64_t& Involuntary) {

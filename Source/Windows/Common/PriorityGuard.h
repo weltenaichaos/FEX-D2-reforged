@@ -142,7 +142,10 @@ namespace FEX::Windows {
 //   FEX_WORKER_NICE=alt  the workers at nice -10 in every other 10 s window (seconds 1-10, 21-30, ... of the stats log,
 //                      the same windows as its frames10s lines), at nice 0 (FEX_PRIO=normal; else their own) in the
 //                      others: one run compares both. "alt-5" uses -5. The D2R default in build 87.
-//   FEX_WORKER_NICE=N    keep them at nice N
+//   FEX_WORKER_NICE=N    keep them at nice N (the D2R default -10 from build 88: in build 87's comparison the raised
+//                      workers waited 42% less for a CPU, lost it 80% less often, the main thread polled 20% less for
+//                      their jobs, and play had a quarter fewer slow game frames; the wineserver waited 86 ms a second
+//                      for a CPU against 54, with no change in frame times or lag)
 //   FEX_WORKER_NICE=off  leave them to Wine and FEX_PRIO
 //
 // A worker is a thread other than the main thread that calls the job system's getter (every queue operation does); loader

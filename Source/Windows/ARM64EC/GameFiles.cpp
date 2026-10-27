@@ -136,6 +136,19 @@ namespace {
     uint64_t At; // counter ticks
   };
 
+  // Build 88: what the main thread's thread did during one of its reads (getrusage RUSAGE_THREAD before and after), and
+  // the storage's clock before and after (MHz, 0 = unknown). The build 87 log had the main thread's big reads of game data
+  // at ~230 MB/s whether or not storage was asked for the whole range first.
+  struct ReadUsage {
+    bool Have;
+    float CpuMs; // user + kernel
+    float SystemMs;
+    uint32_t StorageKB; // read from storage by this thread (its reads and the readahead they started)
+    uint32_t MinorFaults, MajorFaults;
+    uint32_t Slept, Preempted;
+    uint32_t ClockBeforeMHz, ClockAfterMHz;
+  };
+
   struct SlowRead {
     int32_t Watch;
     uint32_t OffsetMB;
@@ -143,6 +156,7 @@ namespace {
     float Ms;
     uint8_t Bucket;
     bool Kept;
+    ReadUsage U;
   };
 
   // Per second, under ReadLock.
@@ -161,6 +175,8 @@ namespace {
     // Build 87: the main thread's reads asked ahead (FEX_GAME_FILES_AHEAD), their bytes, the time the asking took, its
     // calls, and the reads' own wait.
     uint64_t AheadReads, AheadBytes, AheadAskTicks, AheadCalls, AheadReadTicks, AheadLongest;
+    // Build 88: the main thread's reads of watched files measured: CPU time during them, KB it read from storage.
+    uint64_t MainMeasured, MainCpuUs, MainStorageKB;
     SlowRead Slow[MaxSlowReads];
     size_t SlowCount;
     uint64_t SlowMore;
@@ -421,6 +437,7 @@ namespace {
   }
 
   fextl::string StorageReadAhead(const char* Path);
+  void FindStorageClock();
 
   // The kernel's file cache ("Cached") and the device's available memory ("MemAvailable") from /proc/meminfo, in KB; 0
   // when unreadable.
@@ -532,6 +549,9 @@ namespace {
     if (ReadWatchOn) {
       FEX::Windows::StatsLogNote(fextl::fmt::format("game files: reads followed in {} of {} files ({} MB pieces)", WatchedCount.load(),
                                                     FileCount, PiecesUsed));
+    }
+    if (ReadWatchOn) {
+      FindStorageClock();
     }
     if (AheadMin) {
       const fextl::string Device = Folder.empty() ? fextl::string("game folder not found") : StorageReadAhead(Folder.c_str());
@@ -650,7 +670,10 @@ namespace {
   }
 
   // A finished (or, Queued, started) read of Bytes at Offset of File by this thread, which waited Ticks for it.
-  void NoteRead(HANDLE File, uint64_t Offset, bool HaveOffset, uint64_t Bytes, bool Queued, uint64_t Ticks, uint64_t Start) {
+  uint32_t StorageClockMHz();
+
+  void NoteRead(HANDLE File, uint64_t Offset, bool HaveOffset, uint64_t Bytes, bool Queued, uint64_t Ticks, uint64_t Start,
+                ReadUsage* Usage = nullptr) {
     if (!Bytes) {
       return;
     }
@@ -734,11 +757,19 @@ namespace {
         R.MainKeptBytes += Bytes;
         R.MainKeptTicks += Ticks;
       }
+      if (Usage && Usage->Have) {
+        ++R.MainMeasured;
+        R.MainCpuUs += static_cast<uint64_t>(Usage->CpuMs * 1000.0f);
+        R.MainStorageKB += Usage->StorageKB;
+      }
       const double Ms = static_cast<double>(Ticks) * 1000.0 / static_cast<double>(CounterFreq);
       if (Ms >= SlowReadMs) {
         if (R.SlowCount < MaxSlowReads) {
-          R.Slow[R.SlowCount++] = {Index, static_cast<uint32_t>(Offset >> 20), static_cast<uint32_t>(Bytes >> 10), static_cast<float>(Ms),
-                                   FirstBucket, AllKept};
+          if (Usage && Usage->Have) {
+            Usage->ClockAfterMHz = StorageClockMHz();
+          }
+          R.Slow[R.SlowCount++] = {Index,     static_cast<uint32_t>(Offset >> 20), static_cast<uint32_t>(Bytes >> 10), static_cast<float>(Ms),
+                                   FirstBucket, AllKept, Usage ? *Usage : ReadUsage {}};
         } else {
           ++R.SlowMore;
         }
@@ -838,6 +869,150 @@ namespace {
     return fextl::fmt::format("device {}:{}, read-ahead {}, largest request {}", Major, Minor, Text(ReadAheadKB), Text(MaxSectorsKB));
   }
 
+  // Build 88: the storage controller's clock (UFS on the Thor), from its devfreq device: cur_freq now, and trans_stat's
+  // time at each clock for a per-second split. Found by FEXFileCache at start; empty when there is none or it can't be
+  // read.
+  char ClockDir[128];
+  std::atomic<bool> ClockOn {};
+  constexpr size_t MaxClocks = 16;
+  struct ClockTimes {
+    size_t Count;
+    uint64_t Hz[MaxClocks];
+    uint64_t Ms[MaxClocks];
+    uint64_t Changes;
+  };
+  ClockTimes PrevClock {}; // stats log thread only
+  bool HavePrevClock {};
+
+  uint32_t StorageClockMHz() {
+    if (!ClockOn.load(std::memory_order_acquire)) {
+      return 0;
+    }
+    char Path[160];
+    snprintf(Path, sizeof(Path), "%s/cur_freq", ClockDir);
+    char Text[32];
+    if (FEX::Windows::Linux::ReadSmallFile(Path, Text, sizeof(Text)) <= 0) {
+      return 0;
+    }
+    return static_cast<uint32_t>(strtoull(Text, nullptr, 10) / 1'000'000);
+  }
+
+  // trans_stat: "*  37500000:  0  5  ...  12345" rows (the last number is the time at that clock in ms), then "Total
+  // transition : N".
+  bool ReadClockTimes(ClockTimes& Out) {
+    char Path[160];
+    snprintf(Path, sizeof(Path), "%s/trans_stat", ClockDir);
+    char Text[2048];
+    if (FEX::Windows::Linux::ReadSmallFile(Path, Text, sizeof(Text)) <= 0) {
+      return false;
+    }
+    Out = {};
+    for (const char* Line = Text; Line && *Line;) {
+      const char* End = strchr(Line, '\n');
+      const char* P = Line;
+      while (*P == ' ' || *P == '*') {
+        ++P;
+      }
+      char* After {};
+      const uint64_t Hz = strtoull(P, &After, 10);
+      if (After != P && *After == ':' && Out.Count < MaxClocks) {
+        // The last number on the line.
+        uint64_t Last {};
+        for (const char* Q = After + 1; Q < (End ? End : Q + strlen(Q));) {
+          char* Next {};
+          const uint64_t V = strtoull(Q, &Next, 10);
+          if (Next == Q) {
+            break;
+          }
+          Last = V;
+          Q = Next;
+        }
+        Out.Hz[Out.Count] = Hz;
+        Out.Ms[Out.Count] = Last;
+        ++Out.Count;
+      } else if (const char* Total = strstr(Line, "Total transition"); Total && (!End || Total < End)) {
+        if (const char* Colon = strchr(Total, ':')) {
+          Out.Changes = strtoull(Colon + 1, nullptr, 10);
+        }
+      }
+      Line = End ? End + 1 : nullptr;
+    }
+    return Out.Count > 0;
+  }
+
+  // Once a second: the time at each clock since the last second, printed when Show.
+  fextl::string StorageClockLine(bool Show) {
+    if (!ClockOn.load(std::memory_order_acquire)) {
+      return {};
+    }
+    ClockTimes Now {};
+    if (!ReadClockTimes(Now)) {
+      return {};
+    }
+    fextl::string Out;
+    if (Show && HavePrevClock && Now.Count == PrevClock.Count) {
+      for (size_t i = 0; i < Now.Count; ++i) {
+        const uint64_t Ms = Now.Ms[i] >= PrevClock.Ms[i] ? Now.Ms[i] - PrevClock.Ms[i] : 0;
+        if (Ms) {
+          Out += fextl::fmt::format("{}{} MHz {} ms", Out.empty() ? "" : ", ", Now.Hz[i] / 1'000'000, Ms);
+        }
+      }
+      Out = fextl::fmt::format("  storage clock: {} | {} changes | now {} MHz\n", Out.empty() ? fextl::string("-") : Out,
+                               Now.Changes >= PrevClock.Changes ? Now.Changes - PrevClock.Changes : 0, StorageClockMHz());
+    }
+    PrevClock = Now;
+    HavePrevClock = true;
+    return Out;
+  }
+
+  struct ClockFind {
+    char Name[64];
+  };
+
+  void FindClockEntry(const char* Name, void* Arg) {
+    auto* F = static_cast<ClockFind*>(Arg);
+    if (!F->Name[0] && (strstr(Name, "ufs") || strstr(Name, "mmc") || strstr(Name, "sdhc"))) {
+      snprintf(F->Name, sizeof(F->Name), "%s", Name);
+    }
+  }
+
+  // Looks for the storage controller's devfreq device and notes what it says.
+  void FindStorageClock() {
+    ClockFind F {};
+    if (!FEX::Windows::Linux::ForEachEntry("/sys/class/devfreq", FindClockEntry, &F)) {
+      FEX::Windows::StatsLogNote("game files: storage clock: /sys/class/devfreq can't be read");
+      return;
+    }
+    if (!F.Name[0]) {
+      FEX::Windows::StatsLogNote("game files: storage clock: no storage controller among the devfreq devices");
+      return;
+    }
+    snprintf(ClockDir, sizeof(ClockDir), "/sys/class/devfreq/%s", F.Name);
+    auto ReadText = [&](const char* Leaf) {
+      char Path[160];
+      snprintf(Path, sizeof(Path), "%s/%s", ClockDir, Leaf);
+      char Text[512];
+      if (FEX::Windows::Linux::ReadSmallFile(Path, Text, sizeof(Text)) <= 0) {
+        return fextl::string("unreadable");
+      }
+      fextl::string Value(Text);
+      while (!Value.empty() && (Value.back() == '\n' || Value.back() == ' ')) {
+        Value.pop_back();
+      }
+      return Value;
+    };
+    const fextl::string Cur = ReadText("cur_freq");
+    ClockTimes Times {};
+    const bool HaveTimes = ReadClockTimes(Times);
+    ClockOn.store(Cur != "unreadable", std::memory_order_release);
+    FEX::Windows::StatsLogNote(fextl::fmt::format("game files: storage clock: {} now {} Hz (min {}, max {}, governor {}, polling {} ms; "
+                                                  "clocks {}), time at each clock {}",
+                                                  F.Name, Cur, ReadText("min_freq"), ReadText("max_freq"), ReadText("governor"),
+                                                  ReadText("polling_interval"), ReadText("available_frequencies"),
+                                                  HaveTimes ? "readable: a 'storage clock' line in seconds the main thread read game data" :
+                                                              "unreadable"));
+  }
+
   double MB(uint64_t Bytes) {
     return static_cast<double>(Bytes) / (1024.0 * 1024.0);
   }
@@ -857,8 +1032,9 @@ namespace {
       R = Reads;
       Reads = {};
     }
+    const fextl::string Clock = StorageClockLine(R.MainReads > 0);
     if (!R.Reads && !R.OtherFiles && !R.AheadReads) {
-      return {};
+      return Clock;
     }
     const double MsPerTick = 1000.0 / static_cast<double>(CounterFreq);
     auto Ms = [&](uint64_t Ticks) {
@@ -869,15 +1045,25 @@ namespace {
       const auto& S = R.Slow[i];
       Slow += fextl::fmt::format("{}{}@{}MB {}KB {:.1f}ms {}{}", i ? ", " : " | slow main: ", Watched[S.Watch].Name, S.OffsetMB, S.KB, S.Ms,
                                  BucketNames[S.Bucket], S.Kept ? " kept" : "");
+      if (S.U.Have) {
+        Slow += fextl::fmt::format(" [cpu {:.1f} ms (kernel {:.1f}), from storage {} KB, faults {}+{} major, slept {}, preempted {}, storage clock "
+                                   "{}->{} MHz]",
+                                   S.U.CpuMs, S.U.SystemMs, S.U.StorageKB, S.U.MinorFaults, S.U.MajorFaults, S.U.Slept, S.U.Preempted,
+                                   S.U.ClockBeforeMHz, S.U.ClockAfterMHz);
+      }
     }
     if (R.SlowMore) {
       Slow += fextl::fmt::format(", {} more", R.SlowMore);
     }
-    return fextl::fmt::format(
-      "  game reads: {} reads {:.1f} MB ({} queued {:.1f} MB) | main {} reads {:.1f} MB {:.1f} ms (longest {:.1f}), kept {} {:.1f} MB "
+    return Clock + fextl::fmt::format(
+      "  game reads: {} reads {:.1f} MB ({} queued {:.1f} MB) | main {} reads {:.1f} MB {:.1f} ms (longest {:.1f}{}), kept {} {:.1f} MB "
       "{:.1f} ms | others {} {:.1f} MB {:.1f} ms (longest {:.1f}), kept {} {:.1f} MB {:.1f} ms | MB by read since its last read "
       "{}: main {}, main by its own {}, others {} | other files {} reads {:.1f} MB{}{}{}\n",
-      R.Reads, MB(R.Bytes), R.Queued, MB(R.QueuedBytes), R.MainReads, MB(R.MainBytes), Ms(R.MainTicks), Ms(R.MainLongest), R.MainKeptReads,
+      R.Reads, MB(R.Bytes), R.Queued, MB(R.QueuedBytes), R.MainReads, MB(R.MainBytes), Ms(R.MainTicks), Ms(R.MainLongest),
+      R.MainMeasured ? fextl::fmt::format("; on a CPU {:.1f} ms, from storage {:.1f} MB", static_cast<double>(R.MainCpuUs) / 1000.0,
+                                          static_cast<double>(R.MainStorageKB) / 1024.0) :
+                       fextl::string(),
+      R.MainKeptReads,
       MB(R.MainKeptBytes), Ms(R.MainKeptTicks), R.OtherReads, MB(R.OtherBytes), Ms(R.OtherTicks), Ms(R.OtherLongest), R.OtherKeptReads,
       MB(R.OtherKeptBytes), Ms(R.OtherKeptTicks), "<128M/<512M/<1G/<2G/<4G/<8G/more/first", Histogram(R.ReuseMain),
       Histogram(R.ReuseMainOwn), Histogram(R.ReuseOther), R.OtherFiles, MB(R.OtherFilesBytes),
@@ -978,14 +1164,32 @@ extern "C" BOOL FEXNativeReadFile(HANDLE File, void* Buffer, DWORD Bytes, DWORD*
   const uint64_t Start = GetCounter();
   uint32_t AskCalls {};
   uint64_t Asked = Start;
-  if (AheadMin && Bytes >= AheadMin && WatchedCount.load(std::memory_order_relaxed) && reinterpret_cast<uint64_t>(NtCurrentTeb()) == MainTeb) {
+  const bool MainThread = WatchedCount.load(std::memory_order_relaxed) && reinterpret_cast<uint64_t>(NtCurrentTeb()) == MainTeb;
+  if (AheadMin && Bytes >= AheadMin && MainThread) {
     AskCalls = AskAhead(File, Overlapped != nullptr, Offset, Bytes, Start);
     Asked = GetCounter();
+  }
+  // Build 88: the main thread's reads are taken apart (see ReadUsage).
+  FEX::Windows::Linux::ThreadUsage Before {};
+  ReadUsage Usage {};
+  const bool Measure = MainThread && FEX::Windows::Linux::GetThreadUsage(Before);
+  if (Measure && Bytes >= (256u << 10)) {
+    Usage.ClockBeforeMHz = StorageClockMHz();
   }
   const BOOL Result = Real(File, Buffer, Bytes, Read, Overlapped);
   const uint64_t End = GetCounter();
   if (!WatchedCount.load(std::memory_order_relaxed)) {
     return Result;
+  }
+  if (FEX::Windows::Linux::ThreadUsage After {}; Measure && FEX::Windows::Linux::GetThreadUsage(After)) {
+    Usage.Have = true;
+    Usage.CpuMs = static_cast<float>((After.UserUs + After.SystemUs) - (Before.UserUs + Before.SystemUs)) / 1000.0f;
+    Usage.SystemMs = static_cast<float>(After.SystemUs - Before.SystemUs) / 1000.0f;
+    Usage.StorageKB = static_cast<uint32_t>((After.InBlocks - Before.InBlocks) / 2);
+    Usage.MinorFaults = static_cast<uint32_t>(After.MinorFaults - Before.MinorFaults);
+    Usage.MajorFaults = static_cast<uint32_t>(After.MajorFaults - Before.MajorFaults);
+    Usage.Slept = static_cast<uint32_t>(After.Voluntary - Before.Voluntary);
+    Usage.Preempted = static_cast<uint32_t>(After.Involuntary - Before.Involuntary);
   }
   // Nothing below may change what the game sees: the last error stays as ReadFile left it.
   auto* LastError = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(NtCurrentTeb()) + TebLastError);
@@ -993,7 +1197,7 @@ extern "C" BOOL FEXNativeReadFile(HANDLE File, void* Buffer, DWORD Bytes, DWORD*
   const bool Queued = !Result && Error == ErrorIoPending;
   if (Result || Queued) {
     const uint64_t Got = Queued ? Bytes : Read ? *Read : Overlapped ? Overlapped->InternalHigh : Bytes;
-    NoteRead(File, Offset, Overlapped != nullptr, Got, Queued, End - Start, Start);
+    NoteRead(File, Offset, Overlapped != nullptr, Got, Queued, End - Start, Start, Usage.Have ? &Usage : nullptr);
   }
   if (AskCalls) {
     NoteAhead(Bytes, AskCalls, Asked - Start, End - Asked);
