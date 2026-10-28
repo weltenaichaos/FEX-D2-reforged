@@ -134,7 +134,10 @@ jobs:
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "tu_fex_color_clear_3d_index" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 8" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 9" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "tu_fex_emit_cp_ubos" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "tu_fex_desc_sets_skip" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "fex_cp_ubo_sets" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c"
           grep -q "fex_cs_nir_options" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir.c"
           strings "$so" | grep -q TU_FEX_COLOR_CLEAR
           strings "$so" | grep -q TU_FEX_CS_UNROLL
