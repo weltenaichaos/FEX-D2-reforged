@@ -180,6 +180,10 @@ namespace {
                                !(Chan->Compile & T::CompileLoopPrefetch) ? "off (FEX_TU_LOOP_PREFETCH=0)" :
                                Chan->Patch < 7                           ? "NOT available (driver older than fex7)" :
                                                                            "NOT honored";
+    const char* CpUbo = (Status & T::StatusCpUbo)               ? "ON" :
+                        !(Chan->Compile & T::CompileCpUbo) ? "off (FEX_TU_CP_UBO=0)" :
+                        Chan->Patch < 9                    ? "NOT available (driver older than fex9)" :
+                                                             "NOT honored (needs an a7xx GPU like the a740)";
     const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
                              Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
@@ -197,10 +201,11 @@ namespace {
                                                                      "read at most every 250 ms (FEX_TU_BUDGET_CACHE=1)";
     FEX::Windows::StatsLogNote(fextl::fmt::format(
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
-      "preamble loads first {}, list loops read ahead {}, depth clears at the start of direct passes {}, available memory for the "
+      "preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the command processor {}, depth clears "
+      "at the start of direct passes {}, available memory for the "
       "memory budget {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, DepthClear, Budget,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, DepthClear, Budget,
       Chan->CountersReserved,
       Chan->CounterCount,
       (Status & T::StatusNotKgsl) ? " (not KGSL)" : "", (Status & T::StatusRingFailed) ? ", ring allocation FAILED" : "",

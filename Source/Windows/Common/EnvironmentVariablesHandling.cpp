@@ -365,6 +365,12 @@ namespace {
     if (!SwitchOff(Switch("FEX_TU_LOOP_PREFETCH"))) {
       Chan->Compile |= Turnip::CompileLoopPrefetch;
     }
+    // FEX_TU_CP_UBO: 1 (default) = the command processor loads root constant buffer ranges into the shaders' constants
+    // before each draw, and draws that then don't read the root set through descriptors keep the descriptor set state
+    // (driver fex9 and later); 0 = stock.
+    if (!SwitchOff(Switch("FEX_TU_CP_UBO"))) {
+      Chan->Compile |= Turnip::CompileCpUbo;
+    }
 
     const auto Text = fextl::fmt::format("{:x}", reinterpret_cast<uintptr_t>(Chan));
     auto WineSetEnv = reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv);
@@ -376,7 +382,8 @@ namespace {
     }
     TurnipChannelPtr = Chan;
     StatsLogNote(fextl::fmt::format("turnip: FEX link TU_FEX_CHANNEL={} set: descriptor fix {}, early preamble for root constant "
-                                    "buffers {}, preamble loads first {}, list loops read ahead {}, depth clears at pass start {}, "
+                                    "buffers {}, preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the "
+                                    "command processor {}, depth clears at pass start {}, "
                                     "memory budget {}, {} GPU counters asked for, passes with {}+ draws timed and counted; only FEX's "
                                     "Turnip build (fex1 and later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
@@ -386,6 +393,8 @@ namespace {
                                                                                      "off (FEX_TU_PREAMBLE_LOADS=0)",
                                     (Chan->Compile & Turnip::CompileLoopPrefetch) ? "asked for (FEX_TU_LOOP_PREFETCH=1, driver fex7 and later)" :
                                                                                     "off (FEX_TU_LOOP_PREFETCH=0)",
+                                    (Chan->Compile & Turnip::CompileCpUbo) ? "asked for (FEX_TU_CP_UBO=1, driver fex9 and later)" :
+                                                                             "off (FEX_TU_CP_UBO=0)",
                                     TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
                                                             "in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
                                     TurnipDepthClear == 3 ? "by a 3D draw without fragment shader (fast Z, FEX_TU_DEPTH_CLEAR=fastz, "
@@ -434,6 +443,11 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "new GPU memory of 4-64 MB for the game's heaps comes from spares a background thread made before "
                       "the game asked, instead of the kernel zeroing it on the game's thread (VKD3D fex17 and later; 'gpu "
                       "memory ahead' line)");
+  SetupVkd3dFexSwitch("FEX_VKD3D_CBV_SIZE", L"VKD3D_FEX_CBV_SIZE",
+                      "a constant buffer a shader indexes with a register keeps the size the shader declares (up to 256 "
+                      "vectors) instead of 64 KiB, so the driver can load it into the shader's constants; with Turnip fex9 "
+                      "D2R's lighting shaders then stop reading the root constant buffer set through descriptors (VKD3D "
+                      "fex29 and later; part of vkd3d's shader cache key)");
   SetupVkd3dShaderCopy();
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");

@@ -24,6 +24,10 @@
 //  - (fex7 and later) with CompileLoopPrefetch in 'Compile', fragment shader loops that walk a list read the next
 //    entry while the current one is worked on (one memory wait per entry instead of two), and count the reads moved
 //    and the shaders that had any in 'LoopPrefetchLoads' / 'LoopPrefetchShaders'.
+//  - (fex9 and later) with CompileCpUbo in 'Compile', the command processor loads the ranges of push descriptor set
+//    UBOs (vkd3d's root constant buffers) that graphics shaders read into their constants before each draw, and a draw
+//    whose shaders then don't read the push set through descriptors keeps the previous descriptor set state when only
+//    the push set changed (fewer 'descriptor updates' than 'push' on the 'turnip' line).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -45,6 +49,7 @@ constexpr uint8_t SlotDepthClear = 0x80;
 constexpr uint32_t CompilePushSpeculate = 0x1;
 constexpr uint32_t CompilePreambleLoads = 0x2; // fex6 and later: preamble loads first, each value stored once
 constexpr uint32_t CompileLoopPrefetch = 0x4;  // fex7 and later: list loops read the next entry one iteration ahead
+constexpr uint32_t CompileCpUbo = 0x8;         // fex9 and later: push set UBO ranges loaded by the command processor
 
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
@@ -59,6 +64,7 @@ constexpr uint32_t StatusDepthClearFastZ = 0x200; // fex4 and later: ModeDepthCl
 constexpr uint32_t StatusBudgetCache = 0x400;     // fex5 and later: ModeBudgetCache honored
 constexpr uint32_t StatusPreambleLoads = 0x800;   // fex6 and later: CompilePreambleLoads honored
 constexpr uint32_t StatusLoopPrefetch = 0x1000;   // fex7 and later: CompileLoopPrefetch honored
+constexpr uint32_t StatusCpUbo = 0x8000;          // fex9 and later: CompileCpUbo honored (a7xx without consts via preamble)
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;

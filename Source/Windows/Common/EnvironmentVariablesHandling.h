@@ -92,6 +92,17 @@ namespace FEX::Windows {
 //                            burst, up to a quarter of VKD3D_FEX_MEMORY_AHEAD_MB (default 256 MB) for all together. A
 //                            'gpu memory ahead' line shows spares taken, requests that found none, the spares made and
 //                            how long the allocations made when asked took.
+//   FEX_VKD3D_CBV_SIZE=1 VKD3D_FEX_CBV_SIZE=1 (the D2R default, build 98, VKD3D fex29). vkd3d's shader converter
+//                            (dxbc-spirv) declares a constant buffer that a shader indexes with a register as 64 KiB,
+//                            the D3D maximum, whatever size the shader declares. Turnip can't keep that in the GPU's
+//                            constant registers, so every read stays a memory load through the buffer's descriptor;
+//                            D2R's lighting pixel shaders index two root constant buffers this way (90 and 16 vectors
+//                            declared), which go through vkd3d's root constant buffer set, pushed again for nearly
+//                            every draw. With the declared size (if 256 vectors or less) the buffer fits, and with
+//                            FEX_TU_CP_UBO the driver loads it before the draw. An index past the declared end reads
+//                            other constants instead of buffer memory (the D3D compiler only makes such indices for
+//                            out-of-range array reads). Part of vkd3d's shader cache key, so a change rebuilds it. The
+//                            '# vkd3d' line names it.
 //
 // Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
 // same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader
@@ -176,6 +187,18 @@ namespace FEX::Windows {
 //                          file on every query. Build 76: D2R's main thread in that call for 3% of every second of play
 //                          (~1 ms of every frame), as DXGI's QueryVideoMemoryInfo asks for the budget each frame.
 //                          0 = stock. Works without the stats log too (it is part of the mode set before the game).
+//   FEX_TU_CP_UBO=1        (the D2R default from build 98, driver fex9 and later, a7xx without consts via preamble like
+//                          the a740) the ranges of push descriptor set UBOs that graphics shaders read (vkd3d's D3D12
+//                          root constant buffers) are loaded into the shader's constants by the GPU's command
+//                          processor before each draw (CP_LOAD_STATE6 from the address in the pushed descriptor),
+//                          instead of by the shader's preamble through the descriptor. A draw whose shaders then no
+//                          longer read the push set through descriptors keeps the previous descriptor set state when
+//                          only the push set changed: no new bindless base and no invalidation of all 8 descriptor
+//                          sets for each draw. D2R pushes new root constant buffers for nearly every draw; the fex28
+//                          probe measured ~1.4 us more GPU time per long-shader draw when they change. Barriers
+//                          before graphics uniform reads also make the command processor wait for earlier writes.
+//                          The 'turnip' line's 'descriptor updates' then drop below 'push'. Read once at device
+//                          creation and part of the shader keys, so shaders are compiled anew once. 0 = stock.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

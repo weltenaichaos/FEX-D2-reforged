@@ -191,6 +191,12 @@ namespace {
     // memory while the main thread waited. FEX's vkd3d-proton build makes spares on a background thread so the game's
     // threads take one instead (see EnvironmentVariablesHandling.h).
     {"FEX_VKD3D_MEMORY_AHEAD", "1"},
+    // Build 98 + VKD3D fex29: D2R's lighting pixel shaders index two of their root constant buffers with a register
+    // (90 and 16 vectors declared), and vkd3d's shader converter declares any such buffer as 64 KiB, too big for the
+    // GPU's constant registers, so Turnip reads them from memory through vkd3d's root constant buffer set, the push
+    // descriptor set vkd3d pushes for nearly every draw. With the declared sizes they fit, and with FEX_TU_CP_UBO the
+    // driver loads them before the draw (see EnvironmentVariablesHandling.h).
+    {"FEX_VKD3D_CBV_SIZE", "1"},
     // Build 68: the main pass's time grows ~14.6 us per draw at about the same shaded pixel count (b67: 238 draws 5.4 ms,
     // 963 draws 15.9 ms, ~0.85M pixels each), and a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9).
     // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14
@@ -256,6 +262,14 @@ namespace {
     // of /proc/meminfo for every query. FEX's Turnip fex5 reads it at most every 250 ms and reuses the last value in
     // between (the budget is a rough estimate anyway); the 'turnip: memory budget' line counts queries, reads and time.
     {"FEX_TU_BUDGET_CACHE", "1"},
+    // Build 98: the fex28 probe measured ~1.4 us more GPU time per long-shader draw when the root constant buffers
+    // change between draws, and D2R changes them for nearly every main pass draw (~1,000-1,400 in fights). Stock Turnip
+    // then rebinds and invalidates all 8 descriptor sets for each draw, and the lighting shader's preamble fetches ~100
+    // vectors through the new descriptors with loads that wait on each other before the draw's pixels start. FEX's
+    // Turnip fex9 has the command processor load those ranges straight into the shader's constants from the address
+    // vkd3d pushed, and keeps the descriptor set state when only the root set changed and the shaders no longer read it
+    // through descriptors.
+    {"FEX_TU_CP_UBO", "1"},
   };
 
   // In the order the stats log lists them.
@@ -333,6 +347,7 @@ namespace {
     "FEX_VKD3D_SHADER_COPY",
     "FEX_VKD3D_LATENCY_RESYNC",
     "FEX_VKD3D_MEMORY_AHEAD",
+    "FEX_VKD3D_CBV_SIZE",
     "FEX_TU_NOPREAMBLE",
     "FEX_TU_CHANNEL",
     "FEX_TU_DESC",
@@ -343,6 +358,7 @@ namespace {
     "FEX_TU_LOOP_PREFETCH",
     "FEX_TU_DEPTH_CLEAR",
     "FEX_TU_BUDGET_CACHE",
+    "FEX_TU_CP_UBO",
   };
 
   bool UseD2RDefaults {};
