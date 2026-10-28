@@ -39,6 +39,9 @@
 //  - (fex12 and later) with CompileNoAliasAlt in 'Compile', big fragment shaders (1,024+ instructions, 64+ alias.tex
 //    helpers; D2R's lighting shaders) get a second binary without alias.tex, and with ModeNoAlias in 'Mode' pipeline
 //    binds use that binary. Counts in the extension (NaBinds..NaPipes, ExtSize 0x358).
+//  - (fex13 and later) with CompileNoPreambleAlt in 'Compile', that second binary (fragment shaders with 1,024+
+//    instructions and a preamble of 32+) is compiled without preamble instead (or as well), with its own constant
+//    layout; ModeNoAlias (= ModeAltFs) picks it the same way. NaPreamble in the extension (ExtSize 0x360).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -56,6 +59,7 @@ constexpr uint32_t ModeDepthClearFastZ = 0x8; // fex4 and later: the 3D depth cl
 constexpr uint32_t ModeBudgetCache = 0x10;    // fex5 and later: /proc/meminfo read at most every 250 ms by the budget query
 constexpr uint32_t ModeSwitch = 0x20;         // fex11 and later: pipeline switches send only what changed
 constexpr uint32_t ModeNoAlias = 0x40;        // fex12 and later: pipelines use the fragment shader binary without alias.tex
+constexpr uint32_t ModeAltFs = ModeNoAlias;   // fex13 and later: the same bit picks the second binary however it was made
 // Slot::Mode bit (fex3 and later): the pass clears a depth/stencil attachment at its start.
 constexpr uint8_t SlotDepthClear = 0x80;
 
@@ -65,6 +69,7 @@ constexpr uint32_t CompileLoopPrefetch = 0x4;  // fex7 and later: list loops rea
 constexpr uint32_t CompileCpUbo = 0x8;         // fex9 and later: push set UBO ranges loaded by the command processor
 constexpr uint32_t CompileUboTable = 0x10;     // fex10 and later: other push set UBO reads through the shader's UBO table
 constexpr uint32_t CompileNoAliasAlt = 0x20;   // fex12 and later: big fragment shaders also compiled without alias.tex
+constexpr uint32_t CompileNoPreambleAlt = 0x40; // fex13 and later: that second binary is compiled without preamble
 
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
@@ -85,6 +90,7 @@ constexpr uint32_t StatusSwitch = 0x20000;        // fex11 and later: ModeSwitch
 constexpr uint32_t StatusSwitchStats = 0x40000;   // fex11 and later: the switch counts in the extension are written
 constexpr uint32_t StatusNoAlias = 0x80000;       // fex12 and later: CompileNoAliasAlt honored (a7xx)
 constexpr uint32_t StatusNoAliasStats = 0x100000; // fex12 and later: the no-alias counts in the extension are written
+constexpr uint32_t StatusNoPreamble = 0x200000;   // fex13 and later: CompileNoPreambleAlt honored (a7xx, consts by the CP)
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -177,11 +183,15 @@ struct Channel {
   // 0x350: graphics pipelines made whose fragment shader has the second binary: [0] can use it, [1] cannot (they use
   // the reduced-constants binary)
   volatile uint32_t NaPipes[2];
+  // 0x358 (fex13 and later): preamble instructions of both binaries (totals like NaInstr)
+  volatile uint32_t NaPreamble[2];
 };
 // 'Size' = the layout before fex11.
 constexpr uint32_t ChannelBaseSize = 0x2a8;
 // The fex11 layout (switch counts).
 constexpr uint32_t ChannelSwSize = 0x300;
+// The fex12 layout (no-alias counts).
+constexpr uint32_t ChannelNaSize = 0x358;
 
 struct Slot {
   uint64_t Seq;
@@ -220,7 +230,8 @@ static_assert(offsetof(Channel, NaShaders) == 0x310);
 static_assert(offsetof(Channel, NaRegs) == 0x338);
 static_assert(offsetof(Channel, NaSsStall) == 0x340);
 static_assert(offsetof(Channel, NaPipes) == 0x350);
-static_assert(sizeof(Channel) == 0x358);
+static_assert(offsetof(Channel, NaPreamble) == ChannelNaSize);
+static_assert(sizeof(Channel) == 0x360);
 static_assert(sizeof(Slot) == 48);
 
 // The channel EnvironmentVariablesHandling set up for this process (FEX_TU_CHANNEL), or nullptr.
@@ -238,4 +249,8 @@ uint32_t PipelineSwitchSwitch();
 // FEX_TU_NOALIAS: 0 stock lighting shaders, 1 the binaries without alias.tex always, 2 those in every other second
 // (needs the stats log; without it nothing flips it, so it stays on).
 uint32_t NoAliasSwitch();
+// FEX_TU_NOPREAMBLE: 0 stock, 1 IR3_SHADER_DEBUG=nopreamble for every shader (set before the driver loads), 2 (alt) the
+// lighting shaders' second binary without preamble in every other second (needs the stats log; without it nothing flips
+// it, so it stays on), 3 (lit) that binary always.
+uint32_t NoPreambleSwitch();
 } // namespace FEX::Windows::Turnip

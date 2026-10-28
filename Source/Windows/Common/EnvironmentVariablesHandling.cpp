@@ -182,9 +182,30 @@ namespace {
   // See EnvironmentVariablesHandling.h: Turnip's shader compiler reads IR3_SHADER_DEBUG from the Unix environment once,
   // when the game's Vulkan device is created, long after this runs. Wine copied the Unix environment into the process
   // environment at start, so a value set by the launcher can be read here and is kept.
-  void SetupTurnipNoPreamble(FARPROC SetUnixEnv) {
+  // FEX_TU_NOPREAMBLE: 0 off; 1 IR3_SHADER_DEBUG=nopreamble for every shader (below); alt (D2R default in build 104) =
+  // the driver (fex13 and later) compiles the big fragment shaders (D2R's lighting shaders) a second time without
+  // preamble and pipelines use those binaries in every other second (TurnipReport flips the mode bit, so without the
+  // stats log it stays on); lit = those binaries always. Build 103: lighting waves spend 25-30% of their life in the
+  // HWAVE_WAIT state, which no other pass shows; the lighting shaders' 137-instruction early preamble runs once per draw
+  // before that draw's waves may start.
+  uint32_t TurnipNoPreamble {};
+  uint32_t ParseNoPreamble() {
     const char* Value = Switch("FEX_TU_NOPREAMBLE");
-    const bool On = Value && !(Value[0] == '0' && !Value[1]);
+    if (!Value || (Value[0] == '0' && !Value[1])) {
+      return 0;
+    }
+    if (Value[0] == 'a' || Value[0] == 'A' || (Value[0] == '2' && !Value[1])) {
+      return 2;
+    }
+    if (Value[0] == 'l' || Value[0] == 'L' || (Value[0] == '3' && !Value[1])) {
+      return 3;
+    }
+    return 1;
+  }
+
+  void SetupTurnipNoPreamble(FARPROC SetUnixEnv) {
+    TurnipNoPreamble = ParseNoPreamble();
+    const bool On = TurnipNoPreamble == 1;
     static constexpr wchar_t NameText[] = L"IR3_SHADER_DEBUG";
     static constexpr wchar_t Flag[] = L"nopreamble";
     constexpr size_t FlagLen = std::size(Flag) - 1;
@@ -197,9 +218,15 @@ namespace {
     const auto Before = Len ? Narrow(Old, Len) : fextl::string("-");
 
     if (!On) {
-      StatsLogNote(fextl::fmt::format("turnip: IR3_SHADER_DEBUG={} left alone (FEX_TU_NOPREAMBLE off): the driver builds its "
-                                      "per-draw shader preambles",
-                                      Before));
+      StatsLogNote(fextl::fmt::format("turnip: IR3_SHADER_DEBUG={} left alone ({}): the driver builds its per-draw shader "
+                                      "preambles{}",
+                                      Before,
+                                      TurnipNoPreamble == 2 ? "FEX_TU_NOPREAMBLE=alt" :
+                                      TurnipNoPreamble == 3 ? "FEX_TU_NOPREAMBLE=lit" :
+                                                              "FEX_TU_NOPREAMBLE off",
+                                      TurnipNoPreamble >= 2 ? ", and through FEX's link a second binary of the lighting shaders "
+                                                              "without preamble (see the FEX link note)" :
+                                                              ""));
       return;
     }
     if (QueryStatus != 0 && QueryStatus != StatusVariableNotFound) {
@@ -312,10 +339,12 @@ namespace {
     // stats log alt stays on.
     const char* NoAlias = Switch("FEX_TU_NOALIAS");
     TurnipNoAlias = SwitchOff(NoAlias) ? 0 : (NoAlias[0] == 'a' || NoAlias[0] == 'A' || NoAlias[0] == '2') ? 2 : 1;
+    // FEX_TU_NOPREAMBLE alt/lit (SetupTurnipNoPreamble): the second binary without preamble, picked with the same mode bit.
     Chan->Mode = (TurnipDesc ? (Turnip::ModeChangedOnly | Turnip::ModePushReuse) : 0) |
                  (TurnipDepthClear ? Turnip::ModeDepthClear3d : 0) |
                  (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0) | (TurnipBudgetCache ? Turnip::ModeBudgetCache : 0) |
-                 (TurnipSwitch ? Turnip::ModeSwitch : 0) | (TurnipNoAlias ? Turnip::ModeNoAlias : 0);
+                 (TurnipSwitch ? Turnip::ModeSwitch : 0) |
+                 ((TurnipNoAlias || TurnipNoPreamble >= 2) ? Turnip::ModeAltFs : 0);
 
     // FEX_TU_COUNTERS: 1 (D2R default in build 102) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at
     // least this many draws get timed and counted (D2R default 100 in build 102: the main pass, the depth prepasses and
@@ -399,6 +428,10 @@ namespace {
     if (TurnipNoAlias) {
       Chan->Compile |= Turnip::CompileNoAliasAlt;
     }
+    // FEX_TU_NOPREAMBLE alt/lit: the same for the second binary without preamble (driver fex13 and later).
+    if (TurnipNoPreamble >= 2) {
+      Chan->Compile |= Turnip::CompileNoPreambleAlt;
+    }
 
     const auto Text = fextl::fmt::format("{:x}", reinterpret_cast<uintptr_t>(Chan));
     auto WineSetEnv = reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv);
@@ -412,8 +445,8 @@ namespace {
     StatsLogNote(fextl::fmt::format("turnip: FEX link TU_FEX_CHANNEL={} set: descriptor fix {}, early preamble for root constant "
                                     "buffers {}, preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the "
                                     "command processor {}, other root constant buffer reads through the shaders' UBO table {}, pipeline "
-                                    "switches send only what changed {}, lighting shaders without alias.tex helpers {}, depth clears at "
-                                    "pass start {}, "
+                                    "switches send only what changed {}, lighting shaders without alias.tex helpers {}, lighting "
+                                    "shaders without preamble {}, depth clears at pass start {}, "
                                     "memory budget {}, {} GPU counters asked for, passes with {}+ draws timed and counted; only FEX's "
                                     "Turnip build (fex1 and later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
@@ -435,6 +468,12 @@ namespace {
                                                          "shader recompile)" :
                                     TurnipNoAlias      ? "always (FEX_TU_NOALIAS=1, driver fex12 and later; one-time shader recompile)" :
                                                          "off (FEX_TU_NOALIAS=0)",
+                                    TurnipNoPreamble == 2 ? "in every other second (FEX_TU_NOPREAMBLE=alt, driver fex13 and later; "
+                                                            "one-time shader recompile)" :
+                                    TurnipNoPreamble == 3 ? "always (FEX_TU_NOPREAMBLE=lit, driver fex13 and later; one-time shader "
+                                                            "recompile)" :
+                                    TurnipNoPreamble == 1 ? "for every shader by IR3_SHADER_DEBUG (FEX_TU_NOPREAMBLE=1)" :
+                                                            "off (FEX_TU_NOPREAMBLE=0)",
                                     TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
                                                             "in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
                                     TurnipDepthClear == 3 ? "by a 3D draw without fragment shader (fast Z, FEX_TU_DEPTH_CLEAR=fastz, "
@@ -534,6 +573,9 @@ namespace Turnip {
   }
   uint32_t NoAliasSwitch() {
     return TurnipNoAlias;
+  }
+  uint32_t NoPreambleSwitch() {
+    return TurnipNoPreamble;
   }
 } // namespace Turnip
 } // namespace FEX::Windows

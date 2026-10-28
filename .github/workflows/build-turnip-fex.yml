@@ -15,8 +15,9 @@
 # into shader constants by the command processor, without a descriptor set change per
 # draw, (fex10) the remaining push set UBO reads (indexed arrays such as bone
 # matrices) through the shader's own UBO table, so those draws skip the change too,
-# (fex11) graphics pipeline switches that send only the state that changed, and (fex12)
-# a second binary of big fragment shaders without alias.tex helpers, picked per second.
+# (fex11) graphics pipeline switches that send only the state that changed, (fex12)
+# a second binary of big fragment shaders without alias.tex helpers, picked per second,
+# and (fex13) that second binary without preamble instead, with its own constant layout.
 # Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
@@ -31,7 +32,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex12
+  FEX_PATCH: fex13
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -138,7 +139,10 @@ jobs:
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "tu_fex_color_clear_3d_index" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 12" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 13" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "fex_nopreamble" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir.c"
+          grep -q "TU_FEX_COMPILE_NOPREAMBLE_ALT" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.cc"
+          grep -q "fex_alt_fs_variant" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "TU_FEX_MODE_NOALIAS" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
           grep -q "fex_noalias_tex" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_alias.c"
           grep -q "fex_alt_fs_state" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
@@ -279,6 +283,18 @@ jobs:
             address, size, register footprint and output register. One-time cost: the big shaders are
             compiled twice (new shader cache keys). Status bits 0x80000 (honored) and 0x100000 (counts
             written).
+            fex13 (FEX build 104 and later, FEX_TU_NOPREAMBLE=alt|lit; a7xx without consts via preamble,
+            e.g. a740): the second binary of big fragment shaders (1,024+ instructions, preamble of 32+
+            instructions) is compiled without preamble instead: the values the a7xx early preamble
+            computes once per draw before the draw's waves may start are computed by each wave. Build 103
+            measured D2R's lighting waves spending 25-30% of their life in the HWAVE_WAIT state, which no
+            other pass shows; their preamble is 137 instructions (about 70 one-value constant stores).
+            Without it: 6 preamble instructions left (push constant copy), +0.7% instructions, same
+            24 registers. That binary has its own constant layout, so a bind with FEX's mode bit also
+            loads the fragment stage constants where it reads them. Host check: the root constant buffer
+            ranges and immediates load to the second binary's offsets from the same addresses; registers
+            differ only in the pixel shader's address, size and output register. Status bit 0x200000;
+            the channel extension (0x360) adds both binaries' preamble totals.
             Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

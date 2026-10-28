@@ -321,3 +321,35 @@ the second binary, none refused. `drawtest_sw2` with the lighting shaders (two f
 small one below the threshold), mode bit off and on, with and without fex11's switch path, direct, tiled and
 re-bind: the register state at every draw differs only in `SP_PS_BASE`, `SP_PS_INSTR_SIZE`,
 `SP_PS_CNTL_0` (register footprint) and `SP_PS_OUTPUT[0].REG`; the small shader's draws are unchanged.
+
+- `0013-fex13-nopreamble-alt.patch` (fex13, with FEX build 104): the second binary of big fragment
+  shaders can be compiled without preamble (`TU_FEX_COMPILE_NOPREAMBLE_ALT` 0x40 in `compile`; picked
+  with fex12's mode bit 0x40, also named `TU_FEX_MODE_ALT_FS`; FEX_TU_NOPREAMBLE=alt every other
+  second, lit always; a7xx GPUs that load shader constants with the command processor, like the a740;
+  status bit 0x200000).
+  - ir3: `ir3_shader_key::fex_nopreamble` skips `ir3_nir_opt_preamble` and descriptor prefetch for that
+    variant, like `IR3_SHADER_DEBUG=nopreamble` per shader. The push constant copy stays in a 6-instruction
+    early preamble.
+  - Turnip: with the compile bit (shader key `tu_shader_key::fex_nopreamble_alt`), a fragment shader with
+    at least 1,024 instructions and a preamble of 32+ instructions (Unix env `TU_FEX_NOPREAMBLE_MIN`) gets
+    the second binary with the key bit (with fex12's bit too if that is on). The fex12 checks still apply
+    (same inputs/outputs, early preamble, thread size, constants not longer). Unlike fex12's binary, this
+    one has its own constant layout (no preamble area, so the root constant buffer ranges and immediates
+    sit lower): pipelines keep a pointer to it (`tu_program_state::fex_alt_fs_variant`) and a bind with
+    the mode bit also copies its constant layout into `link[MESA_SHADER_FRAGMENT]`, which every per-draw
+    constant upload reads.
+  - Counts: the channel extension grows to 0x360 (`na_preamble[2]`: preamble instructions of both
+    binaries); the fex12 counts need 0x358 as before.
+  - Why: build 103 counted all 19 SP wave states. D2R's lighting waves spend 25-30% of their life in
+    `SP_WAVE_HWAVE_WAIT_CYCLES` (about 1,500-2,300 cycles a wave, more in small draws); the depth prepass
+    with equally small draws shows 3-4%, shadows 6-10%, full-screen passes 1%. What only the lighting
+    draws have is a 137-instruction early preamble (no memory reads since fex9/fex10: about 70 one-value
+    constant stores of products of root constants) that runs once per draw before its waves may start.
+    Without it: 7120 -> 7181 instructions for 5ff3 (5b7f +47, fb5d -37, 0e15 +46), same 24 registers and
+    8 waves, 164 -> 132 constants.
+
+Host check (fex13): `eptest` (EPTEST_FEX=0x5f EPTEST_EXT=0x360) on the four lighting shaders: all get the
+second binary (preamble 137 -> 6), none refused. `drawtest_sw2` with 0e15, mode bit off and on (direct):
+register state per draw differs only in `SP_PS_BASE`, `SP_PS_INSTR_SIZE` and `SP_PS_OUTPUT[0].REG`; the
+nine root constant buffer ranges and the immediates load from the same addresses to the second binary's
+offsets (c4, c8, c12, c36, c40, c52, c56, c64, c72; immediates c84 instead of c116).

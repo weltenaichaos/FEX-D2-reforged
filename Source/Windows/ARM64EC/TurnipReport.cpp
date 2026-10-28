@@ -163,6 +163,17 @@ namespace {
     return Mode;
   }
 
+  // Name of the second lighting shader binary (fex12: without alias.tex, fex13: without preamble) for the per-second line,
+  // and the short tag of the pass kinds ('na', 'np', or 'alt' with both).
+  const char* AltName() {
+    const bool Na = FEX::Windows::Turnip::NoAliasSwitch() != 0, Np = FEX::Windows::Turnip::NoPreambleSwitch() >= 2;
+    return Na && Np ? "no alias, no preamble" : Np ? "no preamble" : "no alias";
+  }
+  const char* AltTag() {
+    const bool Na = FEX::Windows::Turnip::NoAliasSwitch() != 0, Np = FEX::Windows::Turnip::NoPreambleSwitch() >= 2;
+    return Na && Np ? "alt" : Np ? "np" : "na";
+  }
+
   T::Channel* Chan {};
   bool NotedDriver {};
   bool NotedMissing {};
@@ -229,6 +240,16 @@ namespace {
                                                                                   "ON, counts NOT written") :
                           NoAliasSw == 2                      ? "in every other second (FEX_TU_NOALIAS=alt)" :
                                                                 "ON (FEX_TU_NOALIAS=1)";
+    const uint32_t NoPreSw = FEX::Windows::Turnip::NoPreambleSwitch();
+    const char* NoPre = NoPreSw == 1                       ? "for every shader by IR3_SHADER_DEBUG (FEX_TU_NOPREAMBLE=1)" :
+                        NoPreSw == 0                       ? "off (FEX_TU_NOPREAMBLE=0)" :
+                        Chan->Patch < 13                   ? "NOT available (driver older than fex13)" :
+                        !(Status & T::StatusNoPreamble)    ? "NOT honored (needs an a7xx GPU that loads constants with the command "
+                                                             "processor, like the a740)" :
+                        !(Status & T::StatusNoAliasStats)  ? (NoPreSw == 2 ? "in every other second (FEX_TU_NOPREAMBLE=alt), counts NOT written" :
+                                                                             "ON (FEX_TU_NOPREAMBLE=lit), counts NOT written") :
+                        NoPreSw == 2                       ? "in every other second (FEX_TU_NOPREAMBLE=alt)" :
+                                                             "ON (FEX_TU_NOPREAMBLE=lit)";
     const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
                              Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
@@ -248,10 +269,12 @@ namespace {
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
       "preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the command processor {}, other root "
       "constant buffer reads through the shaders' UBO table {}, pipeline switches send only what changed {}, lighting shaders "
-      "without alias.tex helpers {}, depth clears at the start of direct passes {}, available memory for the "
+      "without alias.tex helpers {}, lighting shaders without preamble {}, depth clears at the start of direct passes {}, available "
+      "memory for the "
       "memory budget {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, NoAlias, DepthClear, Budget,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, NoAlias, NoPre, DepthClear,
+      Budget,
       Chan->CountersReserved,
       Chan->CounterCount,
       (Status & T::StatusNotKgsl) ? " (not KGSL)" : "", (Status & T::StatusRingFailed) ? ", ring allocation FAILED" : "",
@@ -299,7 +322,9 @@ namespace {
                                             K.Width, K.Height, K.Colors, K.Attachments, K.Format0, K.Sysmem ? "direct" : "tiled",
                                             DescSeen ? ((K.Mode & T::ModeChangedOnly) ? " desc on" : " desc off") : "",
                                             SwitchSeen ? ((K.Mode & T::ModeSwitch) ? " sw on" : " sw off") : "",
-                                            NoAliasSeen ? ((K.Mode & T::ModeNoAlias) ? " na on" : " na off") : "", Clear,
+                                            NoAliasSeen ? fextl::fmt::format(" {} {}", AltTag(), (K.Mode & T::ModeNoAlias) ? "on" : "off") :
+                                                          fextl::string(),
+                                            Clear,
                                             K.Passes, K.Draws, Ms, Ms * 1000.0 / Draws);
     const double Cycles = V(T::GroupCp, 0);
     if (Cycles > 0 && K.Ticks) {
@@ -510,7 +535,10 @@ namespace {
     const uint32_t ClearSw = FEX::Windows::Turnip::DepthClearSwitch();
     const uint32_t PipeSw = FEX::Windows::Turnip::PipelineSwitchSwitch();
     const uint32_t NoAliasSw = FEX::Windows::Turnip::NoAliasSwitch();
-    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2 || NoAliasSw == 2) {
+    const uint32_t NoPreSw = FEX::Windows::Turnip::NoPreambleSwitch();
+    // Build 104: the second lighting shader binary (fex12 without alias.tex, fex13 without preamble) shares one mode bit.
+    const bool AltFlip = NoAliasSw == 2 || NoPreSw == 2;
+    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2 || AltFlip) {
       ++Seconds;
       uint32_t Mode = CurrentMode;
       // Each alternating switch takes the next bit of the second count, so every combination gets seconds of its own.
@@ -529,8 +557,9 @@ namespace {
         const bool On = (Seconds >> Bit++) & 1;
         Mode = (Mode & ~T::ModeSwitch) | (On ? T::ModeSwitch : 0);
       }
-      if (NoAliasSw == 2) {
-        // Build 101: pipelines use the lighting shader binaries without alias.tex (driver fex12) in odd seconds.
+      if (AltFlip) {
+        // Build 101: pipelines use the lighting shader binaries without alias.tex (driver fex12) in odd seconds; build 104
+        // the ones without preamble (driver fex13).
         const bool On = (Seconds >> Bit++) & 1;
         Mode = (Mode & ~T::ModeNoAlias) | (On ? T::ModeNoAlias : 0);
       }
@@ -612,16 +641,18 @@ namespace {
     // with the stock binary or the one without alias.tex, as recorded this second; the mode of this second decides which
     // binary the game's command buffers used, so whole-frame GPU times can be split by it too. A note gives the shaders'
     // totals for both binaries whenever new ones were made (compiled, or loaded from the driver's cache).
-    const bool NoAliasSeen = NoAliasSw != 0 && Chan->Patch >= 12 && (Status & T::StatusNoAlias);
+    const bool NoAliasSeen = (NoAliasSw != 0 && Chan->Patch >= 12 && (Status & T::StatusNoAlias)) ||
+                             (NoPreSw >= 2 && Chan->Patch >= 13 && (Status & T::StatusNoPreamble));
     if (Chan->Patch >= 12 && (Status & T::StatusNoAliasStats)) {
       uint64_t NaBinds[2];
       Delta(15, Chan->NaBinds, NaBinds);
       const uint32_t Shaders = Chan->NaShaders, Refused = Chan->NaRefused;
       const uint32_t Pipes[2] = {Chan->NaPipes[0], Chan->NaPipes[1]};
       if (NoAliasSeen || NaBinds[0] || NaBinds[1]) {
-        Out += fextl::fmt::format("  turnip: no alias {} this second | binds stock {} without alias {} | shaders {} refused {} | pipelines "
+        Out += fextl::fmt::format("  turnip: {} {} this second | binds stock {} second binary {} | shaders {} refused {} | pipelines "
                                   "can use {} cannot {}\n",
-                                  (ModeThisSecond & T::ModeNoAlias) ? "on" : "off", NaBinds[0], NaBinds[1], Shaders, Refused, Pipes[0], Pipes[1]);
+                                  AltName(), (ModeThisSecond & T::ModeNoAlias) ? "on" : "off", NaBinds[0], NaBinds[1], Shaders, Refused,
+                                  Pipes[0], Pipes[1]);
       }
       if (Shaders != NaShadersLast || Refused != NaRefusedLast) {
         NaShadersLast = Shaders;
@@ -635,12 +666,15 @@ namespace {
           V[i][0] = Src[i][0];
           V[i][1] = Src[i][1];
         }
+        // fex13: preamble instructions of both binaries.
+        const auto Preamble = Chan->Patch >= 13 ? fextl::fmt::format(", preamble instructions {} -> {}", Chan->NaPreamble[0], Chan->NaPreamble[1]) :
+                                                  fextl::string();
         FEX::Windows::StatsLogNote(fextl::fmt::format(
-          "turnip: no alias: {} fragment shaders have a binary without alias.tex ({} refused), totals stock -> without: "
-          "instructions {} -> {} ({:+.1f}%), nops {} -> {}, alias.tex {} -> {}, movs {} -> {}, registers {} -> {}, estimated "
+          "turnip: {}: {} fragment shaders have a second binary ({} refused), totals stock -> second: "
+          "instructions {} -> {} ({:+.1f}%){}, nops {} -> {}, alias.tex {} -> {}, movs {} -> {}, registers {} -> {}, estimated "
           "(ss) stalls {} -> {}, (sy) stalls {} -> {}; pipelines that can use them {}, that cannot (reduced constants) {}",
-          Shaders, Refused, V[0][0], V[0][1], Pct(V[0][1], V[0][0]), V[1][0], V[1][1], V[2][0], V[2][1], V[3][0], V[3][1], V[4][0], V[4][1],
-          V[5][0], V[5][1], V[6][0], V[6][1], Pipes[0], Pipes[1]));
+          AltName(), Shaders, Refused, V[0][0], V[0][1], Pct(V[0][1], V[0][0]), Preamble, V[1][0], V[1][1], V[2][0], V[2][1], V[3][0],
+          V[3][1], V[4][0], V[4][1], V[5][0], V[5][1], V[6][0], V[6][1], Pipes[0], Pipes[1]));
       }
     }
 

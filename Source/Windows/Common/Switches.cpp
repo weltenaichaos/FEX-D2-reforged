@@ -204,7 +204,14 @@ namespace {
     // compiles without that preamble (IR3_SHADER_DEBUG=nopreamble, see EnvironmentVariablesHandling.h).
     // Build 69: back off; b68 showed no change (main pass 13.3-14.1 us/draw with and without), and the dependent reads
     // just moved into every wave.
-    {"FEX_TU_NOPREAMBLE", "0"},
+    // Build 104: alt. Since fex9/fex10 the lighting shaders' preamble reads no memory; it is 137 instructions (about 70
+    // one-value constant stores) that the a7xx runs once per draw before the draw's waves may start. Build 103 counted
+    // all wave states: lighting waves spend 25-30% of their life in HWAVE_WAIT (1,500-2,300 cycles each, more in small
+    // draws), which no other pass shows (prepass 3-4% with equally small draws). alt = FEX's Turnip (fex13) compiles
+    // those shaders a second time without preamble (+0.7% instructions, same registers) and pipelines use that binary
+    // in every other second, so one run compares both ('np on/off' pass kinds). lit = always that binary, 1 = the old
+    // IR3_SHADER_DEBUG=nopreamble for every shader, 0 = off.
+    {"FEX_TU_NOPREAMBLE", "alt"},
     // Build 69: FEX's own Turnip build (turnip-patches/). Stock Turnip invalidates the GPU's descriptor caches of all 8
     // descriptor sets on every descriptor update, and vkd3d pushes the root constants' descriptors (a push set) before
     // nearly every draw, so every draw of the ~1,000 in a fight's main pass starts with cold descriptor caches. FEX hands

@@ -118,7 +118,15 @@ namespace FEX::Windows {
 //                        work runs in each wave instead (from constants the short remaining preamble uploads in one
 //                        go), so a draw's pixels no longer wait on the chain of reads. Every shader is compiled anew
 //                        the first time (the flag is part of the driver's cache key).
-//   FEX_TU_NOPREAMBLE=0  leave IR3_SHADER_DEBUG alone (the D2R default from build 69)
+//   FEX_TU_NOPREAMBLE=0  leave IR3_SHADER_DEBUG alone (the D2R default from build 69 to 103)
+//   FEX_TU_NOPREAMBLE=alt  (the D2R default from build 104) leave IR3_SHADER_DEBUG alone; through FEX's link FEX's Turnip
+//                        (fex13 and later) compiles the big fragment shaders (D2R's lighting shaders, 1,024+ instructions
+//                        with a preamble of 32+) a second time without preamble, with their own constant layout, and
+//                        pipelines use that binary in every other second (TurnipReport flips the mode bit; 'np on/off'
+//                        pass kinds, 'turnip: second binary' lines). Build 103: lighting waves spend 25-30% of their life
+//                        in HWAVE_WAIT, no other pass does; their 137-instruction early preamble runs once per draw
+//                        before the draw's waves may start
+//   FEX_TU_NOPREAMBLE=lit  that second binary always
 //
 // FEX's Turnip build (build 69, turnip-patches/, Common/TurnipChannel.h). Stock Turnip writes SP_UPDATE_CNTL with all 8
 // bindless sets on every descriptor update, which drops the GPU's descriptor caches of every set; vkd3d keeps the root

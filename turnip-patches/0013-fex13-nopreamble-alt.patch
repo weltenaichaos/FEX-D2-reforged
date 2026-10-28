@@ -1,0 +1,344 @@
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index 7225f31..4bc191b 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1651,7 +1651,8 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
+     * insert instructions in the preamble to push UBOs.
+     */
+    if (so->compiler->has_preamble &&
+-       !(ir3_shader_debug & IR3_DBG_NOPREAMBLE))
++       !(ir3_shader_debug & IR3_DBG_NOPREAMBLE) &&
++       !so->key.fex_nopreamble /* FEX (fex13) */)
+       progress |= OPT(s, ir3_nir_opt_preamble, so);
+ 
+    if (so->compiler->info->props.load_shader_consts_via_preamble)
+@@ -1677,7 +1678,8 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
+       progress |= OPT(s, ir3_nir_fex_ubo_table, so);
+ 
+    if (so->compiler->gen >= 7 &&
+-       !(ir3_shader_debug & (IR3_DBG_NOPREAMBLE | IR3_DBG_NODESCPREFETCH)))
++       !(ir3_shader_debug & (IR3_DBG_NOPREAMBLE | IR3_DBG_NODESCPREFETCH)) &&
++       !so->key.fex_nopreamble /* FEX (fex13) */)
+       progress |= OPT(s, ir3_nir_opt_prefetch_descriptors, so);
+ 
+    if (so->shader_options.push_consts_type == IR3_PUSH_CONSTS_SHARED_PREAMBLE)
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index 4a69cf7..3aea844 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -470,6 +470,15 @@ struct ir3_shader_key {
+           * command buffer (TU_FEX_MODE_NOALIAS).
+           */
+          unsigned fex_noalias_tex : 1;
++
++         /* FEX (fex13): no preamble (ir3_nir_opt_preamble and descriptor
++          * prefetch don't run), like IR3_SHADER_DEBUG=nopreamble but for this
++          * variant only: values the preamble would compute once per draw are
++          * computed by every wave. Only the push constant copy stays in a short
++          * preamble. Turnip compiles big fragment shaders once more with it
++          * (TU_FEX_COMPILE_NOPREAMBLE_ALT), with its own constant layout.
++          */
++         unsigned fex_nopreamble : 1;
+       };
+       uint32_t global;
+    };
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index e4c0e63..b032105 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -6056,9 +6056,19 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+     * begun with TU_FEX_MODE_NOALIAS. Everything below binds
+     * cmd->state.program.fs_state. */
+    if (cmd->state.program.fex_alt_fs_state.size) {
+-      const bool alt = cmd->state.fex.mode & TU_FEX_MODE_NOALIAS;
+-      if (alt)
++      const bool alt = cmd->state.fex.mode & TU_FEX_MODE_ALT_FS;
++      if (alt) {
+          cmd->state.program.fs_state = cmd->state.program.fex_alt_fs_state;
++         /* fex13: constants where that binary reads them (a binary without
++          * preamble has its own layout). The shader's push constant ranges
++          * (tu_const_state) are the same for both binaries. */
++         const struct ir3_shader_variant *av =
++            cmd->state.program.fex_alt_fs_variant;
++         struct tu_program_descriptor_linkage *fl =
++            &cmd->state.program.link[MESA_SHADER_FRAGMENT];
++         fl->const_state = *ir3_const_state(av);
++         fl->constlen = av->constlen;
++      }
+       cmd->state.fex.na_binds[alt]++;
+    }
+ 
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index 775917a..7b6a909 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -117,10 +117,15 @@ tu_fex_device_init(struct tu_device *dev)
+       status |= TU_FEX_STATUS_SWITCH_STATS;
+    }
+    /* fex12: likewise for the no-alias statistics. */
+-   if (chan->ext_size >= sizeof(*chan) && tu_fex_readable(chan, sizeof(*chan))) {
++   if (chan->ext_size >= TU_FEX_CHANNEL_NA_SIZE &&
++       tu_fex_readable(chan, TU_FEX_CHANNEL_NA_SIZE)) {
+       fex->na_stats = true;
+       status |= TU_FEX_STATUS_NOALIAS_STATS;
+    }
++   /* fex13: preamble totals only into a block that has them. */
++   if (fex->na_stats && chan->ext_size >= sizeof(*chan) &&
++       tu_fex_readable(chan, sizeof(*chan)))
++      fex->np_stats = true;
+ 
+    /* Read once: it changes compiled shaders (part of the layout hash). */
+    fex->compile = chan->compile & TU_FEX_COMPILE_MASK;
+@@ -149,6 +154,18 @@ tu_fex_device_init(struct tu_device *dev)
+       fex->noalias_alt = true;
+       status |= TU_FEX_STATUS_NOALIAS;
+    }
++   /* fex13: a7xx early preamble; not where the preamble loads the shader
++    * constants (load_shader_consts_via_preamble, a750 and later). */
++   if ((fex->compile & TU_FEX_COMPILE_NOPREAMBLE_ALT) &&
++       dev->physical_device->info->chip >= 7 &&
++       !dev->physical_device->info->props.load_shader_consts_via_preamble) {
++      fex->nopreamble_alt = true;
++      status |= TU_FEX_STATUS_NOPREAMBLE;
++   }
++   fex->np_min_preamble = TU_FEX_NOPREAMBLE_MIN;
++   const char *np = getenv("TU_FEX_NOPREAMBLE_MIN"); /* host tests */
++   if (np && *np)
++      fex->np_min_preamble = strtoul(np, NULL, 0);
+    fex->na_min_instrs = TU_FEX_NOALIAS_MIN_INSTRS;
+    fex->na_min_alias = TU_FEX_NOALIAS_MIN_ALIAS;
+    const char *nm = getenv("TU_FEX_NOALIAS_MIN"); /* host tests */
+@@ -469,6 +486,8 @@ tu_fex_count_noalias(struct tu_device *dev,
+       __atomic_fetch_add(&c->na_regs[i], b[i]->regs, __ATOMIC_RELAXED);
+       __atomic_fetch_add(&c->na_ss_stall[i], b[i]->ss_stall, __ATOMIC_RELAXED);
+       __atomic_fetch_add(&c->na_sy_stall[i], b[i]->sy_stall, __ATOMIC_RELAXED);
++      if (fex->np_stats)
++         __atomic_fetch_add(&c->na_preamble[i], b[i]->preamble, __ATOMIC_RELAXED);
+    }
+ }
+ 
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index e877d46..55fe89a 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -43,6 +43,10 @@
+  *    shaders are compiled a second time without alias.tex helper
+  *    instructions, and command buffers begun with the mode bit use that
+  *    binary, so FEX can compare both per second in one game run.
++ *  - (fex13) TU_FEX_COMPILE_NOPREAMBLE_ALT: the second binary of big
++ *    fragment shaders is compiled without preamble instead (or as well), and
++ *    has its own constant layout: command buffers with TU_FEX_MODE_NOALIAS
++ *    load its constants where it reads them.
+  * Without the variable (or with a block that fails the checks) the driver
+  * behaves like stock Turnip.
+  *
+@@ -58,7 +62,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 12
++#define TU_FEX_PATCH 13
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -112,6 +116,11 @@
+  * buffers begun with this bit. Same shader, same constants, inputs and
+  * outputs; only the instructions and register numbers differ. */
+ #define TU_FEX_MODE_NOALIAS 0x40u
++/* fex13: the same bit picks the second binary however it was made
++ * (TU_FEX_COMPILE_NOALIAS_ALT and/or TU_FEX_COMPILE_NOPREAMBLE_ALT); the
++ * constants are loaded with that binary's layout (tu_program_state::
++ * fex_alt_fs_variant). */
++#define TU_FEX_MODE_ALT_FS TU_FEX_MODE_NOALIAS
+ /* Mode bits for command buffers (tu_fex_begin_cmdbuf). */
+ #define TU_FEX_MODE_MASK 0x6fu
+ /* fex5: the memory budget query reads /proc/meminfo at most every 250 ms and
+@@ -174,9 +183,22 @@
+  * is not known, hence both binaries and TU_FEX_MODE_NOALIAS. Part of the
+  * shader keys (tu_shader_key::fex_noalias_alt). */
+ #define TU_FEX_COMPILE_NOALIAS_ALT 0x20u
+-#define TU_FEX_COMPILE_MASK 0x3fu
++/* fex13: fragment shaders with at least TU_FEX_NOALIAS_MIN_INSTRS
++ * instructions and a preamble of TU_FEX_NOPREAMBLE_MIN or more instructions
++ * get a second binary without preamble (ir3_shader_key::fex_nopreamble).
++ * The a7xx early preamble runs once per draw before that draw's waves may
++ * start; D2R's lighting shaders have 137 preamble instructions (about 70
++ * one-value const stores, no memory reads since fex9/fex10), and their
++ * waves spend 25-30% of their life in the HWAVE_WAIT state, which no other
++ * pass shows. Without preamble each wave computes those values itself
++ * (+0.7% instructions, same registers). Combined with
++ * TU_FEX_COMPILE_NOALIAS_ALT the second binary has both. Part of the shader
++ * keys (tu_shader_key::fex_nopreamble_alt). */
++#define TU_FEX_COMPILE_NOPREAMBLE_ALT 0x40u
++#define TU_FEX_COMPILE_MASK 0x7fu
+ #define TU_FEX_NOALIAS_MIN_INSTRS 1024u
+ #define TU_FEX_NOALIAS_MIN_ALIAS 64u
++#define TU_FEX_NOPREAMBLE_MIN 32u
+ 
+ /* tu_fex_channel::status bits (driver) */
+ #define TU_FEX_STATUS_ATTACHED 0x1u      /* a device read the channel */
+@@ -210,6 +232,8 @@
+ #define TU_FEX_STATUS_NOALIAS 0x80000u
+ /* fex12: the no-alias statistics in the channel extension are written */
+ #define TU_FEX_STATUS_NOALIAS_STATS 0x100000u
++/* fex13: TU_FEX_COMPILE_NOPREAMBLE_ALT honored (a7xx) */
++#define TU_FEX_STATUS_NOPREAMBLE 0x200000u
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -313,11 +337,16 @@ struct tu_fex_channel {
+     * binary, [0] = the pipeline can use it, [1] = it cannot (the pipeline
+     * uses the reduced-constants binary, ir3_trim_constlen). */
+    volatile uint32_t na_pipes[2];
++   /* 0x358 (fex13): preamble instructions of both binaries (totals over
++    * na_shaders, like na_instr). */
++   volatile uint32_t na_preamble[2];
+ };
+ /* Size of the layout before fex11 (what 'size' holds). */
+ #define TU_FEX_CHANNEL_BASE_SIZE 0x2a8u
+ /* Size of the fex11 layout (switch statistics). */
+ #define TU_FEX_CHANNEL_SW_SIZE 0x300u
++/* Size of the fex12 layout (no-alias statistics). */
++#define TU_FEX_CHANNEL_NA_SIZE 0x358u
+ 
+ /* tu_fex_slot::mode bit (fex3): the pass clears a depth/stencil attachment
+  * at its start, so TU_FEX_MODE_DEPTH_CLEAR_3D may change its time. */
+@@ -361,7 +390,8 @@ static_assert(__builtin_offsetof(struct tu_fex_channel, na_shaders) == 0x310, "l
+ static_assert(__builtin_offsetof(struct tu_fex_channel, na_regs) == 0x338, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, na_ss_stall) == 0x340, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, na_pipes) == 0x350, "layout shared with FEX");
+-static_assert(sizeof(struct tu_fex_channel) == 0x358, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, na_preamble) == 0x358, "layout shared with FEX");
++static_assert(sizeof(struct tu_fex_channel) == 0x360, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
+ 
+ struct tu_device;
+@@ -428,6 +458,10 @@ struct tu_fex_device {
+    uint32_t na_min_instrs;     /* fex12: TU_FEX_NOALIAS_MIN_INSTRS unless the */
+    uint32_t na_min_alias;      /* Unix env TU_FEX_NOALIAS_MIN=instrs,alias says else */
+    bool na_stats;              /* fex12: channel extension covers na_* */
++   bool nopreamble_alt;        /* fex13: TU_FEX_STATUS_NOPREAMBLE */
++   bool np_stats;              /* fex13: channel extension covers na_preamble */
++   uint32_t np_min_preamble;   /* fex13: TU_FEX_NOPREAMBLE_MIN unless the Unix env
++                                * TU_FEX_NOPREAMBLE_MIN says else */
+    uint32_t counter_count;     /* == chan->counter_count */
+    uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
+    uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];
+@@ -474,9 +508,18 @@ tu_fex_noalias_alt(const struct tu_fex_device *fex)
+    return fex && fex->noalias_alt;
+ }
+ 
++/* fex13: big fragment shaders get a second binary without preamble
++ * (false without a channel). */
++static inline bool
++tu_fex_nopreamble_alt(const struct tu_fex_device *fex)
++{
++   return fex && fex->nopreamble_alt;
++}
++
+ /* fex12: totals of one shader's two binaries for the channel. */
+ struct tu_fex_noalias_stats {
+    uint32_t instr, nops, alias, movs, regs, ss_stall, sy_stall;
++   uint32_t preamble; /* fex13 */
+ };
+ /* A fragment shader got its no-alias binary (made or loaded from a cache). */
+ void tu_fex_count_noalias(struct tu_device *dev,
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index f1ac21f..cde58e2 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -2487,6 +2487,8 @@ tu_emit_program_state(struct tu_cs *sub_cs,
+        !(safe_variants & (1u << MESA_SHADER_FRAGMENT)))
+          ? shaders[MESA_SHADER_FRAGMENT]->fex_alt_state
+          : (struct tu_draw_state) {};
++   prog->fex_alt_fs_variant = prog->fex_alt_fs_state.size
++      ? shaders[MESA_SHADER_FRAGMENT]->fex_alt_variant : NULL;
+    if (shaders[MESA_SHADER_FRAGMENT] &&
+        shaders[MESA_SHADER_FRAGMENT]->fex_alt_variant)
+       tu_fex_count_noalias_pipeline(sub_cs->device,
+diff --git a/src/freedreno/vulkan/tu_pipeline.h b/src/freedreno/vulkan/tu_pipeline.h
+index 6759f15..423ef2e 100644
+--- a/src/freedreno/vulkan/tu_pipeline.h
++++ b/src/freedreno/vulkan/tu_pipeline.h
+@@ -109,6 +109,10 @@ struct tu_program_state
+        * (tu_shader::fex_alt_state), size 0 = none. Bound instead of
+        * fs_state in command buffers with TU_FEX_MODE_NOALIAS. */
+       struct tu_draw_state fex_alt_fs_state;
++      /* fex13: the binary behind fex_alt_fs_state. Its constant layout may
++       * differ from the stock one (no preamble), so binding it also loads
++       * link[MESA_SHADER_FRAGMENT] from it. */
++      const struct ir3_shader_variant *fex_alt_fs_variant;
+ 
+       struct tu_push_constant_range shared_consts;
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 2952843..b2bf802 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -3255,6 +3255,7 @@ tu_fex_noalias_stats_of(const struct ir3_shader_variant *v,
+    s->regs = v->info.max_reg + 1;
+    s->ss_stall = v->info.sstall;
+    s->sy_stall = v->info.systall;
++   s->preamble = v->info.preamble_instrs_count; /* fex13 */
+ }
+ 
+ static VkResult
+@@ -3854,12 +3855,19 @@ tu_shader_create(struct tu_device *dev,
+    /* fex12: big fragment shaders once more without alias.tex, for the
+     * per-command-buffer choice (TU_FEX_MODE_NOALIAS). A pipeline that picks
+     * the safe constlen variant doesn't use it (tu_emit_program_state). */
+-   if (key->fex_noalias_alt && shader->variant &&
++   /* fex13: or without preamble (TU_FEX_COMPILE_NOPREAMBLE_ALT), or both. */
++   const bool fex_alt_na =
++      key->fex_noalias_alt && shader->variant &&
++      shader->variant->info.instrs_per_cat[7] >= dev->fex->na_min_alias;
++   const bool fex_alt_np =
++      key->fex_nopreamble_alt && shader->variant &&
++      shader->variant->info.preamble_instrs_count >= dev->fex->np_min_preamble;
++   if ((fex_alt_na || fex_alt_np) &&
+        shader->variant->type == MESA_SHADER_FRAGMENT &&
+-       shader->variant->info.instrs_count >= dev->fex->na_min_instrs &&
+-       shader->variant->info.instrs_per_cat[7] >= dev->fex->na_min_alias) {
++       shader->variant->info.instrs_count >= dev->fex->na_min_instrs) {
+       struct ir3_shader_key alt_key = *ir3_key;
+-      alt_key.fex_noalias_tex = true;
++      alt_key.fex_noalias_tex = key->fex_noalias_alt;
++      alt_key.fex_nopreamble = key->fex_nopreamble_alt;
+       struct ir3_shader_variant *alt =
+          ir3_shader_create_variant(ir3_shader, &alt_key, executable_info);
+       if (alt && tu_fex_noalias_ok(shader->variant, alt)) {
+@@ -4238,6 +4246,7 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
+    key->fex_cp_ubo = tu_fex_cp_ubo(dev->fex);
+    key->fex_ubo_table = tu_fex_ubo_table(dev->fex);
+    key->fex_noalias_alt = tu_fex_noalias_alt(dev->fex);
++   key->fex_nopreamble_alt = tu_fex_nopreamble_alt(dev->fex);
+ }
+ 
+ void
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index f0bd45b..230f993 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -75,7 +75,9 @@ struct tu_shader
+ 
+    /* fex12 (TU_FEX_COMPILE_NOALIAS_ALT): the same fragment shader compiled
+     * without alias.tex, and its draw state; NULL/empty if not made. Same
+-    * constants, inputs and outputs as 'variant' (tu_fex_noalias_ok). */
++    * inputs and outputs as 'variant' (tu_fex_noalias_ok). fex13
++    * (TU_FEX_COMPILE_NOPREAMBLE_ALT): or without preamble, then with its own
++    * constant layout (no more constants than 'variant'). */
+    const struct ir3_shader_variant *fex_alt_variant;
+    struct tu_draw_state fex_alt_state;
+    struct tu_draw_state binning_state;
+@@ -160,7 +162,10 @@ struct tu_shader_key {
+    /* fex12: TU_FEX_COMPILE_NOALIAS_ALT (tu_fex_noalias_alt): big fragment
+     * shaders carry a second binary without alias.tex. */
+    bool fex_noalias_alt : 1;
+-   uint32_t padding : 17;
++   /* fex13: TU_FEX_COMPILE_NOPREAMBLE_ALT (tu_fex_nopreamble_alt): the
++    * second binary of big fragment shaders has no preamble. */
++   bool fex_nopreamble_alt : 1;
++   uint32_t padding : 16;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 
