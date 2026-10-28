@@ -272,9 +272,46 @@ namespace {
   bool TurnipBudgetCache {};
   uint32_t TurnipSwitch {};
   uint32_t TurnipNoAlias {};
+  uint32_t TurnipWaveArms {}; // FEX_TU_WAVE_PAIR: bit N = wave setup arm N takes part
+
+  // FEX_TU_WAVE_PAIR: 0 = off; alt = arms 0-4 a second each; digits 0-4 = those arms (one digit other than 0 = that arm
+  // always).
+  uint32_t ParseWaveArms(const char* Value) {
+    if (!Value || !Value[0]) {
+      return 0;
+    }
+    if (Value[0] == 'a' || Value[0] == 'A') {
+      return 0x1f;
+    }
+    uint32_t Arms = 0;
+    for (const char* c = Value; *c; ++c) {
+      if (*c >= '0' && *c <= '4') {
+        Arms |= 1u << (*c - '0');
+      }
+    }
+    return Arms == 1 ? 0 : Arms;
+  }
 
   bool SwitchOff(const char* Value) {
     return !Value || (Value[0] == '0' && !Value[1]);
+  }
+
+  // The wave setups FEX_TU_WAVE_PAIR asked for, for the FEX link note.
+  fextl::string WaveArmsText(uint32_t Arms) {
+    if (!Arms) {
+      return "stock (FEX_TU_WAVE_PAIR=0)";
+    }
+    static constexpr const char* Names[] = {"stock", "pair mode 1", "pair mode 2", "pair mode 3", "128-pixel waves"};
+    fextl::string List;
+    uint32_t N = 0;
+    for (uint32_t a = 0; a < 5; ++a) {
+      if (Arms & (1u << a)) {
+        List += fextl::fmt::format("{}{}", N++ ? ", " : "", Names[a]);
+      }
+    }
+    return fextl::fmt::format("{} {} (FEX_TU_WAVE_PAIR, driver fex14 and later; one-time recompile of those shaders{})",
+                              N > 1 ? "rotating a second each:" : "always", List,
+                              (Arms & (1u << Turnip::FsArmW128)) ? "; the second binary's mode bit follows setup 128-pixel waves" : "");
   }
 
   // See EnvironmentVariablesHandling.h and TurnipChannel.h. The driver reads TU_FEX_CHANNEL when the game's Vulkan
@@ -339,12 +376,19 @@ namespace {
     // stats log alt stays on.
     const char* NoAlias = Switch("FEX_TU_NOALIAS");
     TurnipNoAlias = SwitchOff(NoAlias) ? 0 : (NoAlias[0] == 'a' || NoAlias[0] == 'A' || NoAlias[0] == '2') ? 2 : 1;
+    // FEX_TU_WAVE_PAIR (see EnvironmentVariablesHandling.h): the wave setup of big fragment shaders, starting with the
+    // lowest arm asked for; TurnipReport moves to the next one each second.
+    TurnipWaveArms = ParseWaveArms(Switch("FEX_TU_WAVE_PAIR"));
+    const uint32_t FirstArm = TurnipWaveArms ? static_cast<uint32_t>(__builtin_ctz(TurnipWaveArms)) : 0;
     // FEX_TU_NOPREAMBLE alt/lit (SetupTurnipNoPreamble): the second binary without preamble, picked with the same mode bit.
+    // With wave setup 4 (the 128-pixel binary) asked for, that bit follows the wave setup instead.
+    const bool AltFs = (TurnipWaveArms & (1u << Turnip::FsArmW128)) ? FirstArm == Turnip::FsArmW128 :
+                                                                       (TurnipNoAlias || TurnipNoPreamble >= 2);
     Chan->Mode = (TurnipDesc ? (Turnip::ModeChangedOnly | Turnip::ModePushReuse) : 0) |
                  (TurnipDepthClear ? Turnip::ModeDepthClear3d : 0) |
                  (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0) | (TurnipBudgetCache ? Turnip::ModeBudgetCache : 0) |
-                 (TurnipSwitch ? Turnip::ModeSwitch : 0) |
-                 ((TurnipNoAlias || TurnipNoPreamble >= 2) ? Turnip::ModeAltFs : 0);
+                 (TurnipSwitch ? Turnip::ModeSwitch : 0) | (AltFs ? Turnip::ModeAltFs : 0) |
+                 (FirstArm << Turnip::ModeFsArmShift);
 
     // FEX_TU_COUNTERS: 1 (D2R default in build 102) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at
     // least this many draws get timed and counted (D2R default 100 in build 102: the main pass, the depth prepasses and
@@ -354,6 +398,8 @@ namespace {
     // wave), and the wave spending 15% on math, 3% on idle issue slots, 27% waiting for texture/memory data and ~40% in
     // states that list didn't count. The texture counters are dropped (102 has them: 40% L1 misses, 25% L2 misses);
     // these are all the shader core's wave state counters, so the shares add up and the biggest state is named.
+    // Build 105: special math (efu, 0.4%) and join (~1%) make room for the 64/128-pixel wave counts, which show whether
+    // the 128-pixel wave setup (FEX_TU_WAVE_PAIR) ran.
     if (!SwitchOff(Switch("FEX_TU_COUNTERS"))) {
       static constexpr struct {
         uint32_t Group, Countable;
@@ -364,9 +410,11 @@ namespace {
         {Turnip::GroupSp, 8},  // SP_WAVE_CONTEXTS
         {Turnip::GroupSp, 10}, // SP_STAGE_WAVE_CYCLES (fragment wave lives)
         {Turnip::GroupSp, 11}, // SP_STAGE_WAVE_SAMPLES (fragment waves)
+        // Build 105: fragment waves launched as 64 (1x) and 128 (2x) pixels, so the 128-pixel setup shows it ran.
+        {Turnip::GroupSp, 97}, // SP_FS_STAGE_1X_WAVES
+        {Turnip::GroupSp, 98}, // SP_FS_STAGE_2X_WAVES
         // Issuing, by unit.
         {Turnip::GroupSp, 89}, // SP_WAVE_ALU_CYCLES (float math)
-        {Turnip::GroupSp, 90}, // SP_WAVE_EFU_CYCLES (special math: square roots, reciprocals, powers, sines)
         {Turnip::GroupSp, 91}, // SP_WAVE_INT_CYCLES (integer math)
         {Turnip::GroupSp, 92}, // SP_WAVE_CSP_CYCLES
         {Turnip::GroupSp, 19}, // SP_WAVE_NOP_CYCLES (idle issue slots the compiler put in)
@@ -380,7 +428,6 @@ namespace {
         {Turnip::GroupSp, 17},  // SP_WAVE_LOAD_CYCLES
         {Turnip::GroupSp, 18},  // SP_WAVE_EMIT_CYCLES
         {Turnip::GroupSp, 23},  // SP_WAVE_END_CYCLES
-        {Turnip::GroupSp, 26},  // SP_WAVE_JOIN_CYCLES
         {Turnip::GroupSp, 104}, // SP_WAVE_INPUT_CYCLES
         {Turnip::GroupSp, 105}, // SP_WAVE_OUTPUT_CYCLES
         {Turnip::GroupSp, 106}, // SP_WAVE_HWAVE_WAIT_CYCLES
@@ -432,6 +479,14 @@ namespace {
     if (TurnipNoPreamble >= 2) {
       Chan->Compile |= Turnip::CompileNoPreambleAlt;
     }
+    // FEX_TU_WAVE_PAIR (driver fex14 and later): pair mode states for arms 1-3 (made when a shader is uploaded), the
+    // 128-pixel second binary for arm 4 (part of the shader keys, so a one-time recompile of the big fragment shaders).
+    if (TurnipWaveArms & 0xe) {
+      Chan->Compile |= Turnip::CompilePairAlt;
+    }
+    if (TurnipWaveArms & (1u << Turnip::FsArmW128)) {
+      Chan->Compile |= Turnip::CompileW128Alt;
+    }
 
     const auto Text = fextl::fmt::format("{:x}", reinterpret_cast<uintptr_t>(Chan));
     auto WineSetEnv = reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv);
@@ -446,7 +501,7 @@ namespace {
                                     "buffers {}, preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the "
                                     "command processor {}, other root constant buffer reads through the shaders' UBO table {}, pipeline "
                                     "switches send only what changed {}, lighting shaders without alias.tex helpers {}, lighting "
-                                    "shaders without preamble {}, depth clears at pass start {}, "
+                                    "shaders without preamble {}, lighting shader wave setups {}, depth clears at pass start {}, "
                                     "memory budget {}, {} GPU counters asked for, passes with {}+ draws timed and counted; only FEX's "
                                     "Turnip build (fex1 and later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
@@ -474,6 +529,7 @@ namespace {
                                                             "recompile)" :
                                     TurnipNoPreamble == 1 ? "for every shader by IR3_SHADER_DEBUG (FEX_TU_NOPREAMBLE=1)" :
                                                             "off (FEX_TU_NOPREAMBLE=0)",
+                                    WaveArmsText(TurnipWaveArms),
                                     TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
                                                             "in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
                                     TurnipDepthClear == 3 ? "by a 3D draw without fragment shader (fast Z, FEX_TU_DEPTH_CLEAR=fastz, "
@@ -576,6 +632,9 @@ namespace Turnip {
   }
   uint32_t NoPreambleSwitch() {
     return TurnipNoPreamble;
+  }
+  uint32_t WavePairArms() {
+    return TurnipWaveArms;
   }
 } // namespace Turnip
 } // namespace FEX::Windows

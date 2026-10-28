@@ -119,7 +119,7 @@ namespace FEX::Windows {
 //                        go), so a draw's pixels no longer wait on the chain of reads. Every shader is compiled anew
 //                        the first time (the flag is part of the driver's cache key).
 //   FEX_TU_NOPREAMBLE=0  leave IR3_SHADER_DEBUG alone (the D2R default from build 69 to 103)
-//   FEX_TU_NOPREAMBLE=alt  (the D2R default from build 104) leave IR3_SHADER_DEBUG alone; through FEX's link FEX's Turnip
+//   FEX_TU_NOPREAMBLE=alt  (the D2R default in build 104 only, 0 from build 105: no gain) leave IR3_SHADER_DEBUG alone; through FEX's link FEX's Turnip
 //                        (fex13 and later) compiles the big fragment shaders (D2R's lighting shaders, 1,024+ instructions
 //                        with a preamble of 32+) a second time without preamble, with their own constant layout, and
 //                        pipelines use that binary in every other second (TurnipReport flips the mode bit; 'np on/off'
@@ -246,6 +246,18 @@ namespace FEX::Windows {
 //                          binary is kept only when the pipeline state built from the shader is the same. Read once at
 //                          device creation and part of the shader keys (one-time recompile). 1 = always, 0 = stock.
 //                          Without the stats log nothing flips it, so alt stays on.
+//   FEX_TU_WAVE_PAIR=alt   (the D2R default from build 105, driver fex14 and later) big fragment shaders (1,024+
+//                          instructions, D2R's lighting shaders) run with another wave setup each second, in turn:
+//                          0 stock, 1-3 SP_PS_CNTL_1.WAVE_PAIR_MODE 1, 2, 3 (a7xx; the driver writes 0, the values are
+//                          not documented), 4 a second binary compiled as 128-pixel waves (ir3 keeps them at 64; same
+//                          instructions and registers). Build 104: lighting waves spend 25-30% of their life in
+//                          HWAVE_WAIT with or without preamble; a Qualcomm patent (US11954758, dynamic wave pairing)
+//                          describes 64-pixel waves running as pairs that part at texture and branch blocks and join
+//                          again, the one that got ahead waiting. A list of digits (e.g. 04) rotates only those, one
+//                          digit = that setup always, 0 = stock. With setup 4 in the list, the second binary's mode bit
+//                          follows the rotation (FEX_TU_NOALIAS / FEX_TU_NOPREAMBLE then only change how that binary is
+//                          compiled). Read once at device creation (one-time recompile of those shaders). Without the
+//                          stats log nothing rotates, so the first setup in the list stays.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

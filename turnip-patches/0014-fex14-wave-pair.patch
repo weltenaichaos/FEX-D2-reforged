@@ -1,0 +1,489 @@
+diff --git a/src/freedreno/ir3/ir3.c b/src/freedreno/ir3/ir3.c
+index 0c26db3..e9d3544 100644
+--- a/src/freedreno/ir3/ir3.c
++++ b/src/freedreno/ir3/ir3.c
+@@ -219,6 +219,10 @@ ir3_should_double_threadsize(struct ir3_shader_variant *v, unsigned regs_count)
+    case MESA_SHADER_KERNEL:
+    case MESA_SHADER_COMPUTE:
+    case MESA_SHADER_FRAGMENT: {
++      /* FEX (fex14): asked for 128-pixel waves (ir3_shader_key::fex_wave128). */
++      if (v->type == MESA_SHADER_FRAGMENT && v->key.fex_wave128)
++         return regs_count * 2 <= compiler->reg_size_vec4;
++
+       /* One of the limits on maximum waves of the shader running in parallel is
+        * the register count used in the shader compared to the hardware's
+        * register file size.  The absolute limit is if doubling the threadsize
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index 3aea844..90bfc68 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -479,6 +479,18 @@ struct ir3_shader_key {
+           * (TU_FEX_COMPILE_NOPREAMBLE_ALT), with its own constant layout.
+           */
+          unsigned fex_nopreamble : 1;
++
++         /* FEX (fex14): a fragment shader runs as 128-pixel waves (double
++          * threadsize) whenever its registers allow it (regs * 2 <= the
++          * register file), instead of ir3's heuristic, which keeps 32-bit
++          * shaders with more than a quarter of the register file at 64. On
++          * a6xx/a7xx 64-pixel waves are launched in pairs that run together
++          * and part at texture and branch blocks; a pair member that gets
++          * ahead waits for the other (SP_WAVE_HWAVE_WAIT_CYCLES). One
++          * 128-pixel wave has no partner. Turnip compiles big fragment
++          * shaders once more with it (TU_FEX_COMPILE_W128_ALT).
++          */
++         unsigned fex_wave128 : 1;
+       };
+       uint32_t global;
+    };
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index b032105..2bb169a 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -6071,6 +6071,22 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+       }
+       cmd->state.fex.na_binds[alt]++;
+    }
++   /* fex14: the wave setup arm of this command buffer. Arms 1-3 bind the
++    * fragment shader's draw state with WAVE_PAIR_MODE 1-3 (same binary and
++    * constants); arm 4 is the second binary above (FEX sets
++    * TU_FEX_MODE_ALT_FS with it). */
++   if (cmd->state.program.fex_pair_fs_state[0].size ||
++       cmd->state.program.fex_alt_fs_state.size) {
++      const uint32_t arm = (cmd->state.fex.mode & TU_FEX_MODE_FS_ARM_MASK) >>
++                           TU_FEX_MODE_FS_ARM_SHIFT;
++      /* Not with the second binary bound: its constant layout may differ. */
++      if (arm >= 1 && arm <= 3 &&
++          !(cmd->state.fex.mode & TU_FEX_MODE_ALT_FS) &&
++          cmd->state.program.fex_pair_fs_state[arm - 1].size)
++         cmd->state.program.fs_state =
++            cmd->state.program.fex_pair_fs_state[arm - 1];
++      cmd->state.fex.arm_binds[arm]++;
++   }
+ 
+    cmd->state.load_state = pipeline->load_state;
+    cmd->state.prim_order_gmem = pipeline->prim_order.state_gmem;
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index 7b6a909..d801a96 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -123,9 +123,15 @@ tu_fex_device_init(struct tu_device *dev)
+       status |= TU_FEX_STATUS_NOALIAS_STATS;
+    }
+    /* fex13: preamble totals only into a block that has them. */
+-   if (fex->na_stats && chan->ext_size >= sizeof(*chan) &&
+-       tu_fex_readable(chan, sizeof(*chan)))
++   if (fex->na_stats && chan->ext_size >= TU_FEX_CHANNEL_NP_SIZE &&
++       tu_fex_readable(chan, TU_FEX_CHANNEL_NP_SIZE))
+       fex->np_stats = true;
++   /* fex14: wave setup statistics only into a block that has them. */
++   if (fex->np_stats && chan->ext_size >= sizeof(*chan) &&
++       tu_fex_readable(chan, sizeof(*chan))) {
++      fex->arm_stats = true;
++      status |= TU_FEX_STATUS_ARM_STATS;
++   }
+ 
+    /* Read once: it changes compiled shaders (part of the layout hash). */
+    fex->compile = chan->compile & TU_FEX_COMPILE_MASK;
+@@ -162,6 +168,19 @@ tu_fex_device_init(struct tu_device *dev)
+       fex->nopreamble_alt = true;
+       status |= TU_FEX_STATUS_NOPREAMBLE;
+    }
++   /* fex14: SP_PS_CNTL_1 (and WAVE_PAIR_MODE) is a7xx only. */
++   if ((fex->compile & TU_FEX_COMPILE_PAIR_ALT) &&
++       dev->physical_device->info->chip == 7) {
++      fex->pair_alt = true;
++      status |= TU_FEX_STATUS_PAIR;
++   }
++   /* fex14: 128-pixel fragment waves where the GPU has them. */
++   if ((fex->compile & TU_FEX_COMPILE_W128_ALT) &&
++       dev->physical_device->info->chip >= 6 &&
++       dev->physical_device->info->props.supports_double_threadsize) {
++      fex->w128_alt = true;
++      status |= TU_FEX_STATUS_W128;
++   }
+    fex->np_min_preamble = TU_FEX_NOPREAMBLE_MIN;
+    const char *np = getenv("TU_FEX_NOPREAMBLE_MIN"); /* host tests */
+    if (np && *np)
+@@ -391,6 +410,15 @@ tu_fex_end_cmdbuf(struct tu_device *dev, struct tu_fex_cmd_state *st)
+       __atomic_fetch_add(&c->na_binds[1], st->na_binds[1], __ATOMIC_RELAXED);
+       st->na_binds[0] = st->na_binds[1] = 0;
+    }
++   /* fex14 */
++   if (fex->arm_stats) {
++      for (uint32_t a = 0; a < TU_FEX_FS_ARMS; a++) {
++         if (st->arm_binds[a]) {
++            __atomic_fetch_add(&c->arm_binds[a], st->arm_binds[a], __ATOMIC_RELAXED);
++            st->arm_binds[a] = 0;
++         }
++      }
++   }
+    if (!fex->sw_stats || !(st->sw_binds | st->sw_draw_run | st->sw_draw_kept))
+       return;
+    const uint32_t i = (st->mode & TU_FEX_MODE_SWITCH) ? 1 : 0;
+@@ -447,6 +475,15 @@ tu_fex_count_depth_clear(struct tu_device *dev, bool draw, bool fastz, uint64_t
+    }
+ }
+ 
++void
++tu_fex_count_pair_shader(struct tu_device *dev)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->arm_stats)
++      return;
++   __atomic_fetch_add(&fex->chan->pair_shaders, 1, __ATOMIC_RELAXED);
++}
++
+ void
+ tu_fex_count_color_clear(struct tu_device *dev, uint64_t pixels)
+ {
+@@ -586,7 +623,9 @@ tu_fex_pass_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool sysmem)
+       }
+    }
+    slot->mode = slot_mode;
+-   slot->sysmem = sysmem;
++   /* fex14: the wave setup arm in bits 4-6 */
++   slot->sysmem = (uint8_t)(sysmem | (((cmd->state.fex.mode & TU_FEX_MODE_FS_ARM_MASK) >>
++                                       TU_FEX_MODE_FS_ARM_SHIFT) << 4));
+    slot->colors = pass ? (uint8_t)MIN2(pass->subpasses[0].color_count, 255) : 0;
+    slot->attachments = pass ? (uint8_t)MIN2(pass->attachment_count, 255) : 0;
+    slot->format0 = pass && pass->attachment_count ? (uint32_t)pass->attachments[0].format : 0;
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 55fe89a..68b9f43 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -47,6 +47,12 @@
+  *    fragment shaders is compiled without preamble instead (or as well), and
+  *    has its own constant layout: command buffers with TU_FEX_MODE_NOALIAS
+  *    load its constants where it reads them.
++ *  - (fex14) TU_FEX_MODE_FS_ARM: big fragment shaders can run with another
++ *    wave setup per command buffer, so FEX can rotate through them a second
++ *    each: SP_PS_CNTL_1.WAVE_PAIR_MODE 1, 2 or 3 (TU_FEX_COMPILE_PAIR_ALT;
++ *    the driver always writes 0) or 128-pixel waves (TU_FEX_COMPILE_W128_ALT,
++ *    the second binary). The arm a pass was recorded with goes into its
++ *    slot (tu_fex_slot::sysmem bits 4-6).
+  * Without the variable (or with a block that fails the checks) the driver
+  * behaves like stock Turnip.
+  *
+@@ -62,7 +68,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 13
++#define TU_FEX_PATCH 14
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -121,8 +127,21 @@
+  * constants are loaded with that binary's layout (tu_program_state::
+  * fex_alt_fs_variant). */
+ #define TU_FEX_MODE_ALT_FS TU_FEX_MODE_NOALIAS
++/* fex14: wave setup of big fragment shaders (bits 8-10, 0 = stock):
++ * 1-3 = their draw state with SP_PS_CNTL_1.WAVE_PAIR_MODE 1-3 (needs
++ * TU_FEX_COMPILE_PAIR_ALT), 4 = the second binary (with
++ * TU_FEX_COMPILE_W128_ALT: 128-pixel waves; FEX sets TU_FEX_MODE_ALT_FS
++ * with it). Build 104 measured D2R's lighting waves 25-30% of their life in
++ * HWAVE_WAIT, which a Qualcomm patent ("dynamic wave pairing", US11954758)
++ * explains: 64-pixel waves run in pairs that part at texture and branch
++ * blocks and join again, and the one that got ahead waits. The driver
++ * writes WAVE_PAIR_MODE 0; what 1-3 do is not documented. */
++#define TU_FEX_MODE_FS_ARM_SHIFT 8
++#define TU_FEX_MODE_FS_ARM_MASK 0x700u
++#define TU_FEX_FS_ARM_W128 4u
++#define TU_FEX_FS_ARMS 8u
+ /* Mode bits for command buffers (tu_fex_begin_cmdbuf). */
+-#define TU_FEX_MODE_MASK 0x6fu
++#define TU_FEX_MODE_MASK 0x76fu
+ /* fex5: the memory budget query reads /proc/meminfo at most every 250 ms and
+  * reuses the last MemAvailable in between (stock: on every call). D3D12 games
+  * ask DXGI for the video memory budget every frame (QueryVideoMemoryInfo); FEX's
+@@ -195,7 +214,17 @@
+  * TU_FEX_COMPILE_NOALIAS_ALT the second binary has both. Part of the shader
+  * keys (tu_shader_key::fex_nopreamble_alt). */
+ #define TU_FEX_COMPILE_NOPREAMBLE_ALT 0x40u
+-#define TU_FEX_COMPILE_MASK 0x7fu
++/* fex14: fragment shaders with at least TU_FEX_NOALIAS_MIN_INSTRS
++ * instructions get three more draw states (same binary) with
++ * SP_PS_CNTL_1.WAVE_PAIR_MODE 1, 2 and 3, for TU_FEX_MODE_FS_ARM 1-3. Not
++ * part of the shader keys (the states are made when the shader is uploaded). */
++#define TU_FEX_COMPILE_PAIR_ALT 0x80u
++/* fex14: fragment shaders with at least TU_FEX_NOALIAS_MIN_INSTRS
++ * instructions that ir3 runs as 64-pixel waves get a second binary as
++ * 128-pixel waves (ir3_shader_key::fex_wave128), for TU_FEX_MODE_FS_ARM 4.
++ * Part of the shader keys (tu_shader_key::fex_w128_alt). */
++#define TU_FEX_COMPILE_W128_ALT 0x100u
++#define TU_FEX_COMPILE_MASK 0x1ffu
+ #define TU_FEX_NOALIAS_MIN_INSTRS 1024u
+ #define TU_FEX_NOALIAS_MIN_ALIAS 64u
+ #define TU_FEX_NOPREAMBLE_MIN 32u
+@@ -234,6 +263,12 @@
+ #define TU_FEX_STATUS_NOALIAS_STATS 0x100000u
+ /* fex13: TU_FEX_COMPILE_NOPREAMBLE_ALT honored (a7xx) */
+ #define TU_FEX_STATUS_NOPREAMBLE 0x200000u
++/* fex14: TU_FEX_COMPILE_PAIR_ALT honored (a7xx) */
++#define TU_FEX_STATUS_PAIR 0x400000u
++/* fex14: TU_FEX_COMPILE_W128_ALT honored (a6xx/a7xx with double threadsize) */
++#define TU_FEX_STATUS_W128 0x800000u
++/* fex14: the wave setup statistics in the channel extension are written */
++#define TU_FEX_STATUS_ARM_STATS 0x1000000u
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -340,6 +375,13 @@ struct tu_fex_channel {
+    /* 0x358 (fex13): preamble instructions of both binaries (totals over
+     * na_shaders, like na_instr). */
+    volatile uint32_t na_preamble[2];
++   /* 0x360 (fex14, driver; only when ext_size covers it): graphics pipeline
++    * binds whose fragment shader has fex14 wave setups (pair mode states or
++    * the second binary), by the command buffer's TU_FEX_MODE_FS_ARM. */
++   volatile uint64_t arm_binds[TU_FEX_FS_ARMS];
++   /* 0x3a0: fragment shaders that got the pair mode states, made this run */
++   volatile uint32_t pair_shaders;
++   uint32_t pad_3a4;
+ };
+ /* Size of the layout before fex11 (what 'size' holds). */
+ #define TU_FEX_CHANNEL_BASE_SIZE 0x2a8u
+@@ -347,6 +389,8 @@ struct tu_fex_channel {
+ #define TU_FEX_CHANNEL_SW_SIZE 0x300u
+ /* Size of the fex12 layout (no-alias statistics). */
+ #define TU_FEX_CHANNEL_NA_SIZE 0x358u
++/* Size of the fex13 layout (preamble totals). */
++#define TU_FEX_CHANNEL_NP_SIZE 0x360u
+ 
+ /* tu_fex_slot::mode bit (fex3): the pass clears a depth/stencil attachment
+  * at its start, so TU_FEX_MODE_DEPTH_CLEAR_3D may change its time. */
+@@ -360,7 +404,8 @@ struct tu_fex_slot {
+    uint16_t height;    /* 14 */
+    uint8_t mode;       /* 16: TU_FEX_MODE_* the pass was recorded with,
+                         * | TU_FEX_SLOT_DEPTH_CLEAR (fex3) */
+-   uint8_t sysmem;     /* 17: 1 direct (sysmem), 0 tiled (gmem) */
++   uint8_t sysmem;     /* 17: bit 0: 1 direct (sysmem), 0 tiled (gmem);
++                        * bits 4-6 (fex14): TU_FEX_MODE_FS_ARM */
+    uint8_t colors;     /* 18: color attachments of the first subpass */
+    uint8_t attachments;/* 19 */
+    uint32_t format0;   /* 20: VkFormat of attachment 0 */
+@@ -391,7 +436,9 @@ static_assert(__builtin_offsetof(struct tu_fex_channel, na_regs) == 0x338, "layo
+ static_assert(__builtin_offsetof(struct tu_fex_channel, na_ss_stall) == 0x340, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, na_pipes) == 0x350, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, na_preamble) == 0x358, "layout shared with FEX");
+-static_assert(sizeof(struct tu_fex_channel) == 0x360, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, arm_binds) == TU_FEX_CHANNEL_NP_SIZE, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, pair_shaders) == 0x3a0, "layout shared with FEX");
++static_assert(sizeof(struct tu_fex_channel) == 0x3a8, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
+ 
+ struct tu_device;
+@@ -443,6 +490,8 @@ struct tu_fex_cmd_state {
+    /* fex12: binds of pipelines with a no-alias fragment shader binary,
+     * [0] stock binary, [1] no-alias binary */
+    uint32_t na_binds[2];
++   /* fex14: binds of pipelines with wave setups, by TU_FEX_MODE_FS_ARM */
++   uint32_t arm_binds[TU_FEX_FS_ARMS];
+ };
+ 
+ struct tu_fex_device {
+@@ -462,6 +511,9 @@ struct tu_fex_device {
+    bool np_stats;              /* fex13: channel extension covers na_preamble */
+    uint32_t np_min_preamble;   /* fex13: TU_FEX_NOPREAMBLE_MIN unless the Unix env
+                                 * TU_FEX_NOPREAMBLE_MIN says else */
++   bool pair_alt;              /* fex14: TU_FEX_STATUS_PAIR */
++   bool w128_alt;              /* fex14: TU_FEX_STATUS_W128 */
++   bool arm_stats;             /* fex14: channel extension covers arm_binds */
+    uint32_t counter_count;     /* == chan->counter_count */
+    uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
+    uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];
+@@ -516,6 +568,25 @@ tu_fex_nopreamble_alt(const struct tu_fex_device *fex)
+    return fex && fex->nopreamble_alt;
+ }
+ 
++/* fex14: big fragment shaders get draw states with WAVE_PAIR_MODE 1-3
++ * (false without a channel). */
++static inline bool
++tu_fex_pair_alt(const struct tu_fex_device *fex)
++{
++   return fex && fex->pair_alt;
++}
++
++/* fex14: big fragment shaders get a second binary as 128-pixel waves
++ * (false without a channel). */
++static inline bool
++tu_fex_w128_alt(const struct tu_fex_device *fex)
++{
++   return fex && fex->w128_alt;
++}
++
++/* fex14: a fragment shader got its pair mode states. */
++void tu_fex_count_pair_shader(struct tu_device *dev);
++
+ /* fex12: totals of one shader's two binaries for the channel. */
+ struct tu_fex_noalias_stats {
+    uint32_t instr, nops, alias, movs, regs, ss_stall, sy_stall;
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index cde58e2..e0536ca 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -2493,6 +2493,14 @@ tu_emit_program_state(struct tu_cs *sub_cs,
+        shaders[MESA_SHADER_FRAGMENT]->fex_alt_variant)
+       tu_fex_count_noalias_pipeline(sub_cs->device,
+                                     prog->fex_alt_fs_state.size != 0);
++   /* fex14: same rule for the pair mode states. */
++   for (unsigned m = 0; m < 3; m++) {
++      prog->fex_pair_fs_state[m] =
++         (shaders[MESA_SHADER_FRAGMENT] &&
++          !(safe_variants & (1u << MESA_SHADER_FRAGMENT)))
++            ? shaders[MESA_SHADER_FRAGMENT]->fex_pair_state[m]
++            : (struct tu_draw_state) {};
++   }
+ 
+    const struct ir3_shader_variant *vs = variants[MESA_SHADER_VERTEX];
+    const struct ir3_shader_variant *hs = variants[MESA_SHADER_TESS_CTRL];
+diff --git a/src/freedreno/vulkan/tu_pipeline.h b/src/freedreno/vulkan/tu_pipeline.h
+index 423ef2e..ff3111b 100644
+--- a/src/freedreno/vulkan/tu_pipeline.h
++++ b/src/freedreno/vulkan/tu_pipeline.h
+@@ -113,6 +113,10 @@ struct tu_program_state
+        * differ from the stock one (no preamble), so binding it also loads
+        * link[MESA_SHADER_FRAGMENT] from it. */
+       const struct ir3_shader_variant *fex_alt_fs_variant;
++      /* fex14: fs_state with SP_PS_CNTL_1.WAVE_PAIR_MODE 1-3
++       * (tu_shader::fex_pair_state), size 0 = none. Bound instead of fs_state
++       * in command buffers with TU_FEX_MODE_FS_ARM 1-3. */
++      struct tu_draw_state fex_pair_fs_state[3];
+ 
+       struct tu_push_constant_range shared_consts;
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index b2bf802..e7bdd00 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -2590,6 +2590,10 @@ tu6_tex_opc_to_prefetch_cmd(opc_t tex_opc)
+    }
+ }
+ 
++/* fex14: WAVE_PAIR_MODE for the fragment shader draw state being made
++ * (tu_upload_shader sets it around the TU_FEX_COMPILE_PAIR_ALT states). */
++static thread_local uint32_t tu_fex_pair_mode_override = 0;
++
+ template <chip CHIP>
+ static void
+ tu6_emit_fs_inputs(struct tu_cs *cs, const struct ir3_shader_variant *fs)
+@@ -2695,6 +2699,7 @@ tu6_emit_fs_inputs(struct tu_cs *cs, const struct ir3_shader_variant *fs)
+          .sysval_regs_count = sysval_regs,
+          .defer_wave_alloc_dis = true,
+          .evict_buf_mode = 1,
++         .wave_pair_mode = tu_fex_pair_mode_override, /* fex14, stock 0 */
+       ));
+    }
+ 
+@@ -3205,10 +3210,15 @@ tu_upload_variant(struct tu_cs *cs,
+  * state is made from the stock binary and must fit both. */
+ static bool
+ tu_fex_noalias_ok(const struct ir3_shader_variant *m,
+-                  const struct ir3_shader_variant *a)
++                  const struct ir3_shader_variant *a,
++                  bool w128 /* fex14: the second binary must be 128 wide */)
+ {
+-   if (a->info.double_threadsize != m->info.double_threadsize ||
+-       a->info.early_preamble != m->info.early_preamble ||
++   /* fex14: the wave size is in the fragment shader's own draw state
++    * (SP_PS_CNTL_0, SP_PS_WAVE_CNTL), which the second binary has its own of. */
++   if (w128 ? (!a->info.double_threadsize || m->info.double_threadsize)
++            : a->info.double_threadsize != m->info.double_threadsize)
++      return false;
++   if (a->info.early_preamble != m->info.early_preamble ||
+        a->mergedregs != m->mergedregs ||
+        m->pvtmem_size || a->pvtmem_size ||
+        a->constlen > m->constlen ||
+@@ -3288,6 +3298,14 @@ tu_upload_shader(struct tu_device *dev,
+       }
+    }
+ 
++   /* fex14: big fragment shaders get 'state' three more times with
++    * WAVE_PAIR_MODE 1-3 (same binary). */
++   const bool fex_pair = tu_fex_pair_alt(dev->fex) &&
++                         v->type == MESA_SHADER_FRAGMENT &&
++                         v->info.instrs_count >= dev->fex->na_min_instrs;
++   if (fex_pair)
++      size += 3 * (xs_size + tu_xs_get_additional_cs_size_dwords(v));
++
+    /* We emit an empty VPC including streamout state in the binning draw state */
+    if (binning || v->type == MESA_SHADER_GEOMETRY) {
+       size += vpc_size;
+@@ -3364,6 +3382,20 @@ tu_upload_shader(struct tu_device *dev,
+       hw_view_mask, iova);
+    shader->state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
+ 
++   if (fex_pair) {
++      for (uint32_t m = 0; m < 3; m++) {
++         tu_cs_begin_sub_stream(&shader->cs, xs_size +
++                                tu_xs_get_additional_cs_size_dwords(v), &sub_cs);
++         tu_fex_pair_mode_override = m + 1;
++         TU_CALLX(dev, tu6_emit_variant)(
++            &sub_cs, shader->variant->type, shader->variant, &pvtmem_config,
++            hw_view_mask, iova);
++         tu_fex_pair_mode_override = 0;
++         shader->fex_pair_state[m] = tu_cs_end_draw_state(&shader->cs, &sub_cs);
++      }
++      tu_fex_count_pair_shader(dev);
++   }
++
+    if (safe_const) {
+       tu_cs_begin_sub_stream(&shader->cs, xs_size +
+                              tu_xs_get_additional_cs_size_dwords(safe_const), &sub_cs);
+@@ -3862,15 +3894,20 @@ tu_shader_create(struct tu_device *dev,
+    const bool fex_alt_np =
+       key->fex_nopreamble_alt && shader->variant &&
+       shader->variant->info.preamble_instrs_count >= dev->fex->np_min_preamble;
+-   if ((fex_alt_na || fex_alt_np) &&
++   /* fex14: or as 128-pixel waves, when ir3 chose 64. */
++   const bool fex_alt_w128 =
++      key->fex_w128_alt && shader->variant &&
++      !shader->variant->info.double_threadsize;
++   if ((fex_alt_na || fex_alt_np || fex_alt_w128) &&
+        shader->variant->type == MESA_SHADER_FRAGMENT &&
+        shader->variant->info.instrs_count >= dev->fex->na_min_instrs) {
+       struct ir3_shader_key alt_key = *ir3_key;
+       alt_key.fex_noalias_tex = key->fex_noalias_alt;
+       alt_key.fex_nopreamble = key->fex_nopreamble_alt;
++      alt_key.fex_wave128 = key->fex_w128_alt;
+       struct ir3_shader_variant *alt =
+          ir3_shader_create_variant(ir3_shader, &alt_key, executable_info);
+-      if (alt && tu_fex_noalias_ok(shader->variant, alt)) {
++      if (alt && tu_fex_noalias_ok(shader->variant, alt, key->fex_w128_alt)) {
+          shader->fex_alt_variant = alt;
+       } else {
+          if (alt)
+@@ -4247,6 +4284,7 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
+    key->fex_ubo_table = tu_fex_ubo_table(dev->fex);
+    key->fex_noalias_alt = tu_fex_noalias_alt(dev->fex);
+    key->fex_nopreamble_alt = tu_fex_nopreamble_alt(dev->fex);
++   key->fex_w128_alt = tu_fex_w128_alt(dev->fex);
+ }
+ 
+ void
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 230f993..6d4143d 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -80,6 +80,9 @@ struct tu_shader
+     * constant layout (no more constants than 'variant'). */
+    const struct ir3_shader_variant *fex_alt_variant;
+    struct tu_draw_state fex_alt_state;
++   /* fex14 (TU_FEX_COMPILE_PAIR_ALT): 'state' again with
++    * SP_PS_CNTL_1.WAVE_PAIR_MODE 1, 2, 3 (same binary); empty if not made. */
++   struct tu_draw_state fex_pair_state[3];
+    struct tu_draw_state binning_state;
+    struct tu_draw_state safe_const_binning_state;
+ 
+@@ -165,7 +168,10 @@ struct tu_shader_key {
+    /* fex13: TU_FEX_COMPILE_NOPREAMBLE_ALT (tu_fex_nopreamble_alt): the
+     * second binary of big fragment shaders has no preamble. */
+    bool fex_nopreamble_alt : 1;
+-   uint32_t padding : 16;
++   /* fex14: TU_FEX_COMPILE_W128_ALT (tu_fex_w128_alt): the second binary of
++    * big fragment shaders runs as 128-pixel waves. */
++   bool fex_w128_alt : 1;
++   uint32_t padding : 15;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 

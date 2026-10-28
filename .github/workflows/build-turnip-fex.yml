@@ -17,7 +17,9 @@
 # matrices) through the shader's own UBO table, so those draws skip the change too,
 # (fex11) graphics pipeline switches that send only the state that changed, (fex12)
 # a second binary of big fragment shaders without alias.tex helpers, picked per second,
-# and (fex13) that second binary without preamble instead, with its own constant layout.
+# (fex13) that second binary without preamble instead, with its own constant layout, and
+# (fex14) other wave setups for big fragment shaders, picked per second (wave pair mode 1-3 or
+# a second binary as 128-pixel waves).
 # Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
@@ -32,7 +34,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex13
+  FEX_PATCH: fex14
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -139,7 +141,11 @@ jobs:
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "tu_fex_color_clear_3d_index" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 13" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 14" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "fex_wave128" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3.c"
+          grep -q "TU_FEX_COMPILE_PAIR_ALT" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.cc"
+          grep -q "fex_pair_fs_state" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "tu_fex_pair_mode_override" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_shader.cc"
           grep -q "fex_nopreamble" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir.c"
           grep -q "TU_FEX_COMPILE_NOPREAMBLE_ALT" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.cc"
           grep -q "fex_alt_fs_variant" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
@@ -295,6 +301,19 @@ jobs:
             ranges and immediates load to the second binary's offsets from the same addresses; registers
             differ only in the pixel shader's address, size and output register. Status bit 0x200000;
             the channel extension (0x360) adds both binaries' preamble totals.
+            fex14 (FEX build 105 and later, FEX_TU_WAVE_PAIR=alt or a list of settings): big fragment
+            shaders (1,024+ instructions) can run with another wave setup in command buffers begun with
+            FEX's arm bits (0x700), so FEX rotates through them one second each: 0 stock, 1-3 the same
+            binary with SP_PS_CNTL_1.WAVE_PAIR_MODE 1, 2 or 3 (a7xx; the driver always writes 0 and the
+            values are not documented), 4 a second binary as 128-pixel waves (ir3 keeps these shaders at
+            64 because they use more than a quarter of the register file). Build 104 still measured D2R's
+            lighting waves 25-30% of their life in HWAVE_WAIT with or without preamble. A Qualcomm patent
+            (US11954758, dynamic wave pairing) explains the state: 64-pixel waves run in pairs that part at
+            texture and branch blocks and join again, and the one that got ahead waits. Host check: arms
+            1-3 change only SP_PS_CNTL_1.WAVE_PAIR_MODE, arm 4 only the binary's address and THREADSIZE in
+            SP_PS_CNTL_0 and SP_PS_WAVE_CNTL (same 7120 instructions and 24 registers for 5ff3). Status bits
+            0x400000 (pair modes), 0x800000 (128-pixel binary), 0x1000000 (counts); the channel extension
+            (0x3a8) adds pipeline binds per setting and the count of shaders with pair mode states.
             Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -353,3 +353,36 @@ second binary (preamble 137 -> 6), none refused. `drawtest_sw2` with 0e15, mode 
 register state per draw differs only in `SP_PS_BASE`, `SP_PS_INSTR_SIZE` and `SP_PS_OUTPUT[0].REG`; the
 nine root constant buffer ranges and the immediates load from the same addresses to the second binary's
 offsets (c4, c8, c12, c36, c40, c52, c56, c64, c72; immediates c84 instead of c116).
+
+- `0014-fex14-wave-pair.patch` (fex14, with FEX build 105): other wave setups for big fragment shaders,
+  picked per command buffer with FEX's arm bits (`TU_FEX_MODE_FS_ARM`, mode bits 8-10; FEX_TU_WAVE_PAIR=alt
+  rotates them a second each).
+  - Arms 1-3 (`TU_FEX_COMPILE_PAIR_ALT` 0x80 in `compile`, a7xx, status bit 0x400000): fragment shaders with
+    at least 1,024 instructions get three more fragment stage draw states made from the same binary, with
+    `SP_PS_CNTL_1.WAVE_PAIR_MODE` 1, 2 and 3 (`tu_shader::fex_pair_state`; stock Turnip and freedreno always
+    write 0, and the values are not documented). Pipelines that use the stock binary keep them
+    (`tu_program_state::fex_pair_fs_state`); a bind in a command buffer with arm 1-3 uses that state (not
+    together with fex12's mode bit, whose binary may have another constant layout).
+  - Arm 4 (`TU_FEX_COMPILE_W128_ALT` 0x100, a6xx/a7xx with double thread size, status bit 0x800000): the
+    second binary of fex12/fex13 is compiled as 128-pixel waves (`ir3_shader_key::fex_wave128`: double
+    thread size whenever the registers allow it, `regs * 2 <= reg_size_vec4`, instead of ir3's rule that
+    keeps 32-bit shaders above a quarter of the register file at 64). `tu_fex_noalias_ok` then asks for a
+    128-wide second binary of a 64-wide shader; the wave size is in the fragment stage's own draw state
+    (`SP_PS_CNTL_0`, `SP_PS_WAVE_CNTL`). FEX sets fex12's mode bit with arm 4.
+  - The arm a render pass was recorded with goes into its slot (`tu_fex_slot::sysmem` bits 4-6), so FEX's
+    pass kinds split per arm. Counts in the channel extension (`ext_size` >= 0x3a8, status bit 0x1000000):
+    `arm_binds[8]` (binds of pipelines with fex14 setups, by arm) at 0x360 and `pair_shaders` at 0x3a0.
+  - Why: build 104's no-preamble binary changed nothing; D2R's lighting waves still spend 25-30% of their
+    life in `SP_WAVE_HWAVE_WAIT_CYCLES`, and a lighting draw takes about one wave life (cycles per draw
+    7,066, wave life 7,081). The wait grows with wave life (correlation 0.94) and the long sync state
+    (0.85), not with issue load. A Qualcomm patent (US11954758, "dynamic wave pairing") describes
+    a hardware wave slot running two 64-wide waves together that part at texture and branch blocks and
+    join again: the one that got ahead waits for its partner. Pair mode 1-3 may change that pairing; a
+    128-pixel wave has no partner.
+
+Host check (fex14): `eptest` (EPTEST_FEX=0x19f EPTEST_EXT=0x3a8) with 5ff3 and 0e15: the 128-pixel binary
+has the same instructions (7120 / 6591) and 24 registers, double thread size 1, max waves 8 -> 4 (same
+pixels); with 0x1df (no preamble too) preamble 137 -> 6 as in fex13. `drawtest_sw14` with 0e15, 8 draws,
+direct: arms 1, 2 and 3 differ from stock only in `SP_PS_CNTL_1.WAVE_PAIR_MODE`; arm 4 (mode 0x440) only
+in the binary's address and `THREADSIZE = THREAD128` in `SP_PS_CNTL_0` and `SP_PS_WAVE_CNTL`; arm binds
+count 8 in the right arm; without the compile bits nothing changes.

@@ -42,6 +42,10 @@
 //  - (fex13 and later) with CompileNoPreambleAlt in 'Compile', that second binary (fragment shaders with 1,024+
 //    instructions and a preamble of 32+) is compiled without preamble instead (or as well), with its own constant
 //    layout; ModeNoAlias (= ModeAltFs) picks it the same way. NaPreamble in the extension (ExtSize 0x360).
+//  - (fex14 and later) the wave setup arm in 'Mode' bits 8-10 (ModeFsArmMask) picks how big fragment shaders (1,024+
+//    instructions) run in that command buffer: 0 stock, 1-3 SP_PS_CNTL_1.WAVE_PAIR_MODE 1-3 (CompilePairAlt), 4 the
+//    second binary as 128-pixel waves (CompileW128Alt; FEX sets ModeAltFs with it). Slot::Sysmem bits 4-6 hold the arm
+//    a pass was recorded with. ArmBinds/PairShaders in the extension (ExtSize 0x3a8).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -60,6 +64,11 @@ constexpr uint32_t ModeBudgetCache = 0x10;    // fex5 and later: /proc/meminfo r
 constexpr uint32_t ModeSwitch = 0x20;         // fex11 and later: pipeline switches send only what changed
 constexpr uint32_t ModeNoAlias = 0x40;        // fex12 and later: pipelines use the fragment shader binary without alias.tex
 constexpr uint32_t ModeAltFs = ModeNoAlias;   // fex13 and later: the same bit picks the second binary however it was made
+// fex14 and later: wave setup arm of big fragment shaders (0 stock, 1-3 wave pair mode 1-3, 4 128-pixel waves).
+constexpr uint32_t ModeFsArmShift = 8;
+constexpr uint32_t ModeFsArmMask = 0x700;
+constexpr uint32_t FsArmW128 = 4;
+constexpr uint32_t FsArms = 8;
 // Slot::Mode bit (fex3 and later): the pass clears a depth/stencil attachment at its start.
 constexpr uint8_t SlotDepthClear = 0x80;
 
@@ -70,6 +79,8 @@ constexpr uint32_t CompileCpUbo = 0x8;         // fex9 and later: push set UBO r
 constexpr uint32_t CompileUboTable = 0x10;     // fex10 and later: other push set UBO reads through the shader's UBO table
 constexpr uint32_t CompileNoAliasAlt = 0x20;   // fex12 and later: big fragment shaders also compiled without alias.tex
 constexpr uint32_t CompileNoPreambleAlt = 0x40; // fex13 and later: that second binary is compiled without preamble
+constexpr uint32_t CompilePairAlt = 0x80;       // fex14 and later: big fragment shaders get wave pair mode 1-3 states
+constexpr uint32_t CompileW128Alt = 0x100;      // fex14 and later: their second binary as 128-pixel waves
 
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
@@ -91,6 +102,9 @@ constexpr uint32_t StatusSwitchStats = 0x40000;   // fex11 and later: the switch
 constexpr uint32_t StatusNoAlias = 0x80000;       // fex12 and later: CompileNoAliasAlt honored (a7xx)
 constexpr uint32_t StatusNoAliasStats = 0x100000; // fex12 and later: the no-alias counts in the extension are written
 constexpr uint32_t StatusNoPreamble = 0x200000;   // fex13 and later: CompileNoPreambleAlt honored (a7xx, consts by the CP)
+constexpr uint32_t StatusPair = 0x400000;         // fex14 and later: CompilePairAlt honored (a7xx)
+constexpr uint32_t StatusW128 = 0x800000;         // fex14 and later: CompileW128Alt honored (double thread size)
+constexpr uint32_t StatusArmStats = 0x1000000;    // fex14 and later: ArmBinds/PairShaders in the extension are written
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -185,6 +199,12 @@ struct Channel {
   volatile uint32_t NaPipes[2];
   // 0x358 (fex13 and later): preamble instructions of both binaries (totals like NaInstr)
   volatile uint32_t NaPreamble[2];
+  // 0x360 (fex14 and later, driver, only when ExtSize covers it): binds of graphics pipelines whose fragment shader has
+  // fex14 wave setups (pair mode states or the second binary), by the command buffer's arm (ModeFsArmMask)
+  volatile uint64_t ArmBinds[FsArms];
+  // 0x3a0: fragment shaders that got the pair mode states this run
+  volatile uint32_t PairShaders;
+  uint32_t Pad3a4;
 };
 // 'Size' = the layout before fex11.
 constexpr uint32_t ChannelBaseSize = 0x2a8;
@@ -192,6 +212,8 @@ constexpr uint32_t ChannelBaseSize = 0x2a8;
 constexpr uint32_t ChannelSwSize = 0x300;
 // The fex12 layout (no-alias counts).
 constexpr uint32_t ChannelNaSize = 0x358;
+// The fex13 layout (preamble totals).
+constexpr uint32_t ChannelNpSize = 0x360;
 
 struct Slot {
   uint64_t Seq;
@@ -199,7 +221,7 @@ struct Slot {
   uint16_t Width;
   uint16_t Height;
   uint8_t Mode;
-  uint8_t Sysmem;
+  uint8_t Sysmem; // bit 0: direct (sysmem) pass; bits 4-6 (fex14 and later): the wave setup arm
   uint8_t Colors;
   uint8_t Attachments;
   uint32_t Format0;
@@ -231,7 +253,9 @@ static_assert(offsetof(Channel, NaRegs) == 0x338);
 static_assert(offsetof(Channel, NaSsStall) == 0x340);
 static_assert(offsetof(Channel, NaPipes) == 0x350);
 static_assert(offsetof(Channel, NaPreamble) == ChannelNaSize);
-static_assert(sizeof(Channel) == 0x360);
+static_assert(offsetof(Channel, ArmBinds) == ChannelNpSize);
+static_assert(offsetof(Channel, PairShaders) == 0x3a0);
+static_assert(sizeof(Channel) == 0x3a8);
 static_assert(sizeof(Slot) == 48);
 
 // The channel EnvironmentVariablesHandling set up for this process (FEX_TU_CHANNEL), or nullptr.
@@ -253,4 +277,8 @@ uint32_t NoAliasSwitch();
 // lighting shaders' second binary without preamble in every other second (needs the stats log; without it nothing flips
 // it, so it stays on), 3 (lit) that binary always.
 uint32_t NoPreambleSwitch();
+// FEX_TU_WAVE_PAIR: bit N = wave setup arm N takes part (bit 0 stock, 1-3 wave pair mode 1-3, 4 128-pixel waves).
+// 0 or 1 (stock only) = off. More than one arm: TurnipReport rotates through them a second each (needs the stats log;
+// without it nothing rotates, so the first arm stays). One arm: always that one.
+uint32_t WavePairArms();
 } // namespace FEX::Windows::Turnip

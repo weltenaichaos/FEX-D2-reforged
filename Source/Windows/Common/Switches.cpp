@@ -211,7 +211,10 @@ namespace {
     // those shaders a second time without preamble (+0.7% instructions, same registers) and pipelines use that binary
     // in every other second, so one run compares both ('np on/off' pass kinds). lit = always that binary, 1 = the old
     // IR3_SHADER_DEBUG=nopreamble for every shader, 0 = off.
-    {"FEX_TU_NOPREAMBLE", "alt"},
+    // Build 105: off. Build 104 measured it: the main lighting pass at the same draws +0.2% (+-0.6%) without preamble,
+    // HWAVE_WAIT per wave unchanged (2,384 vs 2,342 cycles), whole GPU frame 25.0 ms both ways. FEX_TU_NOPREAMBLE=alt or
+    // lit still turn it on.
+    {"FEX_TU_NOPREAMBLE", "0"},
     // Build 69: FEX's own Turnip build (turnip-patches/). Stock Turnip invalidates the GPU's descriptor caches of all 8
     // descriptor sets on every descriptor update, and vkd3d pushes the root constants' descriptors (a push set) before
     // nearly every draw, so every draw of the ~1,000 in a fight's main pass starts with cold descriptor caches. FEX hands
@@ -312,6 +315,16 @@ namespace {
     // 5.77 ms without alias.tex (+2..4%, +-4%), so the helpers cost about nothing; off saves compiling 113 big fragment
     // shaders twice. FEX_TU_NOALIAS=1 or alt still turn it on.
     {"FEX_TU_NOALIAS", "0"},
+    // Build 105: build 104 left the lighting waves' HWAVE_WAIT (25-30% of their life) unexplained by the preamble. A
+    // lighting draw takes about one wave life (cycles per draw 7,066, wave life 7,081), and the wait grows with the wave's
+    // life and its texture waits, not with how many waves share a core. A Qualcomm patent (US11954758, dynamic wave
+    // pairing) describes the a6xx/a7xx running two 64-pixel waves as a pair that parts at texture and branch blocks and
+    // joins again, the one that got ahead waiting for the other. FEX's Turnip fex14 gives the big fragment shaders other
+    // wave setups, and alt rotates them a second each: 0 stock, 1-3 the pair mode field the driver leaves at 0
+    // (SP_PS_CNTL_1.WAVE_PAIR_MODE, undocumented), 4 the shaders compiled as 128-pixel waves (one wave, no partner;
+    // same instructions and registers). A list of digits (e.g. 04) rotates only those, one digit = that setup always,
+    // 0 = stock. Pass kinds carry the setup ('stock', 'pair1'..'pair3', 'w128').
+    {"FEX_TU_WAVE_PAIR", "alt"},
   };
 
   // In the order the stats log lists them.
@@ -404,6 +417,7 @@ namespace {
     "FEX_TU_UBO_TABLE",
     "FEX_TU_SWITCH",
     "FEX_TU_NOALIAS",
+    "FEX_TU_WAVE_PAIR",
   };
 
   bool UseD2RDefaults {};

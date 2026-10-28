@@ -128,8 +128,8 @@ namespace {
   // Slots the driver allocates are 48 bytes + 16 per counter, rounded up to 64.
   constexpr size_t MaxSlotSize = 1024;
 
-  // One kind of render pass: same size, attachments, first format, direct or tiled, descriptor mode, and for direct
-  // passes that clear depth at their start, how that clear was done.
+  // One kind of render pass: same size, attachments, first format, direct or tiled (and from fex14 the wave setup arm,
+  // both in Sysmem), descriptor mode, and for direct passes that clear depth at their start, how that clear was done.
   struct PassKind {
     uint16_t Width, Height;
     uint8_t Colors, Attachments, Sysmem, Mode;
@@ -154,7 +154,7 @@ namespace {
   // T::ModeDepthClearFastZ when that draw ran without fragment shader.
   uint8_t KindMode(const T::Slot& S) {
     uint8_t Mode = S.Mode & (T::ModeChangedOnly | T::ModeSwitch | T::ModeNoAlias);
-    if (S.Sysmem && (S.Mode & T::SlotDepthClear)) {
+    if ((S.Sysmem & 1) && (S.Mode & T::SlotDepthClear)) {
       Mode |= T::SlotDepthClear | (S.Mode & T::ModeDepthClear3d);
       if (S.Mode & T::ModeDepthClear3d) {
         Mode |= S.Mode & T::ModeDepthClearFastZ;
@@ -163,11 +163,26 @@ namespace {
     return Mode;
   }
 
-  // Name of the second lighting shader binary (fex12: without alias.tex, fex13: without preamble) for the per-second line,
-  // and the short tag of the pass kinds ('na', 'np', or 'alt' with both).
+  // FEX_TU_WAVE_PAIR asked for wave setup 4: the second binary is the 128-pixel one and its mode bit follows the rotation.
+  bool ArmOwnsAlt() {
+    return FEX::Windows::Turnip::WavePairArms() & (1u << T::FsArmW128);
+  }
+
+  // Name of the second lighting shader binary (fex12: without alias.tex, fex13: without preamble, fex14: 128-pixel waves)
+  // for the per-second line, and the short tag of the pass kinds ('na', 'np', or 'alt' with both).
   const char* AltName() {
     const bool Na = FEX::Windows::Turnip::NoAliasSwitch() != 0, Np = FEX::Windows::Turnip::NoPreambleSwitch() >= 2;
+    if (ArmOwnsAlt()) {
+      return Na && Np ? "128-pixel waves, no alias, no preamble" : Np ? "128-pixel waves, no preamble" : Na ? "128-pixel waves, no alias" :
+                                                                                                           "128-pixel waves";
+    }
     return Na && Np ? "no alias, no preamble" : Np ? "no preamble" : "no alias";
+  }
+
+  // Wave setup arm (fex14) of a pass kind or a mode, by name.
+  const char* ArmTag(uint32_t Arm) {
+    static constexpr const char* Tags[] = {"stock", "pair1", "pair2", "pair3", "w128", "arm5", "arm6", "arm7"};
+    return Tags[Arm & 7];
   }
   const char* AltTag() {
     const bool Na = FEX::Windows::Turnip::NoAliasSwitch() != 0, Np = FEX::Windows::Turnip::NoPreambleSwitch() >= 2;
@@ -187,6 +202,7 @@ namespace {
   uint64_t BudgetLast[2] {}; // BudgetQueries, BudgetNs at the last report
   uint32_t BudgetLastReads {};
   uint32_t LoopPrefetchLast[2] {}; // LoopPrefetchLoads, LoopPrefetchShaders at the last report
+  uint64_t ArmBindsLast[T::FsArms] {}; // ArmBinds at the last report (fex14)
 
   bool ReadSlot(uint64_t RingCpu, uint32_t Index, uint32_t SlotSize, uint8_t* Out) {
     SIZE_T Read = 0;
@@ -250,6 +266,26 @@ namespace {
                                                                              "ON (FEX_TU_NOPREAMBLE=lit), counts NOT written") :
                         NoPreSw == 2                       ? "in every other second (FEX_TU_NOPREAMBLE=alt)" :
                                                              "ON (FEX_TU_NOPREAMBLE=lit)";
+    // fex14: wave setups of the big fragment shaders (FEX_TU_WAVE_PAIR).
+    const uint32_t Arms = FEX::Windows::Turnip::WavePairArms();
+    fextl::string WaveSetups;
+    if (!Arms) {
+      WaveSetups = "stock (FEX_TU_WAVE_PAIR=0)";
+    } else if (Chan->Patch < 14) {
+      WaveSetups = "NOT available (driver older than fex14)";
+    } else {
+      fextl::string List;
+      uint32_t N = 0;
+      for (uint32_t a = 0; a < 5; ++a) {
+        if (!(Arms & (1u << a))) {
+          continue;
+        }
+        const bool Ok = a == 0 || (a < T::FsArmW128 ? (Status & T::StatusPair) != 0 : (Status & T::StatusW128) != 0);
+        List += fextl::fmt::format("{}{}{}", N++ ? ", " : "", ArmTag(a), Ok ? "" : " (NOT honored)");
+      }
+      WaveSetups = fextl::fmt::format("{} {}{}", N > 1 ? "rotating a second each:" : "always", List,
+                                      (Status & T::StatusArmStats) ? "" : ", counts NOT written");
+    }
     const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
                              Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
@@ -269,11 +305,13 @@ namespace {
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
       "preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the command processor {}, other root "
       "constant buffer reads through the shaders' UBO table {}, pipeline switches send only what changed {}, lighting shaders "
-      "without alias.tex helpers {}, lighting shaders without preamble {}, depth clears at the start of direct passes {}, available "
+      "without alias.tex helpers {}, lighting shaders without preamble {}, lighting shader wave setups {}, depth clears at the start "
+      "of direct passes {}, available "
       "memory for the "
       "memory budget {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, NoAlias, NoPre, DepthClear,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, NoAlias, NoPre,
+      WaveSetups, DepthClear,
       Budget,
       Chan->CountersReserved,
       Chan->CounterCount,
@@ -301,7 +339,7 @@ namespace {
 
   // One pass kind's line: time per draw, then what the counters say about the shader cores and what feeds them, then
   // every counter per draw.
-  fextl::string KindLine(const PassKind& K, uint32_t Count, bool DescSeen, bool SwitchSeen, bool NoAliasSeen) {
+  fextl::string KindLine(const PassKind& K, uint32_t Count, bool DescSeen, bool SwitchSeen, bool NoAliasSeen, bool WaveSeen) {
     const double Ms = K.Ticks / 19200.0;
     const double Draws = K.Draws ? static_cast<double>(K.Draws) : 1.0;
     const auto Has = [&](uint32_t Group, uint32_t Countable) {
@@ -318,12 +356,20 @@ namespace {
                         !(K.Mode & T::ModeDepthClear3d)      ? " clear 2d" :
                         (K.Mode & T::ModeDepthClearFastZ)    ? " clear fastz" :
                                                                " clear 3d";
+    // fex14: the wave setup arm the pass was recorded with (stock, pair1-3, w128); with setup 4 asked for, the second
+    // binary's bit is part of it.
+    fextl::string Alt;
+    if (WaveSeen) {
+      Alt = fextl::fmt::format(" {}", ArmTag(K.Sysmem >> 4));
+    }
+    if (NoAliasSeen && !(WaveSeen && ArmOwnsAlt())) {
+      Alt += fextl::fmt::format(" {} {}", AltTag(), (K.Mode & T::ModeNoAlias) ? "on" : "off");
+    }
     fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}{}{}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
-                                            K.Width, K.Height, K.Colors, K.Attachments, K.Format0, K.Sysmem ? "direct" : "tiled",
+                                            K.Width, K.Height, K.Colors, K.Attachments, K.Format0, (K.Sysmem & 1) ? "direct" : "tiled",
                                             DescSeen ? ((K.Mode & T::ModeChangedOnly) ? " desc on" : " desc off") : "",
                                             SwitchSeen ? ((K.Mode & T::ModeSwitch) ? " sw on" : " sw off") : "",
-                                            NoAliasSeen ? fextl::fmt::format(" {} {}", AltTag(), (K.Mode & T::ModeNoAlias) ? "on" : "off") :
-                                                          fextl::string(),
+                                            Alt,
                                             Clear,
                                             K.Passes, K.Draws, Ms, Ms * 1000.0 / Draws);
     const double Cycles = V(T::GroupCp, 0);
@@ -537,8 +583,12 @@ namespace {
     const uint32_t NoAliasSw = FEX::Windows::Turnip::NoAliasSwitch();
     const uint32_t NoPreSw = FEX::Windows::Turnip::NoPreambleSwitch();
     // Build 104: the second lighting shader binary (fex12 without alias.tex, fex13 without preamble) shares one mode bit.
-    const bool AltFlip = NoAliasSw == 2 || NoPreSw == 2;
-    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2 || AltFlip) {
+    // Build 105: with wave setup 4 (the 128-pixel binary) asked for, the wave setup rotation owns that bit.
+    const uint32_t Arms = FEX::Windows::Turnip::WavePairArms();
+    const uint32_t ArmCount = static_cast<uint32_t>(__builtin_popcount(Arms));
+    const bool ArmRotate = ArmCount > 1;
+    const bool AltFlip = (NoAliasSw == 2 || NoPreSw == 2) && !ArmOwnsAlt();
+    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2 || AltFlip || ArmRotate) {
       ++Seconds;
       uint32_t Mode = CurrentMode;
       // Each alternating switch takes the next bit of the second count, so every combination gets seconds of its own.
@@ -562,6 +612,22 @@ namespace {
         // the ones without preamble (driver fex13).
         const bool On = (Seconds >> Bit++) & 1;
         Mode = (Mode & ~T::ModeNoAlias) | (On ? T::ModeNoAlias : 0);
+      }
+      if (ArmRotate) {
+        // Build 105: the wave setups asked for (FEX_TU_WAVE_PAIR), the next one each second (after the flips above, so
+        // each of their combinations meets every setup).
+        uint32_t Index = (Seconds >> Bit) % ArmCount;
+        uint32_t Arm = 0;
+        for (uint32_t a = 0; a < T::FsArms; ++a) {
+          if ((Arms & (1u << a)) && Index-- == 0) {
+            Arm = a;
+            break;
+          }
+        }
+        Mode = (Mode & ~T::ModeFsArmMask) | (Arm << T::ModeFsArmShift);
+        if (ArmOwnsAlt()) {
+          Mode = (Mode & ~T::ModeAltFs) | (Arm == T::FsArmW128 ? T::ModeAltFs : 0);
+        }
       }
       CurrentMode = Mode;
       __atomic_store_n(&Chan->Mode, CurrentMode, __ATOMIC_RELAXED);
@@ -642,7 +708,28 @@ namespace {
     // binary the game's command buffers used, so whole-frame GPU times can be split by it too. A note gives the shaders'
     // totals for both binaries whenever new ones were made (compiled, or loaded from the driver's cache).
     const bool NoAliasSeen = (NoAliasSw != 0 && Chan->Patch >= 12 && (Status & T::StatusNoAlias)) ||
-                             (NoPreSw >= 2 && Chan->Patch >= 13 && (Status & T::StatusNoPreamble));
+                             (NoPreSw >= 2 && Chan->Patch >= 13 && (Status & T::StatusNoPreamble)) ||
+                             (ArmOwnsAlt() && Chan->Patch >= 14 && (Status & T::StatusW128));
+    // Wave setups (fex14 and later): pipeline binds whose fragment shader has them, by the setup of the command buffer.
+    const bool WaveSeen = Arms != 0 && Chan->Patch >= 14 && (Status & (T::StatusPair | T::StatusW128));
+    if (WaveSeen && (Status & T::StatusArmStats)) {
+      uint64_t ArmBinds[T::FsArms];
+      bool Any = false;
+      for (uint32_t a = 0; a < T::FsArms; ++a) {
+        const uint64_t V = Chan->ArmBinds[a];
+        ArmBinds[a] = V - ArmBindsLast[a];
+        ArmBindsLast[a] = V;
+        Any |= ArmBinds[a] != 0;
+      }
+      if (Any || ArmRotate) {
+        Out += fextl::fmt::format("  turnip: wave setup {} this second | binds stock {} pair1 {} pair2 {} pair3 {} w128 {} | shaders with "
+                                  "pair states {}{}\n",
+                                  ArmTag((ModeThisSecond & T::ModeFsArmMask) >> T::ModeFsArmShift), ArmBinds[0], ArmBinds[1], ArmBinds[2],
+                                  ArmBinds[3], ArmBinds[4], Chan->PairShaders,
+                                  ArmOwnsAlt() ? fextl::fmt::format(" | 128-pixel binaries {} refused {}", Chan->NaShaders, Chan->NaRefused) :
+                                                 fextl::string());
+      }
+    }
     if (Chan->Patch >= 12 && (Status & T::StatusNoAliasStats)) {
       uint64_t NaBinds[2];
       Delta(15, Chan->NaBinds, NaBinds);
@@ -802,7 +889,7 @@ namespace {
       Other.Ticks += Order[i]->Ticks;
     }
     for (size_t i = 0; i < KindCount && i < PrintKinds; ++i) {
-      Out += KindLine(*Order[i], Count, DescSeen, SwitchSeen, NoAliasSeen);
+      Out += KindLine(*Order[i], Count, DescSeen, SwitchSeen, NoAliasSeen, WaveSeen);
     }
     if (Other.Passes) {
       Out += fextl::fmt::format("  turnip pass other: {} passes, {} draws, gpu {:.1f} ms\n", Other.Passes, Other.Draws, Other.Ticks / 19200.0);
