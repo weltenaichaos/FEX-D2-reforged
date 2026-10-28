@@ -13,8 +13,9 @@
 # ahead, (fex8) start-of-pass color clears as 3D draws too, plus compute loops unrolled
 # further when their loads can overlap, (fex9) push descriptor set UBO ranges loaded
 # into shader constants by the command processor, without a descriptor set change per
-# draw, and (fex10) the remaining push set UBO reads (indexed arrays such as bone
-# matrices) through the shader's own UBO table, so those draws skip the change too.
+# draw, (fex10) the remaining push set UBO reads (indexed arrays such as bone
+# matrices) through the shader's own UBO table, so those draws skip the change too, and
+# (fex11) graphics pipeline switches that send only the state that changed.
 # Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
@@ -29,7 +30,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex10
+  FEX_PATCH: fex11
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -136,7 +137,10 @@ jobs:
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "tu_fex_color_clear_3d_index" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 10" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 11" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "TU_FEX_MODE_SWITCH" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "tu_fex_sw_bind" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "fex_common_config" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_pipeline.cc"
           grep -q "ir3_nir_fex_ubo_table" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir.c"
           grep -q "TU_FEX_COMPILE_UBO_TABLE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.cc"
           grep -q "tu_fex_emit_cp_ubos" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
@@ -248,6 +252,18 @@ jobs:
             read the push set through descriptors, so their draws keep the descriptor set state too
             (D2R: 76% of shadow pass draws use a skinning vertex shader; with fex9 alone they still
             changed it for every draw and paid the constant loads on top). Status bit 0x10000.
+            fex11 (FEX build 100 and later, FEX_TU_SWITCH=alt|1; a7xx): at a graphics pipeline switch,
+            stock Turnip makes the command processor run ~16 draw state blocks again: each pipeline has
+            its own copy of its fixed-function state (a copy with the same bytes still has a new address),
+            the empty tessellation/geometry stages are marked dirty, and the program config resets every
+            shader stage, so an unchanged vertex shader or the shared empty fragment shader of depth-only
+            pipelines is sent again too. With FEX's switch bit, a block made only of register writes whose
+            bytes equal the block the GPU ran at the last draw keeps that block's address (skipped), and
+            for pipelines without tessellation/geometry shaders only the vertex/fragment stage whose
+            shader changed is reset (SP_UPDATE_CNTL) and sent again with its config registers. Host
+            check: the register state at every draw is the same as stock's; blocks run per switch 16 ->
+            ~4 (depth-only switches -69% state words). The driver counts binds, blocks run/kept and stage
+            resets/kept for FEX's log. Status bits 0x20000 (honored) and 0x40000 (counts written).
             Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

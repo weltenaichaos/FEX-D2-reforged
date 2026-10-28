@@ -1,0 +1,815 @@
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 12c9991..c67e1c8 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -4695,6 +4695,7 @@ tu_clear_sysmem_attachments(struct tu_cmd_buffer *cmd,
+       tu_cs_emit_qw(cs, 0);
+    }
+    cmd->state.dirty |= TU_CMD_DIRTY_DRAW_STATE;
++   tu_fex_sw_forget(cmd); /* fex11 */
+ 
+    tu_cs_emit_pkt4(cs, REG_A6XX_SP_PS_OUTPUT_CNTL, 2);
+    tu_cs_emit(cs, A6XX_SP_PS_OUTPUT_CNTL_DEPTH_REGID(0xfc) |
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 79783ff..1c8402b 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1207,8 +1207,11 @@ tu6_apply_depth_bounds_workaround(struct tu_device *device,
+                      A6XX_RB_DEPTH_CNTL_ZFUNC(FUNC_ALWAYS);
+ }
+ 
+-void
+-tu_cs_emit_draw_state(struct tu_cs *cs, uint32_t id, struct tu_draw_state state)
++/* dirty: -1 = the stock rule below, 0/1 = fex11's choice for shader stage
++ * groups (tu_fex_sw_bind). */
++static void
++tu_cs_emit_draw_state_dirty(struct tu_cs *cs, uint32_t id,
++                            struct tu_draw_state state, int dirty)
+ {
+    uint32_t enable_mask;
+    switch (id) {
+@@ -1292,7 +1295,10 @@ tu_cs_emit_draw_state(struct tu_cs *cs, uint32_t id, struct tu_draw_state state)
+     * GPU, because their underlying memory may change between setting the draw
+     * state.
+     */
+-   if (id == TU_DRAW_STATE_DESC_SETS_LOAD ||
++   if (dirty >= 0 && !state.writeable) {
++      if (dirty)
++         enable_mask |= CP_SET_DRAW_STATE__0_DIRTY;
++   } else if (id == TU_DRAW_STATE_DESC_SETS_LOAD ||
+        id == TU_DRAW_STATE_VS ||
+        id == TU_DRAW_STATE_VS_BINNING ||
+        id == TU_DRAW_STATE_HS ||
+@@ -1310,6 +1316,253 @@ tu_cs_emit_draw_state(struct tu_cs *cs, uint32_t id, struct tu_draw_state state)
+    tu_cs_emit_qw(cs, state.iova);
+ }
+ 
++void
++tu_cs_emit_draw_state(struct tu_cs *cs, uint32_t id, struct tu_draw_state state)
++{
++   tu_cs_emit_draw_state_dirty(cs, id, state, -1);
++}
++
++/* FEX link, fex11 (TU_FEX_MODE_SWITCH): follows the draw state groups set in
++ * draw_cs in recording order, so a pipeline switch can tell which groups the
++ * GPU already has. exec[] holds the groups as of the last draw; a group set
++ * again to the address it had then is skipped by the command processor
++ * (the stock path relies on that for a pipeline bound twice). The tracking
++ * runs in both modes on a7xx (for the statistics); only TU_FEX_MODE_SWITCH
++ * changes what is emitted.
++ */
++static inline bool
++tu_fex_sw_tracking(const struct tu_cmd_buffer *cmd)
++{
++   return cmd->device->fex && cmd->device->fex->desc_patch;
++}
++
++static_assert(TU_DRAW_STATE_COUNT <= 32, "fex11 tracks groups in a 32-bit mask");
++
++static inline void
++tu_fex_sw_note(struct tu_cmd_buffer *cmd, uint32_t id, struct tu_draw_state st)
++{
++   if (!tu_fex_sw_tracking(cmd) || id >= 32)
++      return;
++   struct tu_fex_cmd_state *f = &cmd->state.fex;
++   f->sw_set[id].iova = (st.size && st.iova) ? st.iova : 0;
++   f->sw_set[id].size = (st.size && st.iova) ? st.size : 0;
++   f->sw_set[id].map = (st.size && st.iova && !st.writeable) ? st.fex_map : NULL;
++   f->sw_pending |= 1u << id;
++}
++
++/* A group set while its bytes are still to be written (tu_cmd_dynamic_state). */
++static inline void
++tu_fex_sw_note_unknown(struct tu_cmd_buffer *cmd, uint32_t id, struct tu_draw_state st)
++{
++   st.fex_map = NULL;
++   tu_fex_sw_note(cmd, id, st);
++}
++
++/* Draw states disabled or changed behind the tracking (blits, secondaries):
++ * nothing is known until the next full emit. */
++void
++tu_fex_sw_forget(struct tu_cmd_buffer *cmd)
++{
++   struct tu_fex_cmd_state *f = &cmd->state.fex;
++   f->sw_known = 0;
++   f->sw_pending = 0;
++   f->sw_inval = 0;
++   f->sw_stock_pending = false;
++}
++
++/* A draw: what was set is what the GPU has now. */
++static inline void
++tu_fex_sw_drawn(struct tu_cmd_buffer *cmd)
++{
++   struct tu_fex_cmd_state *f = &cmd->state.fex;
++   if (!f->sw_pending && !f->sw_inval && !f->sw_stock_pending)
++      return;
++   u_foreach_bit (id, f->sw_pending)
++      f->sw_exec[id] = f->sw_set[id];
++   f->sw_known |= f->sw_pending;
++   f->sw_pending = 0;
++   f->sw_inval = 0;
++   f->sw_stock_pending = false;
++}
++
++/* Only register writes (no state loads, no conditions): such a group can be
++ * skipped when the GPU already ran the same bytes, whatever was reset since. */
++static bool
++tu_fex_regs_only(const uint32_t *p, uint32_t n)
++{
++   uint32_t i = 0;
++   while (i < n) {
++      const uint32_t hdr = p[i];
++      uint32_t len;
++      if (pkt_is_type4(hdr)) {
++         len = type4_pkt_size(hdr);
++      } else if (pkt_is_type7(hdr)) {
++         const uint32_t op = cp_type7_opcode(hdr);
++         if (op != CP_CONTEXT_REG_BUNCH && op != CP_NOP)
++            return false;
++         len = type7_pkt_size(hdr);
++      } else {
++         return false;
++      }
++      i += 1 + len;
++   }
++   return i == n;
++}
++
++/* Whether setting group id to st makes the command processor run it (as far
++ * as the tracking knows): a new address, or not known. */
++static inline bool
++tu_fex_sw_runs(const struct tu_cmd_buffer *cmd, uint32_t id,
++               struct tu_draw_state st, bool dirty)
++{
++   const struct tu_fex_cmd_state *f = &cmd->state.fex;
++   if (dirty || !(f->sw_known & (1u << id)))
++      return st.size && st.iova;
++   return st.size && st.iova && f->sw_exec[id].iova != st.iova;
++}
++
++/* With TU_FEX_MODE_SWITCH: the state to set for group id - the copy the GPU
++ * has as of the last draw when its bytes are the same. */
++static inline struct tu_draw_state
++tu_fex_sw_pick(const struct tu_cmd_buffer *cmd, uint32_t id,
++               struct tu_draw_state st)
++{
++   const struct tu_fex_cmd_state *f = &cmd->state.fex;
++   if (!(f->mode & TU_FEX_MODE_SWITCH) || !(f->sw_known & (1u << id)) ||
++       !st.size || !st.iova || st.writeable || !st.fex_map)
++      return st;
++   const auto *e = &f->sw_exec[id];
++   if (!e->map || e->size != st.size || e->iova == st.iova)
++      return st;
++   if (memcmp(st.fex_map, e->map, st.size * sizeof(uint32_t)) ||
++       !tu_fex_regs_only(st.fex_map, st.size))
++      return st;
++   st.iova = e->iova;
++   st.fex_map = e->map;
++   return st;
++}
++
++/* A bind's group: picked, emitted, noted, counted. */
++static inline void
++tu_fex_sw_emit_bind(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint32_t id,
++                    struct tu_draw_state st, int dirty)
++{
++   if (dirty <= 0)
++      st = tu_fex_sw_pick(cmd, id, st);
++   if (tu_fex_sw_tracking(cmd)) {
++      const bool d = dirty > 0 ||
++         (dirty < 0 && (id == TU_DRAW_STATE_VS || id == TU_DRAW_STATE_VS_BINNING ||
++                        id == TU_DRAW_STATE_HS || id == TU_DRAW_STATE_DS ||
++                        id == TU_DRAW_STATE_GS || id == TU_DRAW_STATE_GS_BINNING ||
++                        id == TU_DRAW_STATE_FS || st.writeable));
++      if (tu_fex_sw_runs(cmd, id, st, d))
++         cmd->state.fex.sw_groups_run++;
++      else if (st.size && st.iova)
++         cmd->state.fex.sw_groups_kept++;
++   }
++   tu_cs_emit_draw_state_dirty(cs, id, st, dirty);
++   tu_fex_sw_note(cmd, id, st);
++}
++
++/* A group re-made at a draw (dynamic state, depth plane): picked, noted,
++ * counted. */
++static inline struct tu_draw_state
++tu_fex_sw_draw_group(struct tu_cmd_buffer *cmd, uint32_t id,
++                     struct tu_draw_state st)
++{
++   if (!tu_fex_sw_tracking(cmd))
++      return st;
++   st = tu_fex_sw_pick(cmd, id, st);
++   if (tu_fex_sw_runs(cmd, id, st, st.writeable))
++      cmd->state.fex.sw_draw_run++;
++   else if (st.size && st.iova)
++      cmd->state.fex.sw_draw_kept++;
++   tu_fex_sw_note(cmd, id, st);
++   return st;
++}
++
++/* With TU_FEX_MODE_SWITCH, a graphics pipeline bind that only sends what
++ * changed. Returns false to take the stock path (which then notes its groups).
++ * a7xx only (tu_fex_device::desc_patch). */
++static bool
++tu_fex_sw_bind(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
++               const struct tu_pipeline *pipeline, uint32_t set_state_mask)
++{
++   struct tu_fex_cmd_state *f = &cmd->state.fex;
++   if (!tu_fex_sw_tracking(cmd))
++      return false;
++   f->sw_binds++;
++   if (!(f->mode & TU_FEX_MODE_SWITCH))
++      return false;
++
++   const struct tu_program_state *prog = &pipeline->program;
++   const uint32_t geom = BIT(TU_DRAW_STATE_HS) | BIT(TU_DRAW_STATE_DS) |
++                         BIT(TU_DRAW_STATE_GS) | BIT(TU_DRAW_STATE_GS_BINNING);
++   const uint32_t geom_reset = A7XX_SP_UPDATE_CNTL_HS_STATE |
++                               A7XX_SP_UPDATE_CNTL_DS_STATE |
++                               A7XX_SP_UPDATE_CNTL_GS_STATE;
++   /* The empty tessellation/geometry stages must be what the GPU has. */
++   if (!prog->fex_simple || f->sw_stock_pending ||
++       (f->sw_known & geom) != geom || (f->sw_inval & geom_reset) ||
++       f->sw_exec[TU_DRAW_STATE_HS].iova != (prog->hs_state.size ? prog->hs_state.iova : 0) ||
++       f->sw_exec[TU_DRAW_STATE_DS].iova != (prog->ds_state.size ? prog->ds_state.iova : 0) ||
++       f->sw_exec[TU_DRAW_STATE_GS].iova != (prog->gs_state.size ? prog->gs_state.iova : 0) ||
++       f->sw_exec[TU_DRAW_STATE_GS_BINNING].iova !=
++          (prog->gs_binning_state.size ? prog->gs_binning_state.iova : 0)) {
++      f->sw_stock++;
++      return false;
++   }
++
++   const uint32_t vsb = BIT(TU_DRAW_STATE_VS) | BIT(TU_DRAW_STATE_VS_BINNING);
++   const bool vs_same =
++      (f->sw_known & vsb) == vsb &&
++      !(f->sw_inval & A7XX_SP_UPDATE_CNTL_VS_STATE) &&
++      f->sw_exec[TU_DRAW_STATE_VS].iova ==
++         (prog->vs_state.size ? prog->vs_state.iova : 0) &&
++      f->sw_exec[TU_DRAW_STATE_VS_BINNING].iova ==
++         (prog->vs_binning_state.size ? prog->vs_binning_state.iova : 0);
++   const bool fs_same =
++      (f->sw_known & BIT(TU_DRAW_STATE_FS)) &&
++      !(f->sw_inval & A7XX_SP_UPDATE_CNTL_FS_STATE) &&
++      f->sw_exec[TU_DRAW_STATE_FS].iova ==
++         (prog->fs_state.size ? prog->fs_state.iova : 0);
++
++   /* Reset the changed stages before their config registers are written
++    * (the order of the stock program config), and before the draw that
++    * runs their groups again. */
++   if (!vs_same || !fs_same) {
++      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(A7XX, .vs_state = !vs_same,
++                                         .fs_state = !fs_same,
++                                         .gfx_uav = true));
++      f->sw_inval |= (vs_same ? 0 : A7XX_SP_UPDATE_CNTL_VS_STATE) |
++                     (fs_same ? 0 : A7XX_SP_UPDATE_CNTL_FS_STATE);
++      f->sw_stage_resets += !vs_same + !fs_same;
++   }
++   f->sw_stages_kept += vs_same + fs_same;
++   for (unsigned i = 0; i < 2; i++) {
++      if (i == 0 ? vs_same : fs_same)
++         continue;
++      const struct tu_draw_state *c = &prog->fex_stage_config[i];
++      tu_cs_reserve(cs, c->size);
++      tu_cs_emit_array(cs, c->fex_map, c->size);
++   }
++
++   tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3 * (10 + util_bitcount(set_state_mask)));
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_PROGRAM_CONFIG, prog->fex_common_config, 0);
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_VS, prog->vs_state, !vs_same);
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_VS_BINNING, prog->vs_binning_state, !vs_same);
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_HS, prog->hs_state, 0);
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_DS, prog->ds_state, 0);
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_GS, prog->gs_state, 0);
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_GS_BINNING, prog->gs_binning_state, 0);
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_FS, prog->fs_state, !fs_same);
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_VPC, prog->vpc_state, 0);
++   tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_PRIM_MODE_GMEM, pipeline->prim_order.state_gmem, 0);
++   u_foreach_bit(i, set_state_mask)
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_DYNAMIC + i, pipeline->dynamic_state[i], 0);
++   return true;
++}
++
+ template <chip CHIP>
+ void
+ tu6_emit_msaa(struct tu_cs *cs, VkSampleCountFlagBits vk_samples,
+@@ -2165,6 +2418,7 @@ tu_disable_draw_states(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    tu_cs_emit(cs, CP_SET_DRAW_STATE__2_ADDR_HI(0));
+ 
+    cmd->state.dirty |= TU_CMD_DIRTY_DRAW_STATE;
++   tu_fex_sw_forget(cmd); /* fex11 */
+ }
+ 
+ template <chip CHIP>
+@@ -4673,6 +4927,7 @@ tu_cmd_dynamic_state(struct tu_cmd_buffer *cmd, uint32_t id, uint32_t size)
+ 
+    tu_cs_emit_pkt7(&cmd->draw_cs, CP_SET_DRAW_STATE, 3);
+    tu_cs_emit_draw_state(&cmd->draw_cs, TU_DRAW_STATE_DYNAMIC + id, cmd->state.dynamic_state[id]);
++   tu_fex_sw_note_unknown(cmd, TU_DRAW_STATE_DYNAMIC + id, cmd->state.dynamic_state[id]);
+ 
+    return cs;
+ }
+@@ -4692,6 +4947,7 @@ tu_cmd_end_dynamic_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+ 
+    tu_cs_emit_pkt7(&cmd->draw_cs, CP_SET_DRAW_STATE, 3);
+    tu_cs_emit_draw_state(&cmd->draw_cs, TU_DRAW_STATE_DYNAMIC + id, cmd->state.dynamic_state[id]);
++   tu_fex_sw_note(cmd, TU_DRAW_STATE_DYNAMIC + id, cmd->state.dynamic_state[id]);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -5636,6 +5892,8 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+    tu_cs_end(&cmd_buffer->draw_cs);
+    tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+ 
++   tu_fex_end_cmdbuf(cmd_buffer->device, &cmd_buffer->state.fex); /* fex11 */
++
+    for (struct tu_cs *cs : { &cmd_buffer->cs, &cmd_buffer->draw_cs, &cmd_buffer->draw_epilogue_cs,
+                              &cmd_buffer->tile_store_cs, &cmd_buffer->sub_cs }) {
+       VkResult result = tu_cs_get_status(cs);
+@@ -5838,23 +6096,36 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+    /* note: this also avoids emitting draw states before renderpass clears,
+     * which may use the 3D clear path (for MSAA cases)
+     */
+-   if (!(cmd->state.dirty & TU_CMD_DIRTY_DRAW_STATE)) {
++   if (!(cmd->state.dirty & TU_CMD_DIRTY_DRAW_STATE) &&
++       !tu_fex_sw_bind(cmd, &cmd->draw_cs, pipeline, set_state_mask)) {
+       struct tu_cs *cs = &cmd->draw_cs;
+ 
++      /* fex11: tu_fex_sw_emit_bind with dirty -1 emits like
++       * tu_cs_emit_draw_state and notes the group for the tracking (it picks
++       * nothing without TU_FEX_MODE_SWITCH, and a stock bind with it must not
++       * pick either: its program config resets every stage). */
++      const bool sw = cmd->state.fex.mode & TU_FEX_MODE_SWITCH;
++      cmd->state.fex.mode &= ~TU_FEX_MODE_SWITCH;
+       tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3 * (10 + util_bitcount(set_state_mask)));
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_PROGRAM_CONFIG, pipeline->program.config_state);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VS, pipeline->program.vs_state);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VS_BINNING, pipeline->program.vs_binning_state);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_HS, pipeline->program.hs_state);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DS, pipeline->program.ds_state);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_GS, pipeline->program.gs_state);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_GS_BINNING, pipeline->program.gs_binning_state);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_FS, pipeline->program.fs_state);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VPC, pipeline->program.vpc_state);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_PRIM_MODE_GMEM, pipeline->prim_order.state_gmem);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_PROGRAM_CONFIG, pipeline->program.config_state, -1);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_VS, pipeline->program.vs_state, -1);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_VS_BINNING, pipeline->program.vs_binning_state, -1);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_HS, pipeline->program.hs_state, -1);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_DS, pipeline->program.ds_state, -1);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_GS, pipeline->program.gs_state, -1);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_GS_BINNING, pipeline->program.gs_binning_state, -1);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_FS, pipeline->program.fs_state, -1);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_VPC, pipeline->program.vpc_state, -1);
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_PRIM_MODE_GMEM, pipeline->prim_order.state_gmem, -1);
+ 
+       u_foreach_bit(i, set_state_mask)
+-         tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DYNAMIC + i, pipeline->dynamic_state[i]);
++         tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_DYNAMIC + i, pipeline->dynamic_state[i], -1);
++      if (sw) {
++         cmd->state.fex.mode |= TU_FEX_MODE_SWITCH;
++         /* Its config resets every stage at the draw: binds before that
++          * draw take the stock path too. */
++         cmd->state.fex.sw_stock_pending = true;
++      }
+    }
+ 
+    cmd->state.pipeline_draw_states = set_state_mask;
+@@ -6846,6 +7117,7 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+       cmd->state.index_size = secondary->state.index_size; /* for restart index update */
+    }
+    cmd->state.dirty = ~0u; /* TODO: set dirty only what needs to be */
++   tu_fex_sw_forget(cmd); /* fex11: secondaries set their own draw states */
+    cmd->state.fex.desc_cum = 0xff; /* FEX link: secondaries changed the caches */
+    cmd->state.fex.desc_emitted_sets = 0; /* fex9: emit the sets again */
+ 
+@@ -9090,8 +9362,10 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+ 
+    /* Early exit if there is nothing to emit, saves CPU cycles */
+    uint32_t dirty = cmd->state.dirty;
+-   if (!dynamic_draw_state_dirty && !(dirty & ~TU_CMD_DIRTY_COMPUTE_DESC_SETS))
++   if (!dynamic_draw_state_dirty && !(dirty & ~TU_CMD_DIRTY_COMPUTE_DESC_SETS)) {
++      tu_fex_sw_drawn(cmd); /* fex11 */
+       return VK_SUCCESS;
++   }
+ 
+    struct tu_tess_params *tess_params = &cmd->state.tess_params;
+    if ((dirty & TU_CMD_DIRTY_TESS_PARAMS) ||
+@@ -9262,6 +9536,25 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+          tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DYNAMIC + i,
+                                cmd->state.dynamic_state[i]);
+       }
++
++      /* fex11: the full emit follows a disable (or starts the pass): what
++       * it sets is all the GPU will have. */
++      if (tu_fex_sw_tracking(cmd)) {
++         tu_fex_sw_forget(cmd);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_PROGRAM_CONFIG, program->config_state);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_VS, program->vs_state);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_VS_BINNING, program->vs_binning_state);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_HS, program->hs_state);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_DS, program->ds_state);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_GS, program->gs_state);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_GS_BINNING, program->gs_binning_state);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_FS, program->fs_state);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_VPC, program->vpc_state);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_PRIM_MODE_GMEM, cmd->state.prim_order_gmem);
++         tu_fex_sw_note(cmd, TU_DRAW_STATE_LRZ_AND_DEPTH_PLANE, cmd->state.lrz_and_depth_plane_state);
++         for (uint32_t i = 0; i < ARRAY_SIZE(cmd->state.dynamic_state); i++)
++            tu_fex_sw_note(cmd, TU_DRAW_STATE_DYNAMIC + i, cmd->state.dynamic_state[i]);
++      }
+    } else {
+       /* emit draw states that were just updated */
+       uint32_t draw_state_count =
+@@ -9286,19 +9579,26 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+       }
+       if (dirty & TU_CMD_DIRTY_VERTEX_BUFFERS)
+          tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VB, cmd->state.vertex_buffers);
++      /* fex11: a re-made group with the bytes the GPU already has keeps
++       * that copy's address (tu_fex_sw_draw_group). */
+       u_foreach_bit (i, dynamic_draw_state_dirty) {
+          tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DYNAMIC + i,
+-                               cmd->state.dynamic_state[i]);
++                               tu_fex_sw_draw_group(cmd, TU_DRAW_STATE_DYNAMIC + i,
++                                                    cmd->state.dynamic_state[i]));
+       }
+       if (dirty & TU_CMD_DIRTY_VS_PARAMS)
+          tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VS_PARAMS, cmd->state.vs_params);
+       if (dirty_fs_params)
+          tu_cs_emit_draw_state(cs, TU_DRAW_STATE_FS_PARAMS, cmd->state.fs_params);
+       if (dirty_lrz) {
+-         tu_cs_emit_draw_state(cs, TU_DRAW_STATE_LRZ_AND_DEPTH_PLANE, cmd->state.lrz_and_depth_plane_state);
++         tu_cs_emit_draw_state(cs, TU_DRAW_STATE_LRZ_AND_DEPTH_PLANE,
++                               tu_fex_sw_draw_group(cmd, TU_DRAW_STATE_LRZ_AND_DEPTH_PLANE,
++                                                    cmd->state.lrz_and_depth_plane_state));
+       }
+    }
+ 
++   tu_fex_sw_drawn(cmd); /* fex11 */
++
+    tu_cs_sanity_check(cs);
+ 
+    /* There are too many graphics dirty bits to list here, so just list the
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 3e412eb..c3b52c4 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -932,6 +932,10 @@ void tu6_emit_blit_scissor(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+ 
+ void tu_disable_draw_states(struct tu_cmd_buffer *cmd, struct tu_cs *cs);
+ 
++/* fex11: the draw state groups the GPU has are no longer known (they were
++ * disabled or set outside the tracking). */
++void tu_fex_sw_forget(struct tu_cmd_buffer *cmd);
++
+ void tu6_apply_depth_bounds_workaround(struct tu_device *device,
+                                        uint32_t *rb_depth_cntl);
+ 
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+index 8f0d6ea..b4d5a24 100644
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -69,6 +69,10 @@ struct tu_draw_state {
+    uint64_t iova;
+    uint16_t size;
+    bool writeable;
++   /* FEX (fex11): CPU address of the state's dwords when the driver wrote
++    * them through a mapped sub-stream, NULL when not known. Lets a pipeline
++    * switch compare a state with the one the GPU already has. */
++   const uint32_t *fex_map;
+ };
+ 
+ struct tu_bo_array {
+@@ -294,6 +298,7 @@ tu_cs_end_draw_state(struct tu_cs *cs, struct tu_cs *sub_cs)
+       .iova = entry.bo->iova + entry.offset,
+       .size = entry.size / sizeof(uint32_t),
+       .writeable = sub_cs->writeable,
++      .fex_map = sub_cs->start,
+    };
+ }
+ 
+@@ -340,6 +345,7 @@ tu_cs_draw_state(struct tu_cs *sub_cs, struct tu_cs *cs, uint32_t size)
+       .iova = memory.iova,
+       .size = size,
+       .writeable = sub_cs->writeable,
++      .fex_map = memory.map,
+    };
+ }
+ 
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index eb464ee..976a00a 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -65,10 +65,13 @@ tu_fex_find_channel(void)
+    if (!addr || (end && *end) || (addr & 7))
+       return NULL;
+    struct tu_fex_channel *chan = (struct tu_fex_channel *)(uintptr_t)addr;
+-   if (!tu_fex_readable(chan, sizeof(*chan)))
++   if (!tu_fex_readable(chan, TU_FEX_CHANNEL_BASE_SIZE))
+       return NULL;
++   /* fex11: 'size' is the base layout; the extension is announced by
++    * ext_size (checked by tu_fex_device_init). */
+    if (chan->magic != TU_FEX_MAGIC || chan->version != TU_FEX_VERSION ||
+-       chan->size != sizeof(*chan) || chan->counter_count > TU_FEX_MAX_COUNTERS)
++       chan->size != TU_FEX_CHANNEL_BASE_SIZE ||
++       chan->counter_count > TU_FEX_MAX_COUNTERS)
+       return NULL;
+    return chan;
+ }
+@@ -96,7 +99,7 @@ tu_fex_device_init(struct tu_device *dev)
+    if (dev->physical_device->info->chip == 7) {
+       fex->desc_patch = true;
+       status |= TU_FEX_STATUS_DESC_PATCH | TU_FEX_STATUS_DEPTH_CLEAR_3D |
+-                TU_FEX_STATUS_DEPTH_CLEAR_FASTZ;
++                TU_FEX_STATUS_DEPTH_CLEAR_FASTZ | TU_FEX_STATUS_SWITCH;
+       /* fex8: on unless the Unix environment says TU_FEX_COLOR_CLEAR=0. */
+       const char *cc = getenv("TU_FEX_COLOR_CLEAR");
+       fex->color_clear_3d = !(cc && !strcmp(cc, "0"));
+@@ -107,6 +110,11 @@ tu_fex_device_init(struct tu_device *dev)
+    }
+    /* fex5: on every GPU (tu_fex_available_memory). */
+    status |= TU_FEX_STATUS_BUDGET_CACHE;
++   /* fex11: switch statistics only into a block FEX made big enough. */
++   if (chan->ext_size >= sizeof(*chan) && tu_fex_readable(chan, sizeof(*chan))) {
++      fex->sw_stats = true;
++      status |= TU_FEX_STATUS_SWITCH_STATS;
++   }
+ 
+    /* Read once: it changes compiled shaders (part of the layout hash). */
+    fex->compile = chan->compile & TU_FEX_COMPILE_MASK;
+@@ -333,6 +341,30 @@ tu_fex_begin_cmdbuf(struct tu_device *dev)
+    return mode;
+ }
+ 
++void
++tu_fex_end_cmdbuf(struct tu_device *dev, struct tu_fex_cmd_state *st)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->sw_stats || !(st->sw_binds | st->sw_draw_run | st->sw_draw_kept))
++      return;
++   struct tu_fex_channel *c = fex->chan;
++   const uint32_t i = (st->mode & TU_FEX_MODE_SWITCH) ? 1 : 0;
++   __atomic_fetch_add(&c->sw_binds[i], st->sw_binds, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->sw_groups_run[i], st->sw_groups_run, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->sw_groups_kept[i], st->sw_groups_kept, __ATOMIC_RELAXED);
++   if (st->sw_stage_resets)
++      __atomic_fetch_add(&c->sw_stage_resets, st->sw_stage_resets, __ATOMIC_RELAXED);
++   if (st->sw_stages_kept)
++      __atomic_fetch_add(&c->sw_stages_kept, st->sw_stages_kept, __ATOMIC_RELAXED);
++   if (st->sw_stock)
++      __atomic_fetch_add(&c->sw_stock, st->sw_stock, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->sw_draw_groups[0], st->sw_draw_run, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->sw_draw_groups[1], st->sw_draw_kept, __ATOMIC_RELAXED);
++   st->sw_binds = st->sw_groups_run = st->sw_groups_kept = 0;
++   st->sw_stage_resets = st->sw_stages_kept = st->sw_stock = 0;
++   st->sw_draw_run = st->sw_draw_kept = 0;
++}
++
+ void
+ tu_fex_count_desc(struct tu_device *dev, uint32_t mode, uint32_t sets_flushed)
+ {
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 90c04f5..2e89de0 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -35,6 +35,10 @@
+  *    matrices) are read through the shader's own UBO table, whose entries the
+  *    driver writes from the pushed descriptors before each draw, so those
+  *    draws don't change the descriptor set state either.
++ *  - (fex11) TU_FEX_MODE_SWITCH: at a graphics pipeline switch, state
++ *    blocks with the same bytes as the ones the GPU already has keep their
++ *    address (the command processor skips them), and only the shader stages
++ *    that changed have their state reset and sent again.
+  * Without the variable (or with a block that fails the checks) the driver
+  * behaves like stock Turnip.
+  *
+@@ -50,7 +54,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 10
++#define TU_FEX_PATCH 11
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -79,8 +83,28 @@
+  * a second each, and FEX's "fast z" clear counts are the color clears done by
+  * a 3D draw (tu_fex_count_color_clear). */
+ #define TU_FEX_MODE_DEPTH_CLEAR_FASTZ 0x8u
++/* fex11: graphics pipeline switches send only what changed (a7xx).
++ * Stock Turnip re-runs ~20 draw state groups at every switch: each pipeline
++ * has its own copy of its fixed-function state, so a copy with the same
++ * bytes still has a new address and the command processor runs it again,
++ * and the program config group resets every shader stage's state
++ * (SP_UPDATE_CNTL), so the vertex shader group runs again too when only the
++ * fragment shader changed. Each register write after a draw makes the GPU
++ * take a new register context for that block, and it only has two.
++ * With this bit, while recording a command buffer:
++ *  - a group whose bytes equal the group the GPU has as of the last draw is
++ *    set to that copy's address again, so the command processor skips it
++ *    (only groups made of register writes, no state loads);
++ *  - for pipelines without tessellation/geometry shaders, the program
++ *    config group shrinks to the part shared by all of them, and the
++ *    vertex/fragment stage whose shader changed gets its state reset
++ *    (SP_UPDATE_CNTL with that stage's bit), its config registers and its
++ *    shader group (marked dirty) sent; an unchanged stage is left alone.
++ * Anything else (tessellation/geometry, state not known since the last
++ * draw) takes the stock path. */
++#define TU_FEX_MODE_SWITCH 0x20u
+ /* Mode bits for command buffers (tu_fex_begin_cmdbuf). */
+-#define TU_FEX_MODE_MASK 0xfu
++#define TU_FEX_MODE_MASK 0x2fu
+ /* fex5: the memory budget query reads /proc/meminfo at most every 250 ms and
+  * reuses the last MemAvailable in between (stock: on every call). D3D12 games
+  * ask DXGI for the video memory budget every frame (QueryVideoMemoryInfo); FEX's
+@@ -156,6 +180,10 @@
+ #define TU_FEX_STATUS_CP_UBO 0x8000u
+ /* fex10: TU_FEX_COMPILE_UBO_TABLE honored (needs TU_FEX_STATUS_CP_UBO) */
+ #define TU_FEX_STATUS_UBO_TABLE 0x10000u
++/* fex11: TU_FEX_MODE_SWITCH honored (a7xx) */
++#define TU_FEX_STATUS_SWITCH 0x20000u
++/* fex11: the switch statistics in the channel extension are written */
++#define TU_FEX_STATUS_SWITCH_STATS 0x40000u
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -173,7 +201,10 @@ struct tu_fex_channel {
+    uint32_t sample_min_draws; /* sample render passes with at least this many draws, 0 = none */
+    uint32_t ring_slots;       /* slots wanted (power of two), 0 = 4096 */
+    uint32_t compile;          /* TU_FEX_COMPILE_*, read when a device is created (fex2) */
+-   uint32_t reserved0;
++   /* fex11: bytes of the block FEX allocated, extension included (0 from
++    * older FEX builds). 'size' stays the size of the base layout so older
++    * drivers still accept the block. */
++   uint32_t ext_size;
+    /* 0x020 */
+    struct tu_fex_counter counters[TU_FEX_MAX_COUNTERS];
+    /* 0x1a0: written by FEX while the game runs */
+@@ -219,7 +250,23 @@ struct tu_fex_channel {
+     * getting the available system memory (file reads included) */
+    volatile uint64_t budget_queries;
+    volatile uint64_t budget_ns;
++   /* 0x2a8 (fex11, driver; only when ext_size covers it): graphics pipeline
++    * switches as recorded, [0] = command buffers without TU_FEX_MODE_SWITCH,
++    * [1] = with it. */
++   volatile uint64_t sw_binds[2];       /* binds that set draw state groups */
++   volatile uint64_t sw_groups_run[2];  /* groups those binds made the command
++                                         * processor run (new address or dirty) */
++   volatile uint64_t sw_groups_kept[2]; /* groups kept at the address the GPU
++                                         * already had (skipped) */
++   volatile uint64_t sw_stage_resets;   /* shader stages reset (SP_UPDATE_CNTL)
++                                         * because their shader changed */
++   volatile uint64_t sw_stages_kept;    /* vertex/fragment stages left alone */
++   volatile uint64_t sw_stock;          /* binds that took the stock path */
++   volatile uint64_t sw_draw_groups[2]; /* groups re-made at draws (dynamic,
++                                         * depth plane), [0] run, [1] kept */
+ };
++/* Size of the layout before fex11 (what 'size' holds). */
++#define TU_FEX_CHANNEL_BASE_SIZE 0x2a8u
+ 
+ /* tu_fex_slot::mode bit (fex3): the pass clears a depth/stencil attachment
+  * at its start, so TU_FEX_MODE_DEPTH_CLEAR_3D may change its time. */
+@@ -257,7 +304,8 @@ static_assert(__builtin_offsetof(struct tu_fex_channel, depth_clears_fastz) == 0
+ static_assert(__builtin_offsetof(struct tu_fex_channel, budget_reads) == 0x1a4, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, loop_prefetch_loads) == 0x1a8, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, budget_queries) == 0x298, "layout shared with FEX");
+-static_assert(sizeof(struct tu_fex_channel) == 0x2a8, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, sw_binds) == TU_FEX_CHANNEL_BASE_SIZE, "layout shared with FEX");
++static_assert(sizeof(struct tu_fex_channel) == 0x300, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
+ 
+ struct tu_device;
+@@ -291,6 +339,21 @@ struct tu_fex_cmd_state {
+    uint32_t desc_emitted_sets;
+    uint32_t desc_emitted_dyn; /* max_dynamic_offset_size then */
+    uint64_t load_emitted;     /* iova of the last emitted load_state */
++   /* fex11 (TU_FEX_MODE_SWITCH): draw state groups of draw_cs in recording
++    * order. exec[] = what the GPU has as of the last draw (bit in 'known'),
++    * set[] = set since then (bit in 'pending'). */
++   uint32_t sw_known;
++   uint32_t sw_pending;
++   uint32_t sw_inval;          /* stages reset (SP_UPDATE_CNTL bits) since the last draw */
++   bool sw_stock_pending;      /* a bind since the last draw took the stock path */
++   struct tu_fex_sw_group {
++      uint64_t iova;
++      const uint32_t *map;     /* NULL: bytes not known */
++      uint16_t size;
++   } sw_exec[32], sw_set[32];
++   /* statistics, added to the channel at vkEndCommandBuffer */
++   uint32_t sw_binds, sw_groups_run, sw_groups_kept, sw_stage_resets,
++            sw_stages_kept, sw_stock, sw_draw_run, sw_draw_kept;
+ };
+ 
+ struct tu_fex_device {
+@@ -301,6 +364,7 @@ struct tu_fex_device {
+    bool cs_unroll;             /* fex8: TU_FEX_STATUS_CS_UNROLL */
+    bool cp_ubo;                /* fex9: TU_FEX_STATUS_CP_UBO */
+    bool ubo_table;             /* fex10: TU_FEX_STATUS_UBO_TABLE */
++   bool sw_stats;              /* fex11: channel extension present */
+    uint32_t counter_count;     /* == chan->counter_count */
+    uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
+    uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];
+@@ -349,6 +413,8 @@ void tu_fex_device_finish(struct tu_device *dev);
+ 
+ /* Mode for a command buffer begun now (0 without a channel). */
+ uint32_t tu_fex_begin_cmdbuf(struct tu_device *dev);
++/* fex11: adds a command buffer's switch statistics to the channel. */
++void tu_fex_end_cmdbuf(struct tu_device *dev, struct tu_fex_cmd_state *st);
+ 
+ /* Statistics (no-ops without a channel). */
+ void tu_fex_count_desc(struct tu_device *dev, uint32_t mode, uint32_t sets_flushed);
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index 127f89f..4d7177f 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -2395,6 +2395,68 @@ tu_emit_program_state(struct tu_cs *sub_cs,
+    tu6_emit_program_config<CHIP>(&prog_cs, prog, shaders, variants);
+    prog->config_state = tu_cs_end_draw_state(sub_cs, &prog_cs);
+ 
++   /* fex11: the parts of the program config a pipeline switch sends
++    * separately (see TU_FEX_MODE_SWITCH). They write the same registers
++    * with the same values as tu6_emit_program_config, without the
++    * SP_UPDATE_CNTL stage resets, which the switch sends itself for the
++    * stages whose shader changed. */
++   prog->fex_simple = false;
++   if (CHIP == A7XX && dev->fex && dev->fex->desc_patch &&
++       !variants[MESA_SHADER_TESS_CTRL] && !variants[MESA_SHADER_TESS_EVAL] &&
++       !variants[MESA_SHADER_GEOMETRY] &&
++       prog->shared_consts.type != IR3_PUSH_CONSTS_SHARED &&
++       !dev->physical_device->info->props.load_shader_consts_via_preamble &&
++       (!variants[MESA_SHADER_VERTEX] ||
++        shaders[MESA_SHADER_VERTEX]->const_state.dynamic_offset_loc == UINT32_MAX) &&
++       (!variants[MESA_SHADER_FRAGMENT] ||
++        shaders[MESA_SHADER_FRAGMENT]->const_state.dynamic_offset_loc == UINT32_MAX ||
++        /* The empty fragment shader (depth-only pipelines) reads no
++         * constants: the dynamic offsets stock loads for it (its
++         * zero-initialized dynamic_offset_loc) are never used. */
++        shaders[MESA_SHADER_FRAGMENT] == dev->empty_fs ||
++        shaders[MESA_SHADER_FRAGMENT] == dev->empty_fs_fdm)) {
++      const struct ir3_shader_variant *fvs = variants[MESA_SHADER_VERTEX];
++      const struct ir3_shader_variant *ffs = variants[MESA_SHADER_FRAGMENT];
++
++      tu_cs_begin_sub_stream(sub_cs, 16, &prog_cs);
++      {
++         tu_crb crb = prog_cs.crb(0);
++         tu6_emit_shared_consts_enable<CHIP>(crb, false);
++         crb.flush();
++      }
++      prog->fex_common_config = tu_cs_end_draw_state(sub_cs, &prog_cs);
++
++      tu_cs_begin_sub_stream(sub_cs, 16, &prog_cs);
++      {
++         tu_crb crb = prog_cs.crb(0);
++         crb.add(SP_VS_CONST_CONFIG(CHIP,
++            .constlen = COND(fvs, fvs->constlen),
++            .enabled = fvs,
++            .read_imm_shared_consts = push_shared_consts(fvs),
++         ));
++         crb.add(A6XX_SP_VS_CONFIG(.dword = sp_xs_config(fvs)));
++         crb.flush();
++      }
++      prog->fex_stage_config[0] = tu_cs_end_draw_state(sub_cs, &prog_cs);
++
++      tu_cs_begin_sub_stream(sub_cs, 16, &prog_cs);
++      {
++         tu_crb crb = prog_cs.crb(0);
++         crb.add(SP_PS_CONST_CONFIG(CHIP,
++            .constlen = COND(ffs, ffs->constlen),
++            .enabled = ffs,
++            .read_imm_shared_consts = push_shared_consts(ffs),
++         ));
++         crb.add(A6XX_SP_PS_CONFIG(.dword = sp_xs_config(ffs)));
++         crb.flush();
++      }
++      prog->fex_stage_config[1] = tu_cs_end_draw_state(sub_cs, &prog_cs);
++
++      prog->fex_simple = prog->fex_common_config.fex_map &&
++                         prog->fex_stage_config[0].fex_map &&
++                         prog->fex_stage_config[1].fex_map;
++   }
++
+    prog->vs_state = draw_states[MESA_SHADER_VERTEX];
+ 
+   /* Don't use the binning pass variant when GS is present because we don't
+diff --git a/src/freedreno/vulkan/tu_pipeline.h b/src/freedreno/vulkan/tu_pipeline.h
+index a0dd39a..2f69cff 100644
+--- a/src/freedreno/vulkan/tu_pipeline.h
++++ b/src/freedreno/vulkan/tu_pipeline.h
+@@ -117,6 +117,16 @@ struct tu_program_state
+       uint8_t fex_sets_used;
+       bool fex_sets_known;
+ 
++      /* fex11 (TU_FEX_MODE_SWITCH, a7xx): for programs without
++       * tessellation/geometry shaders or dynamic descriptor offsets
++       * (fex_simple), the program config without the stage resets and the
++       * per-stage registers (the same bytes for all such programs), and the
++       * config registers of the vertex (0) and fragment (1) stage, sent when
++       * that stage's shader changes at a switch. */
++      bool fex_simple;
++      struct tu_draw_state fex_common_config;
++      struct tu_draw_state fex_stage_config[2];
++
+       char stage_blake3[MESA_SHADER_STAGES][BLAKE3_HEX_LEN];
+ 
+       unsigned dynamic_descriptor_offsets[MAX_SETS];

@@ -244,3 +244,42 @@ lose set 3 too (0xf -> 0x7) with the same instruction counts. A test VS with a d
 it at index 1 and the table entries at 2-3. `drawtest` (skinning VS + 5ff3, 3 draws, new root constant
 buffers each): one `CP_LOAD_STATE6_GEOM ST6_UBO` per draw at the per-draw address (size 0x80 vec4) and
 the descriptor set state only for the first draw (fex9: every draw).
+- `0011-fex11-pipeline-switch.patch` (fex11, with FEX build 100): graphics pipeline switches send only
+  the state that changed (`TU_FEX_MODE_SWITCH` 0x20 in `mode`, so FEX can switch it each second;
+  FEX_TU_SWITCH=0 off, 1 on, 2/alt every other second; a7xx; status bit 0x20000, and 0x40000 when the
+  channel extension for its counts is there).
+  - Tracking (both modes, a7xx with the link): every draw state group set in `draw_cs` is noted in
+    recording order (`tu_fex_sw_note`), and at each draw what was set becomes what the GPU has
+    (`sw_exec`). A disable (render pass end, 3D clears/blits), a full re-emit, a secondary command
+    buffer or anything not known resets it.
+  - With the bit: a group made only of register writes (`pkt4`, `CP_CONTEXT_REG_BUNCH`, `CP_NOP`)
+    whose bytes equal the group the GPU ran at the last draw is set to that group's address again, so
+    the command processor skips it (`tu_fex_sw_pick`; pipeline-baked dynamic groups, the VPC and
+    primitive mode groups, and groups re-made at draws such as the depth plane and dynamic state).
+    `tu_draw_state::fex_map` keeps the CPU address of each state's bytes for the comparison.
+  - For pipelines without tessellation/geometry shaders (and without dynamic descriptor offsets, the
+    empty fragment shader of depth-only pipelines allowed), `tu_fex_sw_bind` replaces the bind: the
+    program config group becomes the part all such programs share (`SP_MODE_CNTL`), and the vertex /
+    fragment stage whose shader group changed since the last draw gets `SP_UPDATE_CNTL` with only its
+    bit (plus `GFX_UAV`), its config registers (`SP_xS_CONST_CONFIG`, `SP_xS_CONFIG`) written directly
+    and its shader group marked dirty. An unchanged stage is neither reset nor sent; the empty
+    tessellation/geometry groups keep their address without the dirty flag. Anything else (or a stock
+    bind since the last draw) takes the stock path.
+  - Counts per command buffer, added to the channel extension at `vkEndCommandBuffer` (`ext_size`, the
+    old `reserved0`, says FEX allocated it; `size` stays the old layout so fex10 and older still accept
+    the block): binds, groups run/kept per mode, stage resets/kept, stock binds, groups re-made at draws
+    run/kept.
+  - Why: build 99's log, regressing pass time on draws and pipeline switches: each switch costs ~1.5 us
+    in shadow passes and ~3.5 us in the prepass (31-44% of their draws switch; fights ~900 switches a
+    frame in depth passes, ~2 ms). Stock re-runs ~16 groups per switch, most of them byte-identical, and
+    resets every shader stage; build 73's counters had shadow draws waiting ~2,400 GPU cycles on
+    context register writes.
+
+Host check (fex11): `drawtest_sw2` (vkd3d-like layout, dynamic viewport/scissor/stencil reference/
+topology, 8 pipelines: two vertex shaders, two fragment shaders, depth-only, depth compare variants)
+recorded with the bit off and on, decoded with cffdump: the register state at every draw is the same
+(~195 registers, all but `SP_UPDATE_CNTL`) in direct and tiled (binning + tile) passes and with
+re-binds. Command processor groups run (sticky dirty model): switches with fragment shaders 16 ->
+~4 groups per switch (state words -34%; Turnip links stages, so a different fragment shader usually
+means a different vertex shader variant too), depth-only switches 361 -> 97 groups (-69% words), same
+shaders with other depth state: only the depth and depth plane groups.
