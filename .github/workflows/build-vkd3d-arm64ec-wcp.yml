@@ -22,8 +22,8 @@ on:
 env:
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
   VKD3D_TAG: v3.0b
-  WCP_VERSION: 3.0b-arm64ec-fex27
-  WCP_VERSION_CODE: 28
+  WCP_VERSION: 3.0b-arm64ec-fex28
+  WCP_VERSION_CODE: 29
 
 jobs:
   build:
@@ -254,6 +254,13 @@ jobs:
             draw), and batched (data found by instance index, or one multi-draw call). It never
             destroys its GPU device or anything it made (the game died when fex24 and fex26 tore
             the device down after their last test); ~35 MB of GPU memory stay until the game ends.
+            From fex28 on, the draw probe tests D2R's main pass setup only, and adds a long pixel
+            shader shaped like D2R's lighting shaders (3,531 instructions, decal and 16-tap soft
+            shadow loops) at 2 and 8 lights, each without and with D2R's per-draw changes, plus at
+            8 lights: push constants only, root constant buffers only, an 18-binding root buffer set
+            like D2R's, a new pipeline every 6th draw, and the two batched ways. It answers whether
+            the per-draw state changes are what doubles D2R's main pass draws. The probe thread now
+            never ends (with fex27 the game still died about a second after the last test).
             Install in GameNative as a VKD3D
             content profile; it appears as `${{ env.WCP_VERSION }}`.
         env:
