@@ -181,3 +181,36 @@ no CCU flush or wait for idle after it; mode 12: color by `CP_BLIT`, depth by th
 1 (4096 px)" in mode 4). Compute (scratchpad tool cstest, D2R's 17 compute shaders from build 97):
 only 66a6aa1d0c34c002 changes, 82 -> 768 instructions, 5 -> 12 registers, 16 waves kept, loops 2 -> 1,
 32 `isam` per outer iteration with 9 (sy) instead of one (sy) per read.
+
+
+- `0009-fex9-cp-ubo-push-sets.patch` (fex9, with VKD3D fex29 and FEX build 98): root constant buffers
+  loaded by the command processor, on by default (`TU_FEX_COMPILE_CP_UBO` 0x8, FEX_TU_CP_UBO=0 turns it
+  off; a7xx without `load_shader_consts_via_preamble` only, status bit 0x8000).
+  - ir3: `ir3_shader_options::fex_cp_ubo_sets` names the push descriptor sets of the layout (Turnip,
+    graphics stages). UBO ranges of those sets are marked `ir3_ubo_range::fex_cp`; loads from them,
+    also in the preamble, read the const file, and the preamble doesn't copy them
+    (`copy_ubo_to_uniform`). `ir3_shader_variant::fex_bindless_sets` records which bindless sets the
+    final shader still reads through descriptors (every `bindless_resource_ir3`, plus the
+    framebuffer-read descriptor); it is kept in the shader cache.
+  - Turnip: `tu_fex_emit_cp_ubos` (in `tu_emit_consts`) emits one `CP_LOAD_STATE6` `ST6_CONSTANTS`
+    `SS6_INDIRECT` per marked range from the UBO address and size in the push set's CPU copy (UBO
+    descriptor dwords 0-1), clamped to the UBO's size and the stage's constlen; push set changes dirty
+    the consts. `tu_fex_desc_sets_skip`: when the only sets whose address changed since the last
+    emitted descriptor set state are ones the program (binning variants included) doesn't read through
+    descriptors, the draw keeps that state (no `SP_GFX_BINDLESS_BASE`, no `SP_UPDATE_CNTL`
+    invalidation); a new program's descriptor preloads are still pointed to. Barriers whose
+    destination is a graphics uniform read (outside render passes) also count as an indirect command
+    read, so writes reach memory and the command processor waits for them before loading.
+  - Why: D2R's lighting pixel shaders read ~100 vectors of vkd3d's root constant buffers (set 3, a
+    push descriptor set vkd3d pushes for nearly every draw). Stock Turnip invalidates all 8 bindless
+    descriptor sets at every push and the preamble fetches the ranges with dependent `ldc` loads;
+    the fex28 probe measured ~1.4 us more per long-shader draw when the root constant buffers change.
+  - VKD3D fex29 (`VKD3D_FEX_CBV_SIZE=1`): dxbc-spirv declares dynamically indexed constant buffers with
+    their declared size (D2R: 90 and 16 vectors) instead of 4096, so their reads fit the const file
+    and set 3 is no longer read through descriptors at all.
+
+Host check (fex9): `eptest` on D2R's lighting shader 5ff3 with sized constant buffers: 9 ranges
+loaded by the driver, preamble 184 -> 137 instructions and still early, sets still read through
+descriptors 0x7 (set 3 gone). `drawtest` (3 draws, new root constant buffers each): 9
+`CP_LOAD_STATE6_FRAG SS6_INDIRECT` const loads per draw at the per-draw addresses;
+`SP_GFX_BINDLESS_BASE[3]` and `SP_UPDATE_CNTL` only for the first draw (fex8: every draw).

@@ -10,9 +10,10 @@
 # fragment shader (fast Z), (fex5) a memory budget query that reads /proc/meminfo at most
 # every 250 ms, (fex6) shader preambles that issue their memory loads first and store each
 # value once, (fex7) fragment shader list loops that read the next entry one iteration
-# ahead and (fex8) start-of-pass color clears as 3D draws too, plus compute loops unrolled
-# further when their loads can overlap. Without FEX's link the driver behaves like stock
-# Turnip.
+# ahead, (fex8) start-of-pass color clears as 3D draws too, plus compute loops unrolled
+# further when their loads can overlap, and (fex9) push descriptor set UBO ranges loaded
+# into shader constants by the command processor, without a descriptor set change per
+# draw. Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
 name: Build Turnip (FEX)
@@ -26,7 +27,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex8
+  FEX_PATCH: fex9
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -152,7 +153,7 @@ jobs:
           {
             "schemaVersion": 1,
             "name": "Turnip ${MESA_VERSION} FEX ${FEX_PATCH} (build ${{ github.run_number }})",
-            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets, preamble loads first, list loops read ahead, 3D depth and color clears, compute loops unrolled further and a cached memory budget via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
+            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets, preamble loads first, list loops read ahead, 3D depth and color clears, compute loops unrolled further, root constant buffers loaded by the command processor and a cached memory budget via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
             "author": "FEX-D2-reforged",
             "packageVersion": "${{ github.run_number }}",
             "vendor": "Mesa",
@@ -223,6 +224,15 @@ jobs:
             depend on the iteration are unrolled up to 128 iterations (stock 32), so the loads go out
             together (D2R's 66a6aa1d0c34c002: 512 serial buffer reads per thread, 0.23 ms a frame);
             TU_FEX_CS_UNROLL=0 turns it off. Status bits 0x2000 / 0x4000 show both.
+            fex9 (FEX build 98 and later, FEX_TU_CP_UBO=1, the default; a7xx like the a740): the ranges of
+            push descriptor set UBOs that graphics shaders read (vkd3d's D3D12 root constant buffers) are
+            loaded into the shader's constants by the command processor before each draw, from the address
+            in the pushed descriptor, instead of by the shader's preamble through the descriptor. A draw
+            whose shaders then no longer read the push set through descriptors keeps the previous
+            descriptor set state when only the push set changed: no new bindless base and no descriptor
+            cache invalidation for each draw (D2R pushes new root constant buffers for nearly every draw;
+            VKD3D fex29's VKD3D_FEX_CBV_SIZE=1 lets its lighting shaders reach that). Barriers before
+            graphics uniform reads also wait for the command processor read. Status bit 0x8000.
             Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
