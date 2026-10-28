@@ -31,6 +31,11 @@
 //  - (fex10 and later) with CompileUboTable as well, push set UBOs that shaders still read as UBOs (no known range,
 //    like indexed bone matrices) are read through the shader's own UBO table, whose entries the driver writes from the
 //    pushed descriptors before each draw, so those draws keep the descriptor set state too.
+//  - (fex11 and later) with ModeSwitch in 'Mode', a graphics pipeline switch only sends what changed: state blocks with
+//    the same bytes as the ones the GPU ran at the last draw keep that block's address (the command processor skips
+//    them), and for pipelines without tessellation/geometry shaders only the vertex/fragment stage whose shader changed
+//    is reset and sent again. The driver counts binds, blocks run/kept and stage resets/kept into the extension after
+//    the base layout, which 'ExtSize' announces ('Size' stays the base layout so older drivers still accept the block).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -46,6 +51,7 @@ constexpr uint32_t ModePushReuse = 0x2;
 constexpr uint32_t ModeDepthClear3d = 0x4; // fex3 and later
 constexpr uint32_t ModeDepthClearFastZ = 0x8; // fex4 and later: the 3D depth clear draw runs without fragment shader
 constexpr uint32_t ModeBudgetCache = 0x10;    // fex5 and later: /proc/meminfo read at most every 250 ms by the budget query
+constexpr uint32_t ModeSwitch = 0x20;         // fex11 and later: pipeline switches send only what changed
 // Slot::Mode bit (fex3 and later): the pass clears a depth/stencil attachment at its start.
 constexpr uint8_t SlotDepthClear = 0x80;
 
@@ -70,6 +76,8 @@ constexpr uint32_t StatusPreambleLoads = 0x800;   // fex6 and later: CompilePrea
 constexpr uint32_t StatusLoopPrefetch = 0x1000;   // fex7 and later: CompileLoopPrefetch honored
 constexpr uint32_t StatusCpUbo = 0x8000;          // fex9 and later: CompileCpUbo honored (a7xx without consts via preamble)
 constexpr uint32_t StatusUboTable = 0x10000;      // fex10 and later: CompileUboTable honored (needs StatusCpUbo)
+constexpr uint32_t StatusSwitch = 0x20000;        // fex11 and later: ModeSwitch honored (a7xx)
+constexpr uint32_t StatusSwitchStats = 0x40000;   // fex11 and later: the switch counts in the extension are written
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -99,7 +107,7 @@ struct Channel {
   uint32_t SampleMinDraws;
   uint32_t RingSlots;
   uint32_t Compile; // 0x018, Compile*: read once when the driver creates a device (fex2 and later; fex1 ignores it)
-  uint32_t Reserved0;
+  uint32_t ExtSize; // 0x01c (fex11 and later): bytes FEX allocated, extension included (0 in older FEX builds)
   Counter Counters[MaxCounters]; // 0x020
   // 0x1a0: written by FEX while the game runs
   volatile uint32_t Mode;
@@ -136,7 +144,18 @@ struct Channel {
   // 0x298 (fex5 and later): memory budget queries, and the nanoseconds they spent getting the available system memory
   volatile uint64_t BudgetQueries;
   volatile uint64_t BudgetNs;
+  // 0x2a8 (fex11 and later, driver, only when ExtSize covers it): graphics pipeline binds as recorded, added at
+  // vkEndCommandBuffer; [0] = command buffers without ModeSwitch, [1] = with it
+  volatile uint64_t SwBinds[2];
+  volatile uint64_t SwGroupsRun[2];  // draw state blocks those binds made the command processor run (new address or dirty)
+  volatile uint64_t SwGroupsKept[2]; // blocks kept at the address the GPU already had (skipped)
+  volatile uint64_t SwStageResets;   // vertex/fragment stages reset because their shader changed (ModeSwitch)
+  volatile uint64_t SwStagesKept;    // vertex/fragment stages left alone (ModeSwitch)
+  volatile uint64_t SwStock;         // binds with ModeSwitch that took the stock path
+  volatile uint64_t SwDrawGroups[2]; // blocks re-made at draws (dynamic state, depth plane): [0] run, [1] kept
 };
+// 'Size' = the layout before fex11.
+constexpr uint32_t ChannelBaseSize = 0x2a8;
 
 struct Slot {
   uint64_t Seq;
@@ -167,7 +186,10 @@ static_assert(offsetof(Channel, DepthClearsFastZ) == 0x288);
 static_assert(offsetof(Channel, BudgetReads) == 0x1a4);
 static_assert(offsetof(Channel, LoopPrefetchLoads) == 0x1a8);
 static_assert(offsetof(Channel, BudgetQueries) == 0x298);
-static_assert(sizeof(Channel) == 0x2a8);
+static_assert(offsetof(Channel, ExtSize) == 0x1c);
+static_assert(offsetof(Channel, SwBinds) == ChannelBaseSize);
+static_assert(offsetof(Channel, SwDrawGroups) == 0x2f0);
+static_assert(sizeof(Channel) == 0x300);
 static_assert(sizeof(Slot) == 48);
 
 // The channel EnvironmentVariablesHandling set up for this process (FEX_TU_CHANNEL), or nullptr.
@@ -179,4 +201,7 @@ uint32_t DescSwitch();
 uint32_t DepthClearSwitch();
 // FEX_TU_BUDGET_CACHE: true = ModeBudgetCache asked for.
 bool BudgetCacheSwitch();
+// FEX_TU_SWITCH: 0 stock pipeline switches, 1 ModeSwitch always, 2 ModeSwitch in every other second (needs the stats
+// log; without it nothing flips it, so it stays on).
+uint32_t PipelineSwitchSwitch();
 } // namespace FEX::Windows::Turnip

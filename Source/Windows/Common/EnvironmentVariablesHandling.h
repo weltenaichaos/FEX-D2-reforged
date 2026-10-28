@@ -211,6 +211,17 @@ namespace FEX::Windows {
 //                          draws use skinning vertex shaders, which still changed it for every draw and paid the
 //                          constant loads on top. Read once at device creation and part of the shader keys. 0 = as
 //                          build 98.
+//   FEX_TU_SWITCH=alt      (the D2R default in build 100, driver fex11 and later, a7xx) at a graphics pipeline switch the
+//                          driver only sends what changed, in every other second so one run compares both: a state
+//                          block made of register writes whose bytes equal the block the GPU ran at the last draw keeps
+//                          that block's address (the command processor skips it), and for pipelines without
+//                          tessellation/geometry shaders only the vertex/fragment stage whose shader changed is reset
+//                          (SP_UPDATE_CNTL with that stage's bit) and sent again with its config registers. Stock Turnip
+//                          runs ~16 blocks again at every switch, most of them byte-identical (each pipeline has its own
+//                          copy of its fixed-function state), and resets every shader stage, so an unchanged vertex
+//                          shader or the empty fragment shader shared by depth-only pipelines is sent again too. Build
+//                          99: each switch cost ~1.5 us of GPU time in the shadow passes and ~3.5 us in the depth
+//                          prepass. 1 = always, 0 = stock. Without the stats log nothing flips it, so alt stays on.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

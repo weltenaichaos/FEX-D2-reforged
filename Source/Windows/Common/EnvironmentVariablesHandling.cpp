@@ -243,6 +243,7 @@ namespace {
   uint32_t TurnipDesc {};
   uint32_t TurnipDepthClear {};
   bool TurnipBudgetCache {};
+  uint32_t TurnipSwitch {};
 
   bool SwitchOff(const char* Value) {
     return !Value || (Value[0] == '0' && !Value[1]);
@@ -270,7 +271,10 @@ namespace {
     auto* Chan = static_cast<Turnip::Channel*>(Base);
     Chan->Magic = Turnip::Magic;
     Chan->Version = Turnip::Version;
-    Chan->Size = sizeof(Turnip::Channel);
+    // fex11 and later: 'Size' stays the base layout (older drivers check it), 'ExtSize' says the block holds the
+    // extension the driver writes its pipeline switch counts into.
+    Chan->Size = Turnip::ChannelBaseSize;
+    Chan->ExtSize = sizeof(Turnip::Channel);
 
     // FEX_TU_DESC: 0 stock, 1 always on, alt (default) = on in every other second (TurnipReport flips it; without the
     // stats log nothing flips it, so it stays on).
@@ -291,9 +295,17 @@ namespace {
     // every frame) in vkGetPhysicalDeviceMemoryProperties2, which DXGI's QueryVideoMemoryInfo calls each frame for the
     // budget, and stock Turnip reads the whole of /proc/meminfo for every call.
     TurnipBudgetCache = !SwitchOff(Switch("FEX_TU_BUDGET_CACHE"));
+    // FEX_TU_SWITCH: 1 = a graphics pipeline switch only sends what changed (driver fex11 and later), alt (D2R default in
+    // build 100) = in every other second, so one run compares both; 0 = stock. Build 99: each switch cost ~1.5 us of GPU
+    // time in the shadow passes and ~3.5 us in the depth prepass (31-44% of their draws switch, ~900 switches a frame in
+    // fights); stock Turnip runs ~16 state blocks again at every switch, most of them byte-identical, and resets every
+    // shader stage. Like FEX_TU_DESC, only TurnipReport flips it, so without the stats log alt stays on.
+    const char* PipeSwitch = Switch("FEX_TU_SWITCH");
+    TurnipSwitch = SwitchOff(PipeSwitch) ? 0 : (PipeSwitch[0] == 'a' || PipeSwitch[0] == 'A' || PipeSwitch[0] == '2') ? 2 : 1;
     Chan->Mode = (TurnipDesc ? (Turnip::ModeChangedOnly | Turnip::ModePushReuse) : 0) |
                  (TurnipDepthClear ? Turnip::ModeDepthClear3d : 0) |
-                 (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0) | (TurnipBudgetCache ? Turnip::ModeBudgetCache : 0);
+                 (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0) | (TurnipBudgetCache ? Turnip::ModeBudgetCache : 0) |
+                 (TurnipSwitch ? Turnip::ModeSwitch : 0);
 
     // FEX_TU_COUNTERS: 1 (default) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at least this many
     // draws get timed and counted (default 100: the main pass, the depth prepass and the shadow maps in towns and
@@ -389,8 +401,8 @@ namespace {
     TurnipChannelPtr = Chan;
     StatsLogNote(fextl::fmt::format("turnip: FEX link TU_FEX_CHANNEL={} set: descriptor fix {}, early preamble for root constant "
                                     "buffers {}, preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the "
-                                    "command processor {}, other root constant buffer reads through the shaders' UBO table {}, depth clears "
-                                    "at pass start {}, "
+                                    "command processor {}, other root constant buffer reads through the shaders' UBO table {}, pipeline "
+                                    "switches send only what changed {}, depth clears at pass start {}, "
                                     "memory budget {}, {} GPU counters asked for, passes with {}+ draws timed and counted; only FEX's "
                                     "Turnip build (fex1 and later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
@@ -405,6 +417,9 @@ namespace {
                                     !(Chan->Compile & Turnip::CompileUboTable) ? "off (FEX_TU_UBO_TABLE=0)" :
                                     !(Chan->Compile & Turnip::CompileCpUbo)    ? "off (needs FEX_TU_CP_UBO=1)" :
                                                                                  "asked for (FEX_TU_UBO_TABLE=1, driver fex10 and later)",
+                                    TurnipSwitch == 2 ? "in every other second (FEX_TU_SWITCH=alt, driver fex11 and later)" :
+                                    TurnipSwitch      ? "on (FEX_TU_SWITCH=1, driver fex11 and later)" :
+                                                        "off (FEX_TU_SWITCH=0)",
                                     TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
                                                             "in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
                                     TurnipDepthClear == 3 ? "by a 3D draw without fragment shader (fast Z, FEX_TU_DEPTH_CLEAR=fastz, "
@@ -498,6 +513,9 @@ namespace Turnip {
   }
   bool BudgetCacheSwitch() {
     return TurnipBudgetCache;
+  }
+  uint32_t PipelineSwitchSwitch() {
+    return TurnipSwitch;
   }
 } // namespace Turnip
 } // namespace FEX::Windows

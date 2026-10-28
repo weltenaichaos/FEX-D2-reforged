@@ -128,10 +128,11 @@ namespace {
   // Kinds printed per second, the ones with the most GPU time.
   constexpr size_t PrintKinds = 5;
 
-  // PassKind::Mode bits: T::ModeChangedOnly, and for direct passes with a depth clear T::SlotDepthClear plus
-  // T::ModeDepthClear3d when the 3D draw did it and T::ModeDepthClearFastZ when that draw ran without fragment shader.
+  // PassKind::Mode bits: T::ModeChangedOnly, T::ModeSwitch (fex11: pipeline switches sent only what changed), and for
+  // direct passes with a depth clear T::SlotDepthClear plus T::ModeDepthClear3d when the 3D draw did it and
+  // T::ModeDepthClearFastZ when that draw ran without fragment shader.
   uint8_t KindMode(const T::Slot& S) {
-    uint8_t Mode = S.Mode & T::ModeChangedOnly;
+    uint8_t Mode = S.Mode & (T::ModeChangedOnly | T::ModeSwitch);
     if (S.Sysmem && (S.Mode & T::SlotDepthClear)) {
       Mode |= T::SlotDepthClear | (S.Mode & T::ModeDepthClear3d);
       if (S.Mode & T::ModeDepthClear3d) {
@@ -148,7 +149,7 @@ namespace {
   uint32_t Seconds {};
   uint32_t CurrentMode {};
   uint64_t NextSeq {1};
-  uint64_t Last[9][2] {};
+  uint64_t Last[15][2] {};
   uint64_t BudgetLast[2] {}; // BudgetQueries, BudgetNs at the last report
   uint32_t BudgetLastReads {};
   uint32_t LoopPrefetchLast[2] {}; // LoopPrefetchLoads, LoopPrefetchShaders at the last report
@@ -189,6 +190,14 @@ namespace {
                            !(Status & T::StatusCpUbo)            ? "off (needs the command processor loads above)" :
                            Chan->Patch < 10                      ? "NOT available (driver older than fex10)" :
                                                                    "NOT honored";
+    const uint32_t PipeSwitch = FEX::Windows::Turnip::PipelineSwitchSwitch();
+    const char* Switches = !PipeSwitch                         ? "off (FEX_TU_SWITCH=0)" :
+                           Chan->Patch < 11                    ? "NOT available (driver older than fex11)" :
+                           !(Status & T::StatusSwitch)         ? "NOT honored (needs an a7xx GPU like the a740)" :
+                           !(Status & T::StatusSwitchStats)    ? (PipeSwitch == 2 ? "in every other second (FEX_TU_SWITCH=alt), counts NOT written" :
+                                                                                    "ON, counts NOT written") :
+                           PipeSwitch == 2                     ? "in every other second (FEX_TU_SWITCH=alt)" :
+                                                                 "ON (FEX_TU_SWITCH=1)";
     const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
                              Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
@@ -207,11 +216,11 @@ namespace {
     FEX::Windows::StatsLogNote(fextl::fmt::format(
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
       "preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the command processor {}, other root "
-      "constant buffer reads through the shaders' UBO table {}, depth clears "
+      "constant buffer reads through the shaders' UBO table {}, pipeline switches send only what changed {}, depth clears "
       "at the start of direct passes {}, available memory for the "
       "memory budget {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, DepthClear, Budget,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, DepthClear, Budget,
       Chan->CountersReserved,
       Chan->CounterCount,
       (Status & T::StatusNotKgsl) ? " (not KGSL)" : "", (Status & T::StatusRingFailed) ? ", ring allocation FAILED" : "",
@@ -238,7 +247,7 @@ namespace {
 
   // One pass kind's line: time per draw, then what the counters say about the shader cores and what feeds them, then
   // every counter per draw.
-  fextl::string KindLine(const PassKind& K, uint32_t Count, bool DescSeen) {
+  fextl::string KindLine(const PassKind& K, uint32_t Count, bool DescSeen, bool SwitchSeen) {
     const double Ms = K.Ticks / 19200.0;
     const double Draws = K.Draws ? static_cast<double>(K.Draws) : 1.0;
     const auto Has = [&](uint32_t Group, uint32_t Countable) {
@@ -255,9 +264,10 @@ namespace {
                         !(K.Mode & T::ModeDepthClear3d)      ? " clear 2d" :
                         (K.Mode & T::ModeDepthClearFastZ)    ? " clear fastz" :
                                                                " clear 3d";
-    fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
+    fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}{}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
                                             K.Width, K.Height, K.Colors, K.Attachments, K.Format0, K.Sysmem ? "direct" : "tiled",
-                                            DescSeen ? ((K.Mode & T::ModeChangedOnly) ? " desc on" : " desc off") : "", Clear,
+                                            DescSeen ? ((K.Mode & T::ModeChangedOnly) ? " desc on" : " desc off") : "",
+                                            SwitchSeen ? ((K.Mode & T::ModeSwitch) ? " sw on" : " sw off") : "", Clear,
                                             K.Passes, K.Draws, Ms, Ms * 1000.0 / Draws);
     const double Cycles = V(T::GroupCp, 0);
     if (Cycles > 0 && K.Ticks) {
@@ -400,16 +410,25 @@ namespace {
     const uint32_t ModeThisSecond = CurrentMode;
     const uint32_t DescSw = FEX::Windows::Turnip::DescSwitch();
     const uint32_t ClearSw = FEX::Windows::Turnip::DepthClearSwitch();
-    if (DescSw == 2 || ClearSw == 2) {
+    const uint32_t PipeSw = FEX::Windows::Turnip::PipelineSwitchSwitch();
+    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2) {
       ++Seconds;
       uint32_t Mode = CurrentMode;
+      // Each alternating switch takes the next bit of the second count, so every combination gets seconds of its own.
+      uint32_t Bit = 0;
       if (DescSw == 2) {
-        Mode = (Mode & ~(T::ModeChangedOnly | T::ModePushReuse)) | ((Seconds & 1) ? (T::ModeChangedOnly | T::ModePushReuse) : 0);
+        const bool On = (Seconds >> Bit++) & 1;
+        Mode = (Mode & ~(T::ModeChangedOnly | T::ModePushReuse)) | (On ? (T::ModeChangedOnly | T::ModePushReuse) : 0);
       }
       if (ClearSw == 2) {
         // Build 74: the 3D draw stays on, its fast Z (no fragment shader) flips.
-        const bool On = DescSw == 2 ? ((Seconds >> 1) & 1) : (Seconds & 1);
+        const bool On = (Seconds >> Bit++) & 1;
         Mode = (Mode & ~T::ModeDepthClearFastZ) | T::ModeDepthClear3d | (On ? T::ModeDepthClearFastZ : 0);
+      }
+      if (PipeSw == 2) {
+        // Build 100: pipeline switches that send only what changed (driver fex11), on in odd seconds.
+        const bool On = (Seconds >> Bit++) & 1;
+        Mode = (Mode & ~T::ModeSwitch) | (On ? T::ModeSwitch : 0);
       }
       CurrentMode = Mode;
       __atomic_store_n(&Chan->Mode, CurrentMode, __ATOMIC_RELAXED);
@@ -456,6 +475,33 @@ namespace {
     } else {
       Out += fextl::fmt::format("  turnip: cmdbufs {} | descriptor updates {} | push {} | passes sampled {} small {}\n", CmdBufs[0],
                                 Emits[0], PushAll, Misc[0], Misc[1]);
+    }
+
+    // Graphics pipeline binds as recorded this second (fex11 and later, counted at vkEndCommandBuffer): draw state blocks
+    // per bind the command processor runs (new address or dirty) or skips (kept at the address it already had), and
+    // with the switch on, the vertex/fragment stages reset because their shader changed or left alone, binds that took
+    // the stock path, and blocks re-made at draws (dynamic state, depth plane) run or kept.
+    const uint32_t PipeSwNow = FEX::Windows::Turnip::PipelineSwitchSwitch();
+    const bool SwitchSeen = PipeSwNow != 0 && Chan->Patch >= 11 && (Status & T::StatusSwitch);
+    if (Chan->Patch >= 11 && (Status & T::StatusSwitchStats)) {
+      uint64_t Binds[2], Run[2], Kept[2], DrawGroups[2], Stages[2], Stock[2];
+      Delta(9, Chan->SwBinds, Binds);
+      Delta(10, Chan->SwGroupsRun, Run);
+      Delta(11, Chan->SwGroupsKept, Kept);
+      Delta(12, Chan->SwDrawGroups, DrawGroups);
+      const uint64_t StagesNow[2] = {Chan->SwStageResets, Chan->SwStagesKept};
+      Delta(13, StagesNow, Stages);
+      const uint64_t StockNow[2] = {Chan->SwStock, 0};
+      Delta(14, StockNow, Stock);
+      const auto PerBind = [&](const uint64_t* V, int i) {
+        return Binds[i] ? fextl::fmt::format("{:.1f}", static_cast<double>(V[i]) / Binds[i]) : fextl::string("-");
+      };
+      if (Binds[0] || Binds[1] || DrawGroups[0] || DrawGroups[1]) {
+        Out += fextl::fmt::format("  turnip: pipeline switch {} this second | binds off {} on {} | blocks run per bind off {} on {} | kept "
+                                  "per bind off {} on {} | stages reset {} kept {} | stock binds {} | blocks re-made at draws run {} kept {}\n",
+                                  (ModeThisSecond & T::ModeSwitch) ? "on" : "off", Binds[0], Binds[1], PerBind(Run, 0), PerBind(Run, 1),
+                                  PerBind(Kept, 0), PerBind(Kept, 1), Stages[0], Stages[1], Stock[0], DrawGroups[0], DrawGroups[1]);
+      }
     }
 
     // Depth clears at the start of passes that may run direct, as recorded (fex3 and later): by the 2D engine or a 3D draw,
@@ -582,7 +628,7 @@ namespace {
       Other.Ticks += Order[i]->Ticks;
     }
     for (size_t i = 0; i < KindCount && i < PrintKinds; ++i) {
-      Out += KindLine(*Order[i], Count, DescSeen);
+      Out += KindLine(*Order[i], Count, DescSeen, SwitchSeen);
     }
     if (Other.Passes) {
       Out += fextl::fmt::format("  turnip pass other: {} passes, {} draws, gpu {:.1f} ms\n", Other.Passes, Other.Draws, Other.Ticks / 19200.0);

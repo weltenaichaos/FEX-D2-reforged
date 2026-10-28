@@ -277,6 +277,14 @@ namespace {
     // us/draw). FEX's Turnip fex10 reads those buffers through the shader's own UBO table, written from the pushed
     // descriptor before each draw, so the skinned draws skip the change too.
     {"FEX_TU_UBO_TABLE", "1"},
+    // Build 100: build 99's log, pass time regressed on draws and pipeline switches: each switch costs ~1.5 us of GPU
+    // time in the shadow passes and ~3.5 us in the depth prepass, 31-44% of their draws switch (fights: ~900 switches a
+    // frame in depth passes, ~2 ms). Stock Turnip makes the command processor run ~16 state blocks again at every
+    // switch (each pipeline has its own copy of its fixed-function state, so identical bytes still get a new address)
+    // and resets every shader stage, so an unchanged vertex shader or the shared empty fragment shader of depth-only
+    // pipelines is sent again too. FEX's Turnip fex11 keeps identical blocks and resets only the stage that changed.
+    // alt = in every other second, so this run measures it ('turnip: pipeline switch' line, 'sw on/off' pass kinds).
+    {"FEX_TU_SWITCH", "alt"},
   };
 
   // In the order the stats log lists them.
@@ -367,6 +375,7 @@ namespace {
     "FEX_TU_BUDGET_CACHE",
     "FEX_TU_CP_UBO",
     "FEX_TU_UBO_TABLE",
+    "FEX_TU_SWITCH",
   };
 
   bool UseD2RDefaults {};
