@@ -284,7 +284,18 @@ namespace {
     // and resets every shader stage, so an unchanged vertex shader or the shared empty fragment shader of depth-only
     // pipelines is sent again too. FEX's Turnip fex11 keeps identical blocks and resets only the stage that changed.
     // alt = in every other second, so this run measures it ('turnip: pipeline switch' line, 'sw on/off' pass kinds).
-    {"FEX_TU_SWITCH", "alt"},
+    // Build 101: build 100 measured it: blocks run per switch 15.8 -> 4.1, but no GPU time saved (shadow 1.27 vs 1.27 ms
+    // per 4096 map, main pass -1.4% +-2.3 at the same draws), so the per-switch cost is the draws' own work, not the
+    // command stream. Off; FEX_TU_SWITCH=1 or alt still turn it on.
+    {"FEX_TU_SWITCH", "0"},
+    // Build 101: the main pass costs about one lighting shader wave per draw (build 70: ~12k GPU cycles a draw, ~2 draws
+    // in flight), so its time follows the lighting shaders' length. They are ~6,600-7,200 instructions, 17% of them
+    // alias.tex helpers (each lets one texture fetch read its coordinates from scattered registers, and is its own
+    // instruction). FEX's Turnip fex12 compiles them a second time without those helpers (11-12% fewer instructions, with
+    // more movs and 32 instead of 24 registers); whether a helper costs the GPU a cycle like a mov is not documented, so
+    // alt uses the second binaries in every other second and the log compares the main pass at the same draws
+    // ('turnip: no alias' line, 'na on/off' pass kinds).
+    {"FEX_TU_NOALIAS", "alt"},
   };
 
   // In the order the stats log lists them.
@@ -376,6 +387,7 @@ namespace {
     "FEX_TU_CP_UBO",
     "FEX_TU_UBO_TABLE",
     "FEX_TU_SWITCH",
+    "FEX_TU_NOALIAS",
   };
 
   bool UseD2RDefaults {};

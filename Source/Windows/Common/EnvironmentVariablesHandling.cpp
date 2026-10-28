@@ -244,6 +244,7 @@ namespace {
   uint32_t TurnipDepthClear {};
   bool TurnipBudgetCache {};
   uint32_t TurnipSwitch {};
+  uint32_t TurnipNoAlias {};
 
   bool SwitchOff(const char* Value) {
     return !Value || (Value[0] == '0' && !Value[1]);
@@ -272,7 +273,7 @@ namespace {
     Chan->Magic = Turnip::Magic;
     Chan->Version = Turnip::Version;
     // fex11 and later: 'Size' stays the base layout (older drivers check it), 'ExtSize' says the block holds the
-    // extension the driver writes its pipeline switch counts into.
+    // extension the driver writes its pipeline switch counts (fex11) and no-alias counts (fex12) into.
     Chan->Size = Turnip::ChannelBaseSize;
     Chan->ExtSize = sizeof(Turnip::Channel);
 
@@ -302,10 +303,19 @@ namespace {
     // shader stage. Like FEX_TU_DESC, only TurnipReport flips it, so without the stats log alt stays on.
     const char* PipeSwitch = Switch("FEX_TU_SWITCH");
     TurnipSwitch = SwitchOff(PipeSwitch) ? 0 : (PipeSwitch[0] == 'a' || PipeSwitch[0] == 'A' || PipeSwitch[0] == '2') ? 2 : 1;
+    // FEX_TU_NOALIAS: alt (D2R default in build 101) = the driver (fex12 and later) also compiles big fragment shaders
+    // (D2R's lighting shaders) without alias.tex helper instructions, and pipelines use those binaries in every other
+    // second, so one run compares both; 1 = always those binaries; 0 = stock (no second compile). Build 100: the main pass
+    // costs about one lighting shader wave per draw, so a shorter shader should shorten it nearly 1:1; the lighting
+    // shaders are ~7,000 instructions, 17% of them alias.tex (each its own instruction), and without them 11-12% shorter
+    // (with more movs and 32 instead of 24 registers). Like FEX_TU_DESC, only TurnipReport flips it, so without the
+    // stats log alt stays on.
+    const char* NoAlias = Switch("FEX_TU_NOALIAS");
+    TurnipNoAlias = SwitchOff(NoAlias) ? 0 : (NoAlias[0] == 'a' || NoAlias[0] == 'A' || NoAlias[0] == '2') ? 2 : 1;
     Chan->Mode = (TurnipDesc ? (Turnip::ModeChangedOnly | Turnip::ModePushReuse) : 0) |
                  (TurnipDepthClear ? Turnip::ModeDepthClear3d : 0) |
                  (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0) | (TurnipBudgetCache ? Turnip::ModeBudgetCache : 0) |
-                 (TurnipSwitch ? Turnip::ModeSwitch : 0);
+                 (TurnipSwitch ? Turnip::ModeSwitch : 0) | (TurnipNoAlias ? Turnip::ModeNoAlias : 0);
 
     // FEX_TU_COUNTERS: 1 (default) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at least this many
     // draws get timed and counted (default 100: the main pass, the depth prepass and the shadow maps in towns and
@@ -389,6 +399,11 @@ namespace {
     if (!SwitchOff(Switch("FEX_TU_UBO_TABLE"))) {
       Chan->Compile |= Turnip::CompileUboTable;
     }
+    // FEX_TU_NOALIAS (above): the second binaries are compiled only when asked for (part of the driver's shader keys, so
+    // turning it on or off makes the driver compile its shaders anew once).
+    if (TurnipNoAlias) {
+      Chan->Compile |= Turnip::CompileNoAliasAlt;
+    }
 
     const auto Text = fextl::fmt::format("{:x}", reinterpret_cast<uintptr_t>(Chan));
     auto WineSetEnv = reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv);
@@ -402,7 +417,8 @@ namespace {
     StatsLogNote(fextl::fmt::format("turnip: FEX link TU_FEX_CHANNEL={} set: descriptor fix {}, early preamble for root constant "
                                     "buffers {}, preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the "
                                     "command processor {}, other root constant buffer reads through the shaders' UBO table {}, pipeline "
-                                    "switches send only what changed {}, depth clears at pass start {}, "
+                                    "switches send only what changed {}, lighting shaders without alias.tex helpers {}, depth clears at "
+                                    "pass start {}, "
                                     "memory budget {}, {} GPU counters asked for, passes with {}+ draws timed and counted; only FEX's "
                                     "Turnip build (fex1 and later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
@@ -420,6 +436,10 @@ namespace {
                                     TurnipSwitch == 2 ? "in every other second (FEX_TU_SWITCH=alt, driver fex11 and later)" :
                                     TurnipSwitch      ? "on (FEX_TU_SWITCH=1, driver fex11 and later)" :
                                                         "off (FEX_TU_SWITCH=0)",
+                                    TurnipNoAlias == 2 ? "in every other second (FEX_TU_NOALIAS=alt, driver fex12 and later; one-time "
+                                                         "shader recompile)" :
+                                    TurnipNoAlias      ? "always (FEX_TU_NOALIAS=1, driver fex12 and later; one-time shader recompile)" :
+                                                         "off (FEX_TU_NOALIAS=0)",
                                     TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
                                                             "in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
                                     TurnipDepthClear == 3 ? "by a 3D draw without fragment shader (fast Z, FEX_TU_DEPTH_CLEAR=fastz, "
@@ -516,6 +536,9 @@ namespace Turnip {
   }
   uint32_t PipelineSwitchSwitch() {
     return TurnipSwitch;
+  }
+  uint32_t NoAliasSwitch() {
+    return TurnipNoAlias;
   }
 } // namespace Turnip
 } // namespace FEX::Windows

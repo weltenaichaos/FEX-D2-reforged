@@ -36,6 +36,9 @@
 //    them), and for pipelines without tessellation/geometry shaders only the vertex/fragment stage whose shader changed
 //    is reset and sent again. The driver counts binds, blocks run/kept and stage resets/kept into the extension after
 //    the base layout, which 'ExtSize' announces ('Size' stays the base layout so older drivers still accept the block).
+//  - (fex12 and later) with CompileNoAliasAlt in 'Compile', big fragment shaders (1,024+ instructions, 64+ alias.tex
+//    helpers; D2R's lighting shaders) get a second binary without alias.tex, and with ModeNoAlias in 'Mode' pipeline
+//    binds use that binary. Counts in the extension (NaBinds..NaPipes, ExtSize 0x358).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -52,6 +55,7 @@ constexpr uint32_t ModeDepthClear3d = 0x4; // fex3 and later
 constexpr uint32_t ModeDepthClearFastZ = 0x8; // fex4 and later: the 3D depth clear draw runs without fragment shader
 constexpr uint32_t ModeBudgetCache = 0x10;    // fex5 and later: /proc/meminfo read at most every 250 ms by the budget query
 constexpr uint32_t ModeSwitch = 0x20;         // fex11 and later: pipeline switches send only what changed
+constexpr uint32_t ModeNoAlias = 0x40;        // fex12 and later: pipelines use the fragment shader binary without alias.tex
 // Slot::Mode bit (fex3 and later): the pass clears a depth/stencil attachment at its start.
 constexpr uint8_t SlotDepthClear = 0x80;
 
@@ -60,6 +64,7 @@ constexpr uint32_t CompilePreambleLoads = 0x2; // fex6 and later: preamble loads
 constexpr uint32_t CompileLoopPrefetch = 0x4;  // fex7 and later: list loops read the next entry one iteration ahead
 constexpr uint32_t CompileCpUbo = 0x8;         // fex9 and later: push set UBO ranges loaded by the command processor
 constexpr uint32_t CompileUboTable = 0x10;     // fex10 and later: other push set UBO reads through the shader's UBO table
+constexpr uint32_t CompileNoAliasAlt = 0x20;   // fex12 and later: big fragment shaders also compiled without alias.tex
 
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
@@ -78,6 +83,8 @@ constexpr uint32_t StatusCpUbo = 0x8000;          // fex9 and later: CompileCpUb
 constexpr uint32_t StatusUboTable = 0x10000;      // fex10 and later: CompileUboTable honored (needs StatusCpUbo)
 constexpr uint32_t StatusSwitch = 0x20000;        // fex11 and later: ModeSwitch honored (a7xx)
 constexpr uint32_t StatusSwitchStats = 0x40000;   // fex11 and later: the switch counts in the extension are written
+constexpr uint32_t StatusNoAlias = 0x80000;       // fex12 and later: CompileNoAliasAlt honored (a7xx)
+constexpr uint32_t StatusNoAliasStats = 0x100000; // fex12 and later: the no-alias counts in the extension are written
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -153,9 +160,27 @@ struct Channel {
   volatile uint64_t SwStagesKept;    // vertex/fragment stages left alone (ModeSwitch)
   volatile uint64_t SwStock;         // binds with ModeSwitch that took the stock path
   volatile uint64_t SwDrawGroups[2]; // blocks re-made at draws (dynamic state, depth plane): [0] run, [1] kept
+  // 0x300 (fex12 and later, driver, only when ExtSize covers it): binds of graphics pipelines whose fragment shader has
+  // the binary without alias.tex, added at vkEndCommandBuffer; [0] = stock binary used, [1] = the one without (ModeNoAlias)
+  volatile uint64_t NaBinds[2];
+  // 0x310: fragment shaders that got the second binary (compiled or loaded from a cache), and totals for both binaries
+  volatile uint32_t NaShaders;
+  volatile uint32_t NaRefused;  // second binary compiled but dropped (differs in more than code and registers)
+  volatile uint32_t NaInstr[2]; // instructions [0] stock, [1] without alias.tex
+  volatile uint32_t NaNops[2];
+  volatile uint32_t NaAlias[2]; // alias.tex instructions
+  volatile uint32_t NaMovs[2];
+  volatile uint32_t NaRegs[2];  // full registers (vec4 units)
+  volatile uint32_t NaSsStall[2]; // ir3's estimated (ss) stall cycles
+  volatile uint32_t NaSyStall[2]; // ir3's estimated (sy) stall cycles
+  // 0x350: graphics pipelines made whose fragment shader has the second binary: [0] can use it, [1] cannot (they use
+  // the reduced-constants binary)
+  volatile uint32_t NaPipes[2];
 };
 // 'Size' = the layout before fex11.
 constexpr uint32_t ChannelBaseSize = 0x2a8;
+// The fex11 layout (switch counts).
+constexpr uint32_t ChannelSwSize = 0x300;
 
 struct Slot {
   uint64_t Seq;
@@ -189,7 +214,12 @@ static_assert(offsetof(Channel, BudgetQueries) == 0x298);
 static_assert(offsetof(Channel, ExtSize) == 0x1c);
 static_assert(offsetof(Channel, SwBinds) == ChannelBaseSize);
 static_assert(offsetof(Channel, SwDrawGroups) == 0x2f0);
-static_assert(sizeof(Channel) == 0x300);
+static_assert(offsetof(Channel, NaBinds) == ChannelSwSize);
+static_assert(offsetof(Channel, NaShaders) == 0x310);
+static_assert(offsetof(Channel, NaRegs) == 0x338);
+static_assert(offsetof(Channel, NaSsStall) == 0x340);
+static_assert(offsetof(Channel, NaPipes) == 0x350);
+static_assert(sizeof(Channel) == 0x358);
 static_assert(sizeof(Slot) == 48);
 
 // The channel EnvironmentVariablesHandling set up for this process (FEX_TU_CHANNEL), or nullptr.
@@ -204,4 +234,7 @@ bool BudgetCacheSwitch();
 // FEX_TU_SWITCH: 0 stock pipeline switches, 1 ModeSwitch always, 2 ModeSwitch in every other second (needs the stats
 // log; without it nothing flips it, so it stays on).
 uint32_t PipelineSwitchSwitch();
+// FEX_TU_NOALIAS: 0 stock lighting shaders, 1 the binaries without alias.tex always, 2 those in every other second
+// (needs the stats log; without it nothing flips it, so it stays on).
+uint32_t NoAliasSwitch();
 } // namespace FEX::Windows::Turnip

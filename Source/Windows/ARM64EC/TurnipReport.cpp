@@ -128,11 +128,12 @@ namespace {
   // Kinds printed per second, the ones with the most GPU time.
   constexpr size_t PrintKinds = 5;
 
-  // PassKind::Mode bits: T::ModeChangedOnly, T::ModeSwitch (fex11: pipeline switches sent only what changed), and for
+  // PassKind::Mode bits: T::ModeChangedOnly, T::ModeSwitch (fex11: pipeline switches sent only what changed),
+  // T::ModeNoAlias (fex12: pipelines used the fragment shader binaries without alias.tex), and for
   // direct passes with a depth clear T::SlotDepthClear plus T::ModeDepthClear3d when the 3D draw did it and
   // T::ModeDepthClearFastZ when that draw ran without fragment shader.
   uint8_t KindMode(const T::Slot& S) {
-    uint8_t Mode = S.Mode & (T::ModeChangedOnly | T::ModeSwitch);
+    uint8_t Mode = S.Mode & (T::ModeChangedOnly | T::ModeSwitch | T::ModeNoAlias);
     if (S.Sysmem && (S.Mode & T::SlotDepthClear)) {
       Mode |= T::SlotDepthClear | (S.Mode & T::ModeDepthClear3d);
       if (S.Mode & T::ModeDepthClear3d) {
@@ -149,7 +150,9 @@ namespace {
   uint32_t Seconds {};
   uint32_t CurrentMode {};
   uint64_t NextSeq {1};
-  uint64_t Last[15][2] {};
+  uint64_t Last[16][2] {};
+  uint32_t NaShadersLast {};   // NaShaders at the last '# turnip: no alias' note
+  uint32_t NaRefusedLast {};
   uint64_t BudgetLast[2] {}; // BudgetQueries, BudgetNs at the last report
   uint32_t BudgetLastReads {};
   uint32_t LoopPrefetchLast[2] {}; // LoopPrefetchLoads, LoopPrefetchShaders at the last report
@@ -198,6 +201,14 @@ namespace {
                                                                                     "ON, counts NOT written") :
                            PipeSwitch == 2                     ? "in every other second (FEX_TU_SWITCH=alt)" :
                                                                  "ON (FEX_TU_SWITCH=1)";
+    const uint32_t NoAliasSw = FEX::Windows::Turnip::NoAliasSwitch();
+    const char* NoAlias = !NoAliasSw                          ? "off (FEX_TU_NOALIAS=0)" :
+                          Chan->Patch < 12                    ? "NOT available (driver older than fex12)" :
+                          !(Status & T::StatusNoAlias)        ? "NOT honored (needs an a7xx GPU like the a740)" :
+                          !(Status & T::StatusNoAliasStats)   ? (NoAliasSw == 2 ? "in every other second (FEX_TU_NOALIAS=alt), counts NOT written" :
+                                                                                  "ON, counts NOT written") :
+                          NoAliasSw == 2                      ? "in every other second (FEX_TU_NOALIAS=alt)" :
+                                                                "ON (FEX_TU_NOALIAS=1)";
     const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
                              Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
@@ -216,11 +227,11 @@ namespace {
     FEX::Windows::StatsLogNote(fextl::fmt::format(
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
       "preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the command processor {}, other root "
-      "constant buffer reads through the shaders' UBO table {}, pipeline switches send only what changed {}, depth clears "
-      "at the start of direct passes {}, available memory for the "
+      "constant buffer reads through the shaders' UBO table {}, pipeline switches send only what changed {}, lighting shaders "
+      "without alias.tex helpers {}, depth clears at the start of direct passes {}, available memory for the "
       "memory budget {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
-      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, DepthClear, Budget,
+      (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, NoAlias, DepthClear, Budget,
       Chan->CountersReserved,
       Chan->CounterCount,
       (Status & T::StatusNotKgsl) ? " (not KGSL)" : "", (Status & T::StatusRingFailed) ? ", ring allocation FAILED" : "",
@@ -247,7 +258,7 @@ namespace {
 
   // One pass kind's line: time per draw, then what the counters say about the shader cores and what feeds them, then
   // every counter per draw.
-  fextl::string KindLine(const PassKind& K, uint32_t Count, bool DescSeen, bool SwitchSeen) {
+  fextl::string KindLine(const PassKind& K, uint32_t Count, bool DescSeen, bool SwitchSeen, bool NoAliasSeen) {
     const double Ms = K.Ticks / 19200.0;
     const double Draws = K.Draws ? static_cast<double>(K.Draws) : 1.0;
     const auto Has = [&](uint32_t Group, uint32_t Countable) {
@@ -264,10 +275,11 @@ namespace {
                         !(K.Mode & T::ModeDepthClear3d)      ? " clear 2d" :
                         (K.Mode & T::ModeDepthClearFastZ)    ? " clear fastz" :
                                                                " clear 3d";
-    fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}{}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
+    fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}{}{}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
                                             K.Width, K.Height, K.Colors, K.Attachments, K.Format0, K.Sysmem ? "direct" : "tiled",
                                             DescSeen ? ((K.Mode & T::ModeChangedOnly) ? " desc on" : " desc off") : "",
-                                            SwitchSeen ? ((K.Mode & T::ModeSwitch) ? " sw on" : " sw off") : "", Clear,
+                                            SwitchSeen ? ((K.Mode & T::ModeSwitch) ? " sw on" : " sw off") : "",
+                                            NoAliasSeen ? ((K.Mode & T::ModeNoAlias) ? " na on" : " na off") : "", Clear,
                                             K.Passes, K.Draws, Ms, Ms * 1000.0 / Draws);
     const double Cycles = V(T::GroupCp, 0);
     if (Cycles > 0 && K.Ticks) {
@@ -411,7 +423,8 @@ namespace {
     const uint32_t DescSw = FEX::Windows::Turnip::DescSwitch();
     const uint32_t ClearSw = FEX::Windows::Turnip::DepthClearSwitch();
     const uint32_t PipeSw = FEX::Windows::Turnip::PipelineSwitchSwitch();
-    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2) {
+    const uint32_t NoAliasSw = FEX::Windows::Turnip::NoAliasSwitch();
+    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2 || NoAliasSw == 2) {
       ++Seconds;
       uint32_t Mode = CurrentMode;
       // Each alternating switch takes the next bit of the second count, so every combination gets seconds of its own.
@@ -429,6 +442,11 @@ namespace {
         // Build 100: pipeline switches that send only what changed (driver fex11), on in odd seconds.
         const bool On = (Seconds >> Bit++) & 1;
         Mode = (Mode & ~T::ModeSwitch) | (On ? T::ModeSwitch : 0);
+      }
+      if (NoAliasSw == 2) {
+        // Build 101: pipelines use the lighting shader binaries without alias.tex (driver fex12) in odd seconds.
+        const bool On = (Seconds >> Bit++) & 1;
+        Mode = (Mode & ~T::ModeNoAlias) | (On ? T::ModeNoAlias : 0);
       }
       CurrentMode = Mode;
       __atomic_store_n(&Chan->Mode, CurrentMode, __ATOMIC_RELAXED);
@@ -501,6 +519,42 @@ namespace {
                                   "per bind off {} on {} | stages reset {} kept {} | stock binds {} | blocks re-made at draws run {} kept {}\n",
                                   (ModeThisSecond & T::ModeSwitch) ? "on" : "off", Binds[0], Binds[1], PerBind(Run, 0), PerBind(Run, 1),
                                   PerBind(Kept, 0), PerBind(Kept, 1), Stages[0], Stages[1], Stock[0], DrawGroups[0], DrawGroups[1]);
+      }
+    }
+
+    // Lighting shaders without alias.tex (fex12 and later): binds of pipelines whose fragment shader has the second binary,
+    // with the stock binary or the one without alias.tex, as recorded this second; the mode of this second decides which
+    // binary the game's command buffers used, so whole-frame GPU times can be split by it too. A note gives the shaders'
+    // totals for both binaries whenever new ones were made (compiled, or loaded from the driver's cache).
+    const bool NoAliasSeen = NoAliasSw != 0 && Chan->Patch >= 12 && (Status & T::StatusNoAlias);
+    if (Chan->Patch >= 12 && (Status & T::StatusNoAliasStats)) {
+      uint64_t NaBinds[2];
+      Delta(15, Chan->NaBinds, NaBinds);
+      const uint32_t Shaders = Chan->NaShaders, Refused = Chan->NaRefused;
+      const uint32_t Pipes[2] = {Chan->NaPipes[0], Chan->NaPipes[1]};
+      if (NoAliasSeen || NaBinds[0] || NaBinds[1]) {
+        Out += fextl::fmt::format("  turnip: no alias {} this second | binds stock {} without alias {} | shaders {} refused {} | pipelines "
+                                  "can use {} cannot {}\n",
+                                  (ModeThisSecond & T::ModeNoAlias) ? "on" : "off", NaBinds[0], NaBinds[1], Shaders, Refused, Pipes[0], Pipes[1]);
+      }
+      if (Shaders != NaShadersLast || Refused != NaRefusedLast) {
+        NaShadersLast = Shaders;
+        NaRefusedLast = Refused;
+        const auto Pct = [](uint32_t A, uint32_t B) {
+          return B ? 100.0 * (static_cast<double>(A) - static_cast<double>(B)) / static_cast<double>(B) : 0.0;
+        };
+        uint32_t V[7][2];
+        const volatile uint32_t* Src[7] = {Chan->NaInstr, Chan->NaNops, Chan->NaAlias, Chan->NaMovs, Chan->NaRegs, Chan->NaSsStall, Chan->NaSyStall};
+        for (int i = 0; i < 7; ++i) {
+          V[i][0] = Src[i][0];
+          V[i][1] = Src[i][1];
+        }
+        FEX::Windows::StatsLogNote(fextl::fmt::format(
+          "turnip: no alias: {} fragment shaders have a binary without alias.tex ({} refused), totals stock -> without: "
+          "instructions {} -> {} ({:+.1f}%), nops {} -> {}, alias.tex {} -> {}, movs {} -> {}, registers {} -> {}, estimated "
+          "(ss) stalls {} -> {}, (sy) stalls {} -> {}; pipelines that can use them {}, that cannot (reduced constants) {}",
+          Shaders, Refused, V[0][0], V[0][1], Pct(V[0][1], V[0][0]), V[1][0], V[1][1], V[2][0], V[2][1], V[3][0], V[3][1], V[4][0], V[4][1],
+          V[5][0], V[5][1], V[6][0], V[6][1], Pipes[0], Pipes[1]));
       }
     }
 
@@ -628,7 +682,7 @@ namespace {
       Other.Ticks += Order[i]->Ticks;
     }
     for (size_t i = 0; i < KindCount && i < PrintKinds; ++i) {
-      Out += KindLine(*Order[i], Count, DescSeen, SwitchSeen);
+      Out += KindLine(*Order[i], Count, DescSeen, SwitchSeen, NoAliasSeen);
     }
     if (Other.Passes) {
       Out += fextl::fmt::format("  turnip pass other: {} passes, {} draws, gpu {:.1f} ms\n", Other.Passes, Other.Draws, Other.Ticks / 19200.0);

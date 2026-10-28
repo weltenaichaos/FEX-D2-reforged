@@ -222,6 +222,17 @@ namespace FEX::Windows {
 //                          shader or the empty fragment shader shared by depth-only pipelines is sent again too. Build
 //                          99: each switch cost ~1.5 us of GPU time in the shadow passes and ~3.5 us in the depth
 //                          prepass. 1 = always, 0 = stock. Without the stats log nothing flips it, so alt stays on.
+//                          Build 101: off by default (build 100: blocks per switch 15.8 -> 4.1 but no GPU time saved).
+//   FEX_TU_NOALIAS=alt     (the D2R default in build 101, driver fex12 and later, a7xx) the driver also compiles fragment
+//                          shaders with 1,024+ instructions and 64+ alias.tex helpers (D2R's lighting shaders) without
+//                          alias.tex, and pipelines use those binaries in every other second so one run compares both.
+//                          alias.tex lets a texture fetch read its coordinates from scattered registers; each alias is an
+//                          instruction of its own (17% of the lighting shaders). Without them the coordinates are moved
+//                          next to each other by movs: 11-12% fewer instructions, 32 instead of 24 registers. The main
+//                          pass costs about one lighting shader wave per draw, so its time should follow. The second
+//                          binary is kept only when the pipeline state built from the shader is the same. Read once at
+//                          device creation and part of the shader keys (one-time recompile). 1 = always, 0 = stock.
+//                          Without the stats log nothing flips it, so alt stays on.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }
