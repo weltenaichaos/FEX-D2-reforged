@@ -1,0 +1,364 @@
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index ff44e37..7225f31 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1672,6 +1672,10 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
+ 
+    progress |= OPT(s, ir3_nir_lower_ubo_loads, so);
+ 
++   /* FEX (fex10): before descriptor prefetch, which would prefetch them. */
++   if (so->shader_options.fex_ubo_table)
++      progress |= OPT(s, ir3_nir_fex_ubo_table, so);
++
+    if (so->compiler->gen >= 7 &&
+        !(ir3_shader_debug & (IR3_DBG_NOPREAMBLE | IR3_DBG_NODESCPREFETCH)))
+       progress |= OPT(s, ir3_nir_opt_prefetch_descriptors, so);
+diff --git a/src/freedreno/ir3/ir3_nir.h b/src/freedreno/ir3/ir3_nir.h
+index d21da19..5ae7da5 100644
+--- a/src/freedreno/ir3/ir3_nir.h
++++ b/src/freedreno/ir3/ir3_nir.h
+@@ -105,6 +105,7 @@ void ir3_alloc_driver_params(struct ir3_const_allocations *const_alloc,
+ bool ir3_nir_lower_load_constant(nir_shader *nir, struct ir3_shader_variant *v);
+ void ir3_nir_analyze_ubo_ranges(nir_shader *nir, struct ir3_shader_variant *v);
+ bool ir3_nir_lower_ubo_loads(nir_shader *nir, struct ir3_shader_variant *v);
++bool ir3_nir_fex_ubo_table(nir_shader *nir, struct ir3_shader_variant *v);
+ bool ir3_nir_lower_const_global_loads(nir_shader *nir, struct ir3_shader_variant *v);
+ bool ir3_nir_can_lower_to_ldg_k(nir_intrinsic_instr *intrin);
+ bool ir3_nir_fixup_load_const_ir3(nir_shader *nir);
+diff --git a/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c b/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
+index e83b906..c48fb67 100644
+--- a/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
++++ b/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
+@@ -810,6 +810,91 @@ ir3_nir_lower_ubo_loads(nir_shader *nir, struct ir3_shader_variant *v)
+    return progress;
+ }
+ 
++/* FEX (fex10): the UBO table index of a driver-loaded UBO, -1 if it has none.
++ * The binning variant shares the draw variant's const state and only looks
++ * entries up.
++ */
++static int
++fex_ubo_table_idx(nir_shader *nir, struct ir3_shader_variant *v,
++                  const struct ir3_ubo_info *ubo)
++{
++   const struct ir3_const_state *const_state = ir3_const_state(v);
++
++   for (unsigned i = 0; i < const_state->num_fex_ubos; i++) {
++      if (const_state->fex_ubo[i].set == ubo->bindless_base &&
++          const_state->fex_ubo[i].block == ubo->block) {
++         nir->info.num_ubos =
++            MAX2(nir->info.num_ubos, const_state->fex_ubo[i].idx + 1);
++         return const_state->fex_ubo[i].idx;
++      }
++   }
++
++   if (v->binning_pass || ubo->block > UINT16_MAX)
++      return -1;
++
++   struct ir3_const_state *mut = ir3_const_state_mut(v);
++   if (mut->num_fex_ubos >= IR3_FEX_MAX_UBOS)
++      return -1;
++
++   /* Like ir3_get_driver_ubo: UBO 0 stays free. */
++   unsigned idx = MAX2(nir->info.num_ubos, 1);
++   if (idx >= IR3_FEX_UBO_IDX_LIMIT)
++      return -1;
++   nir->info.num_ubos = idx + 1;
++
++   mut->fex_ubo[mut->num_fex_ubos].idx = idx;
++   mut->fex_ubo[mut->num_fex_ubos].set = ubo->bindless_base;
++   mut->fex_ubo[mut->num_fex_ubos].block = ubo->block;
++   mut->num_fex_ubos++;
++   return idx;
++}
++
++/* FEX (fex10): after ir3_nir_lower_ubo_loads, loads from driver-loaded UBOs
++ * (ir3_shader_options::fex_cp_ubo_sets) that are still UBO loads have no
++ * known range, like D3D12 skinning shaders' dynamically indexed bone
++ * matrices. They read through the bindless descriptor, so the draw still
++ * needs the push set rebound for every root constant buffer change. Read
++ * them through the shader's own UBO table instead: the driver writes the
++ * entry from the pushed descriptor before each draw (tu_fex_emit_cp_ubos),
++ * and the shader no longer reads the push set through descriptors.
++ */
++bool
++ir3_nir_fex_ubo_table(nir_shader *nir, struct ir3_shader_variant *v)
++{
++   if (!v->shader_options.fex_ubo_table || !v->shader_options.fex_cp_ubo_sets)
++      return false;
++
++   bool progress = false;
++   nir_foreach_function_impl (impl, nir) {
++      bool impl_progress = false;
++      nir_builder b = nir_builder_create(impl);
++      nir_foreach_block (block, impl) {
++         nir_foreach_instr (instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_load_ubo)
++               continue;
++
++            struct ir3_ubo_info ubo = {};
++            if (!get_ubo_info(intr, &ubo) || !fex_cp_ubo(v, &ubo))
++               continue;
++
++            int idx = fex_ubo_table_idx(nir, v, &ubo);
++            if (idx < 0)
++               continue;
++
++            b.cursor = nir_before_instr(instr);
++            nir_src_rewrite(&intr->src[0], nir_imm_int(&b, idx));
++            impl_progress = true;
++         }
++      }
++      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
++   }
++
++   return progress;
++}
++
+ static bool
+ fixup_load_const_ir3_filter(const nir_instr *instr, const void *arg)
+ {
+diff --git a/src/freedreno/ir3/ir3_shader.c b/src/freedreno/ir3/ir3_shader.c
+index edbe4c1..569fdb1 100644
+--- a/src/freedreno/ir3/ir3_shader.c
++++ b/src/freedreno/ir3/ir3_shader.c
+@@ -1145,6 +1145,14 @@ dump_const_state(struct ir3_shader_variant *so, FILE *out)
+    if (so->shader_options.fex_cp_ubo_sets)
+       fprintf(out, "; fex_cp_ubo_sets 0x%x, sets still read through descriptors 0x%x\n",
+               so->shader_options.fex_cp_ubo_sets, so->fex_bindless_sets);
++   if (so->shader_options.fex_ubo_table) {
++      const struct ir3_const_state *cs = ir3_const_state(so);
++      fprintf(out, "; fex_ubo_table %u:", cs->num_fex_ubos);
++      for (unsigned i = 0; i < cs->num_fex_ubos; i++)
++         fprintf(out, " ubo%u=set%u.%u", cs->fex_ubo[i].idx,
++                 cs->fex_ubo[i].set, cs->fex_ubo[i].block);
++      fprintf(out, "\n");
++   }
+ }
+ 
+ static uint8_t
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index ccc9497..010c541 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -296,6 +296,12 @@ struct ir3_imm_const_state {
+  *
+  * Note UBO size in bytes should be aligned to vec4
+  */
++/* FEX (fex10): UBO table entries per stage (ir3_const_state::fex_ubo), and the
++ * first table index they may not use.
++ */
++#define IR3_FEX_MAX_UBOS 8
++#define IR3_FEX_UBO_IDX_LIMIT 16
++
+ struct ir3_const_state {
+    unsigned num_ubos;
+    unsigned num_app_ubos;      /* # of UBOs not including driver UBOs */
+@@ -312,6 +318,19 @@ struct ir3_const_state {
+    /* State of ubo access lowered to push consts: */
+    struct ir3_ubo_analysis_state ubo_state;
+    enum ir3_push_consts_type push_consts_type;
++
++   /* FEX (fex10): driver-loaded (fex_cp) UBOs that still have UBO loads
++    * (no known range, e.g. dynamically indexed arrays) and read through the
++    * shader's own UBO table at index idx instead of the bindless descriptor.
++    * The driver writes each entry from the pushed descriptor (set, block)
++    * before the draw (ir3_nir_fex_ubo_table).
++    */
++   struct {
++      uint8_t idx;
++      uint8_t set;
++      uint16_t block;
++   } fex_ubo[IR3_FEX_MAX_UBOS];
++   uint8_t num_fex_ubos;
+ };
+ 
+ /**
+@@ -647,6 +666,11 @@ struct ir3_shader_options {
+     * preamble, read the const file; the preamble doesn't copy them.
+     */
+    uint8_t fex_cp_ubo_sets;
++
++   /* FEX (fex10): loads from fex_cp_ubo_sets UBOs that stay UBO loads read
++    * through the shader's own UBO table (ir3_const_state::fex_ubo).
++    */
++   bool fex_ubo_table;
+ };
+ 
+ struct ir3_shader_output {
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index b0659bb..79783ff 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -8248,6 +8248,8 @@ tu6_const_size(struct tu_cmd_buffer *cmd,
+             if (ubo_state->range[i].fex_cp)
+                dwords += 4;
+          }
++         /* fex10: one UBO table entry each */
++         dwords += 6 * cmd->state.program.link[type].const_state.num_fex_ubos;
+       }
+    }
+ 
+@@ -8306,6 +8308,33 @@ tu_fex_emit_cp_ubos(struct tu_cs *cs,
+             CP_LOAD_STATE6_0_NUM_UNIT(num_vec4));
+       tu_cs_emit_qw(cs, va + range->start);
+    }
++
++   /* fex10: the stage's UBO table entries for push set UBOs it reads as UBOs
++    * (ir3_const_state::fex_ubo): the pushed descriptor's two UBO dwords
++    * (address, size in vec4), the same format as the table. Zero (no buffer)
++    * if the descriptor isn't there, like a null descriptor.
++    */
++   for (uint32_t i = 0; i < const_state->num_fex_ubos; i++) {
++      const unsigned set = const_state->fex_ubo[i].set;
++      const uint32_t desc_dw = const_state->fex_ubo[i].block * FDL6_TEX_CONST_DWORDS;
++      uint32_t ubo[2] = { 0, 0 };
++      if (set < MAX_SETS && descriptors->sets[set] == push && push->layout &&
++          push->mapped_ptr && (desc_dw + 2) * 4 <= push->layout->size) {
++         ubo[0] = push->mapped_ptr[desc_dw];
++         ubo[1] = push->mapped_ptr[desc_dw + 1];
++      }
++
++      tu_cs_emit_pkt7(cs, tu6_stage2opcode(type), 5);
++      tu_cs_emit(cs, CP_LOAD_STATE6_0_DST_OFF(const_state->fex_ubo[i].idx) |
++            CP_LOAD_STATE6_0_STATE_TYPE(ST6_UBO) |
++            CP_LOAD_STATE6_0_STATE_SRC(SS6_DIRECT) |
++            CP_LOAD_STATE6_0_STATE_BLOCK(tu6_stage2shadersb(type)) |
++            CP_LOAD_STATE6_0_NUM_UNIT(1));
++      tu_cs_emit(cs, CP_LOAD_STATE6_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(cs, CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(0));
++      tu_cs_emit(cs, ubo[0]);
++      tu_cs_emit(cs, ubo[1]);
++   }
+ }
+ 
+ static void
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index 7b99521..eb464ee 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -123,6 +123,11 @@ tu_fex_device_init(struct tu_device *dev)
+        !dev->physical_device->info->props.load_shader_consts_via_preamble) {
+       fex->cp_ubo = true;
+       status |= TU_FEX_STATUS_CP_UBO;
++      /* fex10: only together with fex9 (same draw path). */
++      if (fex->compile & TU_FEX_COMPILE_UBO_TABLE) {
++         fex->ubo_table = true;
++         status |= TU_FEX_STATUS_UBO_TABLE;
++      }
+    }
+    /* fex8: on unless TU_FEX_CS_UNROLL=0; read once (shader keys carry it). */
+    const char *cu = getenv("TU_FEX_CS_UNROLL");
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 309f997..90c04f5 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -30,6 +30,11 @@
+  *    push descriptor set UBOs that shaders read into the const file before
+  *    each draw, and draws whose shaders read the push set only that way
+  *    don't change the descriptor set state when the set is pushed again.
++ *  - (fex10) TU_FEX_COMPILE_UBO_TABLE: push set UBOs that shaders still read
++ *    as UBOs (no known range: dynamically indexed arrays such as bone
++ *    matrices) are read through the shader's own UBO table, whose entries the
++ *    driver writes from the pushed descriptors before each draw, so those
++ *    draws don't change the descriptor set state either.
+  * Without the variable (or with a block that fails the checks) the driver
+  * behaves like stock Turnip.
+  *
+@@ -45,7 +50,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 9
++#define TU_FEX_PATCH 10
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -116,7 +121,16 @@
+  * !load_shader_consts_via_preamble only (a740). Part of the shader keys
+  * (tu_shader_key::fex_cp_ubo). */
+ #define TU_FEX_COMPILE_CP_UBO 0x8u
+-#define TU_FEX_COMPILE_MASK 0xfu
++/* fex10: with TU_FEX_COMPILE_CP_UBO, push set UBO loads with no known range
++ * (D3D12 skinning shaders index their bone matrices: cb2[1536] in D2R) read
++ * through the shader's own (non-bindless) UBO table instead of the push set's
++ * descriptor (ir3_nir_fex_ubo_table); the driver writes the table entries
++ * from the pushed descriptors before each draw (CP_LOAD_STATE6 ST6_UBO). Then
++ * those shaders don't read the push set through descriptors either, and
++ * their draws keep the descriptor set state too. Part of the shader keys
++ * (tu_shader_key::fex_ubo_table). */
++#define TU_FEX_COMPILE_UBO_TABLE 0x10u
++#define TU_FEX_COMPILE_MASK 0x1fu
+ 
+ /* tu_fex_channel::status bits (driver) */
+ #define TU_FEX_STATUS_ATTACHED 0x1u      /* a device read the channel */
+@@ -140,6 +154,8 @@
+ #define TU_FEX_STATUS_CS_UNROLL 0x4000u
+ /* fex9: TU_FEX_COMPILE_CP_UBO honored (a7xx without consts via preamble) */
+ #define TU_FEX_STATUS_CP_UBO 0x8000u
++/* fex10: TU_FEX_COMPILE_UBO_TABLE honored (needs TU_FEX_STATUS_CP_UBO) */
++#define TU_FEX_STATUS_UBO_TABLE 0x10000u
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -284,6 +300,7 @@ struct tu_fex_device {
+    bool color_clear_3d;        /* fex8: TU_FEX_STATUS_COLOR_CLEAR_3D */
+    bool cs_unroll;             /* fex8: TU_FEX_STATUS_CS_UNROLL */
+    bool cp_ubo;                /* fex9: TU_FEX_STATUS_CP_UBO */
++   bool ubo_table;             /* fex10: TU_FEX_STATUS_UBO_TABLE */
+    uint32_t counter_count;     /* == chan->counter_count */
+    uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
+    uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];
+@@ -314,6 +331,14 @@ tu_fex_cp_ubo(const struct tu_fex_device *fex)
+    return fex && fex->cp_ubo;
+ }
+ 
++/* fex10: leftover push set UBO loads through the shader's UBO table (false
++ * without a channel; implies tu_fex_cp_ubo). */
++static inline bool
++tu_fex_ubo_table(const struct tu_fex_device *fex)
++{
++   return fex && fex->cp_ubo && fex->ubo_table;
++}
++
+ /* TU_FEX_COMPILE_* bits in effect (0 without a channel). */
+ static inline uint32_t
+ tu_fex_compile(const struct tu_fex_device *fex)
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 7f09818..5b75f9e 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -3749,6 +3749,7 @@ tu_shader_create(struct tu_device *dev,
+       .const_allocs = const_allocs,
+       .nir_options = nir_options,
+       .fex_cp_ubo_sets = fex_cp_ubo_sets,
++      .fex_ubo_table = fex_cp_ubo_sets && key->fex_ubo_table,
+    };
+ 
+    struct ir3_shader *ir3_shader =
+@@ -4132,6 +4133,7 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
+    key->fex_loop_prefetch = dev->compiler->options.fex_loop_prefetch;
+    key->fex_cs_unroll = dev->compiler->options.fex_cs_unroll;
+    key->fex_cp_ubo = tu_fex_cp_ubo(dev->fex);
++   key->fex_ubo_table = tu_fex_ubo_table(dev->fex);
+ }
+ 
+ void
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 990d2fe..6003a3f 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -149,7 +149,9 @@ struct tu_shader_key {
+    bool fex_cs_unroll : 1;
+    /* fex9: TU_FEX_COMPILE_CP_UBO (tu_fex_cp_ubo). */
+    bool fex_cp_ubo : 1;
+-   uint32_t padding : 19;
++   /* fex10: TU_FEX_COMPILE_UBO_TABLE (tu_fex_ubo_table). */
++   bool fex_ubo_table : 1;
++   uint32_t padding : 18;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 

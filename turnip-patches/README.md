@@ -214,3 +214,33 @@ loaded by the driver, preamble 184 -> 137 instructions and still early, sets sti
 descriptors 0x7 (set 3 gone). `drawtest` (3 draws, new root constant buffers each): 9
 `CP_LOAD_STATE6_FRAG SS6_INDIRECT` const loads per draw at the per-draw addresses;
 `SP_GFX_BINDLESS_BASE[3]` and `SP_UPDATE_CNTL` only for the first draw (fex8: every draw).
+
+- `0010-fex10-ubo-table-push-sets.patch` (fex10, with FEX build 99): push set UBOs that shaders still
+  read as UBOs go through the shader's own UBO table, on by default (`TU_FEX_COMPILE_UBO_TABLE` 0x10,
+  only together with fex9's 0x8; FEX_TU_UBO_TABLE=0 turns it off; status bit 0x10000).
+  - ir3: `ir3_nir_fex_ubo_table` runs right after `ir3_nir_lower_ubo_loads` (before descriptor
+    prefetch), also on preamble functions. Each `load_ubo` left on a `fex_cp_ubo_sets` set (no known
+    range, e.g. a dynamically indexed array) gets a non-bindless UBO index instead of its
+    `bindless_resource_ir3`: one per (set, binding block), allocated like driver UBOs (index 0 stays
+    free), at most 8 per stage and index < 16, recorded in `ir3_const_state::fex_ubo` (shared with the
+    binning variant, which only looks entries up; kept in the shader cache). The shader code is
+    otherwise the same (`ldc` without the bindless flag; one descriptor prefetch less).
+  - Turnip: `tu_fex_emit_cp_ubos` also writes each entry with `CP_LOAD_STATE6` `ST6_UBO` `SS6_DIRECT`
+    (the pushed descriptor's dwords 0-1, address and size in vec4, the table's format; zero if the
+    descriptor is missing, like a null descriptor). The stage's `fex_bindless_sets` loses the push set,
+    so `tu_fex_desc_sets_skip` applies to these draws too. Shader key bit `fex_ubo_table`.
+  - Why: build 98's log: draws whose shaders read root constant buffers only through fex9's loads got
+    2.4x cheaper where the GPU front end was the limit (a 350-draw main pass at every start 1.72-2.39
+    -> 0.79 ms, prepass 0.95 -> 0.76 ms, 94% of descriptor changes skipped), but shadow passes got
+    slower (1.98 -> 2.35 us/draw): 76% of their draws use skinning vertex shaders that index cb2 (1536
+    vectors, too big for the const file), so they still changed the descriptor set state at every draw
+    and paid the constant loads on top.
+
+Host check (fex10): D2R's skinning vertex shader fb5d (DXBC from build 71, dxbc-spirv, root constant
+buffers moved to set 3): sets still read through descriptors 0x8 -> 0x0, `ubo1=set3.2` in both the
+draw and binning variants, 273 instructions either way, preamble 8 -> 7 (descriptor prefetch gone).
+Pixel shaders with sized constant buffers (5ff3) unchanged; the unsized captures of 5ff3/fb5d/5b7f/0e15
+lose set 3 too (0xf -> 0x7) with the same instruction counts. A test VS with a driver constant UBO puts
+it at index 1 and the table entries at 2-3. `drawtest` (skinning VS + 5ff3, 3 draws, new root constant
+buffers each): one `CP_LOAD_STATE6_GEOM ST6_UBO` per draw at the per-draw address (size 0x80 vec4) and
+the descriptor set state only for the first draw (fex9: every draw).
