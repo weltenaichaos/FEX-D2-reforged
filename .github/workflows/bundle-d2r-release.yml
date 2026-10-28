@@ -1,5 +1,6 @@
-# Publishes one release that bundles the current D2R-on-Thor components (FEX, frame gen layer, vkd3d), taken from
-# their own releases. Edit tools/release/d2r-thor-assets.txt and d2r-thor-notes.md, then push or run it by hand.
+# Publishes one release that bundles the current D2R-on-Thor components (FEX, vkd3d, Turnip driver, frame gen layer),
+# taken from their own releases. Edit tools/release/d2r-thor-assets.txt and d2r-thor-notes.md, then push or run it by
+# hand. It publishes a test version (pre-release, tag d2r-thor-test-N) unless run by hand with "test" unticked.
 name: Bundle D2R release
 
 on:
@@ -7,6 +8,11 @@ on:
     branches: [ d2r/clean ]
     paths: [ tools/release/** ]
   workflow_dispatch:
+    inputs:
+      test:
+        description: Test version (pre-release, still in development)
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -28,7 +34,8 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: d2r-thor-${{ github.run_number }}
-          name: D2R on AYN Thor, setup bundle ${{ github.run_number }}
+          tag_name: ${{ (github.event_name != 'workflow_dispatch' || inputs.test) && 'd2r-thor-test-' || 'd2r-thor-' }}${{ github.run_number }}
+          name: D2R on AYN Thor, ${{ (github.event_name != 'workflow_dispatch' || inputs.test) && 'TEST version' || 'setup bundle' }} ${{ github.run_number }}${{ (github.event_name != 'workflow_dispatch' || inputs.test) && ' (still in development)' || '' }}
+          prerelease: ${{ github.event_name != 'workflow_dispatch' || inputs.test }}
           body_path: notes.md
           files: out/*
