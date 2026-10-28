@@ -320,48 +320,42 @@ namespace {
     // FEX_TU_COUNTERS: 1 (D2R default in build 102) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at
     // least this many draws get timed and counted (D2R default 100 in build 102: the main pass, the depth prepasses and
     // the shadow maps in towns and fights).
-    // Build 102's list, for the main (lighting) pass: since the last counter run (build 74) the lighting draws got their
-    // setup ahead of the draw (fex2), their constants from the command processor (fex9/fex10), and builds 100 and 101
-    // cut the command processor's work per switch by 74% and the lighting shaders by 12% without any GPU time saved.
-    // Build 70 saw a lighting wave spend ~15% of its time on math and ~21-30% waiting for texture/memory results, with
-    // about half of its time in states it didn't count, and builds 69/70 an average texture fetch taking ~850 GPU
-    // cycles. This list says where a wave's time goes now (every wave state: math, idle issue slots, waits for earlier
-    // results, texture/memory waits, short waits, flow control, input load, output emit, wave end, ready but not picked),
-    // how long a wave lives and how many texture instructions it runs, and what a texture fetch waits on: the texture
-    // units (busy, shader cores unable to send more requests), their L1 cache, the L2 cache and memory.
+    // Build 103's list, every wave state at once. Build 102 found the lighting pass limited by one lighting wave's own
+    // start-to-finish time (the GPU keeps about two draws in flight, so each draw costs ~4,700 GPU cycles plus 54 per
+    // wave), and the wave spending 15% on math, 3% on idle issue slots, 27% waiting for texture/memory data and ~40% in
+    // states that list didn't count. The texture counters are dropped (102 has them: 40% L1 misses, 25% L2 misses);
+    // these are all the shader core's wave state counters, so the shares add up and the biggest state is named.
     if (!SwitchOff(Switch("FEX_TU_COUNTERS"))) {
       static constexpr struct {
         uint32_t Group, Countable;
       } List[] = {
         {Turnip::GroupCp, 0}, // CP_ALWAYS_COUNT (GPU cycles, shared with KGSL)
-        // Shader cores (summed over the a740's 6): busy, resident waves (integral over cycles), FS wave lives.
+        // Shader cores: busy, resident waves (integral over cycles), fragment wave lives.
         {Turnip::GroupSp, 0},  // SP_BUSY_CYCLES
         {Turnip::GroupSp, 8},  // SP_WAVE_CONTEXTS
         {Turnip::GroupSp, 10}, // SP_STAGE_WAVE_CYCLES (fragment wave lives)
         {Turnip::GroupSp, 11}, // SP_STAGE_WAVE_SAMPLES (fragment waves)
-        // Where wave time goes, one counter per wave state.
-        {Turnip::GroupSp, 89}, // SP_WAVE_ALU_CYCLES (issuing math)
+        // Issuing, by unit.
+        {Turnip::GroupSp, 89}, // SP_WAVE_ALU_CYCLES (float math)
+        {Turnip::GroupSp, 90}, // SP_WAVE_EFU_CYCLES (special math: square roots, reciprocals, powers, sines)
+        {Turnip::GroupSp, 91}, // SP_WAVE_INT_CYCLES (integer math)
+        {Turnip::GroupSp, 92}, // SP_WAVE_CSP_CYCLES
         {Turnip::GroupSp, 19}, // SP_WAVE_NOP_CYCLES (idle issue slots the compiler put in)
-        {Turnip::GroupSp, 20}, // SP_WAVE_WAIT_CYCLES
-        {Turnip::GroupSp, 22}, // SP_WAVE_IDLE_CYCLES (ready, another wave issued)
-        {Turnip::GroupSp, 24}, // SP_WAVE_LONG_SYNC_CYCLES (waiting for texture/memory results)
-        {Turnip::GroupSp, 25}, // SP_WAVE_SHORT_SYNC_CYCLES
-        {Turnip::GroupSp, 16}, // SP_WAVE_CTRL_CYCLES
-        {Turnip::GroupSp, 17}, // SP_WAVE_LOAD_CYCLES
-        {Turnip::GroupSp, 18}, // SP_WAVE_EMIT_CYCLES
-        {Turnip::GroupSp, 23}, // SP_WAVE_END_CYCLES
-        // Texture path: shader cores unable to send more texture requests, texture instructions run.
-        {Turnip::GroupSp, 4},  // SP_STALL_CYCLES_TP
-        {Turnip::GroupSp, 37}, // SP_FS_STAGE_TEX_INSTRUCTIONS
-        // Texture units: busy, fetch latency, L1 cache lines asked for and missed.
-        {Turnip::GroupTp, 0}, // TP_BUSY_CYCLES
-        {Turnip::GroupTp, 2}, // TP_LATENCY_CYCLES
-        {Turnip::GroupTp, 3}, // TP_LATENCY_TRANS
-        {Turnip::GroupTp, 6}, // TP_L1_CACHELINE_REQUESTS
-        {Turnip::GroupTp, 7}, // TP_L1_CACHELINE_MISSES
-        // L2 cache: texture requests, and the 32-byte beats it read from memory for them (L2 misses).
-        {Turnip::GroupUche, 9}, // UCHE_READ_REQUESTS_TP
-        {Turnip::GroupUche, 4}, // UCHE_VBIF_READ_BEATS_TP
+        // Waiting and the rest of a wave's life.
+        {Turnip::GroupSp, 20},  // SP_WAVE_WAIT_CYCLES
+        {Turnip::GroupSp, 21},  // SP_WAVE_FETCH_CYCLES (instruction fetch)
+        {Turnip::GroupSp, 22},  // SP_WAVE_IDLE_CYCLES
+        {Turnip::GroupSp, 24},  // SP_WAVE_LONG_SYNC_CYCLES (texture/memory results)
+        {Turnip::GroupSp, 25},  // SP_WAVE_SHORT_SYNC_CYCLES
+        {Turnip::GroupSp, 16},  // SP_WAVE_CTRL_CYCLES
+        {Turnip::GroupSp, 17},  // SP_WAVE_LOAD_CYCLES
+        {Turnip::GroupSp, 18},  // SP_WAVE_EMIT_CYCLES
+        {Turnip::GroupSp, 23},  // SP_WAVE_END_CYCLES
+        {Turnip::GroupSp, 26},  // SP_WAVE_JOIN_CYCLES
+        {Turnip::GroupSp, 104}, // SP_WAVE_INPUT_CYCLES
+        {Turnip::GroupSp, 105}, // SP_WAVE_OUTPUT_CYCLES
+        {Turnip::GroupSp, 106}, // SP_WAVE_HWAVE_WAIT_CYCLES
+        {Turnip::GroupSp, 107}, // SP_WAVE_HWAVE_SYNC
       };
       static_assert(std::size(List) <= Turnip::MaxCounters);
       for (const auto& C : List) {

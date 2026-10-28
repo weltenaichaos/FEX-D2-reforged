@@ -105,6 +105,15 @@ namespace {
     {T::GroupTp, 6, "tp_l1_req"},
     {T::GroupUche, 9, "l2_req_tp"},
     {T::GroupUche, 4, "mem_beats_tp"},
+    // build 103 additions
+    {T::GroupSp, 90, "wave_efu"},
+    {T::GroupSp, 91, "wave_int"},
+    {T::GroupSp, 92, "wave_csp"},
+    {T::GroupSp, 26, "wave_join"},
+    {T::GroupSp, 104, "wave_input"},
+    {T::GroupSp, 105, "wave_output"},
+    {T::GroupSp, 106, "wave_hwave_wait"},
+    {T::GroupSp, 107, "wave_hwave_sync"},
   };
 
   fextl::string CounterLabel(uint32_t Group, uint32_t Countable) {
@@ -329,17 +338,20 @@ namespace {
     if (Has(T::GroupSp, 10) && Has(T::GroupSp, 11)) {
       Line += fextl::fmt::format(", wave life {:.0f} cyc", Ratio(V(T::GroupSp, 10), V(T::GroupSp, 11)));
     }
-    // Wave cycles (resident wave x cycle) by state: issuing math (alu), idle issue slots the compiler put in (nop),
-    // waiting for an earlier instruction's result (wait), waiting for texture/memory results (long-sync) or short
-    // results (short-sync), flow control (ctrl), loading inputs (load), sending outputs (emit), ending (end), ready
-    // but another wave issued (idle). With 4+ states counted, 'rest' is what none of them covers.
+    // Wave cycles (resident wave x cycle) by state: issuing float math (alu), special math (efu), integer math (int),
+    // csp, idle issue slots the compiler put in (nop), waiting for an earlier instruction's result (wait), waiting for
+    // texture/memory results (long-sync) or short results (short-sync), instruction fetch (fetch), flow control
+    // (ctrl), loading inputs (load), sending outputs (emit), ending (end), join, input, output, half-wave wait/sync
+    // (build 103), ready but another wave issued (idle). With 4+ states counted, 'rest' is what none of them covers.
     const double Waves = V(T::GroupSp, 8);
     if (Waves > 0) {
       static constexpr struct {
         uint32_t Countable;
         const char* Name;
-      } Split[] = {{89, "alu"},        {19, "nop"},  {20, "wait"}, {24, "long-sync"}, {25, "short-sync"},
-                   {16, "ctrl"},       {17, "load"}, {18, "emit"}, {23, "end"},       {22, "idle"}};
+      } Split[] = {{89, "alu"},   {90, "efu"},       {91, "int"},        {92, "csp"},   {19, "nop"},
+                   {20, "wait"},  {24, "long-sync"}, {25, "short-sync"}, {21, "fetch"}, {16, "ctrl"},
+                   {17, "load"},  {18, "emit"},      {23, "end"},        {26, "join"},  {104, "input"},
+                   {105, "output"}, {106, "half-wave wait"}, {107, "half-wave sync"}, {22, "idle"}};
       fextl::string Parts;
       double Sum = 0;
       int Counted = 0;

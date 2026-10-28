@@ -220,6 +220,8 @@ namespace {
     // processor work and lighting shader instructions without GPU time saved, so the main pass's limit isn't where
     // build 74's counters pointed any more; build 102's list (EnvironmentVariablesHandling.cpp) says where a lighting
     // wave's time goes and what its texture fetches wait on.
+    // Build 103: on for a second measuring run with every wave state counter (build 102 left ~40% of a lighting wave's
+    // time in states its list didn't count).
     {"FEX_TU_COUNTERS", "1"},
     {"FEX_TU_SAMPLE_DRAWS", "100"},
     // Build 71: build 70 found the main pass's lighting draws each wait for their setup step (the shader preamble: ~730

@@ -133,7 +133,9 @@ namespace FEX::Windows {
 //   FEX_TU_COUNTERS=1      reserve 24 GPU counters through KGSL and record them around big passes (the D2R default up
 //                          to build 75, 0 in builds 76-101, 1 again in build 102 with a lighting pass list: every wave
 //                          state, wave life, texture instructions, texture unit busy and latency, shader cores unable
-//                          to send texture requests, L1 and L2 cache misses for textures;
+//                          to send texture requests, L1 and L2 cache misses for textures; build 103: every wave
+//                          state counter (float/special/integer math, csp, nops, waits, fetch, flow control, input
+//                          load, emit, end, join, input, output, half-wave waits, idle) with wave life and occupancy;
 //                          build 74: GPU cycles, state contexts, and where the command processor's time per draw goes
 //                          (busy, register writes and bunches, state loads, draw packets, waits for command or draw
 //                          state data, syncs, waits for idle, packets and dwords read), shader front end stalls and
