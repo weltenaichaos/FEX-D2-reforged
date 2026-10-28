@@ -199,6 +199,18 @@ namespace FEX::Windows {
 //                          before graphics uniform reads also make the command processor wait for earlier writes.
 //                          The 'turnip' line's 'descriptor updates' then drop below 'push'. Read once at device
 //                          creation and part of the shader keys, so shaders are compiled anew once. 0 = stock.
+//   FEX_TU_UBO_TABLE=1     (the D2R default from build 99, driver fex10 and later, only with FEX_TU_CP_UBO) root
+//                          constant buffers that shaders still read from memory, because they index more than fits the
+//                          constants (D2R's skinning vertex shaders: bone matrices, cb2 with 1536 vectors), are read
+//                          through the shader's own UBO table instead of the root set's descriptor. The driver writes
+//                          the table entry from the pushed descriptor before each draw (CP_LOAD_STATE6 ST6_UBO). Those
+//                          shaders then no longer read the root set through descriptors, so their draws keep the
+//                          descriptor set state like the others. Build 98: draws that skipped the descriptor set change
+//                          got 2.4x cheaper where the GPU front end was the limit (a 350-draw main pass at every start
+//                          1.72-2.39 -> 0.79 ms), but shadow passes got slower (1.98 -> 2.35 us/draw): 76% of their
+//                          draws use skinning vertex shaders, which still changed it for every draw and paid the
+//                          constant loads on top. Read once at device creation and part of the shader keys. 0 = as
+//                          build 98.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

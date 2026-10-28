@@ -28,6 +28,9 @@
 //    UBOs (vkd3d's root constant buffers) that graphics shaders read into their constants before each draw, and a draw
 //    whose shaders then don't read the push set through descriptors keeps the previous descriptor set state when only
 //    the push set changed (fewer 'descriptor updates' than 'push' on the 'turnip' line).
+//  - (fex10 and later) with CompileUboTable as well, push set UBOs that shaders still read as UBOs (no known range,
+//    like indexed bone matrices) are read through the shader's own UBO table, whose entries the driver writes from the
+//    pushed descriptors before each draw, so those draws keep the descriptor set state too.
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -50,6 +53,7 @@ constexpr uint32_t CompilePushSpeculate = 0x1;
 constexpr uint32_t CompilePreambleLoads = 0x2; // fex6 and later: preamble loads first, each value stored once
 constexpr uint32_t CompileLoopPrefetch = 0x4;  // fex7 and later: list loops read the next entry one iteration ahead
 constexpr uint32_t CompileCpUbo = 0x8;         // fex9 and later: push set UBO ranges loaded by the command processor
+constexpr uint32_t CompileUboTable = 0x10;     // fex10 and later: other push set UBO reads through the shader's UBO table
 
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
@@ -65,6 +69,7 @@ constexpr uint32_t StatusBudgetCache = 0x400;     // fex5 and later: ModeBudgetC
 constexpr uint32_t StatusPreambleLoads = 0x800;   // fex6 and later: CompilePreambleLoads honored
 constexpr uint32_t StatusLoopPrefetch = 0x1000;   // fex7 and later: CompileLoopPrefetch honored
 constexpr uint32_t StatusCpUbo = 0x8000;          // fex9 and later: CompileCpUbo honored (a7xx without consts via preamble)
+constexpr uint32_t StatusUboTable = 0x10000;      // fex10 and later: CompileUboTable honored (needs StatusCpUbo)
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;

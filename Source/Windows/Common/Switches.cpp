@@ -270,6 +270,13 @@ namespace {
     // vkd3d pushed, and keeps the descriptor set state when only the root set changed and the shaders no longer read it
     // through descriptors.
     {"FEX_TU_CP_UBO", "1"},
+    // Build 99: build 98's log showed the skipped descriptor set change working (a 350-draw main pass at every start
+    // 1.72-2.39 -> 0.79 ms), but D2R's skinning vertex shaders index their bone matrices (cb2, 1536 vectors), which
+    // doesn't fit the constants, so they still read the root set through descriptors: their draws (76% of shadow pass
+    // draws) kept changing the descriptor set state and paid the command processor loads on top (shadow 1.98 -> 2.35
+    // us/draw). FEX's Turnip fex10 reads those buffers through the shader's own UBO table, written from the pushed
+    // descriptor before each draw, so the skinned draws skip the change too.
+    {"FEX_TU_UBO_TABLE", "1"},
   };
 
   // In the order the stats log lists them.
@@ -359,6 +366,7 @@ namespace {
     "FEX_TU_DEPTH_CLEAR",
     "FEX_TU_BUDGET_CACHE",
     "FEX_TU_CP_UBO",
+    "FEX_TU_UBO_TABLE",
   };
 
   bool UseD2RDefaults {};
