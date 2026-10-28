@@ -131,14 +131,16 @@ namespace FEX::Windows {
 //                          pass began, and an identical push keeps its old copy; alt = on in every other second, so
 //                          one run compares both ways (needs the stats log, without it alt stays on)
 //   FEX_TU_COUNTERS=1      reserve 24 GPU counters through KGSL and record them around big passes (the D2R default up
-//                          to build 75, 0 from build 76: the study is done;
+//                          to build 75, 0 in builds 76-101, 1 again in build 102 with a lighting pass list: every wave
+//                          state, wave life, texture instructions, texture unit busy and latency, shader cores unable
+//                          to send texture requests, L1 and L2 cache misses for textures;
 //                          build 74: GPU cycles, state contexts, and where the command processor's time per draw goes
 //                          (busy, register writes and bunches, state loads, draw packets, waits for command or draw
 //                          state data, syncs, waits for idle, packets and dwords read), shader front end stalls and
 //                          draw overlap, shader core occupancy/starvation and pixels, primitive control starved by
 //                          the command processor, render backend busy and depth writes waiting for memory); 0 = none
-//   FEX_TU_SAMPLE_DRAWS=N  passes with at least N draws are timed and counted (default 100; the D2R default 0 from build
-//                          76: each sampled pass paid two GPU waits for idle)
+//   FEX_TU_SAMPLE_DRAWS=N  passes with at least N draws are timed and counted (default 100; the D2R default 0 in builds
+//                          76-101: each sampled pass paid two GPU waits for idle; 100 again in build 102)
 //   FEX_TU_EARLY_PREAMBLE=1  (the D2R default from build 71, driver fex2 and later) push descriptor sets count as written,
 //                          so the lighting shaders' reads of vkd3d's root constant buffers can run in the early
 //                          preamble, ahead of the draw's pixel waves, as Qualcomm's driver does for D3D11 games. Build
@@ -223,7 +225,8 @@ namespace FEX::Windows {
 //                          99: each switch cost ~1.5 us of GPU time in the shadow passes and ~3.5 us in the depth
 //                          prepass. 1 = always, 0 = stock. Without the stats log nothing flips it, so alt stays on.
 //                          Build 101: off by default (build 100: blocks per switch 15.8 -> 4.1 but no GPU time saved).
-//   FEX_TU_NOALIAS=alt     (the D2R default in build 101, driver fex12 and later, a7xx) the driver also compiles fragment
+//   FEX_TU_NOALIAS=alt     (the D2R default in build 101 only, 0 from build 102: no gain; driver fex12 and later, a7xx)
+//                          the driver also compiles fragment
 //                          shaders with 1,024+ instructions and 64+ alias.tex helpers (D2R's lighting shaders) without
 //                          alias.tex, and pipelines use those binaries in every other second so one run compares both.
 //                          alias.tex lets a texture fetch read its coordinates from scattered registers; each alias is an

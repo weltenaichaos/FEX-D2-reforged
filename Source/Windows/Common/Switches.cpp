@@ -216,8 +216,12 @@ namespace {
     {"FEX_TU_DESC", "0"},
     // Build 76: off. The counter study is done (builds 70-74); each pass of 100 draws or more paid two GPU waits for idle
     // (and ~50 register reads) to be timed and counted, and the 'turnip pass' lines were 14% of a log.
-    {"FEX_TU_COUNTERS", "0"},
-    {"FEX_TU_SAMPLE_DRAWS", "0"},
+    // Build 102: on again for one measuring run. Builds 100 and 101 removed command
+    // processor work and lighting shader instructions without GPU time saved, so the main pass's limit isn't where
+    // build 74's counters pointed any more; build 102's list (EnvironmentVariablesHandling.cpp) says where a lighting
+    // wave's time goes and what its texture fetches wait on.
+    {"FEX_TU_COUNTERS", "1"},
+    {"FEX_TU_SAMPLE_DRAWS", "100"},
     // Build 71: build 70 found the main pass's lighting draws each wait for their setup step (the shader preamble: ~730
     // instructions, ~108 memory reads, 47 branches) inside the draw's first pixel wave. Qualcomm's own driver and stock
     // Turnip run it ahead of the draw ('early preamble'), but Turnip refuses here: with vkd3d's descriptor buffers it
@@ -295,7 +299,10 @@ namespace {
     // more movs and 32 instead of 24 registers); whether a helper costs the GPU a cycle like a mov is not documented, so
     // alt uses the second binaries in every other second and the log compares the main pass at the same draws
     // ('turnip: no alias' line, 'na on/off' pass kinds).
-    {"FEX_TU_NOALIAS", "alt"},
+    // Build 102: off. Build 101 measured it: the main pass at the same draws took 5.65 ms with the stock binaries and
+    // 5.77 ms without alias.tex (+2..4%, +-4%), so the helpers cost about nothing; off saves compiling 113 big fragment
+    // shaders twice. FEX_TU_NOALIAS=1 or alt still turn it on.
+    {"FEX_TU_NOALIAS", "0"},
   };
 
   // In the order the stats log lists them.

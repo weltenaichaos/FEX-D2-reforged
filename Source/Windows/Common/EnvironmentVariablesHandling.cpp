@@ -317,50 +317,51 @@ namespace {
                  (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0) | (TurnipBudgetCache ? Turnip::ModeBudgetCache : 0) |
                  (TurnipSwitch ? Turnip::ModeSwitch : 0) | (TurnipNoAlias ? Turnip::ModeNoAlias : 0);
 
-    // FEX_TU_COUNTERS: 1 (default) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at least this many
-    // draws get timed and counted (default 100: the main pass, the depth prepass and the shadow maps in towns and
-    // fights). Build 74's list: build 73 found primitive control waiting for the command processor's next draw ~43% of
-    // the main pass and the command processor's output stalled ~42%, with every draw taking a new state context, so the
-    // fixed cost per draw (~6,000 GPU cycles in the main pass, ~2,000 in the shadow maps) sits in the command processor.
-    // The command processor counters say where its time per draw goes: executing register writes, state loads
-    // (constants, descriptors), draw packets, waiting for its command or draw state data to arrive from memory, or for
-    // syncs, and how many packets and dwords a draw takes. Dropped from build 73's list: units that read ~0.8-0.9 busy
-    // per cycle in every pass (vertex fetch, triangle setup, rasterizer, depth pre-test), the 2D engine (depth clears
-    // are 3D draws now), draw setup starve (always 0) and the wave life/kind/alu/long-sync counters (known).
+    // FEX_TU_COUNTERS: 1 (D2R default in build 102) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at
+    // least this many draws get timed and counted (D2R default 100 in build 102: the main pass, the depth prepasses and
+    // the shadow maps in towns and fights).
+    // Build 102's list, for the main (lighting) pass: since the last counter run (build 74) the lighting draws got their
+    // setup ahead of the draw (fex2), their constants from the command processor (fex9/fex10), and builds 100 and 101
+    // cut the command processor's work per switch by 74% and the lighting shaders by 12% without any GPU time saved.
+    // Build 70 saw a lighting wave spend ~15% of its time on math and ~21-30% waiting for texture/memory results, with
+    // about half of its time in states it didn't count, and builds 69/70 an average texture fetch taking ~850 GPU
+    // cycles. This list says where a wave's time goes now (every wave state: math, idle issue slots, waits for earlier
+    // results, texture/memory waits, short waits, flow control, input load, output emit, wave end, ready but not picked),
+    // how long a wave lives and how many texture instructions it runs, and what a texture fetch waits on: the texture
+    // units (busy, shader cores unable to send more requests), their L1 cache, the L2 cache and memory.
     if (!SwitchOff(Switch("FEX_TU_COUNTERS"))) {
       static constexpr struct {
         uint32_t Group, Countable;
       } List[] = {
-        // Clock and command processor: GPU cycles, how many state contexts the draws used, whether the command
-        // processor waits on the GPU (pipe out stall), and (build 74) where its own time goes. A7xx has 14 command
-        // processor counters, counter 0 shared with KGSL's always-on count: this list takes the other 13.
-        {Turnip::GroupCp, 0},  // CP_ALWAYS_COUNT (GPU cycles, shared with KGSL)
-        {Turnip::GroupCp, 11}, // CP_CONTEXT_DONE
-        {Turnip::GroupCp, 22}, // CP_SQE_PIPE_OUT_STALL
-        {Turnip::GroupCp, 2},  // CP_BUSY_CYCLES
-        {Turnip::GroupCp, 16}, // CP_SQE_PM4_STARVE_RB_IB (waiting for command buffer data from memory)
-        {Turnip::GroupCp, 17}, // CP_SQE_PM4_STARVE_SDS (waiting for draw state data from memory)
-        {Turnip::GroupCp, 23}, // CP_SQE_SYNC_STALL
-        {Turnip::GroupCp, 24}, // CP_SQE_PM4_WFI_STALL (wait for idle)
-        {Turnip::GroupCp, 26}, // CP_SQE_T4_EXEC (register writes)
-        {Turnip::GroupCp, 27}, // CP_SQE_LOAD_STATE_EXEC (constant/descriptor/shader loads)
-        {Turnip::GroupCp, 29}, // CP_SQE_DRAW_EXEC (draw packets)
-        {Turnip::GroupCp, 30}, // CP_SQE_CTXT_REG_BUNCH_EXEC (register bunches)
-        {Turnip::GroupCp, 45}, // CP_PM4_DATA (dwords)
-        {Turnip::GroupCp, 46}, // CP_PM4_HEADERS (packets)
-        // Shader front end: two pixel shader states active at once (draw overlap), waits.
-        {Turnip::GroupHlsq, 11}, // HLSQ_FS_DATA_WAIT_PROGRAMMING
-        {Turnip::GroupHlsq, 12}, // HLSQ_DUAL_FS_PROG_ACTIVE
-        {Turnip::GroupHlsq, 22}, // HLSQ_FS_STALL_CYCLES
-        // Shader cores: occupancy, starvation, pixels (fast Z depth clears run no pixels through them).
-        {Turnip::GroupSp, 0},   // SP_BUSY_CYCLES
-        {Turnip::GroupSp, 8},   // SP_WAVE_CONTEXTS
-        {Turnip::GroupSp, 69},  // SP_STARVE_CYCLES_HLSQ
-        {Turnip::GroupSp, 101}, // SP_PIXELS
-        // Geometry front end and back end: primitive control waiting for the next draw, render backend.
-        {Turnip::GroupPc, 13},  // PC_STARVE_CYCLES_DI (waiting for the command processor's next draw)
-        {Turnip::GroupRb, 0},   // RB_BUSY_CYCLES (render backend)
-        {Turnip::GroupRb, 37},  // RB_STALL_CYCLES_CCU_DEPTH_WRITE (depth writes waiting for the cache/memory)
+        {Turnip::GroupCp, 0}, // CP_ALWAYS_COUNT (GPU cycles, shared with KGSL)
+        // Shader cores (summed over the a740's 6): busy, resident waves (integral over cycles), FS wave lives.
+        {Turnip::GroupSp, 0},  // SP_BUSY_CYCLES
+        {Turnip::GroupSp, 8},  // SP_WAVE_CONTEXTS
+        {Turnip::GroupSp, 10}, // SP_STAGE_WAVE_CYCLES (fragment wave lives)
+        {Turnip::GroupSp, 11}, // SP_STAGE_WAVE_SAMPLES (fragment waves)
+        // Where wave time goes, one counter per wave state.
+        {Turnip::GroupSp, 89}, // SP_WAVE_ALU_CYCLES (issuing math)
+        {Turnip::GroupSp, 19}, // SP_WAVE_NOP_CYCLES (idle issue slots the compiler put in)
+        {Turnip::GroupSp, 20}, // SP_WAVE_WAIT_CYCLES
+        {Turnip::GroupSp, 22}, // SP_WAVE_IDLE_CYCLES (ready, another wave issued)
+        {Turnip::GroupSp, 24}, // SP_WAVE_LONG_SYNC_CYCLES (waiting for texture/memory results)
+        {Turnip::GroupSp, 25}, // SP_WAVE_SHORT_SYNC_CYCLES
+        {Turnip::GroupSp, 16}, // SP_WAVE_CTRL_CYCLES
+        {Turnip::GroupSp, 17}, // SP_WAVE_LOAD_CYCLES
+        {Turnip::GroupSp, 18}, // SP_WAVE_EMIT_CYCLES
+        {Turnip::GroupSp, 23}, // SP_WAVE_END_CYCLES
+        // Texture path: shader cores unable to send more texture requests, texture instructions run.
+        {Turnip::GroupSp, 4},  // SP_STALL_CYCLES_TP
+        {Turnip::GroupSp, 37}, // SP_FS_STAGE_TEX_INSTRUCTIONS
+        // Texture units: busy, fetch latency, L1 cache lines asked for and missed.
+        {Turnip::GroupTp, 0}, // TP_BUSY_CYCLES
+        {Turnip::GroupTp, 2}, // TP_LATENCY_CYCLES
+        {Turnip::GroupTp, 3}, // TP_LATENCY_TRANS
+        {Turnip::GroupTp, 6}, // TP_L1_CACHELINE_REQUESTS
+        {Turnip::GroupTp, 7}, // TP_L1_CACHELINE_MISSES
+        // L2 cache: texture requests, and the 32-byte beats it read from memory for them (L2 misses).
+        {Turnip::GroupUche, 9}, // UCHE_READ_REQUESTS_TP
+        {Turnip::GroupUche, 4}, // UCHE_VBIF_READ_BEATS_TP
       };
       static_assert(std::size(List) <= Turnip::MaxCounters);
       for (const auto& C : List) {

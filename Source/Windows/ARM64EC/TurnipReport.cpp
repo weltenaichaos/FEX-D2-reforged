@@ -94,6 +94,17 @@ namespace {
     {T::GroupTp, 2, "tp_lat_cyc"},
     {T::GroupTp, 3, "tp_lat_trans"},
     {T::GroupHlsq, 55, "hlsq_stche_miss_fs"},
+    // build 102 additions
+    {T::GroupSp, 19, "wave_nop"},
+    {T::GroupSp, 16, "wave_ctrl"},
+    {T::GroupSp, 17, "wave_load"},
+    {T::GroupSp, 18, "wave_emit"},
+    {T::GroupSp, 23, "wave_end"},
+    {T::GroupSp, 37, "fs_tex_inst"},
+    {T::GroupTp, 0, "tp_busy"},
+    {T::GroupTp, 6, "tp_l1_req"},
+    {T::GroupUche, 9, "l2_req_tp"},
+    {T::GroupUche, 4, "mem_beats_tp"},
   };
 
   fextl::string CounterLabel(uint32_t Group, uint32_t Countable) {
@@ -308,6 +319,9 @@ namespace {
     if (Has(T::GroupSp, 97) || Has(T::GroupSp, 98)) {
       const double W1 = V(T::GroupSp, 97), W2 = V(T::GroupSp, 98);
       Line += fextl::fmt::format(" | fs waves/draw {:.1f} (2x {:.0f}%)", (W1 + W2) / Draws, 100.0 * Ratio(W2, W1 + W2));
+    } else if (Has(T::GroupSp, 11)) {
+      // Build 102: the wave life samples count every fragment wave.
+      Line += fextl::fmt::format(" | fs waves/draw {:.1f}", V(T::GroupSp, 11) / Draws);
     }
     if (Has(T::GroupSp, 101)) {
       Line += fextl::fmt::format(", px/draw {:.0f}", V(T::GroupSp, 101) / Draws);
@@ -315,20 +329,77 @@ namespace {
     if (Has(T::GroupSp, 10) && Has(T::GroupSp, 11)) {
       Line += fextl::fmt::format(", wave life {:.0f} cyc", Ratio(V(T::GroupSp, 10), V(T::GroupSp, 11)));
     }
+    // Wave cycles (resident wave x cycle) by state: issuing math (alu), idle issue slots the compiler put in (nop),
+    // waiting for an earlier instruction's result (wait), waiting for texture/memory results (long-sync) or short
+    // results (short-sync), flow control (ctrl), loading inputs (load), sending outputs (emit), ending (end), ready
+    // but another wave issued (idle). With 4+ states counted, 'rest' is what none of them covers.
     const double Waves = V(T::GroupSp, 8);
     if (Waves > 0) {
       static constexpr struct {
         uint32_t Countable;
         const char* Name;
-      } Split[] = {{89, "alu"}, {20, "wait"}, {22, "idle"}, {24, "long-sync"}, {25, "short-sync"}};
+      } Split[] = {{89, "alu"},        {19, "nop"},  {20, "wait"}, {24, "long-sync"}, {25, "short-sync"},
+                   {16, "ctrl"},       {17, "load"}, {18, "emit"}, {23, "end"},       {22, "idle"}};
       fextl::string Parts;
+      double Sum = 0;
+      int Counted = 0;
       for (const auto& P : Split) {
         if (Has(T::GroupSp, P.Countable)) {
-          Parts += fextl::fmt::format(" {} {:.0f}%", P.Name, 100.0 * V(T::GroupSp, P.Countable) / Waves);
+          const double Pct = 100.0 * V(T::GroupSp, P.Countable) / Waves;
+          Parts += fextl::fmt::format(" {} {:.0f}%", P.Name, Pct);
+          Sum += Pct;
+          ++Counted;
         }
+      }
+      if (Counted >= 4) {
+        Parts += fextl::fmt::format(" rest {:.0f}%", 100.0 - Sum);
       }
       if (!Parts.empty()) {
         Line += " | wave cycles" + Parts;
+      }
+    }
+    // Texture path (build 102): texture instructions per fragment wave, how long a texture fetch takes on average and
+    // how many of those a wave's life is, shader cores unable to send more texture requests and texture units busy
+    // (both summed over the 6 cores, so 6.00 = all of them all the time), the texture L1 cache's line misses, the L2
+    // cache's misses for texture requests (2 memory beats of 32 bytes per 64-byte request missed, Mesa's formula) and
+    // the texture data read from memory per pass. Textures read compressed (UBWC) go through the decompressor and are
+    // not in the L2 numbers.
+    {
+      fextl::string Parts;
+      const auto Add = [&](const fextl::string& Part) {
+        Parts += (Parts.empty() ? "" : ", ") + Part;
+      };
+      const double FsWaves = V(T::GroupSp, 11);
+      if (Has(T::GroupSp, 37) && FsWaves > 0) {
+        Add(fextl::fmt::format("tex instructions/wave {:.0f}", V(T::GroupSp, 37) / FsWaves));
+      }
+      if (Has(T::GroupTp, 2) && Has(T::GroupTp, 3) && V(T::GroupTp, 3) > 0) {
+        const double Latency = V(T::GroupTp, 2) / V(T::GroupTp, 3);
+        Add(fextl::fmt::format("fetch latency {:.0f} cyc", Latency));
+        if (Has(T::GroupSp, 10) && FsWaves > 0 && Latency > 0) {
+          Add(fextl::fmt::format("wave life = {:.1f} fetch latencies", V(T::GroupSp, 10) / FsWaves / Latency));
+        }
+      }
+      if (Cycles > 0 && Has(T::GroupSp, 4)) {
+        Add(fextl::fmt::format("cores can't send {:.2f}", V(T::GroupSp, 4) / Cycles));
+      }
+      if (Cycles > 0 && Has(T::GroupTp, 0)) {
+        Add(fextl::fmt::format("tp busy {:.2f}", V(T::GroupTp, 0) / Cycles));
+      }
+      if (Has(T::GroupTp, 6) && Has(T::GroupTp, 7) && V(T::GroupTp, 6) > 0) {
+        Add(fextl::fmt::format("L1 miss {:.1f}% of {:.0f} lines/draw", 100.0 * V(T::GroupTp, 7) / V(T::GroupTp, 6), V(T::GroupTp, 6) / Draws));
+      }
+      if (Has(T::GroupUche, 9) && V(T::GroupUche, 9) > 0) {
+        if (Has(T::GroupUche, 4)) {
+          Add(fextl::fmt::format("L2 miss {:.1f}% of {:.0f} requests/draw", 100.0 * 2.0 * V(T::GroupUche, 4) / V(T::GroupUche, 9),
+                                 V(T::GroupUche, 9) / Draws));
+        }
+      }
+      if (Has(T::GroupUche, 4) && K.Passes) {
+        Add(fextl::fmt::format("memory {:.2f} MB/pass", V(T::GroupUche, 4) * 32.0 / 1e6 / static_cast<double>(K.Passes)));
+      }
+      if (!Parts.empty()) {
+        Line += " | texture: " + Parts;
       }
     }
     if (Has(T::GroupSp, 119) && Has(T::GroupSp, 120)) {

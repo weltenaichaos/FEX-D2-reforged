@@ -93,6 +93,7 @@ constexpr uint32_t GroupVfd = 0x3;
 constexpr uint32_t GroupHlsq = 0x4;
 constexpr uint32_t GroupTse = 0x6;
 constexpr uint32_t GroupRas = 0x7;
+constexpr uint32_t GroupUche = 0x8; // the GPU's L2 cache
 constexpr uint32_t GroupTp = 0x9;
 constexpr uint32_t GroupSp = 0xA;
 constexpr uint32_t GroupRb = 0xB;
