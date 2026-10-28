@@ -1,0 +1,131 @@
+From 5955b0129a490768ebc19ea45124a3a38c5cc45f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 17:14:18 +0000
+Subject: [PATCH] FEX: indexed constant buffers keep their declared size
+ (VKD3D_FEX_CBV_SIZE)
+
+dxbc-spirv declares a constant buffer the shader indexes with a register
+as 4096 vectors (64 KiB), the D3D maximum, whatever size the shader
+declares. Drivers can't keep a 64 KiB buffer in constant registers, so
+on Turnip every such read stays a memory load through the descriptor
+set it was bound with. D2R's lighting pixel shaders index two root
+constant buffers this way (90 and 16 vectors declared): their reads go
+through vkd3d's root-CBV push descriptor set, which vkd3d pushes before
+nearly every draw, so the driver has to rebind descriptors per draw
+and the pixel waves wait on those loads.
+
+With VKD3D_FEX_CBV_SIZE=1 such a buffer is declared with the size the
+shader declares when that is 256 vectors or less. The driver can then
+load the whole buffer into constants before the draw (Turnip fex9 does
+it from the command processor) and the shader no longer reads the root
+set through descriptors. An index past the declared end then reads
+other constants instead of buffer memory; fxc only emits such indices
+for out-of-range array accesses.
+
+The setting goes into the shader interface key, so a pipeline cache
+written with the other setting is not used. The gpu report's flag
+0x8000 tells FEX's log that it is on. FEX sets the variable
+(FEX_VKD3D_CBV_SIZE, on for D2R from FEX build 98).
+---
+ libs/vkd3d/device.c        | 11 +++++++++++
+ libs/vkd3d/vkd3d_private.h |  1 +
+ .../dxbc-spirv/dxbc/dxbc_resources.cpp       | 42 ++++++++++++++++++++++
+ 3 files changed, 54 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 83bae22..b6ed528 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9797,6 +9797,17 @@ static void vkd3d_compute_shader_interface_key(struct d3d12_device *device)
+         key = hash_fnv1_iterate_string(key, env);
+     }
+ 
++    /* VKD3D fex29: VKD3D_FEX_CBV_SIZE=1 makes dxbc-spirv declare dynamically indexed constant buffers with their
++     * declared size (dxbc_resources.cpp), so the same DXBC gives different SPIR-V: cached shaders from the other
++     * setting must not be used. FEX's log says whether it is on (gpu report flag). */
++    if (vkd3d_get_env_var("VKD3D_FEX_CBV_SIZE", env, sizeof(env)) && !strcmp(env, "1"))
++    {
++        INFO("FEX: indexed constant buffers keep their declared size.\n");
++        key = hash_fnv1_iterate_string(key, "VKD3D_FEX_CBV_SIZE=1");
++        vkd3d_atomic_uint32_or((uint32_t *)&vkd3d_fex_gpu_report.flags, VKD3D_FEX_REPORT_FLAG_CBV_SIZE,
++                vkd3d_memory_order_release);
++    }
++
+     device->shader_interface_key = key;
+ }
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 3a889a0..3f61f55 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3084,6 +3084,7 @@ struct vkd3d_timestamp_profiler_submitted_work;
+ #define VKD3D_FEX_REPORT_FLAG_LATENCY_RESYNC 0x1000u /* present report: frame credit resync is on (VKD3D fex16) */
+ #define VKD3D_FEX_REPORT_FLAG_MEMORY_AHEAD 0x2000u /* gpu report: GPU memory made ahead is on (VKD3D fex17) */
+ #define VKD3D_FEX_REPORT_FLAG_PRESENT_THREAD 0x4000u /* present report: presents run on their own thread (VKD3D fex19) */
++#define VKD3D_FEX_REPORT_FLAG_CBV_SIZE 0x8000u /* gpu report: indexed constant buffers keep their declared size (VKD3D fex29) */
+ #define VKD3D_FEX_REPORT_FLAG_DEVICE 0x80000000u /* a D3D12 device was created */
+ struct vkd3d_fex_report
+ {
+diff --git a/subprojects/dxil-spirv/subprojects/dxbc-spirv/dxbc/dxbc_resources.cpp b/subprojects/dxil-spirv/subprojects/dxbc-spirv/dxbc/dxbc_resources.cpp
+index 1e9db8c..d6ff47b 100644
+--- a/subprojects/dxil-spirv/subprojects/dxbc-spirv/dxbc/dxbc_resources.cpp
++++ b/subprojects/dxil-spirv/subprojects/dxbc-spirv/dxbc/dxbc_resources.cpp
+@@ -1,6 +1,41 @@
+ #include "dxbc_converter.h"
+ #include "dxbc_resources.h"
+ 
++#include <cstdlib>
++
++#ifdef _WIN32
++extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(
++  const char* name, char* buffer, unsigned long size);
++#endif
++
++/* FEX-D2-reforged (VKD3D fex29): VKD3D_FEX_CBV_SIZE=1 declares a dynamically
++ * indexed constant buffer with the size the shader declares (up to 256
++ * vectors) instead of the 64 KiB maximum. The driver can then keep the whole
++ * buffer in its constant registers: D2R's lighting shaders index two root
++ * constant buffers of 90 and 16 vectors, which Turnip otherwise reads from
++ * memory in every pixel wave and through the root descriptor set it pushes
++ * before every draw. Out-of-range indices read other constants instead of
++ * buffer memory past the declared end. FEX sets the variable
++ * (FEX_VKD3D_CBV_SIZE, on for D2R). */
++static bool fexCbvDeclaredSize() {
++  static const bool on = [] {
++    char value[8] = { };
++#ifdef _WIN32
++    unsigned long n = GetEnvironmentVariableA("VKD3D_FEX_CBV_SIZE", value, sizeof(value));
++    if (!n || n >= sizeof(value))
++      return false;
++#else
++    const char* env = std::getenv("VKD3D_FEX_CBV_SIZE");
++    if (!env)
++      return false;
++    for (size_t i = 0u; i + 1u < sizeof(value) && env[i]; i++)
++      value[i] = env[i];
++#endif
++    return value[0] == '1' && !value[1];
++  }();
++  return on;
++}
++
+ namespace dxbc_spv::dxbc {
+ 
+ ResourceMap::ResourceMap(Converter& converter)
+@@ -49,6 +84,13 @@ bool ResourceMap::handleDclConstantBuffer(ir::Builder& builder, const Instructio
+       arraySize = op.getImm(0u).getImmediate<uint32_t>(0u);
+     else
+       arraySize = operand.getIndex(1u);
++  } else if (fexCbvDeclaredSize()) {
++    uint32_t declaredSize = m_converter.isSm51()
++      ? op.getImm(0u).getImmediate<uint32_t>(0u)
++      : operand.getIndex(1u);
++
++    if (declaredSize <= 256u)
++      arraySize = declaredSize;
+   }
+ 
+   if (!arraySize)
+-- 
+2.43.0
+
