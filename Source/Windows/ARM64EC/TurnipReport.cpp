@@ -480,7 +480,10 @@ namespace {
     for (uint32_t i = 0; i < Count; ++i) {
       const auto& C = Chan->Counters[i];
       if (C.Reg) {
-        Line += fextl::fmt::format(" {} {:.1f}", CounterLabel(C.Group, C.Countable), static_cast<double>(K.Values[i]) / Draws);
+        // Small per-draw values (sampled counters like the fetch latency's transactions) keep three decimals.
+        const double PerDraw = static_cast<double>(K.Values[i]) / Draws;
+        Line += PerDraw < 10.0 ? fextl::fmt::format(" {} {:.3f}", CounterLabel(C.Group, C.Countable), PerDraw) :
+                                 fextl::fmt::format(" {} {:.1f}", CounterLabel(C.Group, C.Countable), PerDraw);
       }
     }
     return Line + '\n';
