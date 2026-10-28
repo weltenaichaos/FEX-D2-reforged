@@ -14,8 +14,9 @@
 # further when their loads can overlap, (fex9) push descriptor set UBO ranges loaded
 # into shader constants by the command processor, without a descriptor set change per
 # draw, (fex10) the remaining push set UBO reads (indexed arrays such as bone
-# matrices) through the shader's own UBO table, so those draws skip the change too, and
-# (fex11) graphics pipeline switches that send only the state that changed.
+# matrices) through the shader's own UBO table, so those draws skip the change too,
+# (fex11) graphics pipeline switches that send only the state that changed, and (fex12)
+# a second binary of big fragment shaders without alias.tex helpers, picked per second.
 # Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
@@ -30,7 +31,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex11
+  FEX_PATCH: fex12
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -137,7 +138,11 @@ jobs:
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "tu_fex_color_clear_3d_index" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 11" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 12" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "TU_FEX_MODE_NOALIAS" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "fex_noalias_tex" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_alias.c"
+          grep -q "fex_alt_fs_state" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "tu_fex_count_noalias_pipeline" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_pipeline.cc"
           grep -q "TU_FEX_MODE_SWITCH" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
           grep -q "tu_fex_sw_bind" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "fex_common_config" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_pipeline.cc"
@@ -264,6 +269,16 @@ jobs:
             check: the register state at every draw is the same as stock's; blocks run per switch 16 ->
             ~4 (depth-only switches -69% state words). The driver counts binds, blocks run/kept and stage
             resets/kept for FEX's log. Status bits 0x20000 (honored) and 0x40000 (counts written).
+            fex12 (FEX build 101 and later, FEX_TU_NOALIAS=alt|1; a7xx): fragment shaders with 1,024+
+            instructions and 64+ alias.tex helpers (D2R's lighting shaders: ~17% of their instructions)
+            are compiled a second time without alias.tex, which moves texture coordinates next to each
+            other with movs instead (11-12% fewer instructions, 32 instead of 24 registers). The second
+            binary is kept only when the pipeline state built from the shader is the same, and pipelines
+            then use it in command buffers begun with FEX's mode bit (FEX switches it each second, so the
+            log compares both binaries in one run). Host check: draws differ only in the pixel shader's
+            address, size, register footprint and output register. One-time cost: the big shaders are
+            compiled twice (new shader cache keys). Status bits 0x80000 (honored) and 0x100000 (counts
+            written).
             Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

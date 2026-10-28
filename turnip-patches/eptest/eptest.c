@@ -3,10 +3,11 @@
 //   glslangValidator -V vs.vert -o vs.spv && cc -O1 -o eptest eptest.c -lvulkan
 //   VK_ICD_FILENAMES=<freedreno_icd.json of a host Mesa build> \
 //   LD_PRELOAD=<build>/src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so FD_GPU_ID=740 MESA_SHADER_CACHE_DISABLE=1 \
-//   [EPTEST_DB=1] [EPTEST_FEX=1] ./eptest vs.spv FS.spv [ir]
+//   [EPTEST_DB=1] [EPTEST_FEX=<bits>] [EPTEST_EXT=<ext_size>] ./eptest vs.spv FS.spv [ir]
 // EPTEST_DB=1: descriptor buffer layouts as vkd3d-proton makes them on the device (DESCRIPTOR_BUFFER_BIT on every set,
 // heaps VARIABLE_DESCRIPTOR_COUNT only, push set PUSH_DESCRIPTOR|DESCRIPTOR_BUFFER). EPTEST_FEX=<compile bits>: hands
-// the driver a FEX link block (tu_fex.h) with those compile bits. 'ir' writes the driver's IR to ir_e*_*.txt.
+// the driver a FEX link block (tu_fex.h) with those compile bits. 'ir' writes the driver's IR to ir_e*_*.txt. EPTEST_EXT (fex11+): channel
+// extension size (0x358 for fex12); with fex12 prints the no-alias statistics of both fragment shader binaries.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,10 +25,11 @@ static void *readfile(const char *p, size_t *n) {
 int main(int argc, char **argv) {
    if (argc < 3) { printf("usage: eptest VS.spv FS.spv [ir]\n"); return 1; }
    int dump_ir = argc > 3;
-   static uint32_t chan[0x2a8 / 4] __attribute__((aligned(64)));
+   static uint32_t chan[0x400 / 4] __attribute__((aligned(64)));
    if (getenv("EPTEST_FEX")) {
       /* FEX link block (tu_fex.h): magic, version 1, size, no counters, compile bits at 0x18 */
-      chan[0] = 0x58465554u; chan[1] = 1; chan[2] = sizeof(chan); chan[6] = (uint32_t)strtoul(getenv("EPTEST_FEX"), NULL, 0);
+      chan[0] = 0x58465554u; chan[1] = 1; chan[2] = 0x2a8; chan[6] = (uint32_t)strtoul(getenv("EPTEST_FEX"), NULL, 0);
+      chan[7] = getenv("EPTEST_EXT") ? (uint32_t)strtoul(getenv("EPTEST_EXT"), NULL, 0) : 0; /* fex11+: ext_size */
       char v[32]; snprintf(v, sizeof v, "%llx", (unsigned long long)(uintptr_t)chan); setenv("TU_FEX_CHANNEL", v, 1);
    }
    VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3 };
@@ -165,5 +167,11 @@ int main(int argc, char **argv) {
       }
    }
    if (getenv("EPTEST_FEX")) printf("fex link: status 0x%x patch %u driver '%s' loop prefetch loads %u shaders %u\n", chan[0x1b0 / 4], chan[0x1b4 / 4], (char *)&chan[0x1c0 / 4], chan[0x1a8 / 4], chan[0x1ac / 4]);
+   if (getenv("EPTEST_EXT") && chan[7] >= 0x350) {
+      /* fex12 no-alias statistics (tu_fex_channel::na_*) */
+      const uint32_t *n = &chan[0x310 / 4];
+      printf("fex12 no-alias: shaders %u refused %u | instr %u -> %u, nops %u -> %u, alias %u -> %u, movs %u -> %u, regs %u -> %u, ss stall %u -> %u, sy stall %u -> %u\n",
+             n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11], n[12], n[13], n[14], n[15]);
+   }
    return 0;
 }

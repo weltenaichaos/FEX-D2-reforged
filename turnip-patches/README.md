@@ -283,3 +283,41 @@ re-binds. Command processor groups run (sticky dirty model): switches with fragm
 ~4 groups per switch (state words -34%; Turnip links stages, so a different fragment shader usually
 means a different vertex shader variant too), depth-only switches 361 -> 97 groups (-69% words), same
 shaders with other depth state: only the depth and depth plane groups.
+
+- `0012-fex12-noalias-alt.patch` (fex12, with FEX build 101): big fragment shaders get a second binary
+  without `alias.tex` helper instructions, and FEX can pick either binary per second
+  (`TU_FEX_COMPILE_NOALIAS_ALT` 0x20 in `compile`, `TU_FEX_MODE_NOALIAS` 0x40 in `mode`;
+  FEX_TU_NOALIAS=0 off, 1 always the second binary, 2/alt every other second; a7xx; status bit 0x80000,
+  and 0x100000 when the channel extension for its counts is there).
+  - ir3: `ir3_shader_key::fex_noalias_tex` (copied to `ir3::fex_noalias_tex`) makes
+    `ir3_create_alias_tex_regs` / `ir3_insert_alias_tex` do nothing for that variant, the same as
+    `IR3_SHADER_DEBUG=noaliastex` but per shader.
+  - Turnip: with the compile bit (part of the shader key, `tu_shader_key::fex_noalias_alt`), a fragment
+    shader with at least 1,024 instructions and 64 `alias.tex` (category 7) instructions is compiled a
+    second time with the key bit. The second binary is kept only when everything the pipeline builds
+    from the shader is the same (thread size, early preamble, merged registers, no private memory,
+    constants not longer, inputs/outputs/locations/interpolation, kill, sample mask, primitive id,
+    samplers and bindless use); otherwise it is dropped and counted as refused. It is uploaded next to
+    the stock binary, its own fragment stage draw state is made (`tu6_emit_variant`: base address,
+    instruction size, register footprint, input/output registers), and it is stored in the pipeline cache
+    with the shader. Thresholds can be changed with the Unix env `TU_FEX_NOALIAS_MIN=instrs,alias`.
+  - Pipelines whose fragment shader has the second binary keep its draw state
+    (`tu_program_state::fex_alt_fs_state`) unless the pipeline uses the reduced-constants binary
+    (`ir3_trim_constlen`). At a pipeline bind in a command buffer begun with the mode bit, the
+    fragment stage draw state is the second binary's; all other state is the pipeline's own.
+  - Counts in the channel extension (`ext_size` >= 0x358): binds with the stock / second binary, shaders
+    with a second binary and their totals for both binaries (instructions, nops, `alias.tex`, movs, full
+    registers, ir3's (ss)/(sy) stall estimates), refused binaries, pipelines that can / cannot use it.
+  - Why: build 100's log and build 70's counters: the main pass costs about one lighting shader wave per
+    draw (~12k cycles per draw, about 2 draws in flight), so a shorter lighting shader should shorten the
+    pass nearly 1:1. D2R's lighting shaders (5ff3, 5b7f, fb5d, 0e15) are 6,600-7,200 instructions with
+    ~1,100-1,170 `alias.tex` helpers (17%). Without them: 11-12% fewer instructions (7120 -> 6277 for 5ff3;
+    nops 1579 -> 1353, movs 180 -> 729, 24 -> 32 registers, which only lowers the wave limit 8 -> 6 where
+    the game runs ~4). Whether an alias costs an issue cycle like a mov is not documented, hence both
+    binaries and the per-second comparison.
+
+Host check (fex12): `eptest` (EPTEST_FEX=0x3f EPTEST_EXT=0x358) on the four lighting shaders: all four get
+the second binary, none refused. `drawtest_sw2` with the lighting shaders (two fragment shaders, plus a
+small one below the threshold), mode bit off and on, with and without fex11's switch path, direct, tiled and
+re-bind: the register state at every draw differs only in `SP_PS_BASE`, `SP_PS_INSTR_SIZE`,
+`SP_PS_CNTL_0` (register footprint) and `SP_PS_OUTPUT[0].REG`; the small shader's draws are unchanged.
