@@ -360,6 +360,14 @@ namespace {
                                                                                "ON (FEX_TU_CS_ATOMICS=1), counts NOT written") :
                             CsSw == 2                           ? "in every other second (FEX_TU_CS_ATOMICS=alt)" :
                                                                   "ON (FEX_TU_CS_ATOMICS=1)";
+    // fex17: kept constants (FEX_TU_CONST_KEEP).
+    const uint32_t KeepSw = FEX::Windows::Turnip::ConstKeepSwitch();
+    const char* ConstKeep = !KeepSw                                 ? "off (FEX_TU_CONST_KEEP=0)" :
+                            Chan->Patch < 17                        ? "NOT available (driver older than fex17)" :
+                            !(Status & T::StatusConstKeep)          ? "NOT honored (needs root constant buffers loaded by the command processor)" :
+                            Chan->ExtSize < sizeof(T::Channel)      ? "ON, counts NOT written" :
+                            KeepSw == 2                             ? "in every other second (FEX_TU_CONST_KEEP=alt)" :
+                                                                      "ON (FEX_TU_CONST_KEEP=1)";
     const char* Dispatches = Chan->Patch < 16                   ? "not timed (driver older than fex16)" :
                              !(Status & T::StatusCsStats)       ? "not timed (counts not written)" :
                              !Chan->SampleMinDraws              ? "not timed (FEX_TU_SAMPLE_DRAWS=0)" :
@@ -384,11 +392,11 @@ namespace {
       "preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the command processor {}, other root "
       "constant buffer reads through the shaders' UBO table {}, pipeline switches send only what changed {}, lighting shaders "
       "without alias.tex helpers {}, lighting shaders without preamble {}, lighting shader wave/draw setups {}, compute atomics once "
-      "per wave {}, compute dispatches {}, depth clears at the start of direct passes {}, available memory for the memory budget {}, "
+      "per wave {}, unchanged root constant buffers kept in the constants {}, compute dispatches {}, depth clears at the start of direct passes {}, available memory for the memory budget {}, "
       "{} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
       (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, NoAlias, NoPre,
-      WaveSetups, CsAtomics, Dispatches, DepthClear,
+      WaveSetups, CsAtomics, ConstKeep, Dispatches, DepthClear,
       Budget,
       Chan->CountersReserved,
       Chan->CounterCount,
@@ -441,6 +449,10 @@ namespace {
     }
     if (NoAliasSeen && !(WaveSeen && ArmOwnsAlt())) {
       Alt += fextl::fmt::format(" {} {}", AltTag(), (K.Mode & T::ModeNoAlias) ? "on" : "off");
+    }
+    // fex17: kept constants (FEX_TU_CONST_KEEP=alt).
+    if (FEX::Windows::Turnip::ConstKeepSwitch() == 2 && Chan->Patch >= 17) {
+      Alt += (K.Sysmem & T::SlotSysmemConstKeep) ? " keep on" : " keep off";
     }
     fextl::string Line = fextl::fmt::format("  turnip pass {}x{} c{}/a{} fmt{} {}{}{}{}{}: {} passes, {} draws, gpu {:.1f} ms ({:.2f} us/draw)",
                                             K.Width, K.Height, K.Colors, K.Attachments, K.Format0, (K.Sysmem & 1) ? "direct" : "tiled",
@@ -782,7 +794,8 @@ namespace {
     const bool ArmRotate = ArmCount > 1;
     const bool AltFlip = (NoAliasSw == 2 || NoPreSw == 2) && !ArmOwnsAlt();
     const uint32_t CsSw = FEX::Windows::Turnip::CsAtomicsSwitch();
-    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2 || AltFlip || CsSw == 2 || ArmRotate) {
+    const uint32_t KeepSw = FEX::Windows::Turnip::ConstKeepSwitch();
+    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2 || AltFlip || CsSw == 2 || KeepSw == 2 || ArmRotate) {
       ++Seconds;
       uint32_t Mode = CurrentMode;
       // Each alternating switch takes the next bit of the second count, so every combination gets seconds of its own.
@@ -811,6 +824,11 @@ namespace {
         // Build 107: compute dispatches use the binaries with atomics once per wave (driver fex16) in odd seconds.
         const bool On = (Seconds >> Bit++) & 1;
         Mode = (Mode & ~T::ModeCsAlt) | (On ? T::ModeCsAlt : 0);
+      }
+      if (KeepSw == 2) {
+        // Build 110: unchanged root constant buffer ranges stay in the shaders' constants (driver fex17) in odd seconds.
+        const bool On = (Seconds >> Bit++) & 1;
+        Mode = (Mode & ~T::ModeConstKeep) | (On ? T::ModeConstKeep : 0);
       }
       if (ArmRotate) {
         // Build 105: the wave setups asked for (FEX_TU_WAVE_PAIR), build 106 the draw setups (FEX_TU_DRAW_SETUP), the
@@ -1027,6 +1045,29 @@ namespace {
           "turnip: compute atomics once per wave: {} compute shaders have a second binary ({} atomics made once per wave), "
           "instructions stock -> second {} -> {} ({:+.1f}%); {} dropped (other layout or workgroup size)",
           Shaders, Chan->CsAltAtomics, I0, I1, I0 ? 100.0 * (static_cast<double>(I1) - static_cast<double>(I0)) / I0 : 0.0, Refused));
+      }
+    }
+
+    // Kept constants (fex17 and later): constant state builds of draws with driver-loaded root constant buffer ranges as
+    // recorded this second, without and with the mode, the vec4s the command processor loads per build, and with the mode
+    // the vec4s left in place, the times the kept group was set again (forced by a pipeline bind or a barrier) and the root
+    // constant buffers moved out of it.
+    if (Chan->Patch >= 17 && (Status & T::StatusConstKeep) && Chan->ExtSize >= sizeof(T::Channel)) {
+      uint64_t KEmits[2], KVec4[2], KKept[2], KRuns[2];
+      Delta(18, Chan->KeepEmits, KEmits);
+      Delta(19, Chan->KeepVec4, KVec4);
+      const uint64_t KeptNow[2] = {Chan->KeepVec4Kept, Chan->KeepMoves};
+      Delta(20, KeptNow, KKept);
+      const uint64_t RunsNow[2] = {Chan->KeepRuns, Chan->KeepForced};
+      Delta(21, RunsNow, KRuns);
+      if (KeepSw != 0 || KEmits[1]) {
+        const auto Per = [](uint64_t A, uint64_t B) {
+          return B ? static_cast<double>(A) / static_cast<double>(B) : 0.0;
+        };
+        Out += fextl::fmt::format("  turnip: constants kept {} this second | builds off {} on {} | vec4 loaded per build off {:.1f} on {:.1f} | "
+                                  "kept {:.1f} per build | kept group set again {} (forced {}), buffers moved out {}\n",
+                                  (ModeThisSecond & T::ModeConstKeep) ? "on" : "off", KEmits[0], KEmits[1], Per(KVec4[0], KEmits[0]),
+                                  Per(KVec4[1], KEmits[1]), Per(KKept[0], KEmits[1]), KRuns[0], KRuns[1], KKept[1]);
       }
     }
 

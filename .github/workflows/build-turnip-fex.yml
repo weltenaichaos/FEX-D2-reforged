@@ -23,7 +23,9 @@
 # second (a binary with no preamble at all, a binary with one constant load per root constant
 # buffer, or wave allocation settings the driver always turns off), and (fex16) a second binary
 # of compute shaders whose memory atomics hit one address for the whole wave, with those atomics
-# done once per wave, picked per second, plus time and GPU counters around big dispatches.
+# done once per wave, picked per second, plus time and GPU counters around big dispatches, and
+# (fex17) push set UBO ranges whose address didn't change kept in the shaders' constants in a
+# draw state group of their own, so a draw loads only the ranges that changed.
 # Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
@@ -38,7 +40,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex16
+  FEX_PATCH: fex17
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -194,7 +196,7 @@ jobs:
           {
             "schemaVersion": 1,
             "name": "Turnip ${MESA_VERSION} FEX ${FEX_PATCH} (build ${{ github.run_number }})",
-            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets, preamble loads first, list loops read ahead, 3D depth and color clears, compute loops unrolled further, root constant buffers loaded by the command processor or read through the shader's UBO table and a cached memory budget via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
+            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets, preamble loads first, list loops read ahead, 3D depth and color clears, compute loops unrolled further, root constant buffers loaded by the command processor or read through the shader's UBO table and a cached memory budget, and unchanged root constant buffer ranges kept in the shaders' constants (fex17), via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
             "author": "FEX-D2-reforged",
             "packageVersion": "${{ github.run_number }}",
             "vendor": "Mesa",
@@ -345,6 +347,20 @@ jobs:
             only their bit. Status bits 0x2000000 (no preamble binary), 0x4000000 (merged loads),
             0x8000000 (alloc states), 0x10000000 (counts); the channel extension (0x3d0) adds the
             counts.
+            fex16 (FEX build 107 and later, FEX_TU_CS_ATOMICS=alt|1): compute shaders whose memory atomics
+            hit one address for the whole wave get a second binary that does each such atomic once per
+            wave; FEX picks it per second. Big dispatches are timed with GPU counters for FEX's log.
+            fex17 (FEX build 110 and later, FEX_TU_CONST_KEEP=alt|1; needs fex9's command processor
+            loads): with fex9 every D2R draw loaded all of its push set UBO ranges again (lighting
+            shaders: 12 ranges, ~100 vec4), because one or two root constant buffers change per draw
+            (~16 vec4). Ranges whose source address and size didn't change now stay in a draw state group
+            of their own (the DESC_SETS_LOAD group id, empty on a7xx), which the command processor skips
+            while it is the same; only the changed ranges load with the draw. A UBO block whose address
+            changes moves to the per-draw group for the rest of the command buffer, so the two groups never
+            load the same constants. The kept group runs again at every pipeline bind, full draw state
+            emit and barrier inside a pass. Host check: 640 -> 184 vec4 over 8 D2R-like draws, sysmem and
+            gmem, pipeline switches and barriers. Status bit 0x80000000; the channel extension (0x400,
+            ext_size 0x440) adds the counts.
             Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

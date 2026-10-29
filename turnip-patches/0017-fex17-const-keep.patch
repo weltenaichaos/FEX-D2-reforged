@@ -1,0 +1,601 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 76c13dc..98cc15a 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -6041,6 +6041,8 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+    struct tu_graphics_pipeline *gfx_pipeline = tu_pipeline_to_graphics(pipeline);
+    cmd->state.dirty |= TU_CMD_DIRTY_DESC_SETS | TU_CMD_DIRTY_SHADER_CONSTS |
+                        TU_CMD_DIRTY_VS_PARAMS | TU_CMD_DIRTY_PROGRAM;
++   /* fex17: the program config resets the stages' constants. */
++   cmd->state.fex.keep_force = true;
+ 
+    tu_bind_vs(cmd, pipeline->shaders[MESA_SHADER_VERTEX]);
+    tu_bind_tcs(cmd, pipeline->shaders[MESA_SHADER_TESS_CTRL]);
+@@ -8663,50 +8665,78 @@ tu_fex_emit_push_by_driver(struct tu_cs *cs,
+  * the preamble's ldc.k did. Ranges past the UBO's size, or of null
+  * descriptors, are left out (D3D12 root constant buffers have no bounds).
+  */
++/* One fex9 range's load from the pushed descriptor: source address, const
++ * file offset and size (vec4). False when the load is left out (range past
++ * the UBO's size, null descriptor, set not the push set). */
++static bool
++tu_fex_cp_range(const struct ir3_ubo_range *range, unsigned constlen,
++                const struct tu_descriptor_state *descriptors,
++                uint64_t *src, uint32_t *dst, uint32_t *num)
++{
++   const struct tu_descriptor_set *push = &descriptors->push_set;
++   const unsigned set = range->ubo.bindless_base;
++   if (set >= MAX_SETS || descriptors->sets[set] != push ||
++       !push->layout || !push->mapped_ptr)
++      return false;
++   const uint32_t desc_dw = range->ubo.block * FDL6_TEX_CONST_DWORDS;
++   if ((desc_dw + 2) * 4 > push->layout->size)
++      return false;
++
++   const uint32_t *desc = push->mapped_ptr + desc_dw;
++   const uint64_t va =
++      desc[0] | ((uint64_t)(desc[1] & A6XX_UBO_1_BASE_HI__MASK) << 32);
++   const uint32_t size_vec4 =
++      (desc[1] & A6XX_UBO_1_SIZE__MASK) >> A6XX_UBO_1_SIZE__SHIFT;
++   const uint32_t start_vec4 = range->start / 16;
++   const uint32_t dst_vec4 = range->offset / 16;
++   if (!va || start_vec4 >= size_vec4 || dst_vec4 >= constlen)
++      return false;
++
++   *src = va + range->start;
++   *dst = dst_vec4;
++   *num = MIN3((range->end - range->start) / 16, size_vec4 - start_vec4,
++               constlen - dst_vec4);
++   return true;
++}
++
+ static void
++tu_fex_emit_cp_range(struct tu_cs *cs, mesa_shader_stage type, uint64_t src,
++                     uint32_t dst, uint32_t num)
++{
++   tu_cs_emit_pkt7(cs, tu6_stage2opcode(type), 3);
++   tu_cs_emit(cs, CP_LOAD_STATE6_0_DST_OFF(dst) |
++         CP_LOAD_STATE6_0_STATE_TYPE(ST6_CONSTANTS) |
++         CP_LOAD_STATE6_0_STATE_SRC(SS6_INDIRECT) |
++         CP_LOAD_STATE6_0_STATE_BLOCK(tu6_stage2shadersb(type)) |
++         CP_LOAD_STATE6_0_NUM_UNIT(num));
++   tu_cs_emit_qw(cs, src);
++}
++
++/* fex17: 'kept' = ranges (bit = index in ubo_state) the kept group loads,
++ * left out here. Returns the vec4s loaded. */
++static uint32_t
+ tu_fex_emit_cp_ubos(struct tu_cs *cs,
+                     const struct ir3_const_state *const_state,
+                     unsigned constlen,
+                     mesa_shader_stage type,
+-                    const struct tu_descriptor_state *descriptors)
++                    const struct tu_descriptor_state *descriptors,
++                    uint32_t kept)
+ {
+    const struct ir3_ubo_analysis_state *ubo_state = &const_state->ubo_state;
+    const struct tu_descriptor_set *push = &descriptors->push_set;
++   uint32_t loaded = 0;
+ 
+    for (uint32_t i = 0; i < ubo_state->num_enabled; i++) {
+       const struct ir3_ubo_range *range = &ubo_state->range[i];
+-      if (!range->fex_cp)
+-         continue;
+-
+-      const unsigned set = range->ubo.bindless_base;
+-      if (set >= MAX_SETS || descriptors->sets[set] != push ||
+-          !push->layout || !push->mapped_ptr)
+-         continue;
+-      const uint32_t desc_dw = range->ubo.block * FDL6_TEX_CONST_DWORDS;
+-      if ((desc_dw + 2) * 4 > push->layout->size)
++      if (!range->fex_cp || (i < 32 && (kept & BITFIELD_BIT(i))))
+          continue;
+ 
+-      const uint32_t *desc = push->mapped_ptr + desc_dw;
+-      const uint64_t va =
+-         desc[0] | ((uint64_t)(desc[1] & A6XX_UBO_1_BASE_HI__MASK) << 32);
+-      const uint32_t size_vec4 =
+-         (desc[1] & A6XX_UBO_1_SIZE__MASK) >> A6XX_UBO_1_SIZE__SHIFT;
+-      const uint32_t start_vec4 = range->start / 16;
+-      const uint32_t dst_vec4 = range->offset / 16;
+-      if (!va || start_vec4 >= size_vec4 || dst_vec4 >= constlen)
++      uint64_t src;
++      uint32_t dst, num;
++      if (!tu_fex_cp_range(range, constlen, descriptors, &src, &dst, &num))
+          continue;
+-
+-      const uint32_t num_vec4 =
+-         MIN3((range->end - range->start) / 16, size_vec4 - start_vec4,
+-              constlen - dst_vec4);
+-
+-      tu_cs_emit_pkt7(cs, tu6_stage2opcode(type), 3);
+-      tu_cs_emit(cs, CP_LOAD_STATE6_0_DST_OFF(dst_vec4) |
+-            CP_LOAD_STATE6_0_STATE_TYPE(ST6_CONSTANTS) |
+-            CP_LOAD_STATE6_0_STATE_SRC(SS6_INDIRECT) |
+-            CP_LOAD_STATE6_0_STATE_BLOCK(tu6_stage2shadersb(type)) |
+-            CP_LOAD_STATE6_0_NUM_UNIT(num_vec4));
+-      tu_cs_emit_qw(cs, va + range->start);
++      tu_fex_emit_cp_range(cs, type, src, dst, num);
++      loaded += num;
+    }
+ 
+    /* fex10: the stage's UBO table entries for push set UBOs it reads as UBOs
+@@ -8735,6 +8765,137 @@ tu_fex_emit_cp_ubos(struct tu_cs *cs,
+       tu_cs_emit(cs, ubo[0]);
+       tu_cs_emit(cs, ubo[1]);
+    }
++   return loaded;
++}
++
++/* FEX link, fex17 (TU_FEX_MODE_CONST_KEEP): see tu_fex.h. */
++static inline bool
++tu_fex_keep_on(const struct tu_cmd_buffer *cmd)
++{
++   return cmd->device->fex && cmd->device->fex->const_keep &&
++          (cmd->state.fex.mode & TU_FEX_MODE_CONST_KEEP) &&
++          cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++}
++
++/* Sorts this build's fex9 ranges into the kept group and the CONST group:
++ * a range stays kept while its source address is the one the kept group
++ * loads; a UBO block whose address changed moves to the CONST group for the
++ * rest of the command buffer, and the kept group is made again without it
++ * (so the latest copies of the two groups never load the same constants,
++ * whatever order the command processor runs them in, e.g. when a tiled
++ * pass skips draws). Returns the vec4s the kept group loads if it is set
++ * again, else 0; *kept_vec4 = vec4s left in place. */
++static uint32_t
++tu_fex_keep_update(struct tu_cmd_buffer *cmd,
++                   const struct tu_descriptor_state *descriptors,
++                   uint32_t *kept_vec4)
++{
++   struct tu_fex_cmd_state *f = &cmd->state.fex;
++   struct tu_fex_cmd_state::tu_fex_keep_range want[TU_FEX_KEEP_MAX];
++   uint32_t n = 0, vec4 = 0;
++   uint32_t mask[TU_FEX_KEEP_STAGES] = {};
++   bool known = !f->keep_force;
++
++   for (uint32_t type = MESA_SHADER_VERTEX; type <= MESA_SHADER_FRAGMENT; type++) {
++      const struct tu_program_descriptor_linkage *link =
++         &cmd->state.program.link[type];
++      const struct ir3_ubo_analysis_state *ubo_state =
++         &link->const_state.ubo_state;
++      for (uint32_t i = 0; i < ubo_state->num_enabled && i < 32; i++) {
++         const struct ir3_ubo_range *range = &ubo_state->range[i];
++         if (!range->fex_cp)
++            continue;
++         const uint32_t block = range->ubo.block;
++         if (block >= 32 || (f->keep_dyn[type] & BITFIELD_BIT(block)) ||
++             n == TU_FEX_KEEP_MAX)
++            continue;
++         uint64_t src;
++         uint32_t dst, num;
++         if (!tu_fex_cp_range(range, link->constlen, descriptors, &src, &dst,
++                              &num))
++            continue;
++         if (known) {
++            const struct tu_fex_cmd_state::tu_fex_keep_range *old = NULL;
++            for (uint32_t k = 0; k < f->keep_n; k++) {
++               if (f->keep[k].stage == type && f->keep[k].dst == dst) {
++                  old = &f->keep[k];
++                  break;
++               }
++            }
++            if (old && (old->src != src || old->num != num)) {
++               f->keep_dyn[type] |= BITFIELD_BIT(block);
++               f->keep_moves++;
++               continue;
++            }
++         }
++         want[n].src = src;
++         want[n].dst = (uint16_t)dst;
++         want[n].num = (uint16_t)num;
++         want[n].stage = (uint8_t)type;
++         want[n].block = (uint8_t)block;
++         n++;
++         vec4 += num;
++         mask[type] |= BITFIELD_BIT(i);
++      }
++   }
++   memcpy(f->keep_mask, mask, sizeof(mask));
++
++   bool same = known && n == f->keep_n;
++   for (uint32_t k = 0; same && k < n; k++) {
++      same = want[k].src == f->keep[k].src && want[k].dst == f->keep[k].dst &&
++             want[k].num == f->keep[k].num &&
++             want[k].stage == f->keep[k].stage;
++   }
++   /* Nothing kept before or now (e.g. shaders without driver-loaded
++    * ranges): no group to set. */
++   if (!n && !f->keep_n && !f->keep_size)
++      same = true;
++   if (same) {
++      f->keep_force = false;
++      *kept_vec4 = vec4;
++      return 0;
++   }
++
++   /* Set the group again: new content, or forced. */
++   if (f->keep_force)
++      f->keep_forced++;
++   f->keep_force = false;
++   f->keep_runs++;
++   memcpy(f->keep, want, n * sizeof(want[0]));
++   f->keep_n = n;
++   f->keep_pending = true;
++   *kept_vec4 = 0;
++   if (!n) {
++      f->keep_iova = 0;
++      f->keep_size = 0;
++      return 0;
++   }
++   struct tu_cs cs;
++   tu_cs_begin_sub_stream(&cmd->sub_cs, 4 * n, &cs);
++   for (uint32_t k = 0; k < n; k++)
++      tu_fex_emit_cp_range(&cs, (mesa_shader_stage)want[k].stage, want[k].src,
++                           want[k].dst, want[k].num);
++   struct tu_draw_state st = tu_cs_end_draw_state(&cmd->sub_cs, &cs);
++   f->keep_iova = st.iova;
++   f->keep_size = st.size;
++   return vec4;
++}
++
++/* The kept group's CP_SET_DRAW_STATE entry (3 dwords): all render modes
++ * (vertex shader ranges are needed for binning too); dirty = run it even if
++ * the command processor already ran this address. */
++static void
++tu_fex_emit_keep_state(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool dirty)
++{
++   struct tu_fex_cmd_state *f = &cmd->state.fex;
++   tu_cs_emit(cs, CP_SET_DRAW_STATE__0_COUNT(f->keep_size) |
++                  CP_SET_DRAW_STATE__0_GMEM | CP_SET_DRAW_STATE__0_SYSMEM |
++                  CP_SET_DRAW_STATE__0_BINNING |
++                  COND(dirty, CP_SET_DRAW_STATE__0_DIRTY) |
++                  CP_SET_DRAW_STATE__0_GROUP_ID(TU_DRAW_STATE_DESC_SETS_LOAD) |
++                  COND(!f->keep_size || !f->keep_iova, CP_SET_DRAW_STATE__0_DISABLE));
++   tu_cs_emit_qw(cs, f->keep_iova);
++   f->keep_pending = false;
+ }
+ 
+ static void
+@@ -8848,6 +9009,16 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
+       compute ? &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state.push_consts :
+       &cmd->state.program.shared_consts;
+ 
++   /* fex17: ranges that stay in the const file load in the kept group
++    * (made here, before this group's sub stream begins). */
++   const bool keep = !compute && tu_fex_keep_on(cmd);
++   uint32_t keep_loaded = 0, kept_vec4 = 0;
++   if (keep) {
++      keep_loaded = tu_fex_keep_update(
++         cmd, tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS),
++         &kept_vec4);
++   }
++
+    dwords = tu6_const_size(cmd, shared_consts, compute);
+ 
+    if (dwords == 0)
+@@ -8882,6 +9053,7 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
+    } else {
+       struct tu_descriptor_state *descriptors =
+          tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
++      uint32_t cp_vec4 = 0;
+       for (uint32_t type = MESA_SHADER_VERTEX; type <= MESA_SHADER_FRAGMENT; type++) {
+          const struct tu_program_descriptor_linkage *link =
+             &cmd->state.program.link[type];
+@@ -8896,13 +9068,19 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
+                                          &link->const_state,
+                                          static_cast<mesa_shader_stage>(type),
+                                          descriptors);
+-         tu_fex_emit_cp_ubos(&cs, &link->const_state, link->constlen,
+-                             static_cast<mesa_shader_stage>(type),
+-                             descriptors);
++         cp_vec4 += tu_fex_emit_cp_ubos(&cs, &link->const_state, link->constlen,
++                                        static_cast<mesa_shader_stage>(type),
++                                        descriptors,
++                                        keep ? cmd->state.fex.keep_mask[type] : 0);
+          tu_fex_emit_push_by_driver(&cs, link,
+                                     static_cast<mesa_shader_stage>(type),
+                                     cmd->push_constants);
+       }
++      if (cp_vec4 | keep_loaded | kept_vec4) {
++         cmd->state.fex.keep_emits++;
++         cmd->state.fex.keep_vec4 += cp_vec4 + keep_loaded;
++         cmd->state.fex.keep_vec4_kept += kept_vec4;
++      }
+    }
+ 
+    return tu_cs_end_draw_state(&cmd->sub_cs, &cs);
+@@ -9668,8 +9846,14 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+       tu_cs_emit_draw_state(cs, TU_DRAW_STATE_PRIM_MODE_GMEM, cmd->state.prim_order_gmem);
+       tu_cs_emit_draw_state(cs, TU_DRAW_STATE_CONST, cmd->state.shader_const);
+       tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DESC_SETS, cmd->state.desc_sets);
+-      tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DESC_SETS_LOAD, cmd->state.load_state);
+-      cmd->state.fex.load_emitted = cmd->state.load_state.iova; /* fex9 */
++      if (tu_fex_keep_on(cmd)) {
++         /* fex17: the kept constants group (load_state is empty on a7xx),
++          * run again: the full emit follows a disable or a pass start. */
++         tu_fex_emit_keep_state(cmd, cs, true);
++      } else {
++         tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DESC_SETS_LOAD, cmd->state.load_state);
++         cmd->state.fex.load_emitted = cmd->state.load_state.iova; /* fex9 */
++      }
+       tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VB, cmd->state.vertex_buffers);
+       tu_cs_emit_draw_state(cs, TU_DRAW_STATE_VS_PARAMS, cmd->state.vs_params);
+       tu_cs_emit_draw_state(cs, TU_DRAW_STATE_FS_PARAMS, cmd->state.fs_params);
+@@ -9700,10 +9884,14 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+       }
+    } else {
+       /* emit draw states that were just updated */
++      /* fex17: the kept constants group takes DESC_SETS_LOAD's place. */
++      const bool fex_keep = tu_fex_keep_on(cmd);
++      const bool emit_load = fex_keep ? cmd->state.fex.keep_pending
++                                      : (dirty & TU_CMD_DIRTY_DESC_SETS) != 0;
+       uint32_t draw_state_count =
+          util_bitcount(dynamic_draw_state_dirty) +
+          ((dirty & TU_CMD_DIRTY_SHADER_CONSTS) ? 1 : 0) +
+-         ((dirty & TU_CMD_DIRTY_DESC_SETS) ? 1 : 0) +
++         (emit_load ? 1 : 0) +
+          ((dirty & TU_CMD_DIRTY_VERTEX_BUFFERS) ? 1 : 0) +
+          ((dirty & TU_CMD_DIRTY_VS_PARAMS) ? 1 : 0) +
+          (dirty_fs_params ? 1 : 0) +
+@@ -9714,7 +9902,9 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+ 
+       if (dirty & TU_CMD_DIRTY_SHADER_CONSTS)
+          tu_cs_emit_draw_state(cs, TU_DRAW_STATE_CONST, cmd->state.shader_const);
+-      if (dirty & TU_CMD_DIRTY_DESC_SETS) {
++      if (emit_load && fex_keep) {
++         tu_fex_emit_keep_state(cmd, cs, true);
++      } else if (emit_load) {
+          /* tu6_emit_descriptor_sets emitted the cmd->state.desc_sets draw state
+           * (unless fex9 kept the previous one). */
+          tu_cs_emit_draw_state(cs, TU_DRAW_STATE_DESC_SETS_LOAD, cmd->state.load_state);
+@@ -11117,6 +11307,13 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+    bool gmem = cmd->state.ccu_state == TU_CMD_CCU_GMEM &&
+       !cmd->state.pass;
+ 
++   /* fex17: memory may change inside the pass: load the kept constants
++    * again at the next draw (outside a pass the next pass start does). */
++   if (cmd->state.pass && tu_fex_keep_on(cmd)) {
++      cmd->state.fex.keep_force = true;
++      cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
++   }
++
+    for (uint32_t dep_idx = 0; dep_idx < dep_count; dep_idx++) {
+       const VkDependencyInfo *dep_info = &dep_infos[dep_idx];
+ 
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index 417754d..ec7261f 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -139,9 +139,13 @@ tu_fex_device_init(struct tu_device *dev)
+       status |= TU_FEX_STATUS_SETUP_STATS;
+    }
+    /* fex16: compute statistics and dispatch slots likewise. */
+-   if (fex->setup_stats && chan->ext_size >= sizeof(*chan) &&
+-       tu_fex_readable(chan, sizeof(*chan)))
++   if (fex->setup_stats && chan->ext_size >= TU_FEX_CHANNEL_CS_SIZE &&
++       tu_fex_readable(chan, TU_FEX_CHANNEL_CS_SIZE))
+       fex->cs_stats = true;
++   /* fex17: kept constants statistics likewise. */
++   if (fex->cs_stats && chan->ext_size >= TU_FEX_CHANNEL_KEEP_SIZE &&
++       tu_fex_readable(chan, TU_FEX_CHANNEL_KEEP_SIZE))
++      fex->keep_stats = true;
+ 
+    /* Read once: it changes compiled shaders (part of the layout hash). */
+    fex->compile = chan->compile & TU_FEX_COMPILE_MASK;
+@@ -164,6 +168,15 @@ tu_fex_device_init(struct tu_device *dev)
+          status |= TU_FEX_STATUS_UBO_TABLE;
+       }
+    }
++   /* fex17: kept constants work on the ranges fex9 loads (a7xx). Unix env
++    * TU_FEX_CONST_KEEP=0 turns it off whatever the mode says. */
++   if (fex->cp_ubo && fex->desc_patch) {
++      const char *ck = getenv("TU_FEX_CONST_KEEP");
++      if (!(ck && !strcmp(ck, "0"))) {
++         fex->const_keep = true;
++         status |= TU_FEX_STATUS_CONST_KEEP;
++      }
++   }
+    /* fex12: alias.tex exists from a7xx on (ir3_compiler::has_alias_tex). */
+    if ((fex->compile & TU_FEX_COMPILE_NOALIAS_ALT) &&
+        dev->physical_device->info->chip >= 7) {
+@@ -454,6 +467,21 @@ tu_fex_end_cmdbuf(struct tu_device *dev, struct tu_fex_cmd_state *st)
+       __atomic_fetch_add(&c->cs_binds[1], st->cs_binds[1], __ATOMIC_RELAXED);
+       st->cs_binds[0] = st->cs_binds[1] = 0;
+    }
++   /* fex17 */
++   if (fex->keep_stats && st->keep_emits) {
++      const uint32_t k = (st->mode & TU_FEX_MODE_CONST_KEEP) ? 1 : 0;
++      __atomic_fetch_add(&c->keep_emits[k], st->keep_emits, __ATOMIC_RELAXED);
++      __atomic_fetch_add(&c->keep_vec4[k], st->keep_vec4, __ATOMIC_RELAXED);
++      if (k) {
++         __atomic_fetch_add(&c->keep_vec4_kept, st->keep_vec4_kept, __ATOMIC_RELAXED);
++         __atomic_fetch_add(&c->keep_runs, st->keep_runs, __ATOMIC_RELAXED);
++         __atomic_fetch_add(&c->keep_forced, st->keep_forced, __ATOMIC_RELAXED);
++         __atomic_fetch_add(&c->keep_moves, st->keep_moves, __ATOMIC_RELAXED);
++      }
++      st->keep_emits = 0;
++      st->keep_vec4 = st->keep_vec4_kept = 0;
++      st->keep_runs = st->keep_forced = st->keep_moves = 0;
++   }
+    /* fex14 */
+    if (fex->arm_stats) {
+       for (uint32_t a = 0; a < TU_FEX_FS_ARMS; a++) {
+@@ -741,9 +769,10 @@ tu_fex_pass_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool sysmem)
+       }
+    }
+    slot->mode = slot_mode;
+-   /* fex14: the wave setup arm in bits 4-6 */
++   /* fex14: the wave setup arm in bits 4-6; fex17: kept constants in bit 2 */
+    slot->sysmem = (uint8_t)(sysmem | (((cmd->state.fex.mode & TU_FEX_MODE_FS_ARM_MASK) >>
+-                                       TU_FEX_MODE_FS_ARM_SHIFT) << 4));
++                                       TU_FEX_MODE_FS_ARM_SHIFT) << 4) |
++                            ((cmd->state.fex.mode & TU_FEX_MODE_CONST_KEEP) ? 0x4 : 0));
+    slot->colors = pass ? (uint8_t)MIN2(pass->subpasses[0].color_count, 255) : 0;
+    slot->attachments = pass ? (uint8_t)MIN2(pass->attachment_count, 255) : 0;
+    slot->format0 = pass && pass->attachment_count ? (uint32_t)pass->attachments[0].format : 0;
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 4cf7bd0..1a0e70c 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -59,6 +59,11 @@
+  *    mode bit dispatch with it. Direct dispatches of 16 or more workgroups
+  *    get a slot in the counter ring too (tu_fex_slot with attachments
+  *    TU_FEX_SLOT_DISPATCH).
++ *  - (fex17) TU_FEX_MODE_CONST_KEEP: constant ranges the command processor
++ *    loads from push set UBOs (fex9) whose buffer address didn't change since
++ *    they were loaded stay in the const file instead of being loaded again
++ *    with every draw's constants; only the ranges whose address changed
++ *    load with the draw.
+  * Without the variable (or with a block that fails the checks) the driver
+  * behaves like stock Turnip.
+  *
+@@ -74,7 +79,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 16
++#define TU_FEX_PATCH 17
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -164,8 +169,24 @@
+  * (TU_FEX_COMPILE_CS_ATOMICS_ALT) dispatch with it. Above the 8 bits a slot
+  * keeps of the mode: dispatch slots carry it in tu_fex_slot::sysmem bit 1. */
+ #define TU_FEX_MODE_CS_ALT 0x800u
++/* fex17 (needs TU_FEX_STATUS_CP_UBO): the push set UBO ranges (fex9) are
++ * split between two draw state groups. Stock fex9 reloads all of a draw's
++ * ranges (D2R's lighting shaders: ~100 vec4) whenever any root constant
++ * buffer or root constant changes, which is every draw. With this bit,
++ * ranges whose UBO address is the same as when they were last loaded go
++ * into a "kept" group (the DESC_SETS_LOAD group id, unused on a7xx) that is
++ * set again only when its content changes, so the command processor skips
++ * it; the CONST group then loads only the ranges whose address changes. A
++ * UBO block (descriptor index) whose address changes while it is kept loads
++ * with the CONST group from then on (until the command buffer ends). The
++ * kept group runs again (marked dirty) at every graphics pipeline bind
++ * (the program config resets the stages' state), every full draw state
++ * emit (pass start, after a 3D clear/blit) and after a barrier inside a
++ * render pass. Primary command buffers only. Passes recorded with it have
++ * tu_fex_slot::sysmem bit 2 set. */
++#define TU_FEX_MODE_CONST_KEEP 0x1000u
+ /* Mode bits for command buffers (tu_fex_begin_cmdbuf). */
+-#define TU_FEX_MODE_MASK 0xf6fu
++#define TU_FEX_MODE_MASK 0x1f6fu
+ /* fex5: the memory budget query reads /proc/meminfo at most every 250 ms and
+  * reuses the last MemAvailable in between (stock: on every call). D3D12 games
+  * ask DXGI for the video memory budget every frame (QueryVideoMemoryInfo); FEX's
+@@ -338,6 +359,10 @@
+ /* fex16: the compute statistics in the channel extension are written and
+  * direct dispatches get slots in the ring */
+ #define TU_FEX_STATUS_CS_STATS 0x40000000u
++/* fex17: TU_FEX_MODE_CONST_KEEP honored (a7xx with TU_FEX_STATUS_CP_UBO);
++ * its statistics in the channel extension are written when ext_size covers
++ * them (TU_FEX_CHANNEL_KEEP_SIZE). */
++#define TU_FEX_STATUS_CONST_KEEP 0x80000000u
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -483,6 +508,22 @@ struct tu_fex_channel {
+    uint32_t pad_3f4;
+    /* 0x3f8: dispatches that got a slot in the ring */
+    volatile uint64_t dispatches_sampled;
++   /* 0x400 (fex17, driver; only when ext_size covers it): graphics constant
++    * state builds (tu_emit_consts) of draws whose shaders have driver-loaded
++    * push set UBO ranges, [0] = command buffers without
++    * TU_FEX_MODE_CONST_KEEP, [1] = with it, and the vec4s of those ranges
++    * the command processor loads for them ([1]: the CONST group's plus the
++    * kept group's when it is set again). */
++   volatile uint64_t keep_emits[2];
++   volatile uint64_t keep_vec4[2];
++   /* 0x420: [1] only: vec4s left in the const file (not loaded again),
++    * times the kept group was set again (content changed or forced),
++    * of those the forced ones (pipeline bind, barrier in a pass), and UBO
++    * blocks moved out of it because their address changed. */
++   volatile uint64_t keep_vec4_kept;
++   volatile uint64_t keep_runs;
++   volatile uint64_t keep_forced;
++   volatile uint64_t keep_moves;
+ };
+ /* Size of the layout before fex11 (what 'size' holds). */
+ #define TU_FEX_CHANNEL_BASE_SIZE 0x2a8u
+@@ -496,6 +537,10 @@ struct tu_fex_channel {
+ #define TU_FEX_CHANNEL_ARM_SIZE 0x3a8u
+ /* Size of the fex15 layout (draw setup statistics). */
+ #define TU_FEX_CHANNEL_SETUP_SIZE 0x3d0u
++/* Size of the fex16 layout (compute statistics). */
++#define TU_FEX_CHANNEL_CS_SIZE 0x400u
++/* Size of the fex17 layout (kept constants statistics). */
++#define TU_FEX_CHANNEL_KEEP_SIZE 0x440u
+ 
+ /* tu_fex_slot::mode bit (fex3): the pass clears a depth/stencil attachment
+  * at its start, so TU_FEX_MODE_DEPTH_CLEAR_3D may change its time. */
+@@ -519,6 +564,7 @@ struct tu_fex_slot {
+    uint8_t mode;       /* 16: TU_FEX_MODE_* the pass was recorded with,
+                         * | TU_FEX_SLOT_DEPTH_CLEAR (fex3) */
+    uint8_t sysmem;     /* 17: bit 0: 1 direct (sysmem), 0 tiled (gmem);
++                        * bit 2 (fex17): TU_FEX_MODE_CONST_KEEP;
+                         * bits 4-6 (fex14): TU_FEX_MODE_FS_ARM */
+    uint8_t colors;     /* 18: color attachments of the first subpass */
+    uint8_t attachments;/* 19 */
+@@ -558,7 +604,9 @@ static_assert(__builtin_offsetof(struct tu_fex_channel, merge_pipes) == 0x3c8, "
+ static_assert(__builtin_offsetof(struct tu_fex_channel, cs_binds) == TU_FEX_CHANNEL_SETUP_SIZE, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, cs_alt_shaders) == 0x3e0, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, dispatches_sampled) == 0x3f8, "layout shared with FEX");
+-static_assert(sizeof(struct tu_fex_channel) == 0x400, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, keep_emits) == TU_FEX_CHANNEL_CS_SIZE, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, keep_vec4_kept) == 0x420, "layout shared with FEX");
++static_assert(sizeof(struct tu_fex_channel) == TU_FEX_CHANNEL_KEEP_SIZE, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
+ 
+ struct tu_device;
+@@ -566,6 +614,11 @@ struct tu_cmd_buffer;
+ struct tu_cs;
+ struct tu_bo;
+ 
++/* fex17: kept ranges per command buffer (more load with the CONST group),
++ * and the graphics stages (vertex .. fragment). */
++#define TU_FEX_KEEP_MAX 64u
++#define TU_FEX_KEEP_STAGES 5u
++
+ /* Per command buffer state, part of tu_cmd_state (zeroed at begin). */
+ struct tu_fex_cmd_state {
+    uint32_t mode;      /* TU_FEX_MODE_* for this command buffer */
+@@ -617,6 +670,27 @@ struct tu_fex_cmd_state {
+    bool cs_alt;
+    /* fex16: compute binds of shaders with that binary, [0] stock, [1] it */
+    uint32_t cs_binds[2];
++   /* fex17 (TU_FEX_MODE_CONST_KEEP, tu_fex_keep_on): the push set UBO
++    * ranges the kept group (TU_DRAW_STATE_DESC_SETS_LOAD) loads, as last
++    * built; keep_mask[stage] = those ranges (bit = index in the stage's
++    * ubo_state) as of the last constant state build, which the CONST group
++    * leaves out. */
++   bool keep_force;   /* rebuild and run the kept group at the next build */
++   bool keep_pending; /* the kept group must be set at the next draw */
++   uint32_t keep_n;
++   struct tu_fex_keep_range {
++      uint64_t src;        /* UBO address + range start */
++      uint16_t dst, num;   /* const file offset and size, vec4 */
++      uint8_t stage, block;
++   } keep[TU_FEX_KEEP_MAX];
++   uint32_t keep_dyn[TU_FEX_KEEP_STAGES];  /* UBO blocks loaded by CONST */
++   uint32_t keep_mask[TU_FEX_KEEP_STAGES];
++   uint64_t keep_iova;
++   uint32_t keep_size;
++   /* statistics, added to the channel at vkEndCommandBuffer */
++   uint32_t keep_emits;
++   uint64_t keep_vec4, keep_vec4_kept;
++   uint32_t keep_runs, keep_forced, keep_moves;
+ };
+ 
+ struct tu_fex_device {
+@@ -645,6 +719,8 @@ struct tu_fex_device {
+    bool setup_stats;           /* fex15: channel extension covers nopre_shaders.. */
+    bool cs_atomics_alt;        /* fex16: TU_FEX_STATUS_CS_ATOMICS */
+    bool cs_stats;              /* fex16: channel extension covers cs_binds.. */
++   bool const_keep;            /* fex17: TU_FEX_STATUS_CONST_KEEP */
++   bool keep_stats;            /* fex17: channel extension covers keep_emits.. */
+    uint32_t counter_count;     /* == chan->counter_count */
+    uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
+    uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];

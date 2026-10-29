@@ -134,6 +134,23 @@ namespace FEX::Windows {
 //                            binds take turns between FEX's version and the game's own (the 'turnip dispatch' lines
 //                            tell them apart by instruction count, cs2224 = the game's); 1 = FEX's version; 2 = the
 //                            game's own.
+//                            Build 110: 1 (fex33's run: clutter 0.66 ms per frame in town with FEX's version vs 1.14
+//                            with the game's own, 1.16 vs 1.19 outdoors; never slower).
+//   FEX_VKD3D_CLEAR_MEMO=1 VKD3D_FEX_CLEAR_MEMO=1 (the D2R default from build 110, VKD3D fex34; with the switch at 0 FEX
+//                            sets 0, as vkd3d remembers unless 0). D2R clears its second 4096 x 4096 shadow map in a
+//                            render pass of its own every frame, 0.55-0.69 ms of GPU time, though nothing draws into it
+//                            (fex33's 'gpu big clear passes' line: the image's next use is always a barrier, then the
+//                            lighting pass reads it). A whole one-plane depth image of 4M+ pixels in memory of its own
+//                            gets a slot in a small GPU buffer the first time such a clear of it gets its own render pass;
+//                            0 = the image still holds that clear's value. The clear then runs as vkCmdClearAttachments
+//                            in a load/store pass under conditional rendering on the slot (the GPU skips it while the
+//                            slot is 0) and sets the slot to 0 after. Every render pass with the image as a writable depth
+//                            attachment, other clear, copy, resolve or discard of it sets the slot to 1 first (once per
+//                            command list until the next such clear). Clears with another value or while the game's own
+//                            predication is on are done in full. Needs FEX_VKD3D_FOLD_CLEARS (on). alt = on and off by
+//                            turns every second (with the stats log). The 'gpu clear memo' line counts the clears the
+//                            GPU may skip, the ones done in full and why, and the marks; the skipped clear passes show as
+//                            their own 'clear-pass ... dLS' kind in the pass lines (done in full: 'dCS').
 //
 // Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
 // same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader
@@ -321,6 +338,18 @@ namespace FEX::Windows {
 //                          workgroups is timed and counted too ('turnip dispatch' lines; two GPU waits for idle each).
 //                          Build 108: 0 (b107: that binary was 5.9% slower; atomics fell from 2457 to 514 per run, but
 //                          only ~2,500 items are placed per run, so the counter never held the shader up).
+//   FEX_TU_CONST_KEEP=alt  (the D2R default from build 110, driver fex17 and later, needs FEX_TU_CP_UBO's command
+//                          processor loads) root constant buffer ranges whose buffer address didn't change stay in the
+//                          shaders' constants instead of being loaded again with every draw. In the lighting pass about
+//                          4 of the GPU's 12 shader cores sit idle between draws while the next draw is set up; every D2R
+//                          draw changes one or two root constant buffers, and the driver then loaded all of the draw's
+//                          ranges again (~100 vec4 per lighting draw, ~16 of them changed). Build 106 saw more constants
+//                          per draw mean less overlap between draws. The driver keeps unchanged ranges in a draw state
+//                          group of their own that the command processor skips while it is the same, and loads only the
+//                          changed ones with the draw (host check: 640 -> 184 vec4 over 8 D2R-like draws). alt = in
+//                          every other second, so one run compares both ways on the 'turnip pass ... keep on/off' lines
+//                          (without the stats log alt stays on); 1 = always; 0 = stock. The 'constants kept' line counts
+//                          the loads per constant state build either way.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

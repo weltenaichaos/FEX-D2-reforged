@@ -295,6 +295,7 @@ namespace {
   uint32_t TurnipWaveArms {}; // FEX_TU_DRAW_SETUP or FEX_TU_WAVE_PAIR: bit N = arm N takes part
   bool TurnipDrawSetup {};    // the arms come from FEX_TU_DRAW_SETUP (arm 4 = no preamble at all, 5-7 fex15 setups)
   uint32_t TurnipCsAtomics {}; // FEX_TU_CS_ATOMICS: 0 off, 1 always, 2 alt
+  uint32_t TurnipConstKeep {}; // FEX_TU_CONST_KEEP: 0 off, 1 always, 2 alt
 
   // FEX_TU_WAVE_PAIR: 0 = off; alt = arms 0-4 a second each; digits 0-4 = those arms (one digit other than 0 = that arm
   // always).
@@ -455,6 +456,12 @@ namespace {
     // flips the mode bit; without the stats log alt stays on); 1 = that binary always; 0 = stock.
     const char* CsAtomics = Switch("FEX_TU_CS_ATOMICS");
     TurnipCsAtomics = SwitchOff(CsAtomics) ? 0 : (CsAtomics[0] == 'a' || CsAtomics[0] == 'A' || CsAtomics[0] == '2') ? 2 : 1;
+    // FEX_TU_CONST_KEEP: alt (D2R default in build 110) = root constant buffer ranges whose address didn't change stay in
+    // the shaders' constants instead of being loaded again with every draw (driver fex17 and later), in every other second
+    // (TurnipReport flips the mode bit; without the stats log alt stays on); 1 = always; 0 = stock. Build 106: the
+    // constants loaded per lighting draw (~100 vec4, all of them every draw) hold the next draw back; only ~16 of them change.
+    const char* ConstKeep = Switch("FEX_TU_CONST_KEEP");
+    TurnipConstKeep = SwitchOff(ConstKeep) ? 0 : (ConstKeep[0] == 'a' || ConstKeep[0] == 'A' || ConstKeep[0] == '2') ? 2 : 1;
     // FEX_TU_NOPREAMBLE alt/lit (SetupTurnipNoPreamble): the second binary without preamble, picked with the same mode bit.
     // With wave setup 4 (the 128-pixel binary) asked for, that bit follows the wave setup instead.
     const bool AltFs = (TurnipWaveArms & (1u << Turnip::FsArmW128)) ? FirstArm == Turnip::FsArmW128 :
@@ -463,7 +470,8 @@ namespace {
                  (TurnipDepthClear ? Turnip::ModeDepthClear3d : 0) |
                  (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0) | (TurnipBudgetCache ? Turnip::ModeBudgetCache : 0) |
                  (TurnipSwitch ? Turnip::ModeSwitch : 0) | (AltFs ? Turnip::ModeAltFs : 0) |
-                 (FirstArm << Turnip::ModeFsArmShift) | (TurnipCsAtomics ? Turnip::ModeCsAlt : 0);
+                 (FirstArm << Turnip::ModeFsArmShift) | (TurnipCsAtomics ? Turnip::ModeCsAlt : 0) |
+                 (TurnipConstKeep ? Turnip::ModeConstKeep : 0);
 
     // FEX_TU_COUNTERS: 1 (D2R default in build 102) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at
     // least this many draws get timed and counted (D2R default 100 in build 102: the main pass, the depth prepasses and
@@ -603,7 +611,7 @@ namespace {
                                     "command processor {}, other root constant buffer reads through the shaders' UBO table {}, pipeline "
                                     "switches send only what changed {}, lighting shaders without alias.tex helpers {}, lighting "
                                     "shaders without preamble {}, lighting shader wave/draw setups {}, compute atomics once per wave {}, "
-                                    "depth clears at pass start {}, memory budget {}, {} GPU counters asked for, passes with {}+ draws "
+                                    "unchanged root constant buffers kept in the constants {}, depth clears at pass start {}, memory budget {}, {} GPU counters asked for, passes with {}+ draws "
                                     "(and from driver fex16 direct dispatches of 16+ workgroups) timed and counted; only FEX's "
                                     "Turnip build (fex1 and later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
@@ -637,6 +645,9 @@ namespace {
                                     TurnipCsAtomics      ? "always (FEX_TU_CS_ATOMICS=1, driver fex16 and later; one-time compute "
                                                            "shader recompile)" :
                                                            "off (FEX_TU_CS_ATOMICS=0)",
+                                    TurnipConstKeep == 2 ? "in every other second (FEX_TU_CONST_KEEP=alt, driver fex17 and later)" :
+                                    TurnipConstKeep      ? "always (FEX_TU_CONST_KEEP=1, driver fex17 and later)" :
+                                                           "off (FEX_TU_CONST_KEEP=0)",
                                     TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
                                                             "in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
                                     TurnipDepthClear == 3 ? "by a 3D draw without fragment shader (fast Z, FEX_TU_DEPTH_CLEAR=fastz, "
@@ -699,6 +710,13 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "D2R's ground clutter compute shader with its on-screen and mask tests before its density noise, "
                       "taking turns with the game's own; 1 = FEX's versions, 2 = the game's own clutter shader)",
                       true, "alt|1|2");
+  SetupVkd3dFexSwitch("FEX_VKD3D_CLEAR_MEMO", L"VKD3D_FEX_CLEAR_MEMO",
+                      "a big depth image (4M+ pixels) whose clear gets a render pass of its own gets a 'still clear' flag "
+                      "on the GPU; the GPU skips that clear while the image still holds the value, and every draw, clear, "
+                      "copy, resolve or discard that may write the image resets the flag (VKD3D fex34 and later; D2R's "
+                      "empty second shadow map, 0.55-0.69 ms per frame; 'gpu clear memo' line; alt = on and off by turns "
+                      "every second)",
+                      true, "alt|1");
   SetupVkd3dShaderCopy();
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
@@ -757,6 +775,9 @@ namespace Turnip {
   }
   uint32_t CsAtomicsSwitch() {
     return TurnipCsAtomics;
+  }
+  uint32_t ConstKeepSwitch() {
+    return TurnipConstKeep;
   }
 } // namespace Turnip
 } // namespace FEX::Windows

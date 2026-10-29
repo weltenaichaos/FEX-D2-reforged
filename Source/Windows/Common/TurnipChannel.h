@@ -54,6 +54,10 @@
 //    the whole wave get a second binary that does them once per wave (nir_opt_uniform_atomics), and command buffers
 //    begun with ModeCsAlt dispatch with it. Direct dispatches of 16 or more workgroups get a slot in the ring too
 //    (Slot::Attachments = SlotDispatch). CsBinds..DispatchesSampled in the extension (ExtSize 0x400).
+//  - (fex17 and later) with ModeConstKeep in 'Mode' (needs StatusCpUbo), the root constant buffer ranges the command
+//    processor loads whose buffer address didn't change since they were loaded stay in the shaders' constants instead
+//    of being loaded again with every draw ("kept" draw state group); only ranges whose address changes load with the
+//    draw. Slot::Sysmem bit 2 = pass recorded with it. KeepEmits..KeepMoves in the extension (ExtSize 0x440).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -78,6 +82,9 @@ constexpr uint32_t ModeFsArmMask = 0x700;
 // fex16 and later: compute dispatches use the binary with atomics once per wave (CompileCsAtomicsAlt). Not part of
 // Slot::Mode (8 bits); a dispatch slot has it in Slot::Sysmem bit 1.
 constexpr uint32_t ModeCsAlt = 0x800;
+// fex17 and later: unchanged root constant buffer ranges stay in the constants (kept group). Slot::Sysmem bit 2.
+constexpr uint32_t ModeConstKeep = 0x1000;
+constexpr uint8_t SlotSysmemConstKeep = 0x4;
 constexpr uint32_t FsArmW128 = 4;
 // fex15 and later: draw setup arms (4 = the second binary, however it was made).
 constexpr uint32_t FsArmAlt = 4;
@@ -131,6 +138,7 @@ constexpr uint32_t StatusCntl = 0x8000000;        // fex15 and later: CompileCnt
 constexpr uint32_t StatusSetupStats = 0x10000000; // fex15 and later: NopreShaders..MergePipes in the extension are written
 constexpr uint32_t StatusCsAtomics = 0x20000000;  // fex16 and later: CompileCsAtomicsAlt honored
 constexpr uint32_t StatusCsStats = 0x40000000;    // fex16 and later: CsBinds..DispatchesSampled written, dispatch slots
+constexpr uint32_t StatusConstKeep = 0x80000000;  // fex17 and later: ModeConstKeep honored (a7xx with StatusCpUbo)
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -254,6 +262,19 @@ struct Channel {
   uint32_t Pad3f4;
   // 0x3f8: dispatches that got a slot in the ring
   volatile uint64_t DispatchesSampled;
+  // 0x400 (fex17 and later, driver, only when ExtSize covers it): graphics constant state builds of draws whose shaders
+  // have driver-loaded root constant buffer ranges, added at vkEndCommandBuffer; [0] = command buffers without
+  // ModeConstKeep, [1] = with it; and the vec4s of those ranges the command processor loaded for them ([1]: the draw's
+  // own group plus the kept group when it was set again).
+  volatile uint64_t KeepEmits[2];
+  volatile uint64_t KeepVec4[2];
+  // 0x420 ([1] only): vec4s left in the constants (not loaded again), times the kept group was set again (content
+  // changed or forced), of those the forced ones (pipeline bind, barrier inside a pass), and root constant buffers moved
+  // out of it because their address changed.
+  volatile uint64_t KeepVec4Kept;
+  volatile uint64_t KeepRuns;
+  volatile uint64_t KeepForced;
+  volatile uint64_t KeepMoves;
 };
 // 'Size' = the layout before fex11.
 constexpr uint32_t ChannelBaseSize = 0x2a8;
@@ -267,6 +288,8 @@ constexpr uint32_t ChannelNpSize = 0x360;
 constexpr uint32_t ChannelArmSize = 0x3a8;
 // The fex15 layout (draw setup counts).
 constexpr uint32_t ChannelSetupSize = 0x3d0;
+// The fex16 layout (compute counts).
+constexpr uint32_t ChannelCsSize = 0x400;
 
 // Slot::Attachments of a dispatch slot (fex16 and later). Such a slot has Width/Height = workgroups in x/y, Colors =
 // workgroups in z (up to 254), Draws = the stock binary's instruction count (the same in both binaries' slots, to tell
@@ -280,7 +303,8 @@ struct Slot {
   uint16_t Width;
   uint16_t Height;
   uint8_t Mode;
-  uint8_t Sysmem; // bit 0: direct (sysmem) pass; bits 4-6 (fex14 and later): the wave setup arm
+  uint8_t Sysmem; // bit 0: direct (sysmem) pass; bit 2 (fex17 and later): ModeConstKeep; bits 4-6 (fex14 and later):
+                  // the wave setup arm
   uint8_t Colors;
   uint8_t Attachments;
   uint32_t Format0;
@@ -321,7 +345,9 @@ static_assert(offsetof(Channel, CsBinds) == ChannelSetupSize);
 static_assert(offsetof(Channel, CsAltShaders) == 0x3e0);
 static_assert(offsetof(Channel, CsAltRefused) == 0x3f0);
 static_assert(offsetof(Channel, DispatchesSampled) == 0x3f8);
-static_assert(sizeof(Channel) == 0x400);
+static_assert(offsetof(Channel, KeepEmits) == ChannelCsSize);
+static_assert(offsetof(Channel, KeepVec4Kept) == 0x420);
+static_assert(sizeof(Channel) == 0x440);
 static_assert(sizeof(Slot) == 48);
 
 // The channel EnvironmentVariablesHandling set up for this process (FEX_TU_CHANNEL), or nullptr.
@@ -354,4 +380,7 @@ bool DrawSetupArms();
 // FEX_TU_CS_ATOMICS (build 107): 0 stock compute shaders, 1 the binaries with atomics once per wave always, 2 (alt)
 // those in every other second (needs the stats log; without it nothing flips it, so it stays on).
 uint32_t CsAtomicsSwitch();
+// FEX_TU_CONST_KEEP (build 110): 0 stock (every driver-loaded root constant buffer range loaded with every draw), 1
+// ModeConstKeep always, 2 (alt) in every other second (needs the stats log; without it nothing flips it, so it stays on).
+uint32_t ConstKeepSwitch();
 } // namespace FEX::Windows::Turnip

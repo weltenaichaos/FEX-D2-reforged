@@ -444,3 +444,34 @@ one `atomic.add` of the count, the result moved through a shared register and ad
 count; only 0e21 of D2R's 17 compute shaders qualifies. Two recorded command buffers (mode 0 and 0x800): the
 alt one binds the second binary (other SP_CS_BASE, INSTR_SIZE 133 vs 128); binds stock 1 alt 1; 2 dispatch
 slots (144x144 and 2x2 groups) with attachments 0xff and local size 8x8x1.
+
+- `0017-fex17-const-keep.patch` (fex17, with FEX build 110): constants that didn't change stay on the GPU.
+  With fex9 the command processor loads every push set UBO range a draw's shaders read (D2R's lighting
+  shaders: 12 ranges, ~100 vec4) whenever any root constant buffer or root constant changes, which is every
+  D2R draw; only 2 of the lighting shader's 6 root constant buffers actually change between draws (blocks 7
+  and 8, 16 vec4). Build 106 showed the per-draw constant volume holds the next draw back (merged loads, +53%
+  vec4: 12% less time with two fragment draws active).
+  - `TU_FEX_MODE_CONST_KEEP` 0x1000 (status 0x80000000, needs fex9's `TU_FEX_STATUS_CP_UBO`; Unix env
+    `TU_FEX_CONST_KEEP=0` turns it off): `tu_fex_keep_update` (called by `tu_emit_consts` before its sub
+    stream) splits the ranges between the CONST group and a "kept" group that uses the DESC_SETS_LOAD
+    group id (always empty on a7xx: no descriptor preloads). A range stays kept while its source address
+    (pushed descriptor + range start) and size are the ones the kept group loads; the kept group is set
+    again only when its content changes, so the command processor skips it. A UBO block whose address
+    changes while kept is moved to the CONST group for the rest of the command buffer and the kept group
+    is made again without it, so the latest copies of the two groups never load the same constants
+    (whatever order the command processor runs them in, e.g. when a tiled pass skips draws).
+  - The kept group runs again (DIRTY, all render modes incl. binning) at every graphics pipeline bind (the
+    program config resets the stages' state), every full draw state emit (pass start, after a 3D
+    clear/blit, after the binning pass) and after a barrier inside a render pass. Primary command buffers
+    only. Pass slots recorded with it have `tu_fex_slot::sysmem` bit 2.
+  - Counts in the channel extension (`ext_size` >= 0x440): `keep_emits[2]` 0x400 (constant state builds
+    with driver-loaded ranges, [0] without the mode, [1] with it), `keep_vec4[2]` (vec4s the command
+    processor loads for them), `keep_vec4_kept` 0x420 (vec4s left in place), `keep_runs`, `keep_forced`,
+    `keep_moves`.
+
+Host check (fex17): `drawtest_sw17.c` (D2R-like lighting draws, 18-UBO push set, STATIC = bindings whose
+address stays fixed, here all but 7 and 8; mode 0x454 vs 0x1454, compile 0x21f, noop drm shim a740):
+8 draws load 640 vec4 stock and 184 with the mode (draw 1: CONST 43 dwords + kept 36 (9 ranges); draw 2:
+the changing block moves, kept made again with 8 ranges; draws 3-8: CONST only, one 4-vec4 range plus the
+push constants). Sysmem and gmem, pipeline switches (PAT=01243, 0000500005, depth-only pipelines), REBIND
+and a barrier in the pass ran without asserts; counts as expected.

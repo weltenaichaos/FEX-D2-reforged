@@ -206,7 +206,13 @@ namespace {
     // binds of the shader take turns between them, so one session times both.
     // VKD3D fex32 (b109: 4 cells 8.5 ms per run, held back by shared memory reads): two versions with 8 cells per
     // thread that read shared memory 3 or 2 times per 8 products instead of 8; alt again takes turns.
-    {"FEX_VKD3D_SHADER_SWAP", "alt"},
+    // Build 110: fex33's run timed D2R's ground clutter shader with FEX's early tests at 0.66 ms per frame in town (the
+    // game's own 1.14) and 1.16 outdoors (1.19), never slower; FEX's versions only from now on.
+    {"FEX_VKD3D_SHADER_SWAP", "1"},
+    // Build 110 + VKD3D fex34: D2R clears its second 4096 x 4096 shadow map in a render pass of its own every frame
+    // (0.55-0.69 ms of GPU time), though nothing draws into it. vkd3d remembers on the GPU when that image still holds
+    // the cleared value and the GPU then skips the clear (see EnvironmentVariablesHandling.h).
+    {"FEX_VKD3D_CLEAR_MEMO", "1"},
     // Build 68: the main pass's time grows ~14.6 us per draw at about the same shaded pixel count (b67: 238 draws 5.4 ms,
     // 963 draws 15.9 ms, ~0.85M pixels each), and a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9).
     // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14
@@ -364,6 +370,13 @@ namespace {
     // its atomics fell from 2457 to 514 per run, but only ~2,500 items are placed per run, so the counter never held the
     // shader up.
     {"FEX_TU_CS_ATOMICS", "0"},
+    // Build 110: the lighting pass leaves ~4 of the GPU's 12 shader cores idle between draws: the next draw's setup isn't
+    // ready. Every D2R draw changes one or two root constant buffers, and Turnip (fex9) then loads all of the draw's root
+    // constant buffer ranges again (~100 vec4 per lighting draw, of which ~16 changed); in b106 more constants per draw
+    // meant less draw overlap (+53% vec4: 12% less time with two fragment draws active). FEX's Turnip fex17 keeps ranges
+    // whose buffer address didn't change in the shaders' constants and loads only the changed ones with the draw.
+    // alt = in every other second, compared on the 'turnip pass ... keep on/off' lines; 1 = always; 0 = stock.
+    {"FEX_TU_CONST_KEEP", "alt"},
   };
 
   // In the order the stats log lists them.
@@ -443,6 +456,7 @@ namespace {
     "FEX_VKD3D_MEMORY_AHEAD",
     "FEX_VKD3D_CBV_SIZE",
     "FEX_VKD3D_SHADER_SWAP",
+    "FEX_VKD3D_CLEAR_MEMO",
     "FEX_TU_NOPREAMBLE",
     "FEX_TU_CHANNEL",
     "FEX_TU_DESC",
@@ -460,6 +474,7 @@ namespace {
     "FEX_TU_WAVE_PAIR",
     "FEX_TU_DRAW_SETUP",
     "FEX_TU_CS_ATOMICS",
+    "FEX_TU_CONST_KEEP",
   };
 
   bool UseD2RDefaults {};

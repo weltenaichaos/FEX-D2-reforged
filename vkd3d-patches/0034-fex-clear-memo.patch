@@ -1,0 +1,738 @@
+From eed108b62b3c49bac17b0d26663fe72c0530c2b2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 20:33:57 +0000
+Subject: [PATCH] FEX: big depth clears skipped by the GPU while the image is
+ still clear
+
+D2R clears its second 4096 x 4096 shadow map in a render pass of its own
+every frame (0.55-0.69 ms on an Adreno 740), though nothing draws into
+it: the same empty image is cleared again and again.
+
+A whole single-plane depth image of 4M+ pixels in memory of its own gets
+a slot in a device-wide buffer the first time such a clear of it gets a
+render pass of its own. 0 means the image still holds the depth value of
+that clear; anything else means it may not. The clear then runs as
+vkCmdClearAttachments in a LOAD/STORE pass under conditional rendering on
+its slot, so the GPU skips it while the slot is 0, and sets the slot to 0
+after. Render passes with the image as a writable depth attachment, other
+clears, copies, resolves and discards of it set the slot to 1 (once per
+command list until the next memo clear). Barriers order every write and
+read of a slot, within and across command lists. An image the memo knows
+is no longer discarded before a clear that waits, so a skipped clear
+leaves its contents as they were. Clears with another value, while the
+game's predication is active or with the memo off are done in full.
+
+VKD3D_FEX_CLEAR_MEMO: unset or 1 = on, 0 = off, 2 or alt = on and off by
+turns every second with the pass meter. Needs VKD3D_FEX_FOLD_CLEARS=1 and
+VK_EXT_conditional_rendering. New 'gpu clear memo' line in the gpu
+report; the memo clear passes show as 'clear-pass ... dLS' (load,
+store) in the pass lines, clears done in full as 'dCS'.
+---
+ libs/vkd3d/command.c        | 432 +++++++++++++++++++++++++++++++++++-
+ libs/vkd3d/device.c         |   2 +
+ libs/vkd3d/fex_pass_meter.c |  28 +++
+ libs/vkd3d/vkd3d_private.h  |  54 +++++
+ 4 files changed, 506 insertions(+), 10 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index a6a5dab..4cd839c 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2121,6 +2121,8 @@ static HRESULT d3d12_command_list_begin_command_buffer(struct d3d12_command_list
+     list->fex_clears.keep = false;
+     list->fex_clears.big_count = 0;
+     list->fex_clears.drawn_count = 0;
++    list->fex_memo.count = 0;
++    list->fex_memo.pending_count = 0;
+ 
+     return S_OK;
+ }
+@@ -4036,16 +4038,384 @@ static void d3d12_command_list_fex_big_barrier(struct d3d12_command_list *list,
+     }
+ }
+ 
++/* VKD3D fex34: "still clear" memo, see struct vkd3d_fex_clear_memo. resource->fex_memo holds slot << 32 | the bits of
++ * the depth value the slot is about; VKD3D_FEX_MEMO_NO_SLOT once no slot was left for it. */
++uint32_t vkd3d_fex_clear_memo_now = 1u;
++static bool fex_clear_memo_alt; /* on and off by turns every second with the pass meter */
++#define VKD3D_FEX_MEMO_NO_SLOT (0xffffffffull << 32)
++#define VKD3D_FEX_MEMO_STATE_DIRTY 1u
++#define VKD3D_FEX_MEMO_STATE_CLEAN 2u
++
++/* The image's slot, 0 = none. */
++static uint32_t d3d12_resource_fex_memo_slot(struct d3d12_resource *resource, uint32_t *value_bits)
++{
++    uint64_t memo = vkd3d_atomic_uint64_load_explicit(&resource->fex_memo, vkd3d_memory_order_relaxed);
++    uint32_t slot = (uint32_t)(memo >> 32);
++
++    if (value_bits)
++        *value_bits = (uint32_t)memo;
++    return slot < VKD3D_FEX_CLEAR_MEMO_SLOTS ? slot : 0;
++}
++
++/* Only whole single-plane depth images of 4M+ pixels in memory of their own, which nothing outside this device writes. */
++static bool d3d12_command_list_fex_memo_eligible(const struct d3d12_command_list *list,
++        const struct vkd3d_fex_pending_clear *clear)
++{
++    const struct d3d12_resource *resource = clear->resource;
++
++    return list->type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
++            clear->aspects == VK_IMAGE_ASPECT_DEPTH_BIT &&
++            clear->view->format->vk_aspect_mask == VK_IMAGE_ASPECT_DEPTH_BIT &&
++            resource->format->vk_aspect_mask == VK_IMAGE_ASPECT_DEPTH_BIT &&
++            resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
++            resource->desc.MipLevels == 1 && resource->desc.DepthOrArraySize == 1 &&
++            resource->desc.SampleDesc.Count == 1 &&
++            (resource->flags & VKD3D_RESOURCE_COMMITTED) && (resource->flags & VKD3D_RESOURCE_ALLOCATION) &&
++            !(resource->flags & (VKD3D_RESOURCE_RESERVED | VKD3D_RESOURCE_LINEAR_STAGING_COPY |
++                    VKD3D_RESOURCE_EXTERNAL)) &&
++            !(resource->heap_flags & D3D12_HEAP_FLAG_SHARED) &&
++            clear->view->info.texture.miplevel_idx == 0 && clear->view->info.texture.layer_idx == 0 &&
++            (uint64_t)resource->desc.Width * resource->desc.Height >= VKD3D_FEX_BIG_CLEAR_PIXELS;
++}
++
++/* Hands an eligible image a slot for this clear value if it has none yet; returns the slot, 0 = none. */
++static uint32_t d3d12_command_list_fex_memo_take_slot(struct d3d12_command_list *list,
++        const struct vkd3d_fex_pending_clear *clear, uint32_t *value_bits)
++{
++    struct vkd3d_fex_clear_memo *memo = list->device->fex_clear_memo;
++    struct d3d12_resource *resource = clear->resource;
++    uint64_t want, old;
++    uint32_t slot;
++
++    if ((slot = d3d12_resource_fex_memo_slot(resource, value_bits)))
++        return slot;
++    if (vkd3d_atomic_uint64_load_explicit(&resource->fex_memo, vkd3d_memory_order_relaxed))
++        return 0; /* no slot was left for it */
++
++    slot = vkd3d_atomic_uint32_increment(&memo->next_slot, vkd3d_memory_order_relaxed) - 1;
++    if (slot >= VKD3D_FEX_CLEAR_MEMO_SLOTS)
++    {
++        want = VKD3D_FEX_MEMO_NO_SLOT;
++        slot = 0;
++    }
++    else
++    {
++        memcpy(value_bits, &clear->value.depthStencil.depth, sizeof(*value_bits));
++        want = (uint64_t)slot << 32 | *value_bits;
++    }
++
++    old = vkd3d_atomic_uint64_compare_exchange(&resource->fex_memo, 0, want,
++            vkd3d_memory_order_relaxed, vkd3d_memory_order_relaxed);
++    if (old)
++    {
++        /* Another list got there first; the slot taken here stays unused. */
++        return d3d12_resource_fex_memo_slot(resource, value_bits);
++    }
++    vkd3d_fex_pass_meter_clear_memo(list->device, slot ? VKD3D_FEX_MEMO_NEW : VKD3D_FEX_MEMO_FULL);
++    return slot;
++}
++
++static int d3d12_command_list_fex_memo_find(const struct d3d12_command_list *list, uint32_t slot)
++{
++    uint32_t i;
++
++    for (i = 0; i < list->fex_memo.count; i++)
++    {
++        if (list->fex_memo.slot[i] == slot)
++            return i;
++    }
++    return -1;
++}
++
++static void d3d12_command_list_fex_memo_set_state(struct d3d12_command_list *list, uint32_t slot, uint8_t state)
++{
++    int i = d3d12_command_list_fex_memo_find(list, slot);
++
++    if (i < 0)
++    {
++        if (list->fex_memo.count >= VKD3D_FEX_CLEAR_MEMO_LIST_SLOTS)
++            return; /* not remembered: every later mark of it is recorded */
++        i = list->fex_memo.count++;
++        list->fex_memo.slot[i] = slot;
++    }
++    list->fex_memo.state[i] = state;
++}
++
++static void d3d12_command_list_fex_memo_fill(struct d3d12_command_list *list, uint32_t slot, uint32_t value)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++
++    VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, list->device->fex_clear_memo->vk_buffer,
++            (VkDeviceSize)slot * sizeof(uint32_t), sizeof(uint32_t), value));
++}
++
++/* Marks that commands of this list may write the image: its next memo clear runs in full. While a render pass is
++ * active the mark waits for the pass to end; it only has to land before the next memo clear of the image. */
++static void d3d12_command_list_fex_memo_dirty(struct d3d12_command_list *list, struct d3d12_resource *resource)
++{
++    uint32_t slot, i;
++    int idx;
++
++    if (!list->device->fex_clear_memo || !resource || !(slot = d3d12_resource_fex_memo_slot(resource, NULL)))
++        return;
++
++    idx = d3d12_command_list_fex_memo_find(list, slot);
++    if (idx >= 0 && list->fex_memo.state[idx] == VKD3D_FEX_MEMO_STATE_DIRTY)
++        return;
++    d3d12_command_list_fex_memo_set_state(list, slot, VKD3D_FEX_MEMO_STATE_DIRTY);
++    vkd3d_fex_pass_meter_clear_memo(list->device, VKD3D_FEX_MEMO_DIRTY);
++
++    if (!(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE))
++    {
++        d3d12_command_list_fex_memo_fill(list, slot, 1);
++        return;
++    }
++
++    for (i = 0; i < list->fex_memo.pending_count; i++)
++    {
++        if (list->fex_memo.pending[i] == slot)
++            return;
++    }
++    if (list->fex_memo.pending_count < VKD3D_FEX_CLEAR_MEMO_LIST_SLOTS)
++        list->fex_memo.pending[list->fex_memo.pending_count++] = slot;
++    else
++        list->fex_memo.pending[0] = 0; /* too many: all slots are marked when the pass ends */
++}
++
++/* Records the marks that waited for the render pass to end. */
++static void d3d12_command_list_fex_memo_flush(struct d3d12_command_list *list)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    uint32_t i, count = list->fex_memo.pending_count;
++    struct vkd3d_fex_clear_memo *memo;
++    uint32_t used;
++
++    list->fex_memo.pending_count = 0;
++    if (!count || !(memo = list->device->fex_clear_memo))
++        return;
++
++    if (!list->fex_memo.pending[0])
++    {
++        used = vkd3d_atomic_uint32_load_explicit(&memo->next_slot, vkd3d_memory_order_relaxed);
++        used = min(used, VKD3D_FEX_CLEAR_MEMO_SLOTS);
++        if (used > 1)
++        {
++            VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, memo->vk_buffer, sizeof(uint32_t),
++                    (VkDeviceSize)(used - 1) * sizeof(uint32_t), 1));
++        }
++        for (i = 0; i < list->fex_memo.count; i++)
++            list->fex_memo.state[i] = VKD3D_FEX_MEMO_STATE_DIRTY;
++        return;
++    }
++
++    for (i = 0; i < count; i++)
++        d3d12_command_list_fex_memo_fill(list, list->fex_memo.pending[i], 1);
++}
++
++/* The memo clear: a LOAD/STORE pass whose vkCmdClearAttachments the GPU skips while the image's slot is 0, then the
++ * slot is set to 0. Barriers order the slot's writes and reads with every other mark, in this and other lists. */
++static void d3d12_command_list_fex_memo_clear(struct d3d12_command_list *list,
++        const struct vkd3d_fex_pending_clear *clear, uint32_t slot, VkRenderingAttachmentInfo *attachment_info,
++        VkRenderingInfo *rendering_info)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkConditionalRenderingBeginInfoEXT cond_info;
++    VkClearAttachment clear_attachment;
++    VkMemoryBarrier2 vk_barrier;
++    VkDependencyInfo dep_info;
++    VkClearRect clear_rect;
++
++    memset(&vk_barrier, 0, sizeof(vk_barrier));
++    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    memset(&dep_info, 0, sizeof(dep_info));
++    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep_info.memoryBarrierCount = 1;
++    dep_info.pMemoryBarriers = &vk_barrier;
++
++    /* Earlier marks (fills) land before the slot is read and before it is set again. */
++    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
++    vk_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
++    vk_barrier.dstAccessMask = VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++
++    memset(&cond_info, 0, sizeof(cond_info));
++    cond_info.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
++    cond_info.buffer = list->device->fex_clear_memo->vk_buffer;
++    cond_info.offset = (VkDeviceSize)slot * sizeof(uint32_t);
++    VK_CALL(vkCmdBeginConditionalRenderingEXT(list->cmd.vk_command_buffer, &cond_info));
++
++    attachment_info->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++    attachment_info->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++
++    if (list->device->fex_pass_meter)
++    {
++        const struct vkd3d_format *fex_color_formats[1] = { clear->view->format };
++
++        vkd3d_fex_pass_meter_begin_pass(list, rendering_info, fex_color_formats,
++                clear->resource->desc.SampleDesc.Count, clear->view->format, VKD3D_FEX_PASS_KIND_CLEAR);
++    }
++
++    VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, rendering_info));
++
++    memset(&clear_attachment, 0, sizeof(clear_attachment));
++    clear_attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++    clear_attachment.clearValue = clear->value;
++    memset(&clear_rect, 0, sizeof(clear_rect));
++    clear_rect.rect = rendering_info->renderArea;
++    clear_rect.baseArrayLayer = 0;
++    clear_rect.layerCount = rendering_info->layerCount;
++    VK_CALL(vkCmdClearAttachments(list->cmd.vk_command_buffer, 1, &clear_attachment, 1, &clear_rect));
++
++    VK_CALL(vkCmdEndRendering(list->cmd.vk_command_buffer));
++    vkd3d_fex_pass_meter_end_pass(list, __LINE__);
++    d3d12_command_list_sync_tiler_renderpass_writes(list, rendering_info);
++
++    VK_CALL(vkCmdEndConditionalRenderingEXT(list->cmd.vk_command_buffer));
++
++    /* The slot was read; now it says "still clear". */
++    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
++    vk_barrier.srcAccessMask = VK_ACCESS_2_NONE;
++    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
++    vk_barrier.dstAccessMask = VK_ACCESS_2_NONE;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++
++    d3d12_command_list_fex_memo_fill(list, slot, 0);
++
++    /* Later marks and reads of the slot (this or later lists) come after this write. */
++    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
++    vk_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
++    vk_barrier.dstAccessMask = VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++
++    d3d12_command_list_fex_memo_set_state(list, slot, VKD3D_FEX_MEMO_STATE_CLEAN);
++    vkd3d_fex_pass_meter_clear_memo(list->device, VKD3D_FEX_MEMO_CLEAR);
++}
++
++void vkd3d_fex_clear_memo_init(struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_fex_clear_memo *memo;
++    uint32_t mode = 1, *map, i;
++    void *ptr = NULL;
++    char env[16];
++
++    device->fex_clear_memo = NULL;
++
++    /* On unless asked otherwise (0 off, 2 on and off by turns every second with the pass meter). */
++    if (vkd3d_get_env_var("VKD3D_FEX_CLEAR_MEMO", env, sizeof(env)))
++    {
++        if (!strcmp(env, "0"))
++            mode = 0;
++        else if (!strcmp(env, "2") || !strcmp(env, "alt"))
++            mode = 2;
++    }
++    if (!mode)
++    {
++        INFO("FEX: big depth clears are always done in full (VKD3D_FEX_CLEAR_MEMO=0).\n");
++        return;
++    }
++    if (!device->fex_fold_clears || !device->vk_info.EXT_conditional_rendering)
++    {
++        INFO("FEX: big depth clears are always done in full (the clear memo needs %s).\n",
++                device->fex_fold_clears ? "VK_EXT_conditional_rendering" : "VKD3D_FEX_FOLD_CLEARS=1");
++        return;
++    }
++
++    if (!(memo = vkd3d_calloc(1, sizeof(*memo))))
++        return;
++    if (FAILED(vkd3d_create_buffer_explicit_usage(device,
++            VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++            VKD3D_FEX_CLEAR_MEMO_SLOTS * sizeof(uint32_t), "fex-clear-memo", &memo->vk_buffer)))
++        goto fail;
++    if (FAILED(vkd3d_allocate_internal_buffer_memory(device, memo->vk_buffer,
++            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &memo->memory)))
++    {
++        memo->memory.vk_memory = VK_NULL_HANDLE;
++        goto fail;
++    }
++    if (VK_CALL(vkMapMemory(device->vk_device, memo->memory.vk_memory, 0, VK_WHOLE_SIZE, 0, &ptr)) != VK_SUCCESS)
++        goto fail;
++    map = ptr;
++    for (i = 0; i < VKD3D_FEX_CLEAR_MEMO_SLOTS; i++)
++        map[i] = 1;
++    VK_CALL(vkUnmapMemory(device->vk_device, memo->memory.vk_memory));
++
++    memo->next_slot = 1;
++    fex_clear_memo_alt = mode == 2;
++    vkd3d_atomic_uint32_store_explicit(&vkd3d_fex_clear_memo_now, 1u, vkd3d_memory_order_relaxed);
++    device->fex_clear_memo = memo;
++    INFO("FEX: big depth clears skipped while the image is still clear%s.\n",
++            mode == 2 ? " (with the pass meter: on and off by turns every second)" : "");
++    return;
++
++fail:
++    WARN("FEX: no clear memo buffer, big depth clears are always done in full.\n");
++    if (memo->memory.vk_memory)
++        vkd3d_free_device_memory(device, &memo->memory);
++    if (memo->vk_buffer)
++        VK_CALL(vkDestroyBuffer(device->vk_device, memo->vk_buffer, NULL));
++    vkd3d_free(memo);
++}
++
++void vkd3d_fex_clear_memo_cleanup(struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_fex_clear_memo *memo = device->fex_clear_memo;
++
++    if (!memo)
++        return;
++    device->fex_clear_memo = NULL;
++    VK_CALL(vkDestroyBuffer(device->vk_device, memo->vk_buffer, NULL));
++    vkd3d_free_device_memory(device, &memo->memory);
++    vkd3d_free(memo);
++}
++
++void vkd3d_fex_clear_memo_flip(struct d3d12_device *device)
++{
++    (void)device;
++    if (fex_clear_memo_alt)
++        vkd3d_atomic_uint32_store_explicit(&vkd3d_fex_clear_memo_now, vkd3d_fex_clear_memo_on() ? 0u : 1u,
++                vkd3d_memory_order_relaxed);
++}
++
++static bool vk_fex_depth_layout_read_only(VkImageLayout layout)
++{
++    return layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL ||
++            layout == VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL ||
++            layout == VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL ||
++            layout == VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
++}
++
+ /* The render pass load_attachment() would have recorded for this clear. Its barriers already ran at clear time.
+  * made_at/line: why it is made now (VKD3D fex33 pass meter). */
+ static void d3d12_command_list_fex_emit_clear_pass(struct d3d12_command_list *list,
+         const struct vkd3d_fex_pending_clear *clear, enum vkd3d_fex_big_clear_event made_at, unsigned int line)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    enum vkd3d_fex_memo_event memo_event = VKD3D_FEX_MEMO_EVENTS;
++    uint32_t memo_slot = 0, memo_bits = 0, value_bits;
+     VkRenderingAttachmentInfo attachment_info;
+     VkRenderingInfo rendering_info;
+     VkExtent3D view_extent;
+ 
++    /* VKD3D fex34: a big depth clear the GPU skips while the image still holds this value. */
++    if (list->device->fex_clear_memo && d3d12_command_list_fex_memo_eligible(list, clear) &&
++            (memo_slot = d3d12_command_list_fex_memo_take_slot(list, clear, &memo_bits)))
++    {
++        memcpy(&value_bits, &clear->value.depthStencil.depth, sizeof(value_bits));
++        if (!vkd3d_fex_clear_memo_on())
++            memo_event = VKD3D_FEX_MEMO_PLAIN_OFF;
++        else if (memo_bits != value_bits)
++            memo_event = VKD3D_FEX_MEMO_PLAIN_VALUE;
++        else if (list->predication.enabled_on_command_buffer)
++            memo_event = VKD3D_FEX_MEMO_PLAIN_PRED;
++        else
++            memo_event = VKD3D_FEX_MEMO_CLEAR;
++    }
++
+     memset(&attachment_info, 0, sizeof(attachment_info));
+     attachment_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+     attachment_info.imageView = clear->view->vk_image_view;
+@@ -4074,19 +4444,32 @@ static void d3d12_command_list_fex_emit_clear_pass(struct d3d12_command_list *li
+ 
+     d3d12_command_list_debug_mark_begin_region(list, "Clear");
+ 
+-    if (list->device->fex_pass_meter)
++    if (memo_event == VKD3D_FEX_MEMO_CLEAR)
+     {
+-        const struct vkd3d_format *fex_color_formats[1] = { clear->view->format };
+-        bool fex_color = !!(clear->aspects & VK_IMAGE_ASPECT_COLOR_BIT);
+-
+-        vkd3d_fex_pass_meter_begin_pass(list, &rendering_info, fex_color_formats,
+-                clear->resource->desc.SampleDesc.Count, fex_color ? NULL : clear->view->format, VKD3D_FEX_PASS_KIND_CLEAR);
++        d3d12_command_list_fex_memo_clear(list, clear, memo_slot, &attachment_info, &rendering_info);
+     }
++    else
++    {
++        /* Done in full: an image the memo knows may now hold another value. */
++        if (memo_event != VKD3D_FEX_MEMO_EVENTS)
++            vkd3d_fex_pass_meter_clear_memo(list->device, memo_event);
++        d3d12_command_list_fex_memo_dirty(list, clear->resource);
+ 
+-    VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, &rendering_info));
+-    VK_CALL(vkCmdEndRendering(list->cmd.vk_command_buffer));
+-    vkd3d_fex_pass_meter_end_pass(list, __LINE__);
+-    d3d12_command_list_sync_tiler_renderpass_writes(list, &rendering_info);
++        if (list->device->fex_pass_meter)
++        {
++            const struct vkd3d_format *fex_color_formats[1] = { clear->view->format };
++            bool fex_color = !!(clear->aspects & VK_IMAGE_ASPECT_COLOR_BIT);
++
++            vkd3d_fex_pass_meter_begin_pass(list, &rendering_info, fex_color_formats,
++                    clear->resource->desc.SampleDesc.Count, fex_color ? NULL : clear->view->format,
++                    VKD3D_FEX_PASS_KIND_CLEAR);
++        }
++
++        VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, &rendering_info));
++        VK_CALL(vkCmdEndRendering(list->cmd.vk_command_buffer));
++        vkd3d_fex_pass_meter_end_pass(list, __LINE__);
++        d3d12_command_list_sync_tiler_renderpass_writes(list, &rendering_info);
++    }
+ 
+     d3d12_command_list_debug_mark_end_region(list);
+ 
+@@ -4343,6 +4726,11 @@ static void d3d12_command_list_load_attachment(struct d3d12_command_list *list,
+             if (view->info.texture.layer_idx != 0 || view->info.texture.layer_count < resource->desc.DepthOrArraySize)
+                 requires_discard_barrier = false;
+ 
++        /* VKD3D fex34: an image the clear memo knows keeps its contents; its waiting clear may be skipped. */
++        if (requires_discard_barrier && fex_defer && !separate_ds_layouts && list->device->fex_clear_memo &&
++                d3d12_resource_fex_memo_slot(resource, NULL))
++            requires_discard_barrier = false;
++
+         if (requires_discard_barrier)
+         {
+             if (separate_ds_layouts)
+@@ -4415,6 +4803,10 @@ static void d3d12_command_list_load_attachment(struct d3d12_command_list *list,
+         }
+     }
+ 
++    /* VKD3D fex34: a clear done now (or a discard) may change what a memo image holds. */
++    if (!fex_defer || separate_ds_layouts)
++        d3d12_command_list_fex_memo_dirty(list, resource);
++
+     d3d12_command_list_debug_mark_begin_region(list, "Clear");
+ 
+     if (dep_info.imageMemoryBarrierCount)
+@@ -4539,6 +4931,7 @@ static void d3d12_command_list_discard_attachment_barrier(struct d3d12_command_l
+     dep_info.pImageMemoryBarriers = &barrier;
+ 
+     VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++    d3d12_command_list_fex_memo_dirty(list, resource); /* VKD3D fex34 */
+ }
+ 
+ enum vkd3d_render_pass_transition_mode
+@@ -5362,6 +5755,10 @@ void d3d12_command_list_end_current_render_pass_line(struct d3d12_command_list *
+ 
+     list->rendering_info.state_flags &= ~VKD3D_RENDERING_ACTIVE;
+ 
++    /* VKD3D fex34: clear memo marks that waited for the pass to end. */
++    if (list->fex_memo.pending_count)
++        d3d12_command_list_fex_memo_flush(list);
++
+     if (list->xfb_buffer_count)
+     {
+         /* We need a barrier between pause and resume. */
+@@ -7796,6 +8193,12 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+                 d3d12_command_list_has_depth_stencil_view(list) ? list->dsv.format : NULL, fex_pass_kind);
+     }
+ 
++    /* VKD3D fex34: draws may write a writable depth attachment. */
++    if (list->device->fex_clear_memo && d3d12_command_list_has_depth_stencil_view(list) &&
++            (fex_fold_ds || !vk_fex_depth_layout_read_only(list->rendering_info.dsv.imageLayout) ||
++            list->rendering_info.dsv.storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE))
++        d3d12_command_list_fex_memo_dirty(list, list->dsv.resource);
++
+     d3d12_command_list_debug_mark_begin_region(list, "RenderPass");
+     VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, &list->rendering_info.info));
+     vkd3d_fex_pass_meter_inside_pass(list);
+@@ -9492,6 +9895,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
+     TRACE("iface %p, dst %p, dst_x %u, dst_y %u, dst_z %u, src %p, src_box %p.\n",
+             iface, dst, dst_x, dst_y, dst_z, src, src_box);
+ 
++    /* VKD3D fex34: the copy may change what a clear memo image holds. */
++    if (dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && dst->pResource)
++        d3d12_command_list_fex_memo_dirty(list, impl_from_ID3D12Resource(dst->pResource));
++
+     if (list->is_inside_render_pass)
+         d3d12_command_list_mark_as_invalid(list, "CopyTextureRegion called within a render pass.\n");
+ 
+@@ -9619,6 +10026,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
+ 
+     d3d12_command_list_end_current_render_pass(list, false);
+     d3d12_command_list_end_transfer_batch(list);
++    d3d12_command_list_fex_memo_dirty(list, dst_resource); /* VKD3D fex34 */
+ 
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_LOW;
+ 
+@@ -10484,6 +10892,8 @@ static void d3d12_command_list_execute_resolve(struct d3d12_command_list *list,
+     VkViewport viewport;
+     unsigned int i, j;
+ 
++    d3d12_command_list_fex_memo_dirty(list, dst_resource); /* VKD3D fex34 */
++
+     if (path == VKD3D_RESOLVE_IMAGE_PATH_DIRECT)
+     {
+         memset(&resolve_info, 0, sizeof(resolve_info));
+@@ -18723,6 +19133,8 @@ static void d3d12_command_list_process_enhanced_barrier_texture(struct d3d12_com
+     discarding_transition = vk_transition.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+             vk_transition.newLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
+             d3d12_barrier_subresource_range_covers_resource(resource, &barrier->Subresources);
++    if (vk_transition.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
++        d3d12_command_list_fex_memo_dirty(list, resource); /* VKD3D fex34: contents dropped */
+     d3d12_command_list_track_resource_usage(list, resource, !discarding_transition);
+ }
+ 
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index f4e239a..b8ac8b9 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4291,6 +4291,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
+     vkd3d_timestamp_profiler_deinit(device->timestamp_profiler);
+ #endif
+     vkd3d_fex_pass_meter_deinit(device->fex_pass_meter);
++    vkd3d_fex_clear_memo_cleanup(device);
+ #ifdef VKD3D_ENABLE_BREADCRUMBS
+     vkd3d_breadcrumb_tracer_cleanup_barrier_hashes(&device->breadcrumb_tracer);
+     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS)
+@@ -10076,6 +10077,7 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+ #endif
+     device->fex_fold_clears = vkd3d_fex_fold_clears_enabled();
+     device->fex_ds_store_none = vkd3d_fex_ds_store_none_enabled();
++    vkd3d_fex_clear_memo_init(device);
+     vkd3d_fex_timeline_init();
+     vkd3d_fex_shader_copy_init();
+     vkd3d_fex_root_dedupe_init();
+diff --git a/libs/vkd3d/fex_pass_meter.c b/libs/vkd3d/fex_pass_meter.c
+index 355bdf1..7315c6d 100644
+--- a/libs/vkd3d/fex_pass_meter.c
++++ b/libs/vkd3d/fex_pass_meter.c
+@@ -267,6 +267,7 @@ struct vkd3d_fex_pass_meter
+     /* Counted by recording threads. */
+     uint32_t clears_folded, clears_own_pass;
+     uint32_t big_clears[VKD3D_FEX_BIG_CLEAR_EVENTS]; /* VKD3D fex33 */
++    uint32_t memo_events[VKD3D_FEX_MEMO_EVENTS];     /* VKD3D fex34 */
+     uint32_t big_clear_line[4], big_clear_line_count[4]; /* command.c lines that ended a pass and made big clears */
+ 
+     /* Draw timing (VKD3D fex9). */
+@@ -1462,6 +1463,14 @@ void vkd3d_fex_pass_meter_big_clear(struct d3d12_device *device, enum vkd3d_fex_
+     }
+ }
+ 
++void vkd3d_fex_pass_meter_clear_memo(struct d3d12_device *device, enum vkd3d_fex_memo_event event)
++{
++    struct vkd3d_fex_pass_meter *meter = device->fex_pass_meter;
++
++    if (meter && event < VKD3D_FEX_MEMO_EVENTS)
++        vkd3d_atomic_uint32_increment(&meter->memo_events[event], vkd3d_memory_order_relaxed);
++}
++
+ uint32_t vkd3d_fex_pass_meter_present(struct d3d12_device *device)
+ {
+     struct vkd3d_fex_pass_meter *meter = device->fex_pass_meter;
+@@ -2479,6 +2488,25 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+         }
+     }
+ 
++    /* VKD3D fex34: big depth clears the GPU skips while the image is still clear. */
++    if (meter->device->fex_clear_memo)
++    {
++        uint32_t memo[VKD3D_FEX_MEMO_EVENTS];
++        bool memo_on = vkd3d_fex_clear_memo_on();
++
++        for (i = 0; i < VKD3D_FEX_MEMO_EVENTS; i++)
++            memo[i] = vkd3d_atomic_uint32_exchange_explicit(&meter->memo_events[i], 0, vkd3d_memory_order_relaxed);
++        len = vkd3d_fex_report_append(text, sizeof(text), len,
++                "  gpu clear memo (VKD3D fex34: big depth clears skipped by the GPU while the image is still clear):"
++                " %s this second | clears the GPU skips if still clear %u | done in full: memo off %u, other value"
++                " %u, game predication %u | 'may be written' marks %u | images remembered: new %u, no slot left %u\n",
++                memo_on ? "on" : "off", memo[VKD3D_FEX_MEMO_CLEAR], memo[VKD3D_FEX_MEMO_PLAIN_OFF],
++                memo[VKD3D_FEX_MEMO_PLAIN_VALUE], memo[VKD3D_FEX_MEMO_PLAIN_PRED], memo[VKD3D_FEX_MEMO_DIRTY],
++                memo[VKD3D_FEX_MEMO_NEW], memo[VKD3D_FEX_MEMO_FULL]);
++        /* Flipped after the line: the line tells what the second just measured had. */
++        vkd3d_fex_clear_memo_flip(meter->device);
++    }
++
+     /* The last draw sample, once. */
+     draw_sample = meter->draw_text_len != 0;
+     if (draw_sample)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 18d6736..2f11733 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1165,6 +1165,10 @@ struct d3d12_resource
+ 
+     struct vkd3d_private_store private_store;
+     struct d3d_destruction_notifier destruction_notifier;
++
++    /* VKD3D fex34 (command.c, VKD3D_FEX_CLEAR_MEMO): slot << 32 | bits of the depth value the memo remembers, 0 = no
++     * slot. Set once, atomically. */
++    UINT64 fex_memo;
+ };
+ 
+ static inline bool d3d12_resource_is_buffer(const struct d3d12_resource *resource)
+@@ -3321,6 +3325,38 @@ enum vkd3d_fex_big_clear_event
+     VKD3D_FEX_BIG_CLEAR_NEXT_NONE,          /* not used again before the list was closed */
+     VKD3D_FEX_BIG_CLEAR_EVENTS
+ };
++/* VKD3D fex34: "still clear" memo (command.c, VKD3D_FEX_CLEAR_MEMO). D2R clears its second 4096x4096 shadow map in
++ * a render pass of its own every frame (0.55-0.69 ms of GPU time), though nothing draws into it in between. A big
++ * depth-only image cleared that way gets a slot in a device-wide buffer: 0 = the image still holds the value its
++ * clears use, anything else = it may not. The clear then runs under conditional rendering on its slot
++ * (vkCmdClearAttachments in a LOAD/STORE pass, skipped by the GPU when the slot is 0) and sets the slot to 0 after;
++ * everything that may write the image (render passes with it as a writable DSV, other clears, copies, resolves,
++ * discards) sets it to 1. Every slot starts at 1; slots are never reused. */
++#define VKD3D_FEX_CLEAR_MEMO_SLOTS 1024u
++#define VKD3D_FEX_CLEAR_MEMO_LIST_SLOTS 16u
++struct vkd3d_fex_clear_memo
++{
++    VkBuffer vk_buffer;
++    struct vkd3d_device_memory_allocation memory;
++    uint32_t next_slot; /* atomic; slot 0 is never handed out */
++};
++enum vkd3d_fex_memo_event
++{
++    VKD3D_FEX_MEMO_CLEAR,       /* a clear recorded that the GPU skips if the image is still clear */
++    VKD3D_FEX_MEMO_PLAIN_OFF,   /* a clear of a remembered image done in full: memo off this second */
++    VKD3D_FEX_MEMO_PLAIN_VALUE, /* ... another clear value than the remembered one */
++    VKD3D_FEX_MEMO_PLAIN_PRED,  /* ... the game's predication was active */
++    VKD3D_FEX_MEMO_DIRTY,       /* a "may be written" mark recorded */
++    VKD3D_FEX_MEMO_NEW,         /* an image got a slot */
++    VKD3D_FEX_MEMO_FULL,        /* an image found no slot left */
++    VKD3D_FEX_MEMO_EVENTS
++};
++extern uint32_t vkd3d_fex_clear_memo_now;
++static inline bool vkd3d_fex_clear_memo_on(void)
++{
++    return vkd3d_atomic_uint32_load_explicit(&vkd3d_fex_clear_memo_now, vkd3d_memory_order_relaxed) != 0;
++}
++
+ struct vkd3d_fex_pending_clear
+ {
+     struct d3d12_resource *resource;
+@@ -3536,6 +3572,17 @@ struct d3d12_command_list
+         struct d3d12_resource *drawn[VKD3D_FEX_BIG_CLEARS];
+         uint32_t drawn_count;
+     } fex_clears;
++
++    /* VKD3D fex34: memo slots this list recorded a mark for (state 1 = "may be written" mark last, 2 = "still clear"
++     * mark last), and "may be written" marks waiting for the render pass to end. */
++    struct
++    {
++        uint32_t slot[VKD3D_FEX_CLEAR_MEMO_LIST_SLOTS];
++        uint8_t state[VKD3D_FEX_CLEAR_MEMO_LIST_SLOTS];
++        uint32_t count;
++        uint32_t pending[VKD3D_FEX_CLEAR_MEMO_LIST_SLOTS];
++        uint32_t pending_count;
++    } fex_memo;
+ };
+ 
+ HRESULT d3d12_command_list_create(struct d3d12_device *device,
+@@ -3585,6 +3632,12 @@ void vkd3d_fex_pass_meter_free_list(struct d3d12_command_list *list);
+ void vkd3d_fex_pass_meter_count_clears(struct d3d12_device *device, uint32_t folded, uint32_t own_pass);
+ void vkd3d_fex_pass_meter_big_clear(struct d3d12_device *device, enum vkd3d_fex_big_clear_event event,
+         unsigned int line);
++/* VKD3D fex34: clear memo events (counted for the gpu report); init/cleanup in command.c. */
++void vkd3d_fex_pass_meter_clear_memo(struct d3d12_device *device, enum vkd3d_fex_memo_event event);
++void vkd3d_fex_clear_memo_init(struct d3d12_device *device);
++void vkd3d_fex_clear_memo_cleanup(struct d3d12_device *device);
++/* Called once a second by the pass meter report: flips the memo in its alt mode. */
++void vkd3d_fex_clear_memo_flip(struct d3d12_device *device);
+ /* VKD3D fex11: a command recorded outside render passes (VKD3D_FEX_OUTSIDE_*), bytes it moves if known. */
+ void vkd3d_fex_pass_meter_outside(struct d3d12_command_list *list, uint32_t type, uint64_t bytes);
+ /* VKD3D fex22: times one Dispatch in measured frames (all-commands timestamps right before and after it). */
+@@ -5913,6 +5966,7 @@ struct d3d12_device
+     struct vkd3d_timestamp_profiler *timestamp_profiler;
+ #endif
+     struct vkd3d_fex_pass_meter *fex_pass_meter;
++    struct vkd3d_fex_clear_memo *fex_clear_memo; /* VKD3D fex34, NULL = off */
+     bool fex_fold_clears;
+     bool fex_ds_store_none;
+     bool fex_skip_fresh_clears; /* VKD3D fex11: zero fills of never-used chunk pages skipped */
+-- 
+2.43.0
+
