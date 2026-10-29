@@ -21,7 +21,9 @@
 # (fex14) other wave setups for big fragment shaders, picked per second (wave pair mode 1-3 or
 # a second binary as 128-pixel waves), and (fex15) other draw setups for them, picked per
 # second (a binary with no preamble at all, a binary with one constant load per root constant
-# buffer, or wave allocation settings the driver always turns off).
+# buffer, or wave allocation settings the driver always turns off), and (fex16) a second binary
+# of compute shaders whose memory atomics hit one address for the whole wave, with those atomics
+# done once per wave, picked per second, plus time and GPU counters around big dispatches.
 # Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
@@ -36,7 +38,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex15
+  FEX_PATCH: fex16
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -143,7 +145,12 @@ jobs:
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "tu_fex_color_clear_3d_index" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 15" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 16" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "nir_opt_uniform_atomics_filtered" "$GITHUB_WORKSPACE/mesa/src/compiler/nir/nir_opt_uniform_atomics.c"
+          grep -q "ir3_nir_fex_uniform_atomics" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir.c"
+          grep -q "tu_fex_dispatch_begin" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "tu_fex_cs_variant" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "TU_FEX_COMPILE_CS_ATOMICS_ALT" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.cc"
           grep -q "fex_merge_cp_ranges" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c"
           grep -q "fex_push_by_driver" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_shader.c"
           grep -q "tu_fex_emit_push_by_driver" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"

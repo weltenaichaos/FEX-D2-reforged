@@ -232,6 +232,7 @@ namespace {
     // wave's time goes and what its texture fetches wait on.
     // Build 103: on for a second measuring run with every wave state counter (build 102 left ~40% of a lighting wave's
     // time in states its list didn't count).
+    // Build 107: a compute list; with driver fex16 every direct dispatch of 16+ workgroups is timed and counted too.
     {"FEX_TU_COUNTERS", "1"},
     {"FEX_TU_SAMPLE_DRAWS", "100"},
     // Build 71: build 70 found the main pass's lighting draws each wait for their setup step (the shader preamble: ~730
@@ -337,7 +338,19 @@ namespace {
     // EVICT_BUF_MODE 0 (the driver always writes 1 and 1; not documented). Digits pick a list (e.g. 045), one digit =
     // that setup always, 0 = off (then FEX_TU_WAVE_PAIR decides). Pass kinds carry the setup ('stock', 'nopre', 'merge',
     // 'defer', 'evict').
-    {"FEX_TU_DRAW_SETUP", "alt"},
+    // Build 107: 4 (the binary with no preamble at all) always. Build 106 measured it: two lighting draws on the GPU at
+    // once 10% more often (dual fs 0.46 -> 0.50), the front end's wait for draw data -10%, lighting pass about -5% (-2%
+    // and -7% in the run's halves; prepass and shadow passes within 1.5%). Merged loads cut the overlap 12% (more data
+    // per draw), the two alloc settings changed nothing. FEX_TU_DRAW_SETUP=alt or digits still rotate setups, 0 = stock.
+    {"FEX_TU_DRAW_SETUP", "4"},
+    // Build 107: the ground clutter compute shader (0e21a3b5088ba1af, a 1152x1152 grid, ~1.2 ms of every frame, the
+    // biggest of the ~2.9 ms of compute) appends each item it places to one list: an atomic add on one counter per item,
+    // so thousands of lanes queue on one address. FEX's Turnip fex16 compiles compute shaders whose memory atomics hit
+    // one address for the whole wave a second time with nir_opt_uniform_atomics (one lane adds the wave's total, each
+    // lane gets its slot from that), as Mesa's AMD, Intel and Apple drivers do; only that shader qualifies (2234 -> 2308
+    // instructions). alt = that binary in every other second, compared on the 'turnip dispatch' lines; 1 = always,
+    // 0 = stock.
+    {"FEX_TU_CS_ATOMICS", "alt"},
   };
 
   // In the order the stats log lists them.
@@ -432,6 +445,7 @@ namespace {
     "FEX_TU_NOALIAS",
     "FEX_TU_WAVE_PAIR",
     "FEX_TU_DRAW_SETUP",
+    "FEX_TU_CS_ATOMICS",
   };
 
   bool UseD2RDefaults {};

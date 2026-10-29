@@ -416,3 +416,31 @@ READ_IMM_SHARED_CONSTS and EARLYPREAMBLE; arm 4 (mode 0x440) CONSTLEN 104, neith
 CP_LOAD_STATE6_FRAG with the push constants; arm 5 (0x500) CONSTLEN 192 and 5 loads; arms 6 and 7 change only
 their bit. Mixed pipelines with dynamic state, rebinds, sysmem and gmem ran without asserts and counted binds
 in the right arm.
+
+- `0016-fex16-cs-atomics.patch` (fex16, with FEX build 107): compute shaders whose memory atomics hit one
+  address for the whole wave get a second binary that does each such atomic once per wave, picked per
+  command buffer (FEX_TU_CS_ATOMICS=alt flips it each second). D2R's biggest compute job, the ground clutter
+  scatter (0e21a3b5088ba1af, 144x144 workgroups of 8x8, ~1.2 ms a frame), appends every item it places to
+  one list with an atomic add on one counter, so lanes queue on one address.
+  - `TU_FEX_COMPILE_CS_ATOMICS_ALT` 0x1000 (status 0x20000000, needs getfiberid): `ir3_shader_key::
+    fex_uniform_atomics` runs `nir_opt_uniform_atomics` in `ir3_nir_lower_variant` before ir3's subgroup
+    lowering (as AMD, Intel and Asahi do; ir3 never did): ballot bit count gives the wave's total, an elected
+    lane does one atomic, `read_first` plus the exclusive count gives each lane its old value. Only SSBO and
+    global atomics (`nir_opt_uniform_atomics_filtered`): shared memory atomics were made slower (6e01: 316
+    -> 386, 03ea: 338 -> 944 instructions). The binary is kept only when it changed an atomic, needs no more
+    private memory and has the same workgroup size (`tu_shader::fex_alt_variant`, own state IB).
+  - `TU_FEX_MODE_CS_ALT` 0x800: compute binds in such command buffers use that binary, and constants,
+    driver params and dispatch read its variant (`tu_fex_cs_variant`).
+  - Dispatch slots: direct dispatches with 16+ workgroups get a counter ring slot (WFI before and after,
+    like passes) with `attachments` = `TU_FEX_SLOT_DISPATCH` 0xff, width/height/colors = workgroups x/y/z,
+    draws = stock instruction count, format0 = workgroup size, sysmem bit 1 = second binary.
+  - Counts in the channel extension (`ext_size` >= 0x400, status 0x40000000): `cs_binds[2]` 0x3d0,
+    `cs_alt_shaders` 0x3e0, `cs_alt_atomics`, `cs_alt_instr[2]`, `cs_alt_refused` 0x3f0,
+    `dispatches_sampled` 0x3f8.
+
+Host check (fex16): `cstest/cstest_rec.c` (EPTEST_FEX=0x101f EPTEST_EXT=0x400, noop drm shim, a740) with
+0e21: second binary 2234 -> 2308 instructions, 19 registers, the ballot/bit count after the third early exit,
+one `atomic.add` of the count, the result moved through a shared register and added to the lane's exclusive
+count; only 0e21 of D2R's 17 compute shaders qualifies. Two recorded command buffers (mode 0 and 0x800): the
+alt one binds the second binary (other SP_CS_BASE, INSTR_SIZE 133 vs 128); binds stock 1 alt 1; 2 dispatch
+slots (144x144 and 2x2 groups) with attachments 0xff and local size 8x8x1.

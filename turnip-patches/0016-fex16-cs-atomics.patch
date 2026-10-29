@@ -1,0 +1,876 @@
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index 44fba83..39908b5 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -7258,6 +7258,9 @@ bool nir_lower_undef_to_zero(nir_shader *shader,
+                              nir_lower_undef_to_zero_filter filter);
+ 
+ bool nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated);
++bool nir_opt_uniform_atomics_filtered(nir_shader *shader, bool fs_atomics_predicated,
++                                      nir_instr_filter_cb filter,
++                                      const void *filter_data);
+ 
+ bool nir_opt_uniform_subgroup(nir_shader *shader,
+                               const nir_lower_subgroups_options *);
+diff --git a/src/compiler/nir/nir_opt_uniform_atomics.c b/src/compiler/nir/nir_opt_uniform_atomics.c
+index e338d4f..b46043b 100644
+--- a/src/compiler/nir/nir_opt_uniform_atomics.c
++++ b/src/compiler/nir/nir_opt_uniform_atomics.c
+@@ -293,7 +293,8 @@ optimize_and_rewrite_atomic(nir_builder *b, nir_intrinsic_instr *intrin,
+ }
+ 
+ static bool
+-opt_uniform_atomics(nir_function_impl *impl, bool fs_atomics_predicated)
++opt_uniform_atomics(nir_function_impl *impl, bool fs_atomics_predicated,
++                    nir_instr_filter_cb filter, const void *filter_data)
+ {
+    bool progress = false;
+    nir_builder b = nir_builder_create(impl);
+@@ -307,6 +308,8 @@ opt_uniform_atomics(nir_function_impl *impl, bool fs_atomics_predicated)
+          unsigned offset_src, offset2_src;
+          if (!parse_atomic(intrin, &offset_src, &offset2_src))
+             continue;
++         if (filter && !filter(instr, filter_data))
++            continue;
+ 
+          nir_atomic_op atomic_op = nir_intrinsic_atomic_op(intrin);
+          if (atomic_op == nir_atomic_op_xchg) {
+@@ -335,6 +338,16 @@ opt_uniform_atomics(nir_function_impl *impl, bool fs_atomics_predicated)
+ 
+ bool
+ nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated)
++{
++   return nir_opt_uniform_atomics_filtered(shader, fs_atomics_predicated,
++                                           NULL, NULL);
++}
++
++/* Only the atomics 'filter' accepts (NULL: all). */
++bool
++nir_opt_uniform_atomics_filtered(nir_shader *shader, bool fs_atomics_predicated,
++                                 nir_instr_filter_cb filter,
++                                 const void *filter_data)
+ {
+    bool progress = false;
+ 
+@@ -350,7 +363,8 @@ nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated)
+    nir_foreach_function_impl(impl, shader) {
+       nir_metadata_require(impl, nir_metadata_block_index | nir_metadata_divergence);
+ 
+-      bool impl_progress = opt_uniform_atomics(impl, fs_atomics_predicated);
++      bool impl_progress = opt_uniform_atomics(impl, fs_atomics_predicated,
++                                               filter, filter_data);
+       progress |= nir_progress(impl_progress, impl,
+                                nir_metadata_none);
+    }
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index 4bc191b..f77f183 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1011,6 +1011,113 @@ ir3_nir_lower_io(nir_shader *s)
+ /**
+  * Late passes that need to be done after pscreen->finalize_nir()
+  */
++/* The subgroup lowering options (FEX fex16: shared with the per-variant
++ * lowering of the subgroup operations nir_opt_uniform_atomics makes).
++ */
++static nir_lower_subgroups_options
++ir3_nir_subgroups_options(const struct ir3_compiler *compiler,
++                          const struct ir3_shader_options *shader_options,
++                          mesa_shader_stage stage)
++{
++   unsigned subgroup_size = 0, max_subgroup_size = 0;
++   ir3_shader_get_subgroup_size(compiler, shader_options, stage,
++                                &subgroup_size, &max_subgroup_size);
++
++   nir_lower_subgroups_options options = {
++         .subgroup_size = subgroup_size,
++         .ballot_bit_size = 32,
++         .ballot_components = MAX2(1, max_subgroup_size / 32),
++         .lower_to_scalar = true,
++         .lower_vote_feq = true,
++         .lower_vote_ieq = true,
++         .lower_vote_bool_eq = true,
++         .lower_subgroup_masks = true,
++         .lower_read_invocation_to_cond = true,
++         .lower_shuffle = !compiler->has_shfl,
++         .lower_relative_shuffle = !compiler->has_shfl,
++         .lower_rotate_to_shuffle = !compiler->has_shfl,
++         .lower_rotate_clustered_to_shuffle = true,
++         .lower_inverse_ballot = true,
++         .lower_quad_vote = true,
++         .lower_reduce = true,
++         .filter = ir3_nir_lower_subgroups_filter,
++         .filter_data = compiler,
++   };
++
++   if (!(mesa_shader_stage_is_compute(stage) ||
++         compiler->info->props.has_getfiberid)) {
++      options.subgroup_size = 1;
++      options.lower_vote_trivial = true;
++   }
++   return options;
++}
++
++/* Atomics on buffers in memory only: atomics on workgroup shared memory are
++ * not serialized at the L2 cache, and the reduction may cost more than
++ * it saves there. */
++static bool
++ir3_nir_fex_memory_atomic(const nir_instr *instr, const void *data)
++{
++   (void)data;
++   switch (nir_instr_as_intrinsic(instr)->intrinsic) {
++   case nir_intrinsic_ssbo_atomic:
++   case nir_intrinsic_global_atomic:
++      return true;
++   default:
++      return false;
++   }
++}
++
++static unsigned
++ir3_nir_fex_count_elects(nir_shader *s)
++{
++   unsigned n = 0;
++   nir_foreach_function_impl (impl, s) {
++      nir_foreach_block (block, impl) {
++         nir_foreach_instr (instr, block) {
++            if (instr->type == nir_instr_type_intrinsic &&
++                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_elect)
++               n++;
++         }
++      }
++   }
++   return n;
++}
++
++/* FEX (fex16): atomics whose address is the same for the whole wave become
++ * one atomic per wave (ir3_shader_key::fex_uniform_atomics). D2R's ground
++ * clutter compute shader (1152x1152 cells, ~1.2 ms a frame on a740) bumps one
++ * append counter per placed item; every lane's atomic goes to the same L2
++ * address one after another (atomics on buffers in memory only, not on
++ * workgroup shared memory). nir_opt_uniform_atomics adds the active lanes'
++ * values with a ballot count, lets one elected lane do the atomic, and gives
++ * every lane the returned value plus its place among the active lanes. The
++ * subgroup operations it makes are lowered here like the shader's own were
++ * in ir3_nir_post_finalize (elect, ballot, read-first and getfiberid are ir3
++ * instructions). Returns the atomics changed.
++ */
++static unsigned
++ir3_nir_fex_uniform_atomics(struct ir3_shader_variant *so, nir_shader *s)
++{
++   if (!mesa_shader_stage_is_compute(s->info.stage))
++      return 0;
++
++   const unsigned before = ir3_nir_fex_count_elects(s);
++   bool progress = false;
++   NIR_PASS(progress, s, nir_opt_uniform_atomics_filtered, false,
++            ir3_nir_fex_memory_atomic, NULL);
++   if (!progress)
++      return 0;
++
++   const unsigned made = ir3_nir_fex_count_elects(s) - before;
++   const nir_lower_subgroups_options options =
++      ir3_nir_subgroups_options(so->compiler, &so->shader_options,
++                                s->info.stage);
++   NIR_PASS(_, s, nir_opt_uniform_subgroup, &options);
++   NIR_PASS(_, s, nir_lower_subgroups, &options);
++   return made;
++}
++
+ void
+ ir3_nir_post_finalize(struct ir3_shader *shader)
+ {
+@@ -1073,36 +1180,8 @@ ir3_nir_post_finalize(struct ir3_shader *shader)
+        * it here. Beyond this point nir_intrinsic_load_subgroup_size will return
+        * the "real" subgroup size.
+        */
+-      unsigned subgroup_size = 0, max_subgroup_size = 0;
+-      ir3_shader_get_subgroup_size(compiler, &shader->options, s->info.stage,
+-                                   &subgroup_size, &max_subgroup_size);
+-
+-      nir_lower_subgroups_options options = {
+-            .subgroup_size = subgroup_size,
+-            .ballot_bit_size = 32,
+-            .ballot_components = MAX2(1, max_subgroup_size / 32),
+-            .lower_to_scalar = true,
+-            .lower_vote_feq = true,
+-            .lower_vote_ieq = true,
+-            .lower_vote_bool_eq = true,
+-            .lower_subgroup_masks = true,
+-            .lower_read_invocation_to_cond = true,
+-            .lower_shuffle = !compiler->has_shfl,
+-            .lower_relative_shuffle = !compiler->has_shfl,
+-            .lower_rotate_to_shuffle = !compiler->has_shfl,
+-            .lower_rotate_clustered_to_shuffle = true,
+-            .lower_inverse_ballot = true,
+-            .lower_quad_vote = true,
+-            .lower_reduce = true,
+-            .filter = ir3_nir_lower_subgroups_filter,
+-            .filter_data = compiler,
+-      };
+-
+-      if (!(mesa_shader_stage_is_compute(s->info.stage) ||
+-            compiler->info->props.has_getfiberid)) {
+-         options.subgroup_size = 1;
+-         options.lower_vote_trivial = true;
+-      }
++      const nir_lower_subgroups_options options =
++         ir3_nir_subgroups_options(compiler, &shader->options, s->info.stage);
+ 
+       OPT(s, nir_opt_uniform_subgroup, &options);
+       OPT(s, nir_lower_subgroups, &options);
+@@ -1608,6 +1687,12 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
+    progress |= OPT(s, nir_lower_int64);
+    progress |= OPT(s, nir_lower_64bit_phis);
+ 
++   /* FEX (fex16) */
++   if (so->key.fex_uniform_atomics) {
++      so->fex_uniform_atomics = ir3_nir_fex_uniform_atomics(so, s);
++      progress |= so->fex_uniform_atomics != 0;
++   }
++
+    progress |= OPT(s, ir3_nir_opt_subgroups, so);
+ 
+    if (so->compiler->info->props.load_shader_consts_via_preamble)
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index 2c662be..1bf1b57 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -507,6 +507,14 @@ struct ir3_shader_key {
+           * constants, fewer loads per draw.
+           */
+          unsigned fex_merge_ranges : 1;
++
++         /* FEX (fex16): compute shader atomics on one address for the whole
++          * wave (a counter that each placed item bumps) are done once per
++          * wave: the lanes' sum in one atomic, each lane's slot from the
++          * returned value plus its place among the active lanes
++          * (nir_opt_uniform_atomics, as AMD, Intel and Apple drivers do).
++          */
++         unsigned fex_uniform_atomics : 1;
+       };
+       uint32_t global;
+    };
+@@ -846,6 +854,11 @@ struct ir3_shader_variant {
+     */
+    unsigned fex_loop_prefetches;
+ 
++   /* FEX (fex16): atomics made one per wave (ir3_shader_key::
++    * fex_uniform_atomics).
++    */
++   unsigned fex_uniform_atomics;
++
+    /* Size in bytes of required shared memory */
+    unsigned shared_size;
+ 
+diff --git a/src/freedreno/vulkan/tu_acceleration_structure.cc b/src/freedreno/vulkan/tu_acceleration_structure.cc
+index 6979f90..56dd636 100644
+--- a/src/freedreno/vulkan/tu_acceleration_structure.cc
++++ b/src/freedreno/vulkan/tu_acceleration_structure.cc
+@@ -299,6 +299,7 @@ const struct vk_acceleration_structure_build_ops tu_as_build_ops = {
+ struct tu_saved_compute_state {
+    uint32_t push_constants[MAX_PUSH_CONSTANTS_SIZE / 4];
+    struct tu_shader *compute_shader;
++   bool fex_cs_alt; /* fex16 */
+ };
+ 
+ static void
+@@ -307,6 +308,7 @@ tu_save_compute_state(struct tu_cmd_buffer *cmd,
+ {
+    memcpy(state->push_constants, cmd->push_constants, sizeof(cmd->push_constants));
+    state->compute_shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
++   state->fex_cs_alt = cmd->state.fex.cs_alt;
+ }
+ 
+ static void
+@@ -314,8 +316,11 @@ tu_restore_compute_state(struct tu_cmd_buffer *cmd,
+                          struct tu_saved_compute_state *state)
+ {
+    cmd->state.shaders[MESA_SHADER_COMPUTE] = state->compute_shader;
++   cmd->state.fex.cs_alt = state->fex_cs_alt; /* fex16 */
+    if (state->compute_shader) {
+-      tu_cs_emit_state_ib(&cmd->cs, state->compute_shader->state);
++      tu_cs_emit_state_ib(&cmd->cs, state->fex_cs_alt ?
++                                       state->compute_shader->fex_alt_state :
++                                       state->compute_shader->state);
+    }
+    memcpy(cmd->push_constants, state->push_constants, sizeof(cmd->push_constants));
+    cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 2e37473..76c13dc 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -6021,10 +6021,17 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
+ 
+    if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+-      cmd->state.shaders[MESA_SHADER_COMPUTE] =
+-         pipeline->shaders[MESA_SHADER_COMPUTE];
++      struct tu_shader *cs_shader = pipeline->shaders[MESA_SHADER_COMPUTE];
++      cmd->state.shaders[MESA_SHADER_COMPUTE] = cs_shader;
++      /* fex16: the binary with atomics once per wave in command buffers
++       * begun with TU_FEX_MODE_CS_ALT (tu_fex_cs_variant). */
++      const bool alt = cs_shader->fex_alt_variant &&
++                       (cmd->state.fex.mode & TU_FEX_MODE_CS_ALT);
++      cmd->state.fex.cs_alt = alt;
++      if (cs_shader->fex_alt_variant)
++         cmd->state.fex.cs_binds[alt ? 1 : 0]++;
+       tu_cs_emit_state_ib(&cmd->cs,
+-                          pipeline->shaders[MESA_SHADER_COMPUTE]->state);
++                          alt ? cs_shader->fex_alt_state : cs_shader->state);
+       cmd->state.compute_load_state = pipeline->load_state;
+       return;
+    }
+@@ -8821,6 +8828,17 @@ tu_emit_bindless_base_addresses(struct tu_cs *cs,
+    }
+ }
+ 
++/* fex16: the binary the bound compute shader runs: its second binary
++ * (atomics once per wave) when the bind picked it, which has its own
++ * constant layout and config. */
++static inline const struct ir3_shader_variant *
++tu_fex_cs_variant(const struct tu_cmd_buffer *cmd)
++{
++   const struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
++   return cmd->state.fex.cs_alt && shader->fex_alt_variant ?
++             shader->fex_alt_variant : shader->variant;
++}
++
+ template <chip CHIP>
+ static struct tu_draw_state
+ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
+@@ -8845,19 +8863,20 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
+    }
+ 
+    if (compute) {
++      const struct ir3_shader_variant *cs_variant = tu_fex_cs_variant(cmd); /* fex16 */
+       tu6_emit_per_stage_push_consts(
+          &cs, &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state,
+-         cmd->state.shaders[MESA_SHADER_COMPUTE]->variant->const_state,
++         cs_variant->const_state,
+          MESA_SHADER_COMPUTE, cmd->push_constants);
+       tu_emit_inline_ubo(
+          &cs, &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state,
+-         cmd->state.shaders[MESA_SHADER_COMPUTE]->variant->const_state,
+-         cmd->state.shaders[MESA_SHADER_COMPUTE]->variant->constlen,
++         cs_variant->const_state,
++         cs_variant->constlen,
+          MESA_SHADER_COMPUTE,
+          tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
+       tu_emit_bindless_base_addresses(
+          &cs, &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state,
+-         cmd->state.shaders[MESA_SHADER_COMPUTE]->variant->const_state,
++         cs_variant->const_state,
+          MESA_SHADER_COMPUTE,
+          tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
+    } else {
+@@ -10415,8 +10434,7 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
+                               const struct tu_dispatch_info *info)
+ {
+    mesa_shader_stage type = MESA_SHADER_COMPUTE;
+-   const struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
+-   const struct ir3_shader_variant *variant = shader->variant;
++   const struct ir3_shader_variant *variant = tu_fex_cs_variant(cmd); /* fex16 */
+    const struct ir3_const_state *const_state = variant->const_state;
+    unsigned subgroup_size = variant->info.subgroup_size;
+    unsigned subgroup_shift = util_logbase2(subgroup_size);
+@@ -10603,16 +10621,19 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
+ 
+    struct tu_cs *cs = &cmd->cs;
+    struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
++   /* fex16: the binary the bind picked (stock or atomics once per wave). */
++   const struct ir3_shader_variant *variant = tu_fex_cs_variant(cmd);
+ 
+    bool emit_instrlen_workaround =
+-      shader->variant->instrlen >
++      variant->instrlen >
+       cmd->device->physical_device->info->props.instr_cache_size;
+ 
+    /* We don't use draw states for dispatches, so the bound pipeline
+     * could be overwritten by reg stomping in a renderpass or blit.
+     */
+    if (cmd->device->dbg_renderpass_stomp_cs) {
+-      tu_cs_emit_state_ib(&cmd->cs, shader->state);
++      tu_cs_emit_state_ib(&cmd->cs, cmd->state.fex.cs_alt ?
++                                       shader->fex_alt_state : shader->state);
+       cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+    }
+ 
+@@ -10632,7 +10653,7 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
+     * See https://gitlab.freedesktop.org/mesa/mesa/-/issues/5892
+     */
+    if (emit_instrlen_workaround) {
+-      tu_cs_emit_regs(cs, A6XX_SP_PS_INSTR_SIZE(shader->variant->instrlen));
++      tu_cs_emit_regs(cs, A6XX_SP_PS_INSTR_SIZE(variant->instrlen));
+       tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
+    }
+ 
+@@ -10657,7 +10678,7 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
+ 
+    tu_set_render_mode<CHIP>(cs, {RM6_COMPUTE});
+ 
+-   const uint16_t *local_size = shader->variant->local_size;
++   const uint16_t *local_size = variant->local_size;
+    const uint32_t *num_groups = info->blocks;
+ 
+    if (info->unaligned) {
+@@ -10837,11 +10858,17 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
+          tu_cs_emit(cs, CP_EXEC_CS_3_NGROUPS_Z(DIV_ROUND_UP(info->blocks[2],
+                                                             local_size[2])));
+       } else {
++         /* fex16: time and GPU counters of this dispatch for FEX. */
++         const uint64_t fex_seq =
++            tu_fex_dispatch_begin(cmd, cs, info->blocks, local_size,
++                                  shader->variant->info.instrs_count,
++                                  cmd->state.fex.cs_alt);
+          tu_cs_emit_pkt7(cs, CP_EXEC_CS, 4);
+          tu_cs_emit(cs, 0x00000000);
+          tu_cs_emit(cs, CP_EXEC_CS_1_NGROUPS_X(info->blocks[0]));
+          tu_cs_emit(cs, CP_EXEC_CS_2_NGROUPS_Y(info->blocks[1]));
+          tu_cs_emit(cs, CP_EXEC_CS_3_NGROUPS_Z(info->blocks[2]));
++         tu_fex_dispatch_end(cmd, cs, fex_seq);
+       }
+ 
+       trace_end_compute(&cmd->trace, cs);
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index 5683aca..417754d 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -133,11 +133,15 @@ tu_fex_device_init(struct tu_device *dev)
+       status |= TU_FEX_STATUS_ARM_STATS;
+    }
+    /* fex15: draw setup statistics only into a block that has them. */
+-   if (fex->arm_stats && chan->ext_size >= sizeof(*chan) &&
+-       tu_fex_readable(chan, sizeof(*chan))) {
++   if (fex->arm_stats && chan->ext_size >= TU_FEX_CHANNEL_SETUP_SIZE &&
++       tu_fex_readable(chan, TU_FEX_CHANNEL_SETUP_SIZE)) {
+       fex->setup_stats = true;
+       status |= TU_FEX_STATUS_SETUP_STATS;
+    }
++   /* fex16: compute statistics and dispatch slots likewise. */
++   if (fex->setup_stats && chan->ext_size >= sizeof(*chan) &&
++       tu_fex_readable(chan, sizeof(*chan)))
++      fex->cs_stats = true;
+ 
+    /* Read once: it changes compiled shaders (part of the layout hash). */
+    fex->compile = chan->compile & TU_FEX_COMPILE_MASK;
+@@ -205,6 +209,14 @@ tu_fex_device_init(struct tu_device *dev)
+       fex->cntl_alt = true;
+       status |= TU_FEX_STATUS_CNTL;
+    }
++   /* fex16: ir3 has the subgroup operations it needs (elect, ballot,
++    * read-first, getfiberid) from a6xx on. */
++   if ((fex->compile & TU_FEX_COMPILE_CS_ATOMICS_ALT) &&
++       dev->physical_device->info->chip >= 6 &&
++       dev->physical_device->info->props.has_getfiberid) {
++      fex->cs_atomics_alt = true;
++      status |= TU_FEX_STATUS_CS_ATOMICS;
++   }
+    fex->np_min_preamble = TU_FEX_NOPREAMBLE_MIN;
+    const char *np = getenv("TU_FEX_NOPREAMBLE_MIN"); /* host tests */
+    if (np && *np)
+@@ -300,6 +312,8 @@ tu_fex_device_init(struct tu_device *dev)
+          __atomic_store_n(&chan->ring_cpu, (uint64_t)(uintptr_t)fex->ring_map,
+                           __ATOMIC_RELEASE);
+          status |= TU_FEX_STATUS_RING;
++         if (fex->cs_stats)
++            status |= TU_FEX_STATUS_CS_STATS;
+       } else {
+          status |= TU_FEX_STATUS_RING_FAILED;
+       }
+@@ -434,6 +448,12 @@ tu_fex_end_cmdbuf(struct tu_device *dev, struct tu_fex_cmd_state *st)
+       __atomic_fetch_add(&c->na_binds[1], st->na_binds[1], __ATOMIC_RELAXED);
+       st->na_binds[0] = st->na_binds[1] = 0;
+    }
++   /* fex16 */
++   if (fex->cs_stats && (st->cs_binds[0] | st->cs_binds[1])) {
++      __atomic_fetch_add(&c->cs_binds[0], st->cs_binds[0], __ATOMIC_RELAXED);
++      __atomic_fetch_add(&c->cs_binds[1], st->cs_binds[1], __ATOMIC_RELAXED);
++      st->cs_binds[0] = st->cs_binds[1] = 0;
++   }
+    /* fex14 */
+    if (fex->arm_stats) {
+       for (uint32_t a = 0; a < TU_FEX_FS_ARMS; a++) {
+@@ -560,6 +580,28 @@ tu_fex_count_merge_pipeline(struct tu_device *dev, bool usable)
+    __atomic_fetch_add(&fex->chan->merge_pipes[usable ? 0 : 1], 1, __ATOMIC_RELAXED);
+ }
+ 
++void
++tu_fex_count_cs_alt_shader(struct tu_device *dev, uint32_t atomics,
++                           uint32_t instr_stock, uint32_t instr_alt)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->cs_stats)
++      return;
++   __atomic_fetch_add(&fex->chan->cs_alt_shaders, 1, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&fex->chan->cs_alt_atomics, atomics, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&fex->chan->cs_alt_instr[0], instr_stock, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&fex->chan->cs_alt_instr[1], instr_alt, __ATOMIC_RELAXED);
++}
++
++void
++tu_fex_count_cs_alt_refused(struct tu_device *dev)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->cs_stats)
++      return;
++   __atomic_fetch_add(&fex->chan->cs_alt_refused, 1, __ATOMIC_RELAXED);
++}
++
+ void
+ tu_fex_count_color_clear(struct tu_device *dev, uint64_t pixels)
+ {
+@@ -733,3 +775,66 @@ tu_fex_pass_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint64_t seq)
+ 
+    __atomic_fetch_add(&fex->chan->passes_sampled, 1, __ATOMIC_RELAXED);
+ }
++
++/* fex16: compute dispatches in the same ring as render passes, so FEX can
++ * show their time and counters per shader. Only direct dispatches (the
++ * workgroup counts are known when recording) of at least
++ * TU_FEX_DISPATCH_MIN_GROUPS workgroups. Like passes, each sampled dispatch
++ * waits for the GPU to be idle before and after (two waits). */
++uint64_t
++tu_fex_dispatch_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
++                      const uint32_t groups[3], const uint16_t local_size[3],
++                      uint32_t instrs, bool alt)
++{
++   struct tu_device *dev = cmd->device;
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->ring_map || !fex->cs_stats || !fex->sample_min_draws)
++      return 0;
++   const uint64_t total = (uint64_t)groups[0] * groups[1] * groups[2];
++   if (total < TU_FEX_DISPATCH_MIN_GROUPS)
++      return 0;
++
++   const uint64_t seq =
++      __atomic_fetch_add(&fex->chan->ring_next, 1, __ATOMIC_RELAXED);
++   const uint32_t index = (uint32_t)(seq & (fex->ring_count - 1));
++   struct tu_fex_slot *slot =
++      (struct tu_fex_slot *)(fex->ring_map + (size_t)index * fex->slot_size);
++
++   slot->done = 0;
++   slot->draws = instrs;
++   slot->width = (uint16_t)MIN2(groups[0], 0xffff);
++   slot->height = (uint16_t)MIN2(groups[1], 0xffff);
++   slot->mode = (uint8_t)cmd->state.fex.mode;
++   slot->sysmem = alt ? 2 : 0;
++   slot->colors = (uint8_t)MIN2(groups[2], 254);
++   slot->attachments = TU_FEX_SLOT_DISPATCH;
++   slot->format0 = (uint32_t)(MAX2(local_size[0], 1) - 1) |
++                   (uint32_t)(MAX2(local_size[1], 1) - 1) << 10 |
++                   (uint32_t)(MAX2(local_size[2], 1) - 1) << 20;
++   slot->cmdbuf = cmd->state.fex.cmdbuf_seq;
++   slot->seq = seq;
++
++   tu_fex_emit_sample(dev, fex, cs, fex->ring_iova + (uint64_t)index * fex->slot_size,
++                      false);
++   return seq;
++}
++
++void
++tu_fex_dispatch_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint64_t seq)
++{
++   struct tu_device *dev = cmd->device;
++   struct tu_fex_device *fex = dev->fex;
++   if (!seq || !fex || !fex->ring_map)
++      return;
++
++   const uint32_t index = (uint32_t)(seq & (fex->ring_count - 1));
++   const uint64_t slot_iova = fex->ring_iova + (uint64_t)index * fex->slot_size;
++   tu_fex_emit_sample(dev, fex, cs, slot_iova, true);
++
++   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
++   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 3);
++   tu_cs_emit_qw(cs, slot_iova + offsetof(struct tu_fex_slot, done));
++   tu_cs_emit(cs, (uint32_t)seq);
++
++   __atomic_fetch_add(&fex->chan->dispatches_sampled, 1, __ATOMIC_RELAXED);
++}
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 672c538..4cf7bd0 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -53,6 +53,12 @@
+  *    the driver always writes 0) or 128-pixel waves (TU_FEX_COMPILE_W128_ALT,
+  *    the second binary). The arm a pass was recorded with goes into its
+  *    slot (tu_fex_slot::sysmem bits 4-6).
++ *  - (fex16) TU_FEX_COMPILE_CS_ATOMICS_ALT + TU_FEX_MODE_CS_ALT: compute
++ *    shaders whose atomics hit one address for the whole wave get a second
++ *    binary that does them once per wave, and command buffers begun with the
++ *    mode bit dispatch with it. Direct dispatches of 16 or more workgroups
++ *    get a slot in the counter ring too (tu_fex_slot with attachments
++ *    TU_FEX_SLOT_DISPATCH).
+  * Without the variable (or with a block that fails the checks) the driver
+  * behaves like stock Turnip.
+  *
+@@ -68,7 +74,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 15
++#define TU_FEX_PATCH 16
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -154,8 +160,12 @@
+ #define TU_FEX_FS_ARM_DEFER 6u
+ #define TU_FEX_FS_ARM_EVICT 7u
+ #define TU_FEX_FS_ARMS 8u
++/* fex16: compute shaders that have the binary with atomics once per wave
++ * (TU_FEX_COMPILE_CS_ATOMICS_ALT) dispatch with it. Above the 8 bits a slot
++ * keeps of the mode: dispatch slots carry it in tu_fex_slot::sysmem bit 1. */
++#define TU_FEX_MODE_CS_ALT 0x800u
+ /* Mode bits for command buffers (tu_fex_begin_cmdbuf). */
+-#define TU_FEX_MODE_MASK 0x76fu
++#define TU_FEX_MODE_MASK 0xf6fu
+ /* fex5: the memory budget query reads /proc/meminfo at most every 250 ms and
+  * reuses the last MemAvailable in between (stock: on every call). D3D12 games
+  * ask DXGI for the video memory budget every frame (QueryVideoMemoryInfo); FEX's
+@@ -258,7 +268,19 @@
+  * SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS 0 and EVICT_BUF_MODE 0, for
+  * TU_FEX_MODE_FS_ARM 6 and 7. Not part of the shader keys. */
+ #define TU_FEX_COMPILE_CNTL_ALT 0x800u
+-#define TU_FEX_COMPILE_MASK 0xfffu
++/* fex16: compute shaders with atomics on an address that is the same for
++ * the whole wave get a second binary that does each such atomic once per
++ * wave (ir3_shader_key::fex_uniform_atomics, nir_opt_uniform_atomics): the
++ * active lanes' values summed with a ballot count, one elected lane's
++ * atomic, every lane's result the returned value plus its place among the
++ * active lanes. D2R's ground clutter shader (0e21a3b5088ba1af, 1152x1152
++ * cells, ~1.2 ms a frame) appends each placed item with an atomic add on
++ * one counter: every lane's add goes to the same L2 address after the
++ * other. AMD, Intel and Apple drivers in Mesa run this pass; ir3 does not.
++ * For TU_FEX_MODE_CS_ALT. Part of the shader keys (tu_shader_key::
++ * fex_cs_atomics_alt). */
++#define TU_FEX_COMPILE_CS_ATOMICS_ALT 0x1000u
++#define TU_FEX_COMPILE_MASK 0x1fffu
+ #define TU_FEX_NOALIAS_MIN_INSTRS 1024u
+ #define TU_FEX_NOALIAS_MIN_ALIAS 64u
+ #define TU_FEX_NOPREAMBLE_MIN 32u
+@@ -311,6 +333,11 @@
+ #define TU_FEX_STATUS_CNTL 0x8000000u
+ /* fex15: the draw setup statistics in the channel extension are written */
+ #define TU_FEX_STATUS_SETUP_STATS 0x10000000u
++/* fex16: TU_FEX_COMPILE_CS_ATOMICS_ALT honored */
++#define TU_FEX_STATUS_CS_ATOMICS 0x20000000u
++/* fex16: the compute statistics in the channel extension are written and
++ * direct dispatches get slots in the ring */
++#define TU_FEX_STATUS_CS_STATS 0x40000000u
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -441,6 +468,21 @@ struct tu_fex_channel {
+     * binary, [0] = the pipeline can use it, [1] = it cannot (the pipeline's
+     * constants would not fit with it). */
+    volatile uint32_t merge_pipes[2];
++   /* 0x3d0 (fex16, driver; only when ext_size covers it): compute pipeline
++    * binds whose shader has the binary with atomics once per wave,
++    * [0] = the stock binary bound, [1] = that binary (TU_FEX_MODE_CS_ALT). */
++   volatile uint64_t cs_binds[2];
++   /* 0x3e0: compute shaders made this run that have that binary, the atomics
++    * it does once per wave (0 for shaders loaded from a cache), the
++    * instructions of both binaries ([0] stock, [1] the second), and second
++    * binaries compiled but dropped (needed more private memory). */
++   volatile uint32_t cs_alt_shaders;
++   volatile uint32_t cs_alt_atomics;
++   volatile uint32_t cs_alt_instr[2];
++   volatile uint32_t cs_alt_refused;
++   uint32_t pad_3f4;
++   /* 0x3f8: dispatches that got a slot in the ring */
++   volatile uint64_t dispatches_sampled;
+ };
+ /* Size of the layout before fex11 (what 'size' holds). */
+ #define TU_FEX_CHANNEL_BASE_SIZE 0x2a8u
+@@ -452,10 +494,21 @@ struct tu_fex_channel {
+ #define TU_FEX_CHANNEL_NP_SIZE 0x360u
+ /* Size of the fex14 layout (wave setup statistics). */
+ #define TU_FEX_CHANNEL_ARM_SIZE 0x3a8u
++/* Size of the fex15 layout (draw setup statistics). */
++#define TU_FEX_CHANNEL_SETUP_SIZE 0x3d0u
+ 
+ /* tu_fex_slot::mode bit (fex3): the pass clears a depth/stencil attachment
+  * at its start, so TU_FEX_MODE_DEPTH_CLEAR_3D may change its time. */
+ #define TU_FEX_SLOT_DEPTH_CLEAR 0x80u
++/* fex16: tu_fex_slot::attachments of a dispatch slot. Such a slot has
++ * width/height = workgroups in x/y, colors = workgroups in z (up to 254),
++ * draws = the stock binary's instruction count (the same in both binaries'
++ * slots, to tell shaders apart), format0 = workgroup size: (x - 1) |
++ * (y - 1) << 10 | (z - 1) << 20, sysmem bit 1 = dispatched with the binary
++ * with atomics once per wave, bit 0 = 0. */
++#define TU_FEX_SLOT_DISPATCH 0xffu
++/* fex16: direct dispatches with at least this many workgroups get a slot. */
++#define TU_FEX_DISPATCH_MIN_GROUPS 16u
+ 
+ /* One sampled render pass. FEX reads a slot once done == (uint32_t)seq. */
+ struct tu_fex_slot {
+@@ -502,7 +555,10 @@ static_assert(__builtin_offsetof(struct tu_fex_channel, pair_shaders) == 0x3a0,
+ static_assert(__builtin_offsetof(struct tu_fex_channel, nopre_shaders) == TU_FEX_CHANNEL_ARM_SIZE, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, cntl_shaders) == 0x3c0, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, merge_pipes) == 0x3c8, "layout shared with FEX");
+-static_assert(sizeof(struct tu_fex_channel) == 0x3d0, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, cs_binds) == TU_FEX_CHANNEL_SETUP_SIZE, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, cs_alt_shaders) == 0x3e0, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, dispatches_sampled) == 0x3f8, "layout shared with FEX");
++static_assert(sizeof(struct tu_fex_channel) == 0x400, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
+ 
+ struct tu_device;
+@@ -556,6 +612,11 @@ struct tu_fex_cmd_state {
+    uint32_t na_binds[2];
+    /* fex14: binds of pipelines with wave setups, by TU_FEX_MODE_FS_ARM */
+    uint32_t arm_binds[TU_FEX_FS_ARMS];
++   /* fex16: the bound compute shader runs its second binary (atomics once
++    * per wave; tu_fex_cs_variant) */
++   bool cs_alt;
++   /* fex16: compute binds of shaders with that binary, [0] stock, [1] it */
++   uint32_t cs_binds[2];
+ };
+ 
+ struct tu_fex_device {
+@@ -582,6 +643,8 @@ struct tu_fex_device {
+    bool merge_alt;             /* fex15: TU_FEX_STATUS_MERGE */
+    bool cntl_alt;              /* fex15: TU_FEX_STATUS_CNTL */
+    bool setup_stats;           /* fex15: channel extension covers nopre_shaders.. */
++   bool cs_atomics_alt;        /* fex16: TU_FEX_STATUS_CS_ATOMICS */
++   bool cs_stats;              /* fex16: channel extension covers cs_binds.. */
+    uint32_t counter_count;     /* == chan->counter_count */
+    uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
+    uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];
+@@ -679,6 +742,19 @@ tu_fex_cntl_alt(const struct tu_fex_device *fex)
+    return fex && fex->cntl_alt;
+ }
+ 
++/* fex16: compute shaders with wave-uniform atomics get a second binary that
++ * does them once per wave (false without a channel). */
++static inline bool
++tu_fex_cs_atomics_alt(const struct tu_fex_device *fex)
++{
++   return fex && fex->cs_atomics_alt;
++}
++
++/* fex16 statistics (no-ops without the channel extension). */
++void tu_fex_count_cs_alt_shader(struct tu_device *dev, uint32_t atomics,
++                                uint32_t instr_stock, uint32_t instr_alt);
++void tu_fex_count_cs_alt_refused(struct tu_device *dev);
++
+ /* fex15 statistics (no-ops without the channel extension). */
+ void tu_fex_count_nopre_shader(struct tu_device *dev);
+ void tu_fex_count_merge_shader(struct tu_device *dev, uint32_t ranges_stock,
+@@ -733,6 +809,12 @@ bool tu_fex_available_memory(uint64_t *available);
+  * sampled) to pass to end. Both emit into cs (outside the draw IB). */
+ uint64_t tu_fex_pass_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool sysmem);
+ void tu_fex_pass_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint64_t seq);
++/* fex16: a slot around a direct dispatch of 'groups' workgroups (0 = none). */
++uint64_t tu_fex_dispatch_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
++                               const uint32_t groups[3],
++                               const uint16_t local_size[3],
++                               uint32_t instrs, bool alt);
++void tu_fex_dispatch_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs, uint64_t seq);
+ #endif
+ 
+ #endif /* TU_FEX_H */
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 363c94d..09c1e92 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -3476,14 +3476,22 @@ tu_upload_shader(struct tu_device *dev,
+          fex_alt_iova);
+       shader->fex_alt_state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
+ 
+-      struct tu_fex_noalias_stats sm, sa;
+-      tu_fex_noalias_stats_of(v, &sm);
+-      tu_fex_noalias_stats_of(fex_alt, &sa);
+-      tu_fex_count_noalias(dev, &sm, &sa);
+-      /* fex15: the second binary without any preamble. */
+-      if (ir3_const_state(fex_alt)->push_consts_type == IR3_PUSH_CONSTS_PER_STAGE &&
+-          ir3_const_state(v)->push_consts_type != IR3_PUSH_CONSTS_PER_STAGE)
+-         tu_fex_count_nopre_shader(dev);
++      if (v->type == MESA_SHADER_COMPUTE) {
++         /* fex16: the compute binary with atomics once per wave (the count
++          * is 0 for shaders from a cache). */
++         tu_fex_count_cs_alt_shader(dev, fex_alt->fex_uniform_atomics,
++                                    v->info.instrs_count,
++                                    fex_alt->info.instrs_count);
++      } else {
++         struct tu_fex_noalias_stats sm, sa;
++         tu_fex_noalias_stats_of(v, &sm);
++         tu_fex_noalias_stats_of(fex_alt, &sa);
++         tu_fex_count_noalias(dev, &sm, &sa);
++         /* fex15: the second binary without any preamble. */
++         if (ir3_const_state(fex_alt)->push_consts_type == IR3_PUSH_CONSTS_PER_STAGE &&
++             ir3_const_state(v)->push_consts_type != IR3_PUSH_CONSTS_PER_STAGE)
++            tu_fex_count_nopre_shader(dev);
++      }
+    }
+ 
+    /* fex15: the third binary (one range per root constant buffer). */
+@@ -4042,6 +4050,33 @@ tu_shader_create(struct tu_device *dev,
+       }
+    }
+ 
++   /* fex16: compute shaders once more with wave-uniform atomics done once
++    * per wave, kept when that changed any (TU_FEX_COMPILE_CS_ATOMICS_ALT).
++    * The second binary has its own constants and config (tu_fex_cs_variant);
++    * private memory is set up once for both, so it must need none more. */
++   if (key->fex_cs_atomics_alt && shader->variant &&
++       shader->variant->type == MESA_SHADER_COMPUTE) {
++      struct ir3_shader_key alt_key = *ir3_key;
++      alt_key.fex_uniform_atomics = true;
++      struct ir3_shader_variant *alt =
++         ir3_shader_create_variant(ir3_shader, &alt_key, executable_info);
++      if (alt && alt->fex_uniform_atomics &&
++          alt->pvtmem_size <= shader->variant->pvtmem_size &&
++          (!alt->pvtmem_size ||
++           alt->pvtmem_per_wave == shader->variant->pvtmem_per_wave) &&
++          alt->local_size[0] == shader->variant->local_size[0] &&
++          alt->local_size[1] == shader->variant->local_size[1] &&
++          alt->local_size[2] == shader->variant->local_size[2] &&
++          alt->local_size_variable == shader->variant->local_size_variable) {
++         shader->fex_alt_variant = alt;
++      } else {
++         if (alt && alt->fex_uniform_atomics)
++            tu_fex_count_cs_alt_refused(dev);
++         if (alt)
++            ralloc_free(alt);
++      }
++   }
++
+    ir3_shader_destroy(ir3_shader);
+ 
+    shader->view_mask = key->multiview_mask;
+@@ -4413,6 +4448,7 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
+    key->fex_w128_alt = tu_fex_w128_alt(dev->fex);
+    key->fex_nopre_all_alt = tu_fex_nopre_all_alt(dev->fex);
+    key->fex_merge_alt = tu_fex_merge_alt(dev->fex);
++   key->fex_cs_atomics_alt = tu_fex_cs_atomics_alt(dev->fex);
+ }
+ 
+ void
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 870cbb5..bea8de9 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -78,6 +78,9 @@ struct tu_shader
+     * inputs and outputs as 'variant' (tu_fex_noalias_ok). fex13
+     * (TU_FEX_COMPILE_NOPREAMBLE_ALT): or without preamble, then with its own
+     * constant layout (no more constants than 'variant'). */
++   /* fex16 (TU_FEX_COMPILE_CS_ATOMICS_ALT): for compute shaders, the binary
++    * whose wave-uniform atomics are done once per wave, with its own
++    * constant layout and config (tu_fex_cs_variant picks it at dispatch). */
+    const struct ir3_shader_variant *fex_alt_variant;
+    struct tu_draw_state fex_alt_state;
+    /* fex14 (TU_FEX_COMPILE_PAIR_ALT): 'state' again with
+@@ -185,7 +188,11 @@ struct tu_shader_key {
+    /* fex15: TU_FEX_COMPILE_MERGE_ALT (tu_fex_merge_alt): big fragment
+     * shaders carry a third binary with one range per root constant buffer. */
+    bool fex_merge_alt : 1;
+-   uint32_t padding : 13;
++   /* fex16: TU_FEX_COMPILE_CS_ATOMICS_ALT (tu_fex_cs_atomics_alt): compute
++    * shaders with wave-uniform atomics carry a second binary that does them
++    * once per wave. */
++   bool fex_cs_atomics_alt : 1;
++   uint32_t padding : 12;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 

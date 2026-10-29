@@ -50,6 +50,10 @@
 //    (CompileNoPreAllAlt: push constants loaded by the command processor; FEX sets ModeAltFs with it), 5 a third binary
 //    with one driver-loaded range per root constant buffer (CompileMergeAlt), 6/7 SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS 0 /
 //    EVICT_BUF_MODE 0 (CompileCntlAlt). NopreShaders..MergePipes in the extension (ExtSize 0x3d0).
+//  - (fex16 and later) with CompileCsAtomicsAlt in 'Compile', compute shaders whose memory atomics hit one address for
+//    the whole wave get a second binary that does them once per wave (nir_opt_uniform_atomics), and command buffers
+//    begun with ModeCsAlt dispatch with it. Direct dispatches of 16 or more workgroups get a slot in the ring too
+//    (Slot::Attachments = SlotDispatch). CsBinds..DispatchesSampled in the extension (ExtSize 0x400).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -71,6 +75,9 @@ constexpr uint32_t ModeAltFs = ModeNoAlias;   // fex13 and later: the same bit p
 // fex14 and later: wave setup arm of big fragment shaders (0 stock, 1-3 wave pair mode 1-3, 4 128-pixel waves).
 constexpr uint32_t ModeFsArmShift = 8;
 constexpr uint32_t ModeFsArmMask = 0x700;
+// fex16 and later: compute dispatches use the binary with atomics once per wave (CompileCsAtomicsAlt). Not part of
+// Slot::Mode (8 bits); a dispatch slot has it in Slot::Sysmem bit 1.
+constexpr uint32_t ModeCsAlt = 0x800;
 constexpr uint32_t FsArmW128 = 4;
 // fex15 and later: draw setup arms (4 = the second binary, however it was made).
 constexpr uint32_t FsArmAlt = 4;
@@ -93,6 +100,7 @@ constexpr uint32_t CompileW128Alt = 0x100;      // fex14 and later: their second
 constexpr uint32_t CompileNoPreAllAlt = 0x200;  // fex15 and later: second binary with no preamble at all (push consts by CP)
 constexpr uint32_t CompileMergeAlt = 0x400;     // fex15 and later: third binary, one driver-loaded range per root CBV
 constexpr uint32_t CompileCntlAlt = 0x800;      // fex15 and later: draw states with DEFER_WAVE_ALLOC_DIS 0 / EVICT_BUF_MODE 0
+constexpr uint32_t CompileCsAtomicsAlt = 0x1000; // fex16 and later: compute shaders get a binary with atomics once per wave
 
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
@@ -121,6 +129,8 @@ constexpr uint32_t StatusNoPreAll = 0x2000000;    // fex15 and later: CompileNoP
 constexpr uint32_t StatusMerge = 0x4000000;       // fex15 and later: CompileMergeAlt honored (needs StatusCpUbo)
 constexpr uint32_t StatusCntl = 0x8000000;        // fex15 and later: CompileCntlAlt honored (a7xx)
 constexpr uint32_t StatusSetupStats = 0x10000000; // fex15 and later: NopreShaders..MergePipes in the extension are written
+constexpr uint32_t StatusCsAtomics = 0x20000000;  // fex16 and later: CompileCsAtomicsAlt honored
+constexpr uint32_t StatusCsStats = 0x40000000;    // fex16 and later: CsBinds..DispatchesSampled written, dispatch slots
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -232,6 +242,18 @@ struct Channel {
   volatile uint32_t SetupRefused;
   // 0x3c8: graphics pipelines made whose fragment shader has the third binary: [0] can use it, [1] cannot
   volatile uint32_t MergePipes[2];
+  // 0x3d0 (fex16 and later, driver, only when ExtSize covers it): binds of compute pipelines whose shader has the binary
+  // with atomics once per wave, added at vkEndCommandBuffer; [0] = stock binary bound, [1] = that binary (ModeCsAlt)
+  volatile uint64_t CsBinds[2];
+  // 0x3e0: compute shaders made this run that got that binary, the atomics it made once per wave, instructions of both
+  // binaries ([0] stock, [1] once per wave), and binaries compiled but dropped (other layout or local size)
+  volatile uint32_t CsAltShaders;
+  volatile uint32_t CsAltAtomics;
+  volatile uint32_t CsAltInstr[2];
+  volatile uint32_t CsAltRefused;
+  uint32_t Pad3f4;
+  // 0x3f8: dispatches that got a slot in the ring
+  volatile uint64_t DispatchesSampled;
 };
 // 'Size' = the layout before fex11.
 constexpr uint32_t ChannelBaseSize = 0x2a8;
@@ -243,6 +265,14 @@ constexpr uint32_t ChannelNaSize = 0x358;
 constexpr uint32_t ChannelNpSize = 0x360;
 // The fex14 layout (wave setup counts).
 constexpr uint32_t ChannelArmSize = 0x3a8;
+// The fex15 layout (draw setup counts).
+constexpr uint32_t ChannelSetupSize = 0x3d0;
+
+// Slot::Attachments of a dispatch slot (fex16 and later). Such a slot has Width/Height = workgroups in x/y, Colors =
+// workgroups in z (up to 254), Draws = the stock binary's instruction count (the same in both binaries' slots, to tell
+// shaders apart), Format0 = workgroup size: (x - 1) | (y - 1) << 10 | (z - 1) << 20, Sysmem bit 1 = dispatched with the
+// binary with atomics once per wave, bit 0 = 0, Mode = the low 8 bits of the command buffer's mode.
+constexpr uint8_t SlotDispatch = 0xff;
 
 struct Slot {
   uint64_t Seq;
@@ -287,7 +317,11 @@ static_assert(offsetof(Channel, PairShaders) == 0x3a0);
 static_assert(offsetof(Channel, NopreShaders) == ChannelArmSize);
 static_assert(offsetof(Channel, CntlShaders) == 0x3c0);
 static_assert(offsetof(Channel, MergePipes) == 0x3c8);
-static_assert(sizeof(Channel) == 0x3d0);
+static_assert(offsetof(Channel, CsBinds) == ChannelSetupSize);
+static_assert(offsetof(Channel, CsAltShaders) == 0x3e0);
+static_assert(offsetof(Channel, CsAltRefused) == 0x3f0);
+static_assert(offsetof(Channel, DispatchesSampled) == 0x3f8);
+static_assert(sizeof(Channel) == 0x400);
 static_assert(sizeof(Slot) == 48);
 
 // The channel EnvironmentVariablesHandling set up for this process (FEX_TU_CHANNEL), or nullptr.
@@ -317,4 +351,7 @@ uint32_t WavePairArms();
 // all and arms 5-7 are the fex15 setups (merged constant loads, DEFER_WAVE_ALLOC_DIS 0, EVICT_BUF_MODE 0); false = from
 // FEX_TU_WAVE_PAIR (arm 4 = 128-pixel waves).
 bool DrawSetupArms();
+// FEX_TU_CS_ATOMICS (build 107): 0 stock compute shaders, 1 the binaries with atomics once per wave always, 2 (alt)
+// those in every other second (needs the stats log; without it nothing flips it, so it stays on).
+uint32_t CsAtomicsSwitch();
 } // namespace FEX::Windows::Turnip

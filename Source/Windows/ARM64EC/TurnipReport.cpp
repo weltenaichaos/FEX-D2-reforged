@@ -13,6 +13,7 @@ $end_info$
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -117,6 +118,20 @@ namespace {
     // build 106 additions
     {T::GroupHlsq, 3, "hlsq_sp_fs_stall"},
     {T::GroupHlsq, 39, "hlsq_fs_starving_sp"},
+    // build 107 additions (compute)
+    {T::GroupSp, 1, "sp_alu_working"},
+    {T::GroupSp, 2, "sp_efu_working"},
+    {T::GroupSp, 5, "sp_stall_uche"},
+    {T::GroupSp, 31, "gm_stores"},
+    {T::GroupSp, 32, "gm_atomics"},
+    {T::GroupSp, 45, "addr_locks"},
+    {T::GroupSp, 56, "cs_inst"},
+    {T::GroupSp, 77, "eu_working_cs"},
+    {T::GroupSp, 100, "cs_threads"},
+    {T::GroupHlsq, 0, "hlsq_busy"},
+    {T::GroupHlsq, 1, "hlsq_stall_uche"},
+    {T::GroupHlsq, 10, "hlsq_cs_dispatches"},
+    {T::GroupUche, 15, "l2_write_req_sp"},
   };
 
   fextl::string CounterLabel(uint32_t Group, uint32_t Countable) {
@@ -150,6 +165,37 @@ namespace {
   constexpr size_t MaxKinds = 16;
   // Kinds printed per second, the ones with the most GPU time.
   constexpr size_t PrintKinds = 5;
+
+  // One kind of compute dispatch (driver fex16, slots with T::SlotDispatch): the same shader (its stock binary's
+  // instruction count), workgroup size, and binary (stock, or atomics once per wave). Workgroup counts are summed; the
+  // last grid is kept, with the smallest and biggest workgroup totals seen.
+  struct DispatchKind {
+    uint32_t Instr;
+    uint32_t Local; // Slot::Format0
+    bool Alt;
+    uint16_t Gx, Gy;
+    uint8_t Gz;
+    uint64_t GroupsMin, GroupsMax;
+    uint64_t Dispatches;
+    uint64_t Groups;
+    uint64_t Ticks;
+    uint64_t Values[T::MaxCounters];
+  };
+  constexpr size_t MaxDispatchKinds = 16;
+  constexpr size_t PrintDispatchKinds = 4;
+
+  // Wave cycles (resident wave x cycle) by state: issuing float math (alu), special math (efu), integer math (int),
+  // csp, idle issue slots the compiler put in (nop), waiting for an earlier instruction's result (wait), waiting for
+  // texture/memory results (long-sync) or short results (short-sync), instruction fetch (fetch), flow control
+  // (ctrl), loading inputs (load), sending outputs (emit), ending (end), join, input, output, half-wave wait/sync
+  // (build 103), ready but another wave issued (idle). With 4+ states counted, 'rest' is what none of them covers.
+  constexpr struct {
+    uint32_t Countable;
+    const char* Name;
+  } WaveSplit[] = {{89, "alu"},   {90, "efu"},       {91, "int"},        {92, "csp"},   {19, "nop"},
+                   {20, "wait"},  {24, "long-sync"}, {25, "short-sync"}, {21, "fetch"}, {16, "ctrl"},
+                   {17, "load"},  {18, "emit"},      {23, "end"},        {26, "join"},  {104, "input"},
+                   {105, "output"}, {106, "half-wave wait"}, {107, "half-wave sync"}, {22, "idle"}};
 
   // PassKind::Mode bits: T::ModeChangedOnly, T::ModeSwitch (fex11: pipeline switches sent only what changed),
   // T::ModeNoAlias (fex12: pipelines used the fragment shader binaries without alias.tex), and for
@@ -206,7 +252,7 @@ namespace {
   uint32_t Seconds {};
   uint32_t CurrentMode {};
   uint64_t NextSeq {1};
-  uint64_t Last[16][2] {};
+  uint64_t Last[24][2] {};
   uint32_t NaShadersLast {};   // NaShaders at the last '# turnip: no alias' note
   uint32_t NaRefusedLast {};
   uint64_t BudgetLast[2] {}; // BudgetQueries, BudgetNs at the last report
@@ -214,6 +260,7 @@ namespace {
   uint32_t LoopPrefetchLast[2] {}; // LoopPrefetchLoads, LoopPrefetchShaders at the last report
   uint64_t ArmBindsLast[T::FsArms] {}; // ArmBinds at the last report (fex14)
   uint32_t SetupLast[4] {};            // NopreShaders, MergeShaders, CntlShaders, SetupRefused at the last note (fex15)
+  uint32_t CsAltLast[2] {};            // CsAltShaders, CsAltRefused at the last note (fex16)
 
   bool ReadSlot(uint64_t RingCpu, uint32_t Index, uint32_t SlotSize, uint8_t* Out) {
     SIZE_T Read = 0;
@@ -304,6 +351,19 @@ namespace {
                                       DrawSetup() ? "FEX_TU_DRAW_SETUP" : "FEX_TU_WAVE_PAIR",
                                       (Status & Stats) == Stats ? "" : ", counts NOT written");
     }
+    // fex16: compute shaders with atomics once per wave (FEX_TU_CS_ATOMICS), and the dispatch slots.
+    const uint32_t CsSw = FEX::Windows::Turnip::CsAtomicsSwitch();
+    const char* CsAtomics = !CsSw                               ? "off (FEX_TU_CS_ATOMICS=0)" :
+                            Chan->Patch < 16                    ? "NOT available (driver older than fex16)" :
+                            !(Status & T::StatusCsAtomics)      ? "NOT honored (needs a GPU with getfiberid, like the a740)" :
+                            !(Status & T::StatusCsStats)        ? (CsSw == 2 ? "in every other second (FEX_TU_CS_ATOMICS=alt), counts NOT written" :
+                                                                               "ON (FEX_TU_CS_ATOMICS=1), counts NOT written") :
+                            CsSw == 2                           ? "in every other second (FEX_TU_CS_ATOMICS=alt)" :
+                                                                  "ON (FEX_TU_CS_ATOMICS=1)";
+    const char* Dispatches = Chan->Patch < 16                   ? "not timed (driver older than fex16)" :
+                             !(Status & T::StatusCsStats)       ? "not timed (counts not written)" :
+                             !Chan->SampleMinDraws              ? "not timed (FEX_TU_SAMPLE_DRAWS=0)" :
+                                                                  "direct ones of 16+ workgroups timed and counted";
     const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
                              Chan->Patch < 3                          ? "by the 2D engine: 3D draw NOT available (driver older than fex3)" :
@@ -323,13 +383,12 @@ namespace {
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
       "preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the command processor {}, other root "
       "constant buffer reads through the shaders' UBO table {}, pipeline switches send only what changed {}, lighting shaders "
-      "without alias.tex helpers {}, lighting shaders without preamble {}, lighting shader wave/draw setups {}, depth clears at the start "
-      "of direct passes {}, available "
-      "memory for the "
-      "memory budget {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
+      "without alias.tex helpers {}, lighting shaders without preamble {}, lighting shader wave/draw setups {}, compute atomics once "
+      "per wave {}, compute dispatches {}, depth clears at the start of direct passes {}, available memory for the memory budget {}, "
+      "{} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
       (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, NoAlias, NoPre,
-      WaveSetups, DepthClear,
+      WaveSetups, CsAtomics, Dispatches, DepthClear,
       Budget,
       Chan->CountersReserved,
       Chan->CounterCount,
@@ -427,24 +486,13 @@ namespace {
     if (Has(T::GroupSp, 10) && Has(T::GroupSp, 11)) {
       Line += fextl::fmt::format(", wave life {:.0f} cyc", Ratio(V(T::GroupSp, 10), V(T::GroupSp, 11)));
     }
-    // Wave cycles (resident wave x cycle) by state: issuing float math (alu), special math (efu), integer math (int),
-    // csp, idle issue slots the compiler put in (nop), waiting for an earlier instruction's result (wait), waiting for
-    // texture/memory results (long-sync) or short results (short-sync), instruction fetch (fetch), flow control
-    // (ctrl), loading inputs (load), sending outputs (emit), ending (end), join, input, output, half-wave wait/sync
-    // (build 103), ready but another wave issued (idle). With 4+ states counted, 'rest' is what none of them covers.
+    // Wave cycles by state (WaveSplit).
     const double Waves = V(T::GroupSp, 8);
     if (Waves > 0) {
-      static constexpr struct {
-        uint32_t Countable;
-        const char* Name;
-      } Split[] = {{89, "alu"},   {90, "efu"},       {91, "int"},        {92, "csp"},   {19, "nop"},
-                   {20, "wait"},  {24, "long-sync"}, {25, "short-sync"}, {21, "fetch"}, {16, "ctrl"},
-                   {17, "load"},  {18, "emit"},      {23, "end"},        {26, "join"},  {104, "input"},
-                   {105, "output"}, {106, "half-wave wait"}, {107, "half-wave sync"}, {22, "idle"}};
       fextl::string Parts;
       double Sum = 0;
       int Counted = 0;
-      for (const auto& P : Split) {
+      for (const auto& P : WaveSplit) {
         if (Has(T::GroupSp, P.Countable)) {
           const double Pct = 100.0 * V(T::GroupSp, P.Countable) / Waves;
           Parts += fextl::fmt::format(" {} {:.0f}%", P.Name, Pct);
@@ -591,6 +639,132 @@ namespace {
     return Line + '\n';
   }
 
+  // One compute dispatch kind's line (build 107, driver fex16): time per dispatch, then the shader cores (busy, waves
+  // per busy core, starved by the front end that starts waves), per workgroup (wave cycles = one wave's life for
+  // 64-thread groups, threads, compute instructions), the wave states, memory per dispatch (atomics, stores, address
+  // locks), stalls per cycle, texture latency, then every counter per dispatch.
+  fextl::string DispatchLine(const DispatchKind& K, uint32_t Count) {
+    const double Ms = K.Ticks / 19200.0;
+    const double N = K.Dispatches ? static_cast<double>(K.Dispatches) : 1.0;
+    const double Groups = K.Groups ? static_cast<double>(K.Groups) : 1.0;
+    const auto Has = [&](uint32_t Group, uint32_t Countable) {
+      return FindCounter(Count, Group, Countable) >= 0;
+    };
+    const auto V = [&](uint32_t Group, uint32_t Countable) {
+      const int i = FindCounter(Count, Group, Countable);
+      return i < 0 ? 0.0 : static_cast<double>(K.Values[i]);
+    };
+    const auto Ratio = [](double A, double B) {
+      return B > 0 ? A / B : 0.0;
+    };
+    const uint32_t Lx = (K.Local & 0x3ff) + 1, Ly = ((K.Local >> 10) & 0x3ff) + 1, Lz = ((K.Local >> 20) & 0x3ff) + 1;
+    const fextl::string Grid = K.GroupsMin == K.GroupsMax ?
+                                 fextl::fmt::format("{}x{}x{}", K.Gx, K.Gy, K.Gz) :
+                                 fextl::fmt::format("{:.0f} avg ({}-{}, last {}x{}x{})", static_cast<double>(K.Groups) / N, K.GroupsMin,
+                                                    K.GroupsMax, K.Gx, K.Gy, K.Gz);
+    fextl::string Line = fextl::fmt::format("  turnip dispatch cs{} {}x{}x{} {}: {} dispatches, groups {}, gpu {:.2f} ms ({:.1f} us/dispatch)",
+                                            K.Instr, Lx, Ly, Lz, K.Alt ? "once per wave" : "stock", K.Dispatches, Grid, Ms,
+                                            1000.0 * Ms / N);
+    const double Cycles = V(T::GroupCp, 0);
+    if (Cycles > 0 && K.Ticks) {
+      Line += fextl::fmt::format(" at {:.0f} MHz", Cycles / (K.Ticks / 19.2));
+    }
+    if (!Count) {
+      return Line + '\n';
+    }
+    const double Busy = V(T::GroupSp, 0);
+    if (Cycles > 0 && Has(T::GroupSp, 0)) {
+      Line += fextl::fmt::format(" | cores busy {:.2f}", Busy / Cycles);
+      if (Has(T::GroupSp, 8)) {
+        Line += fextl::fmt::format(", waves per busy core {:.2f}", Ratio(V(T::GroupSp, 8), Busy));
+      }
+      if (Has(T::GroupSp, 69)) {
+        Line += fextl::fmt::format(", cores starved by hlsq {:.2f}", V(T::GroupSp, 69) / Cycles);
+      }
+    }
+    {
+      fextl::string Parts;
+      if (Has(T::GroupSp, 8)) {
+        Parts += fextl::fmt::format("wave cycles {:.0f}", V(T::GroupSp, 8) / Groups);
+      }
+      if (Has(T::GroupSp, 100)) {
+        Parts += fextl::fmt::format("{}threads {:.1f}", Parts.empty() ? "" : ", ", V(T::GroupSp, 100) / Groups);
+      }
+      if (Has(T::GroupSp, 56)) {
+        Parts += fextl::fmt::format("{}cs instructions {:.0f}", Parts.empty() ? "" : ", ", V(T::GroupSp, 56) / Groups);
+      }
+      if (!Parts.empty()) {
+        Line += " | per group: " + Parts;
+      }
+    }
+    const double Waves = V(T::GroupSp, 8);
+    if (Waves > 0) {
+      fextl::string Parts;
+      double Sum = 0;
+      int Counted = 0;
+      for (const auto& P : WaveSplit) {
+        if (Has(T::GroupSp, P.Countable)) {
+          const double Pct = 100.0 * V(T::GroupSp, P.Countable) / Waves;
+          Parts += fextl::fmt::format(" {} {:.0f}%", P.Name, Pct);
+          Sum += Pct;
+          ++Counted;
+        }
+      }
+      if (Counted >= 4) {
+        Parts += fextl::fmt::format(" rest {:.0f}%", 100.0 - Sum);
+      }
+      if (!Parts.empty()) {
+        Line += " | wave cycles" + Parts;
+      }
+    }
+    {
+      static constexpr struct {
+        uint32_t Group, Countable;
+        const char* Name;
+      } Mem[] = {{T::GroupSp, 32, "atomics"}, {T::GroupSp, 31, "stores"}, {T::GroupSp, 45, "address locks"},
+                 {T::GroupUche, 15, "l2 write requests"}};
+      fextl::string Parts;
+      for (const auto& P : Mem) {
+        if (Has(P.Group, P.Countable)) {
+          Parts += fextl::fmt::format("{}{} {:.0f}", Parts.empty() ? "" : ", ", P.Name, V(P.Group, P.Countable) / N);
+        }
+      }
+      if (!Parts.empty()) {
+        Line += " | memory per dispatch: " + Parts;
+      }
+    }
+    if (Cycles > 0) {
+      static constexpr struct {
+        uint32_t Group, Countable;
+        const char* Name;
+      } PerCycle[] = {{T::GroupSp, 1, "alu working"},        {T::GroupSp, 2, "efu working"}, {T::GroupSp, 77, "eu working cs"},
+                      {T::GroupSp, 5, "cores stalled on l2"}, {T::GroupSp, 4, "cores stalled on tp"},
+                      {T::GroupHlsq, 0, "hlsq busy"},         {T::GroupHlsq, 1, "hlsq stalled on l2"}};
+      fextl::string Parts;
+      for (const auto& P : PerCycle) {
+        if (Has(P.Group, P.Countable)) {
+          Parts += fextl::fmt::format("{}{} {:.2f}", Parts.empty() ? "" : ", ", P.Name, V(P.Group, P.Countable) / Cycles);
+        }
+      }
+      if (!Parts.empty()) {
+        Line += " | per cycle: " + Parts;
+      }
+    }
+    if (Has(T::GroupSp, 119) && Has(T::GroupSp, 120)) {
+      Line += fextl::fmt::format(" | tex latency {:.0f} cyc", Ratio(V(T::GroupSp, 119), V(T::GroupSp, 120)));
+    }
+    Line += "; per dispatch:";
+    for (uint32_t i = 0; i < Count; ++i) {
+      const auto& C = Chan->Counters[i];
+      if (C.Reg) {
+        const double Per = static_cast<double>(K.Values[i]) / N;
+        Line += Per < 10.0 ? fextl::fmt::format(" {} {:.3f}", CounterLabel(C.Group, C.Countable), Per) :
+                             fextl::fmt::format(" {} {:.0f}", CounterLabel(C.Group, C.Countable), Per);
+      }
+    }
+    return Line + '\n';
+  }
+
   fextl::string Lines() {
     const uint32_t Status = __atomic_load_n(&Chan->Status, __ATOMIC_ACQUIRE);
     // Pick the mode for the next second first, so the flip happens at a steady pace. With both switches on alt the
@@ -607,7 +781,8 @@ namespace {
     const uint32_t ArmCount = static_cast<uint32_t>(__builtin_popcount(Arms));
     const bool ArmRotate = ArmCount > 1;
     const bool AltFlip = (NoAliasSw == 2 || NoPreSw == 2) && !ArmOwnsAlt();
-    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2 || AltFlip || ArmRotate) {
+    const uint32_t CsSw = FEX::Windows::Turnip::CsAtomicsSwitch();
+    if (DescSw == 2 || ClearSw == 2 || PipeSw == 2 || AltFlip || CsSw == 2 || ArmRotate) {
       ++Seconds;
       uint32_t Mode = CurrentMode;
       // Each alternating switch takes the next bit of the second count, so every combination gets seconds of its own.
@@ -631,6 +806,11 @@ namespace {
         // the ones without preamble (driver fex13).
         const bool On = (Seconds >> Bit++) & 1;
         Mode = (Mode & ~T::ModeNoAlias) | (On ? T::ModeNoAlias : 0);
+      }
+      if (CsSw == 2) {
+        // Build 107: compute dispatches use the binaries with atomics once per wave (driver fex16) in odd seconds.
+        const bool On = (Seconds >> Bit++) & 1;
+        Mode = (Mode & ~T::ModeCsAlt) | (On ? T::ModeCsAlt : 0);
       }
       if (ArmRotate) {
         // Build 105: the wave setups asked for (FEX_TU_WAVE_PAIR), build 106 the draw setups (FEX_TU_DRAW_SETUP), the
@@ -825,6 +1005,31 @@ namespace {
       }
     }
 
+    // Compute atomics once per wave (fex16 and later): binds of compute pipelines whose shader has the second binary, with
+    // the stock binary or that one, as recorded this second, this run's shaders with it, and dispatches that got a slot.
+    // A note gives both binaries' totals whenever new ones were made.
+    if (Chan->Patch >= 16 && (Status & T::StatusCsStats)) {
+      uint64_t CsBinds[2], Sampled[2];
+      Delta(16, Chan->CsBinds, CsBinds);
+      const uint64_t SampledNow[2] = {Chan->DispatchesSampled, 0};
+      Delta(17, SampledNow, Sampled);
+      const uint32_t Shaders = Chan->CsAltShaders, Refused = Chan->CsAltRefused;
+      if (CsSw != 0 || CsBinds[0] || CsBinds[1] || Sampled[0]) {
+        Out += fextl::fmt::format("  turnip: compute atomics once per wave {} this second | binds stock {} once per wave {} | shaders {} "
+                                  "refused {} | dispatches sampled {}\n",
+                                  (ModeThisSecond & T::ModeCsAlt) ? "on" : "off", CsBinds[0], CsBinds[1], Shaders, Refused, Sampled[0]);
+      }
+      if (Shaders != CsAltLast[0] || Refused != CsAltLast[1]) {
+        CsAltLast[0] = Shaders;
+        CsAltLast[1] = Refused;
+        const uint32_t I0 = Chan->CsAltInstr[0], I1 = Chan->CsAltInstr[1];
+        FEX::Windows::StatsLogNote(fextl::fmt::format(
+          "turnip: compute atomics once per wave: {} compute shaders have a second binary ({} atomics made once per wave), "
+          "instructions stock -> second {} -> {} ({:+.1f}%); {} dropped (other layout or workgroup size)",
+          Shaders, Chan->CsAltAtomics, I0, I1, I0 ? 100.0 * (static_cast<double>(I1) - static_cast<double>(I0)) / I0 : 0.0, Refused));
+      }
+    }
+
     // Depth clears at the start of passes that may run direct, as recorded (fex3 and later): by the 2D engine or a 3D draw,
     // and of the 3D draws the ones without fragment shader (fast Z, fex4 and later).
     if (Chan->Patch >= 3 && (ClearSw != 0 || Clears[1] != 0)) {
@@ -879,6 +1084,9 @@ namespace {
     PassKind Kinds[MaxKinds];
     size_t KindCount = 0;
     PassKind Other {};
+    DispatchKind DKinds[MaxDispatchKinds];
+    size_t DKindCount = 0;
+    DispatchKind DOther {};
     const uint64_t End = __atomic_load_n(&Chan->RingNext, __ATOMIC_ACQUIRE);
     if (End > NextSeq + RingCount) {
       NextSeq = End - RingCount;
@@ -901,6 +1109,43 @@ namespace {
         continue;
       }
       ++NextSeq;
+      const uint64_t* Values = reinterpret_cast<const uint64_t*>(Buffer + sizeof(T::Slot));
+      if (S.Attachments == T::SlotDispatch && Chan->Patch >= 16) {
+        // Build 107: a compute dispatch (driver fex16).
+        const bool Alt = (S.Sysmem & 2) != 0;
+        const uint64_t G = static_cast<uint64_t>(S.Width) * S.Height * S.Colors;
+        DispatchKind* D = nullptr;
+        for (size_t i = 0; i < DKindCount; ++i) {
+          if (DKinds[i].Instr == S.Draws && DKinds[i].Local == S.Format0 && DKinds[i].Alt == Alt) {
+            D = &DKinds[i];
+            break;
+          }
+        }
+        if (!D) {
+          D = DKindCount < MaxDispatchKinds ? &DKinds[DKindCount++] : &DOther;
+          if (D != &DOther) {
+            *D = {};
+            D->Instr = S.Draws;
+            D->Local = S.Format0;
+            D->Alt = Alt;
+            D->GroupsMin = G;
+          }
+        }
+        D->Gx = S.Width;
+        D->Gy = S.Height;
+        D->Gz = S.Colors;
+        D->GroupsMin = std::min(D->GroupsMin, G);
+        D->GroupsMax = std::max(D->GroupsMax, G);
+        D->Dispatches++;
+        D->Groups += G;
+        D->Ticks += S.TsEnd - S.TsBegin;
+        for (uint32_t i = 0; i < Count; ++i) {
+          if (Chan->Counters[i].Reg) {
+            D->Values[i] += Values[Count + i] - Values[i];
+          }
+        }
+        continue;
+      }
       const uint8_t SlotMode = KindMode(S);
       PassKind* K = nullptr;
       for (size_t i = 0; i < KindCount; ++i) {
@@ -925,7 +1170,6 @@ namespace {
       K->Passes++;
       K->Draws += S.Draws;
       K->Ticks += S.TsEnd - S.TsBegin;
-      const uint64_t* Values = reinterpret_cast<const uint64_t*>(Buffer + sizeof(T::Slot));
       for (uint32_t i = 0; i < Count; ++i) {
         if (Chan->Counters[i].Reg) {
           K->Values[i] += Values[Count + i] - Values[i];
@@ -953,6 +1197,35 @@ namespace {
     }
     if (Other.Passes) {
       Out += fextl::fmt::format("  turnip pass other: {} passes, {} draws, gpu {:.1f} ms\n", Other.Passes, Other.Draws, Other.Ticks / 19200.0);
+    }
+
+    // Compute dispatch kinds (build 107), the ones with the most GPU time first, and all of them summed.
+    if (DKindCount || DOther.Dispatches) {
+      DispatchKind* DOrder[MaxDispatchKinds];
+      uint64_t AllDispatches = DOther.Dispatches, AllTicks = DOther.Ticks;
+      for (size_t i = 0; i < DKindCount; ++i) {
+        DOrder[i] = &DKinds[i];
+        AllDispatches += DKinds[i].Dispatches;
+        AllTicks += DKinds[i].Ticks;
+      }
+      for (size_t i = 1; i < DKindCount; ++i) {
+        for (size_t j = i; j > 0 && DOrder[j]->Ticks > DOrder[j - 1]->Ticks; --j) {
+          std::swap(DOrder[j], DOrder[j - 1]);
+        }
+      }
+      uint64_t RestDispatches = DOther.Dispatches, RestTicks = DOther.Ticks;
+      for (size_t i = PrintDispatchKinds; i < DKindCount; ++i) {
+        RestDispatches += DOrder[i]->Dispatches;
+        RestTicks += DOrder[i]->Ticks;
+      }
+      Out += fextl::fmt::format("  turnip dispatches: {} sampled, gpu {:.2f} ms ({} kinds)", AllDispatches, AllTicks / 19200.0, DKindCount);
+      if (RestDispatches) {
+        Out += fextl::fmt::format(" | not listed below: {} dispatches, {:.2f} ms", RestDispatches, RestTicks / 19200.0);
+      }
+      Out += '\n';
+      for (size_t i = 0; i < DKindCount && i < PrintDispatchKinds; ++i) {
+        Out += DispatchLine(*DOrder[i], Count);
+      }
     }
     return Out;
   }

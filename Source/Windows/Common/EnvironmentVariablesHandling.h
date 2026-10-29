@@ -139,7 +139,10 @@ namespace FEX::Windows {
 //                          pass began, and an identical push keeps its old copy; alt = on in every other second, so
 //                          one run compares both ways (needs the stats log, without it alt stays on)
 //   FEX_TU_COUNTERS=1      reserve 24 GPU counters through KGSL and record them around big passes (the D2R default up
-//                          to build 75, 0 in builds 76-101, 1 again in build 102 with a lighting pass list: every wave
+//                          to build 75, 0 in builds 76-101, 1 again in build 102; build 107: a compute list for the
+//                          dispatches (busy, occupancy, launches, compute instructions and threads, every big wave
+//                          state, memory atomics, stores and address locks, stalls on the L2 cache and texture unit,
+//                          texture latency); build 102 a lighting pass list: every wave
 //                          state, wave life, texture instructions, texture unit busy and latency, shader cores unable
 //                          to send texture requests, L1 and L2 cache misses for textures; build 103: every wave
 //                          state counter (float/special/integer math, csp, nops, waits, fetch, flow control, input
@@ -260,8 +263,9 @@ namespace FEX::Windows {
 //                          stats log nothing rotates, so the first setup in the list stays.
 //                          Build 106: default 0 (build 105: 128-pixel waves +12% slower, pair modes no reliable gain);
 //                          only read when FEX_TU_DRAW_SETUP=0.
-//   FEX_TU_DRAW_SETUP=alt  (the D2R default from build 106, driver fex15 and later, a7xx) big fragment shaders (1,024+
-//                          instructions, D2R's lighting shaders) run with another draw setup each second, in turn:
+//   FEX_TU_DRAW_SETUP=4    (the D2R default from build 107; alt in build 106; driver fex15 and later, a7xx) big
+//                          fragment shaders (1,024+ instructions, D2R's lighting shaders) run with another draw setup
+//                          each second, in turn:
 //                          0 stock, 4 a second binary with no preamble at all (push constants loaded by the command
 //                          processor before each draw, the fragment stage not reading the shared constant registers),
 //                          5 a third binary with one constant load per root constant buffer instead of one per range,
@@ -272,7 +276,18 @@ namespace FEX::Windows {
 //                          (1-3 = FEX_TU_WAVE_PAIR's pair modes), one digit = that setup always, 0 = off. With setup 4 in
 //                          the list, the second binary's mode bit follows the rotation. Read once at device creation
 //                          (one-time recompile of those shaders). Without the stats log nothing rotates, so the first
-//                          setup in the list stays.
+//                          setup in the list stays. Build 107: 4 always (build 106: the binary with no preamble raised
+//                          lighting draw overlap 10% and cut the lighting pass about 5%; the others did not help).
+//   FEX_TU_CS_ATOMICS=alt  (the D2R default from build 107, driver fex16 and later) compute shaders whose memory atomics
+//                          hit one address for the whole wave get a second binary that does each such atomic once per
+//                          wave (one lane adds the wave's total, every lane gets its own slot back), as AMD's, Intel's
+//                          and Apple's Mesa drivers do and Turnip didn't. In D2R that is the ground clutter shader
+//                          (0e21a3b5088ba1af, a 1152x1152 grid, about 1.2 ms a frame, the biggest compute job): every
+//                          item it places appends itself to one list with an atomic add on one counter. alt = that
+//                          binary in every other second, so one run compares both ways (needs the stats log, without it
+//                          alt stays on); 1 = always; 0 = stock. Read once at device creation (one-time recompile of
+//                          compute shaders). With FEX_TU_SAMPLE_DRAWS above 0, every direct dispatch of 16 or more
+//                          workgroups is timed and counted too ('turnip dispatch' lines; two GPU waits for idle each).
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }
