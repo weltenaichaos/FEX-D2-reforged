@@ -22,6 +22,7 @@ $end_info$
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <ntstatus.h>
 #include <string_view>
 #include <windef.h>
@@ -397,6 +398,80 @@ namespace {
            CapGridNote(true);
   }
 
+  // GameNative's frame generation layer writes stats.txt next to its conf.toml every 500 ms: shown and base frame rates
+  // and per-stage times per real frame (lsfg-vk-android writeStats). FEX's D2R build (tools/lsfg/, layer 7, build 112)
+  // adds its present thread's: call_ms (time inside the game's vkQueuePresentKHR, VKD3D holds its VkQueue there),
+  // defer_* (real frames presented from the layer's thread: late after their slot, time in vkQueuePresentKHR, the game's
+  // present/acquire waiting for that thread) and gen_drawn_* (generated frames waiting until the GPU drew them, presented
+  // late after their slot). A 'framegen' line shows it once a second while it changes.
+  struct FramegenState {
+    fextl::string Path; // empty: not known yet
+    char Last[2048];
+  };
+  FramegenState Framegen {};
+
+  fextl::string FramegenLine() {
+    namespace Linux = FEX::Windows::Linux;
+    if (Grid.ConfigPath.empty() || !Grid.LayerLoaded) {
+      return {};
+    }
+    if (Framegen.Path.empty()) {
+      const size_t Slash = Grid.ConfigPath.rfind('/');
+      Framegen.Path = (Slash == fextl::string::npos ? fextl::string {} : Grid.ConfigPath.substr(0, Slash + 1)) + "stats.txt";
+    }
+    static char Text[2048];
+    if (Linux::ReadSmallFile(Framegen.Path.c_str(), Text, sizeof(Text)) <= 0 || !strcmp(Text, Framegen.Last)) {
+      return {};
+    }
+    strcpy(Framegen.Last, Text);
+
+    struct Field {
+      std::string_view Key, Value;
+    };
+    Field Fields[48];
+    size_t Count = 0;
+    std::string_view All {Text};
+    while (!All.empty() && Count < std::size(Fields)) {
+      const size_t End = All.find('\n');
+      const std::string_view Line = All.substr(0, End);
+      All = End == std::string_view::npos ? std::string_view {} : All.substr(End + 1);
+      const size_t Eq = Line.find('=');
+      if (Eq != std::string_view::npos) {
+        Fields[Count++] = {Line.substr(0, Eq), Line.substr(Eq + 1)};
+      }
+    }
+    const auto Get = [&](std::string_view Key) -> std::string_view {
+      for (size_t i = 0; i < Count; ++i) {
+        if (Fields[i].Key == Key) {
+          return Fields[i].Value;
+        }
+      }
+      return {};
+    };
+    const auto Num = [&](std::string_view Key) {
+      return atof(fextl::string(Get(Key)).c_str());
+    };
+    const std::string_view Seq = Get("seq").substr(0, 48);
+
+    if (Get("layer").empty()) {
+      return fextl::fmt::format("framegen (a layer without FEX's present thread): {:.1f} FPS shown from {:.1f}, work {:.2f} ms, generated "
+                                "frames slept {:.2f} late {:.2f} ms, presents generated {:.2f} real {:.2f} ms, skipped {}, seq {}\n",
+                                Num("fps"), Num("base"), Num("work_ms"), Num("gen_sleep_ms"), Num("gen_late_ms"), Num("gen_present_ms"),
+                                Num("real_present_ms"), Get("gen_skips"), Seq);
+    }
+    return fextl::fmt::format("framegen ({}): {:.1f} FPS shown from {:.1f} (x{}, limit {}, flow {}, {}), work {:.2f} ms, game's present "
+                              "held {:.2f} ms; present thread {}: real frames {} late {:.2f} present {:.2f} ms, generated {} drawn wait "
+                              "{:.2f} late {:.2f} present {:.2f} ms (drawn wait {}), the game waited for it: present {:.2f} acquire {:.2f} "
+                              "ms; skipped {}, not drawn in 100 ms {}, inline {}, errors {}; inline presents generated {:.2f} real {:.2f} "
+                              "ms; seq {}\n",
+                              Get("layer"), Num("fps"), Num("base"), Get("multiplier"), Get("fps_limit"), Get("flow_scale"),
+                              Get("performance") == "1" ? "performance mode" : "quality mode", Num("work_ms"), Num("call_ms"),
+                              Get("defer"), Get("defer_frames"), Num("defer_late_ms"), Num("defer_present_ms"), Get("defer_gen_frames"),
+                              Num("gen_drawn_wait_ms"), Num("gen_drawn_late_ms"), Num("defer_gen_present_ms"), Get("gen_drawn"),
+                              Num("defer_wait_ms"), Num("defer_acquire_wait_ms"), Get("gen_skips"), Get("gen_drawn_timeouts"),
+                              Get("defer_inline"), Get("defer_errors"), Num("gen_present_ms"), Num("real_present_ms"), Seq);
+  }
+
   enum class ReadResult { Gone, Unchanged, New };
 
   // Copies the report's text into Text when vkd3d published a new one since the last call.
@@ -689,6 +764,9 @@ namespace {
     } else if (Announced && ++Grid.Calls % 5 == 0) {
       Out += CapGridNote(false);
       Out += WriteCapGrid();
+    }
+    if (Announced) {
+      Out += FramegenLine();
     }
     CopyLines(Out);
     return Out;

@@ -99,6 +99,14 @@ namespace {
     // session: 37 FPS at a 40 FPS cap, every 4th frame one refresh long (also seen in builds 89, 92 and 93) (see
     // ARM64EC/Vkd3dReport.cpp).
     {"FEX_VKD3D_CAP_GRID", "1"},
+    // Build 112: GameNative's frame generation layer, FEX's D2R build (tools/lsfg/, layer 7). At 2x from a 30 FPS limit it
+    // slept ~17 ms of every frame in the game's vkQueuePresentKHR before the real frame, with VKD3D holding its only
+    // VkQueue, so every submit of the game waited (the build 55 problem again). The layer now presents the frame from its
+    // own thread and the game's present returns at once. Its generated frame also went to the window system before the
+    // GPU drew it (GameNative's window system shows an image as soon as it gets it, see FEX_VKD3D_PRESENT_DRAWN); it now
+    // waits on that thread until drawn. 0 turns either off (LSFG_D2R_DEFER / LSFG_D2R_GEN_DRAWN in the Unix environment).
+    {"FEX_LSFG_DEFER", "1"},
+    {"FEX_LSFG_GEN_DRAWN", "1"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -462,6 +470,8 @@ namespace {
     "FEX_VKD3D_CAP_PRESLEEP",
     "FEX_VKD3D_FRAME_START",
     "FEX_VKD3D_CAP_GRID",
+    "FEX_LSFG_DEFER",
+    "FEX_LSFG_GEN_DRAWN",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",

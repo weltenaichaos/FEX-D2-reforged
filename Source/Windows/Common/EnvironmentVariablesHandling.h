@@ -179,6 +179,18 @@ namespace FEX::Windows {
 //                        before the draw's waves may start
 //   FEX_TU_NOPREAMBLE=lit  that second binary always
 //
+// GameNative's frame generation layer, FEX's D2R build (build 112, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7). It
+// reads these from the Unix environment (__wine_set_unix_env) at its first present; FEX only sets them to turn one off:
+//   FEX_LSFG_DEFER=1       (the D2R default) the layer presents a frame (the generated one and the real one) from a thread
+//                          of its own, and the game's vkQueuePresentKHR returns at once. Before, it slept there until the
+//                          real frame's slot (~17 ms a frame at 2x from 30) while VKD3D held its only VkQueue. The game's
+//                          next present and acquire wait until that thread is done. 0 = LSFG_D2R_DEFER=0, as before.
+//   FEX_LSFG_GEN_DRAWN=1   (the D2R default, with FEX_LSFG_DEFER and multiplier 2) a generated frame goes out only once
+//                          the GPU drew it (GameNative's window system shows an image as soon as it gets it, see
+//                          FEX_VKD3D_PRESENT_DRAWN). 0 = LSFG_D2R_GEN_DRAWN=0.
+// The layer writes stats.txt next to its conf.toml every 500 ms; with the stats log a 'framegen' line shows it each second
+// (ARM64EC/Vkd3dReport.cpp).
+//
 // FEX's Turnip build (build 69, turnip-patches/, Common/TurnipChannel.h). Stock Turnip writes SP_UPDATE_CNTL with all 8
 // bindless sets on every descriptor update, which drops the GPU's descriptor caches of every set; vkd3d keeps the root
 // constant buffers in a push descriptor set and pushes it before nearly every draw, so each draw of a fight's main pass

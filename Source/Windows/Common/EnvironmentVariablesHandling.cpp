@@ -409,6 +409,30 @@ namespace {
                               (Arms & (1u << Turnip::FsArmW128)) ? "; the second binary's mode bit follows setup 128-pixel waves" : "");
   }
 
+  // See EnvironmentVariablesHandling.h: the frame generation layer's own defaults are on; FEX only turns one off.
+  void SetupLsfgSwitches(FARPROC SetUnixEnv) {
+    struct LsfgSwitch {
+      const char* Name;
+      const char* Variable;
+      const char* What;
+    };
+    static constexpr LsfgSwitch Switches[] = {
+      {"FEX_LSFG_DEFER", "LSFG_D2R_DEFER", "frames presented inside the game's vkQueuePresentKHR, as before layer 7"},
+      {"FEX_LSFG_GEN_DRAWN", "LSFG_D2R_GEN_DRAWN", "generated frames presented without waiting until the GPU drew them"},
+    };
+    for (const auto& S : Switches) {
+      if (!SwitchOff(Switch(S.Name))) {
+        continue;
+      }
+      if (!SetUnixEnv) {
+        StatsLogNote(fextl::fmt::format("framegen: this Wine has no __wine_set_unix_env, {}=0 can't be set", S.Variable));
+        continue;
+      }
+      reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv)(S.Variable, "0");
+      StatsLogNote(fextl::fmt::format("framegen: {}=0 -> {}=0: {}", S.Name, S.Variable, S.What));
+    }
+  }
+
   // See EnvironmentVariablesHandling.h and TurnipChannel.h. The driver reads TU_FEX_CHANNEL when the game's Vulkan
   // device is created; a stock Turnip ignores it.
   void SetupTurnipChannel(FARPROC SetUnixEnv) {
@@ -751,6 +775,7 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
   SetupTurnipNoPreamble(Sym);
   SetupTurnipChannel(Sym);
+  SetupLsfgSwitches(Sym);
 
   // On an ARM system we are expecting uncached memory to have marked overhead due to atomic memory usage.
   // If `tu_override_uncached_as_cache_coherent` isn't already controlled by the user, then set it here.
