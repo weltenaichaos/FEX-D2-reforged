@@ -179,7 +179,7 @@ namespace FEX::Windows {
 //                        before the draw's waves may start
 //   FEX_TU_NOPREAMBLE=lit  that second binary always
 //
-// GameNative's frame generation layer, FEX's D2R build (build 113, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7). It
+// GameNative's frame generation layer, FEX's D2R build (build 113, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7-8). It
 // reads these from the Unix environment (__wine_set_unix_env) at its first present. From build 114 FEX sets them to 0 or 1
 // only in the game (where the switch has a value): build 113 set 0 in Steam, which has no D2R defaults, and the game
 // inherited it (the '# framegen:' note says what the variable was when the game started):
@@ -190,6 +190,11 @@ namespace FEX::Windows {
 //   FEX_LSFG_GEN_DRAWN=1   (the D2R default, with FEX_LSFG_DEFER and multiplier 2) a generated frame goes out only once
 //                          the GPU drew it (GameNative's window system shows an image as soon as it gets it, see
 //                          FEX_VKD3D_PRESENT_DRAWN). 0 = LSFG_D2R_GEN_DRAWN=0.
+//   FEX_LSFG_EARLY=1       (the D2R default from build 115, layer 8, with both above and multiplier 2) a frame's copy and
+//                          frame generation start at the game's submit that blits the frame into its swapchain image
+//                          (the first submit waiting on the semaphore of the game's acquire), ahead of the game's next
+//                          frame on the GPU, instead of in the game's present after VKD3D's cap pre-sleep (build 114 run:
+//                          generated frames ~11 ms late). The swapchain gets one image more. 0 = LSFG_D2R_EARLY=0.
 // The layer writes stats.txt next to its conf.toml every 500 ms; with the stats log a 'framegen' line shows it each second
 // (ARM64EC/Vkd3dReport.cpp).
 //

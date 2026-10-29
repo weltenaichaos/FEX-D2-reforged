@@ -494,13 +494,16 @@ namespace {
                               "held {:.2f} ms; present thread {}: real frames {} late {:.2f} present {:.2f} ms, generated {} drawn wait "
                               "{:.2f} late {:.2f} present {:.2f} ms (drawn wait {}), the game waited for it: present {:.2f} acquire {:.2f} "
                               "ms; skipped {}, not drawn in 100 ms {}, inline {}, errors {}; inline presents generated {:.2f} real {:.2f} "
-                              "ms; seq {}\n",
+                              "ms; frames start at the game's blit {}: {} frames, {:.2f} ms before its present, {:.2f} ms in its "
+                              "submit, no free image {}, let go {}; seq {}\n",
                               Get("layer"), Num("fps"), Num("base"), Get("multiplier"), Get("fps_limit"), Get("flow_scale"),
                               Get("performance") == "1" ? "performance mode" : "quality mode", Num("work_ms"), Num("call_ms"),
                               Get("defer"), Get("defer_frames"), Num("defer_late_ms"), Num("defer_present_ms"), Get("defer_gen_frames"),
                               Num("gen_drawn_wait_ms"), Num("gen_drawn_late_ms"), Num("defer_gen_present_ms"), Get("gen_drawn"),
                               Num("defer_wait_ms"), Num("defer_acquire_wait_ms"), Get("gen_skips"), Get("gen_drawn_timeouts"),
-                              Get("defer_inline"), Get("defer_errors"), Num("gen_present_ms"), Num("real_present_ms"), Seq);
+                              Get("defer_inline"), Get("defer_errors"), Num("gen_present_ms"), Num("real_present_ms"),
+                              Get("early").empty() ? std::string_view {"-"} : Get("early"), Get("early_frames"),
+                              Num("early_lead_ms"), Num("early_work_ms"), Get("early_no_image"), Get("early_dropped"), Seq);
   }
 
   enum class ReadResult { Gone, Unchanged, New };

@@ -443,6 +443,8 @@ namespace {
     static constexpr LsfgSwitch Switches[] = {
       {"FEX_LSFG_DEFER", "LSFG_D2R_DEFER", "frames presented inside the game's vkQueuePresentKHR, as before layer 7"},
       {"FEX_LSFG_GEN_DRAWN", "LSFG_D2R_GEN_DRAWN", "generated frames presented without waiting until the GPU drew them"},
+      {"FEX_LSFG_EARLY", "LSFG_D2R_EARLY",
+       "a frame's copy and frame generation start in the game's present, after VKD3D's cap pre-sleep, as up to layer 7"},
     };
     for (const auto& S : Switches) {
       const char* Value = Switch(S.Name);

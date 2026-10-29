@@ -1,5 +1,5 @@
 diff --git a/include/context.hpp b/include/context.hpp
-index ae382de..27b6174 100644
+index ae382de..d52ebe9 100644
 --- a/include/context.hpp
 +++ b/include/context.hpp
 @@ -20,6 +20,11 @@
@@ -14,7 +14,7 @@ index ae382de..27b6174 100644
  ///
  /// This class is the frame generation context. There should be one instance per swapchain.
  ///
-@@ -69,12 +74,27 @@ class LsContext {
+@@ -69,12 +74,47 @@ class LsContext {
      ///
      VkResult presentPassthrough(VkQueue queue, const VkPresentInfoKHR* pPresentInfo);
  
@@ -29,6 +29,26 @@ index ae382de..27b6174 100644
 +    ///
 +    VkResult takeDeferred(bool fromAcquire);
 +
++    ///
++    /// D2R layer 8: start a frame's copy and frame generation from the game's
++    /// submit that blits it into its swapchain image (VKD3D does that right
++    /// after acquiring the image), so they reach the GPU ahead of the game's
++    /// next frame. The game's present of that image then only paces the frame
++    /// and hands its presents over. False when it doesn't start the frame
++    /// (the game's semaphore is then untouched). The present thread must be
++    /// idle (the game's acquire waited for it).
++    ///
++    bool prepareEarly(const Hooks::DeviceInfo& info, VkQueue queue,
++        VkSemaphore gameSemaphore, uint32_t imageIdx);
++    /// Whether a frame started early and waits for the game's present.
++    [[nodiscard]] bool hasEarly() const;
++    /// A present that doesn't go through present(): the early frame's
++    /// generated presents go out now, and its copy's semaphore replaces the
++    /// game's semaphore it used up.
++    void dropEarly(std::vector<VkSemaphore>& semaphores);
++    /// LSFG_D2R_EARLY (on unless it starts with 0).
++    static bool earlyOn();
++
      // Non-copyable, trivially moveable and destructible
      LsContext(const LsContext&) = delete;
      LsContext& operator=(const LsContext&) = delete;
@@ -42,7 +62,7 @@ index ae382de..27b6174 100644
  private:
      VkSwapchainKHR swapchain;
      std::vector<VkImage> swapchainImages;
-@@ -118,10 +138,23 @@ class LsContext {
+@@ -118,10 +158,23 @@ class LsContext {
      uint64_t statsWorkNs{0};        // copy fence wait + framegen + waitIdle
      uint64_t statsGenSleepNs{0};    // slept before generated presents
      uint64_t statsGenLateNs{0};     // generated present lateness vs its slot
@@ -66,7 +86,7 @@ index ae382de..27b6174 100644
  
      void dumpFrameImages(const Hooks::DeviceInfo& info, uint32_t presentIdx);
      int dumpDoneFrames{0};          // presents already dumped (debug_dump)
-@@ -141,6 +174,65 @@ class LsContext {
+@@ -141,6 +194,91 @@ class LsContext {
          std::vector<Mini::CommandBuffer> postCopyBufs; // copy from out_n to swapchain image
          std::vector<Mini::Semaphore> postCopySemaphores; // signal when postCopyBuf is done
          std::vector<Mini::Semaphore> prevPostCopySemaphores; // signal for previous postCopyBuf
@@ -126,12 +146,57 @@ index ae382de..27b6174 100644
 +        uint64_t errors{0};
 +    };
 +private:
++    // D2R layer 8: a frame started at the game's blit submit (prepareEarly)
++    struct EarlyFrame {
++        bool ready{false};
++        uint32_t presentIdx{};         // the game's image it was started for
++        VkSemaphore gameSemaphore{};   // the blit's semaphore, used up by the copy
++        uint64_t frameIdx{};
++        std::array<DeferJob, 4> genJobs{}; // generated presents (slots set by present())
++        std::array<uint32_t, 4> genIndex{}; // their generated frame numbers
++        uint32_t genCount{0};
++        int lastPresentedGen{-1};
++        int64_t preparedNs{0};
++    };
++    EarlyFrame early;
++    bool earlyOff{false};            // a mismatch turned it off for this swapchain
++    uint64_t statsEarlyFrames{0};    // frames presented from an early start
++    uint64_t statsEarlyLeadNs{0};    // early start to the game's present call
++    uint64_t statsEarlyWorkNs{0};    // time of the early starts (in the game's submit)
++    uint64_t statsEarlyNoImage{0};   // generated frames without a free image at the early start
++    uint64_t statsEarlyDropped{0};   // early frames a present outside present() let go
++
++    bool startFrameWork(const Hooks::DeviceInfo& info, VkQueue queue,
++        const std::vector<VkSemaphore>& gameRenderSemaphores, uint32_t presentIdx,
++        uint64_t fenceTimeoutNs, bool countTimeouts, bool& started);
++    void recordGenCopy(const Hooks::DeviceInfo& info, size_t i, uint32_t imageIdx,
++        uint32_t presentIdx);
++
 +    // Declared last: destroyed first, so a pending present goes out before
 +    // the semaphores and images it uses. Shared with the thread, because the
 +    // context itself is moved into the hooks' map.
 +    std::shared_ptr<DeferState> defer;
 +#endif
  };
+diff --git a/include/hooks.hpp b/include/hooks.hpp
+index e38212c..073a798 100644
+--- a/include/hooks.hpp
++++ b/include/hooks.hpp
+@@ -19,4 +19,14 @@ namespace Hooks {
+     /// Map of hooked Vulkan functions.
+     extern std::unordered_map<std::string, PFN_vkVoidFunction> hooks;
+ 
++    /// D2R layer 8: the semaphore the game's last vkAcquireNextImageKHR
++    /// signals while a frame can start early, else VK_NULL_HANDLE.
++    VkSemaphore earlyArmedSemaphore();
++    /// The game submitted work that waits on that semaphore (VKD3D: the blit
++    /// into the acquired image) and signals releaseSemaphore (VK_NULL_HANDLE:
++    /// not exactly one): start that frame's copy and framegen now. Called
++    /// after the submit, without the layer queue lock.
++    void earlyBlitSubmitted(VkQueue queue, VkSemaphore acquireSemaphore,
++        VkSemaphore releaseSemaphore);
++
+ }
 diff --git a/include/layer.hpp b/include/layer.hpp
 index 2990194..22471f4 100644
 --- a/include/layer.hpp
@@ -163,7 +228,7 @@ index 2990194..22471f4 100644
      /// Call to the original vkQueueSubmit function.
      VkResult ovkQueueSubmit(
 diff --git a/src/context.cpp b/src/context.cpp
-index 2385454..2707988 100644
+index 2385454..194d2bf 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
 @@ -47,6 +47,9 @@ bool LsContext::isStale() const {
@@ -176,7 +241,7 @@ index 2385454..2707988 100644
  
  namespace {
      // Every GPU wait is bounded so an incompatible sync path degrades to
-@@ -245,6 +248,26 @@ namespace {
+@@ -245,6 +248,33 @@ namespace {
          double workMs, genSleepMs, genLateMs, genPresentMs, realPresentMs;
          uint64_t genSkips;
          std::string seq;
@@ -200,16 +265,23 @@ index 2385454..2707988 100644
 +        int fpsLimit;
 +        float flowScale;
 +        bool performance;
++        // layer 8
++        bool earlyOn;             // frames start at the game's blit submit
++        uint64_t earlyFrames;     // real frames presented from an early start
++        double earlyLeadMs;       // per such frame: early start to the game's present call
++        double earlyWorkMs;       // per such frame: time of the early start in the game's submit
++        uint64_t earlyNoImage;    // generated frames without a free image at the early start
++        uint64_t earlyDropped;    // early frames a present outside the frame path let go
      };
  
      void writeStats(const std::filesystem::path& configFile, double fps, double baseFps,
-@@ -259,11 +282,269 @@ namespace {
+@@ -259,11 +289,290 @@ namespace {
              << "\ngen_present_ms=" << d.genPresentMs
              << "\nreal_present_ms=" << d.realPresentMs
              << "\ngen_skips=" << d.genSkips
 -            << "\nseq=" << d.seq << '\n';
 +            << "\nseq=" << d.seq
-+            << "\nlayer=d2r-7"
++            << "\nlayer=d2r-8"
 +            << "\ncall_ms=" << d.callMs
 +            << "\ndefer=" << (d.deferOn ? "on" : "off")
 +            << "\ndefer_frames=" << d.deferFrames
@@ -228,7 +300,13 @@ index 2385454..2707988 100644
 +            << "\nmultiplier=" << d.multiplier
 +            << "\nfps_limit=" << d.fpsLimit
 +            << "\nflow_scale=" << d.flowScale
-+            << "\nperformance=" << (d.performance ? 1 : 0) << '\n';
++            << "\nperformance=" << (d.performance ? 1 : 0)
++            << "\nearly=" << (d.earlyOn ? "on" : "off")
++            << "\nearly_frames=" << d.earlyFrames
++            << "\nearly_lead_ms=" << d.earlyLeadMs
++            << "\nearly_work_ms=" << d.earlyWorkMs
++            << "\nearly_no_image=" << d.earlyNoImage
++            << "\nearly_dropped=" << d.earlyDropped << '\n';
 +    }
 +
 +    // D2R: the real frame's present waits for its slot on a thread of the
@@ -253,6 +331,21 @@ index 2385454..2707988 100644
 +        }();
 +        return on;
 +    }
++
++    // LSFG_D2R_EARLY=0: a frame's copy and framegen start in the game's
++    // present, as up to layer 7, instead of at the game's submit that blits
++    // the frame into its swapchain image (FEX: FEX_LSFG_EARLY=0).
++    bool earlyEnabled() {
++        static const bool on = [] {
++            const char* v = std::getenv("LSFG_D2R_EARLY");
++            return !(v && v[0] == '0');
++        }();
++        return on;
++    }
++
++    // The early start's acquire of the generated frame's image runs in the
++    // game's submit (VKD3D holds its queue there): a short bound.
++    constexpr uint64_t kEarlyAcquireTimeoutNs = 20'000'000ULL;
 +
 +    int deferNice() {
 +        static const int nice = [] {
@@ -474,7 +567,7 @@ index 2385454..2707988 100644
  LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          VkExtent2D extent, const std::vector<VkImage>& swapchainImages)
          : swapchain(swapchain), swapchainImages(swapchainImages),
-@@ -318,7 +599,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -318,7 +627,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
      // Android: single-device framegen on the game's own device and queue —
      // two ICDs interpret shared AHB memory differently and scramble it.
  
@@ -484,7 +577,7 @@ index 2385454..2707988 100644
  
      const VkImageUsageFlags sharedUsage = VK_IMAGE_USAGE_STORAGE_BIT
          | VK_IMAGE_USAGE_SAMPLED_BIT
-@@ -333,7 +616,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -333,7 +644,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          this->out_n.emplace_back(Mini::Image::createDeviceLocal(info.device, info.physicalDevice,
              extent, format, sharedUsage, VK_IMAGE_ASPECT_COLOR_BIT));
  
@@ -494,7 +587,7 @@ index 2385454..2707988 100644
  
      const auto shaderLoader = [](const std::string& name) {
          // debug override: override_<name>.spv next to conf.toml (brackets -> underscores)
-@@ -364,22 +649,24 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -364,22 +677,24 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          return spirv;
      };
      if (conf.performance)
@@ -521,18 +614,20 @@ index 2385454..2707988 100644
      if (conf.performance)
          ctxId = LSFG_3_1P::createContextFromImages(
              this->frame_0.handle(), this->frame_1.handle(),
-@@ -431,7 +718,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -431,7 +746,11 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
              throw LSFG::vulkan_error(VK_TIMEOUT, "Timed out initializing shared image layouts");
      }
  
 -    std::cerr << "lsfg-vk: single-device framegen context created (id=" << ctxId << ")\n";
 +    std::cerr << "lsfg-vk: single-device framegen context created (id=" << ctxId
-+        << ", D2R layer 7, real frame presented " << (deferEnabled() ? "from the layer's present thread" : "inline")
++        << ", D2R layer 8, real frame presented " << (deferEnabled() ? "from the layer's present thread" : "inline")
++        << ", frames start " << (earlyEnabled() && deferEnabled() && genDrawnEnabled() && conf.multiplier == 2
++            ? "at the game's blit submit" : "in the game's present")
 +        << ")\n";
  
  #else
      // Desktop Linux path: use OPAQUE_FD-based image sharing
-@@ -500,6 +789,10 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -500,6 +819,10 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          pass.postCopyBufs.resize(conf.multiplier - 1);
          pass.postCopySemaphores.resize(conf.multiplier - 1);
          pass.prevPostCopySemaphores.resize(conf.multiplier - 1);
@@ -543,7 +638,7 @@ index 2385454..2707988 100644
      }
  }
  
-@@ -524,7 +817,17 @@ void LsContext::paceBaseFrame(int fpsLimit) {
+@@ -524,7 +847,17 @@ void LsContext::paceBaseFrame(int fpsLimit) {
          const int64_t stepNs = std::max<int64_t>(1,
              (targetNs + this->vsyncPeriodNs / 2) / this->vsyncPeriodNs) * this->vsyncPeriodNs;
          int64_t due = this->pacerNextDueNs;
@@ -562,16 +657,78 @@ index 2385454..2707988 100644
              due = this->vsyncPhaseNs
                  + ((entryNs - this->vsyncPhaseNs) / stepNs + 1) * stepNs;
          }
-@@ -739,6 +1042,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
- #ifdef __ANDROID__
-     // Android path: synchronous frame generation using waitIdle()
-     // instead of OPAQUE_FD semaphore export which Turnip doesn't support.
-+    const int64_t callStartNs = nowNs();
+@@ -731,64 +1064,81 @@ VkResult LsContext::presentPassthrough(VkQueue queue, const VkPresentInfoKHR* pP
+ #endif
+ }
  
-     // Base frame-rate limiter (see paceBaseFrame): the on-screen rate becomes
-     // fps_limit * multiplier.
-@@ -789,6 +1093,52 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
-         return passRes;
+-VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, VkQueue queue,
+-        const std::vector<VkSemaphore>& gameRenderSemaphores, uint32_t presentIdx) {
++#ifdef __ANDROID__
++// Steps 1-3 of a frame: the copy of the game's image and the framegen submit.
++// False (nothing submitted) when the copy of the frame before isn't done
++// within fenceTimeoutNs. 'started' says whether the game's semaphores were
++// waited on (used up) when it throws.
++bool LsContext::startFrameWork(const Hooks::DeviceInfo& info, VkQueue queue,
++        const std::vector<VkSemaphore>& gameRenderSemaphores, uint32_t presentIdx,
++        uint64_t fenceTimeoutNs, bool countTimeouts, bool& started) {
+     const auto& conf = Config::activeConf;
+     auto& pass = this->passInfos.at(this->frameIdx % 8);
+-
+-#ifdef __ANDROID__
+-    // Android path: synchronous frame generation using waitIdle()
+-    // instead of OPAQUE_FD semaphore export which Turnip doesn't support.
+-
+-    // Base frame-rate limiter (see paceBaseFrame): the on-screen rate becomes
+-    // fps_limit * multiplier.
+-    startWatchdog();
+-    this->paceBaseFrame(conf.fpsLimit);
+-
+-    // Track the delivered real-frame interval as an EWMA. A cap is a ceiling,
+-    // not a promise on base performance, so generated-frame spacing follows
+-    // the measured cadence.
+-    if (this->lastRealPresentNs != 0 && this->pacerAnchorNs > this->lastRealPresentNs) {
+-        const uint64_t delta = static_cast<uint64_t>(
+-            this->pacerAnchorNs - this->lastRealPresentNs);
+-        // a delta this large is a pause/resume, not a slow frame
+-        if (delta > 250'000'000ull)
+-            this->baseIntervalEwmaNs = 0;
+-        else
+-            this->baseIntervalEwmaNs = this->baseIntervalEwmaNs == 0
+-                ? delta : (this->baseIntervalEwmaNs * 7 + delta) / 8;
+-    }
+-    this->lastRealPresentNs = this->pacerAnchorNs;
++    started = false;
+ 
+     // If the previous frame's copy still hasn't signaled, the sync path is
+     // stuck; pass the frame through untouched. Enough consecutive timeouts
+     // disable framegen for this swapchain entirely.
+     setStage("copy fence wait");
+-    const auto fenceRes = this->preCopyFence.wait(kSyncFenceTimeoutNs);
++    const auto fenceRes = this->preCopyFence.wait(fenceTimeoutNs);
+     setStage("idle");
+     if (fenceRes == VK_SUCCESS)
+         this->copyFenceTimeouts = 0;
+     if (fenceRes != VK_SUCCESS) {
+-        if (++this->copyFenceTimeouts >= kMaxFenceTimeouts && !this->forceDisabled) {
++        if (countTimeouts && ++this->copyFenceTimeouts >= kMaxFenceTimeouts && !this->forceDisabled) {
+             this->forceDisabled = true;
+             std::cerr << "lsfg-vk: disabling frame generation for this swapchain after "
+                 << this->copyFenceTimeouts << " consecutive copy fence timeouts\n";
+         }
+-        const VkPresentInfoKHR passInfo{
+-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+-            .pNext = pNext,
+-            .waitSemaphoreCount = static_cast<uint32_t>(gameRenderSemaphores.size()),
+-            .pWaitSemaphores = gameRenderSemaphores.data(),
+-            .swapchainCount = 1,
+-            .pSwapchains = &this->swapchain,
+-            .pImageIndices = &presentIdx,
+-        };
+-        setStage("fence-timeout passthrough present");
+-        const auto passRes = Layer::ovkQueuePresentKHR(queue, &passInfo);
+-        setStage("idle");
+-        return passRes;
++        return false;
      }
      this->preCopyFence.reset();
 +    if (this->frameIdx == 0 && !this->dbgQueryPool && Layer::lsfgDebug()) {
@@ -646,7 +803,15 @@ index 2385454..2707988 100644
      pass.preCopyBuf.end();
  
      std::vector<VkSemaphore> gameRenderSemaphores2 = gameRenderSemaphores;
-@@ -846,6 +1205,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -839,6 +1198,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+         { pass.preCopySemaphores.at(0).handle(),
+           pass.preCopySemaphores.at(1).handle() },
+         this->preCopyFence.handle());
++    started = true; // the game's semaphores are used up now
+     const int64_t workStartNs = nowNs();
+ 
+     // 2. Tell framegen to generate intermediary frames. Graph-side fence
+@@ -846,6 +1206,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      std::vector<int> noOutSems;  // empty
      setStage("framegen submit");
      try {
@@ -654,7 +819,286 @@ index 2385454..2707988 100644
          if (conf.performance)
              LSFG_3_1P::presentContext(*this->lsfgCtxId, -1, noOutSems);
          else
-@@ -880,9 +1240,24 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -871,6 +1232,278 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+     if (conf.debugDump > 0 && this->dumpDoneFrames < conf.debugDump
+             && !this->dumpFailed)
+         this->dumpFrameImages(info, presentIdx);
++    return true;
++}
++
++// The copy of generated frame i (out_n) into the swapchain image imageIdx.
++void LsContext::recordGenCopy(const Hooks::DeviceInfo& info, size_t i, uint32_t imageIdx,
++        uint32_t presentIdx) {
++    const auto& conf = Config::activeConf;
++    auto& pass = this->passInfos.at(this->frameIdx % 8);
++    const uint32_t dbgSlot = static_cast<uint32_t>(this->frameIdx % 8);
++    pass.postCopySemaphores.at(i) = Mini::Semaphore(info.device);
++    pass.prevPostCopySemaphores.at(i) = Mini::Semaphore(info.device);
++    pass.postCopyBufs.at(i) = Mini::CommandBuffer(info.device, this->cmdPool);
++    pass.postCopyBufs.at(i).begin();
++    {
++        VkCommandBuffer cmd = pass.postCopyBufs.at(i).handle();
++        // debug_inputs: 1 = previous-frame input image, 2 = the real
++        // swapchain image itself (pure same-format round trip)
++        VkImage genSrc = this->out_n.at(i).handle();
++        if (conf.debugInputs == 1)
++            genSrc = this->frameIdx % 2 == 0
++                ? this->frame_1.handle() : this->frame_0.handle();
++        else if (conf.debugInputs == 2)
++            genSrc = this->swapchainImages.at(presentIdx);
++        imageBarrier(cmd, genSrc,
++            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++            conf.debugInputs == 2 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL,
++            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        if (this->dbgQueryPool && i == 0)
++            this->dbgCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                this->dbgQueryPool, dbgSlot * 3 + 2);
++        imageBarrier(cmd, this->swapchainImages.at(imageIdx),
++            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
++            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++        blitFull(cmd, genSrc,
++            this->swapchainImages.at(imageIdx),
++            this->extent.width, this->extent.height);
++        imageBarrier(cmd, genSrc,
++            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++            conf.debugInputs == 2 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL);
++        imageBarrier(cmd, this->swapchainImages.at(imageIdx),
++            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
++            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
++    }
++    pass.postCopyBufs.at(i).end();
++}
++#endif
++
++bool LsContext::earlyOn() {
++#ifdef __ANDROID__
++    return earlyEnabled();
++#else
++    return false;
++#endif
++}
++
++bool LsContext::hasEarly() const {
++#ifdef __ANDROID__
++    return this->early.ready;
++#else
++    return false;
++#endif
++}
++
++bool LsContext::prepareEarly(const Hooks::DeviceInfo& info, VkQueue queue,
++        VkSemaphore gameSemaphore, uint32_t imageIdx) {
++#ifdef __ANDROID__
++    const auto& conf = Config::activeConf;
++    if (this->early.ready || this->earlyOff || this->forceDisabled || !earlyEnabled()
++            || !deferEnabled() || !genDrawnEnabled() || conf.multiplier != 2
++            || queue != info.queue.second || imageIdx >= this->swapchainImages.size()
++            || this->isStale())
++        return false;
++    if (this->defer) {
++        DeferState& s = *this->defer;
++        const std::lock_guard<std::mutex> lk(s.lock);
++        if (s.jobNext < s.jobCount)
++            return false;
++    }
++    const int64_t startNs = nowNs();
++    startWatchdog();
++    const std::vector<VkSemaphore> sems{ gameSemaphore };
++    bool started = false;
++    bool framegen = false;
++    try {
++        // the copy of the frame before finished long ago; don't wait for it
++        // here, where the game holds its queue
++        framegen = this->startFrameWork(info, queue, sems, imageIdx, 0, false, started);
++    } catch (const std::exception& e) {
++        setStage("idle");
++        std::cerr << "lsfg-vk: early frame start: " << e.what() << '\n';
++    }
++    if (!started)
++        return false;
++
++    EarlyFrame& e = this->early;
++    e = EarlyFrame{};
++    e.ready = true;
++    e.presentIdx = imageIdx;
++    e.gameSemaphore = gameSemaphore;
++    e.frameIdx = this->frameIdx;
++    auto& pass = this->passInfos.at(this->frameIdx % 8);
++    if (framegen) {
++        try {
++            for (size_t i = 0; i < static_cast<size_t>(conf.multiplier - 1); i++) {
++                pass.acquireSemaphores.at(i) = Mini::Semaphore(info.device);
++                uint32_t genIdx{};
++                setStage("early gen acquire");
++                const auto res = Layer::ovkAcquireNextImageKHR(info.device, this->swapchain,
++                    kEarlyAcquireTimeoutNs, pass.acquireSemaphores.at(i).handle(),
++                    VK_NULL_HANDLE, &genIdx);
++                setStage("idle");
++                if (res == VK_TIMEOUT || res == VK_NOT_READY) {
++                    // parked, as in present()
++                    this->retiredSemaphores.emplace_back(
++                        std::move(pass.acquireSemaphores.at(i)));
++                    this->statsGenSkips++;
++                    this->statsEarlyNoImage++;
++                    continue;
++                }
++                if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
++                    throw LSFG::vulkan_error(res, "Failed to acquire next swapchain image");
++                if (this->statsSeq.size() < 200)
++                    this->statsSeq += 'a' + static_cast<char>(genIdx % 26);
++                this->recordGenCopy(info, i, genIdx, imageIdx);
++                // presented once drawn, as in present() (its fence is from 8
++                // frames ago; still busy: presented without that wait)
++                const bool drawn = pass.genDrawnFence.wait(0) == VK_SUCCESS;
++                if (drawn)
++                    pass.genDrawnFence.reset();
++                pass.postCopyBufs.at(i).submit(info.queue.second,
++                    { pass.acquireSemaphores.at(i).handle() },
++                    { pass.postCopySemaphores.at(i).handle(),
++                      pass.prevPostCopySemaphores.at(i).handle() },
++                    drawn ? pass.genDrawnFence.handle() : VK_NULL_HANDLE);
++                DeferJob job{
++                    .queue = queue,
++                    .swapchain = this->swapchain,
++                    .imageIdx = genIdx,
++                    .waitCount = 1,
++                };
++                job.waits.at(0) = pass.postCopySemaphores.at(i).handle();
++                job.gen = true;
++                job.hasDrawn = drawn;
++                if (drawn)
++                    job.drawn = pass.genDrawnFence;
++                e.genIndex.at(e.genCount) = static_cast<uint32_t>(i);
++                e.genJobs.at(e.genCount++) = job;
++                e.lastPresentedGen = static_cast<int>(i);
++            }
++        } catch (const std::exception& ex) {
++            setStage("idle");
++            std::cerr << "lsfg-vk: early frame start, generated frame: " << ex.what() << '\n';
++        }
++    }
++    e.preparedNs = nowNs();
++    this->statsEarlyWorkNs += static_cast<uint64_t>(e.preparedNs - startNs);
++    return true;
++#else
++    (void)info; (void)queue; (void)gameSemaphore; (void)imageIdx;
++    return false;
++#endif
++}
++
++void LsContext::dropEarly(std::vector<VkSemaphore>& semaphores) {
++#ifdef __ANDROID__
++    if (!this->early.ready)
++        return;
++    this->early.ready = false;
++    auto& pass = this->passInfos.at(this->early.frameIdx % 8);
++    for (auto& sem : semaphores)
++        if (sem == this->early.gameSemaphore)
++            sem = pass.preCopySemaphores.at(0).handle();
++    // its generated frames hold swapchain images: out with them now
++    for (uint32_t j = 0; j < this->early.genCount; j++)
++        runDeferJob(this->early.genJobs.at(j), true);
++    this->statsEarlyDropped++;
++    this->frameIdx++;
++#else
++    (void)semaphores;
++#endif
++}
++
++VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, VkQueue queue,
++        const std::vector<VkSemaphore>& gameRenderSemaphores, uint32_t presentIdx) {
++    const auto& conf = Config::activeConf;
++    auto& pass = this->passInfos.at(this->frameIdx % 8);
++
++#ifdef __ANDROID__
++    // Android path: synchronous frame generation using waitIdle()
++    // instead of OPAQUE_FD semaphore export which Turnip doesn't support.
++    const int64_t callStartNs = nowNs();
++
++    // Base frame-rate limiter (see paceBaseFrame): the on-screen rate becomes
++    // fps_limit * multiplier.
++    startWatchdog();
++    this->paceBaseFrame(conf.fpsLimit);
++
++    // Track the delivered real-frame interval as an EWMA. A cap is a ceiling,
++    // not a promise on base performance, so generated-frame spacing follows
++    // the measured cadence.
++    if (this->lastRealPresentNs != 0 && this->pacerAnchorNs > this->lastRealPresentNs) {
++        const uint64_t delta = static_cast<uint64_t>(
++            this->pacerAnchorNs - this->lastRealPresentNs);
++        // a delta this large is a pause/resume, not a slow frame
++        if (delta > 250'000'000ull)
++            this->baseIntervalEwmaNs = 0;
++        else
++            this->baseIntervalEwmaNs = this->baseIntervalEwmaNs == 0
++                ? delta : (this->baseIntervalEwmaNs * 7 + delta) / 8;
++    }
++    this->lastRealPresentNs = this->pacerAnchorNs;
++
++    // D2R layer 8: this frame's copy and framegen may have started already,
++    // at the game's submit that blitted it into its swapchain image
++    // (prepareEarly), ahead of the game's next frame on the GPU.
++    bool fromEarly = false;
++    if (this->early.ready) {
++        if (this->early.presentIdx == presentIdx && this->early.frameIdx == this->frameIdx
++                && gameRenderSemaphores.size() == 1
++                && gameRenderSemaphores.front() == this->early.gameSemaphore) {
++            this->early.ready = false;
++            fromEarly = true;
++            this->statsEarlyFrames++;
++            if (callStartNs > this->early.preparedNs)
++                this->statsEarlyLeadNs += static_cast<uint64_t>(callStartNs - this->early.preparedNs);
++        } else {
++            // not the frame that blit was for: what started goes out, this
++            // frame untouched, and no frame starts early again
++            this->earlyOff = true;
++            std::cerr << "lsfg-vk: early frame start was for image " << this->early.presentIdx
++                << ", the game presents image " << presentIdx << ": early start off\n";
++            std::vector<VkSemaphore> sems = gameRenderSemaphores;
++            this->dropEarly(sems);
++            const VkPresentInfoKHR passInfo{
++                .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
++                .pNext = pNext,
++                .waitSemaphoreCount = static_cast<uint32_t>(sems.size()),
++                .pWaitSemaphores = sems.data(),
++                .swapchainCount = 1,
++                .pSwapchains = &this->swapchain,
++                .pImageIndices = &presentIdx,
++            };
++            setStage("early mismatch present");
++            const auto passRes = Layer::ovkQueuePresentKHR(queue, &passInfo);
++            setStage("idle");
++            return passRes;
++        }
++    }
++    bool started = false;
++    if (!fromEarly && !this->startFrameWork(info, queue, gameRenderSemaphores, presentIdx,
++            kSyncFenceTimeoutNs, true, started)) {
++        // the copy of the frame before is stuck: this frame goes through
++        const VkPresentInfoKHR passInfo{
++            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
++            .pNext = pNext,
++            .waitSemaphoreCount = static_cast<uint32_t>(gameRenderSemaphores.size()),
++            .pWaitSemaphores = gameRenderSemaphores.data(),
++            .swapchainCount = 1,
++            .pSwapchains = &this->swapchain,
++            .pImageIndices = &presentIdx,
++        };
++        setStage("fence-timeout passthrough present");
++        const auto passRes = Layer::ovkQueuePresentKHR(queue, &passInfo);
++        setStage("idle");
++        return passRes;
++    }
+ 
+     // Late-frame guard interval: 1/multiplier of the measured base interval,
+     // anchored on the paced real frame. Presents are not delayed to it — a
+@@ -880,9 +1513,43 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          baseIntervalNs = 1'000'000'000ull / static_cast<uint64_t>(conf.fpsLimit);
      const uint64_t outIntervalNs = baseIntervalNs / conf.multiplier;
  
@@ -673,13 +1117,34 @@ index 2385454..2707988 100644
 +    uint32_t jobCount = 0;
 +
      // 4. Copy generated frames to swapchain images and present them
-     int lastPresentedGen = -1;
-     for (size_t i = 0; i < static_cast<size_t>(conf.multiplier - 1); i++) {
+-    int lastPresentedGen = -1;
+-    for (size_t i = 0; i < static_cast<size_t>(conf.multiplier - 1); i++) {
++    int lastPresentedGen = fromEarly ? this->early.lastPresentedGen : -1;
++    if (fromEarly) {
++        // started early: only their slots are new
++        for (uint32_t j = 0; j < this->early.genCount; j++) {
++            DeferJob job = this->early.genJobs.at(j);
++            job.dueNs = outIntervalNs > 0
++                ? this->pacerAnchorNs + static_cast<int64_t>(this->early.genIndex.at(j) * outIntervalNs)
++                : 0;
++            this->statsPresents++;
++            if (deferFrame) {
++                jobs.at(jobCount++) = job;
++                continue;
++            }
++            const JobTimes t = runDeferJob(job, false);
++            this->statsGenPresentNs += static_cast<uint64_t>(t.endNs - t.startNs);
++            if (t.res != VK_SUCCESS && t.res != VK_SUBOPTIMAL_KHR)
++                throw LSFG::vulkan_error(t.res, "Failed to present swapchain image");
++        }
++    }
++    const size_t genLoopCount = fromEarly ? 0 : static_cast<size_t>(conf.multiplier - 1);
++    for (size_t i = 0; i < genLoopCount; i++) {
 +        int64_t genDueNs = 0;
          // A generated frame far past its slot is dropped to hold cadence
          // (presenting it late would push everything after it off-pace).
          // Present as early as possible and let the FIFO queue space the frames
-@@ -898,6 +1273,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -898,6 +1565,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          if (outIntervalNs > 0) {
              const int64_t dueNs = this->pacerAnchorNs
                  + static_cast<int64_t>(i * outIntervalNs);
@@ -687,20 +1152,49 @@ index 2385454..2707988 100644
              const int64_t nowGenNs = nowNs();
              if (nowGenNs > dueNs + static_cast<int64_t>(outIntervalNs) * 3 / 2) {
                  this->statsGenSkips++;
-@@ -953,6 +1329,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
-                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                 conf.debugInputs == 2 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL,
-                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-+            if (this->dbgQueryPool && i == 0)
-+                this->dbgCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-+                    this->dbgQueryPool, dbgSlot * 3 + 2);
-             imageBarrier(cmd, this->swapchainImages.at(imageIdx),
-                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-@@ -972,10 +1351,37 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
-                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-         }
-         pass.postCopyBufs.at(i).end();
+@@ -934,48 +1602,38 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+ 
+         // copy output image to swapchain image (same device: plain
+         // compute->transfer barriers order the read after framegen's write)
+-        pass.postCopySemaphores.at(i) = Mini::Semaphore(info.device);
+-        pass.prevPostCopySemaphores.at(i) = Mini::Semaphore(info.device);
+-        pass.postCopyBufs.at(i) = Mini::CommandBuffer(info.device, this->cmdPool);
+-        pass.postCopyBufs.at(i).begin();
+-        {
+-            VkCommandBuffer cmd = pass.postCopyBufs.at(i).handle();
+-            // debug_inputs: 1 = previous-frame input image, 2 = the real
+-            // swapchain image itself (pure same-format round trip)
+-            VkImage genSrc = this->out_n.at(i).handle();
+-            if (conf.debugInputs == 1)
+-                genSrc = this->frameIdx % 2 == 0
+-                    ? this->frame_1.handle() : this->frame_0.handle();
+-            else if (conf.debugInputs == 2)
+-                genSrc = this->swapchainImages.at(presentIdx);
+-            imageBarrier(cmd, genSrc,
+-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+-                conf.debugInputs == 2 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL,
+-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+-            imageBarrier(cmd, this->swapchainImages.at(imageIdx),
+-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+-                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-            blitFull(cmd, genSrc,
+-                this->swapchainImages.at(imageIdx),
+-                this->extent.width, this->extent.height);
+-            imageBarrier(cmd, genSrc,
+-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-                conf.debugInputs == 2 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL);
+-            imageBarrier(cmd, this->swapchainImages.at(imageIdx),
+-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+-        }
+-        pass.postCopyBufs.at(i).end();
++        this->recordGenCopy(info, i, imageIdx, presentIdx);
 +        // D2R: a generated frame for the present thread gets a fence there, and
 +        // goes out once the GPU drew it (GameNative's window system shows an
 +        // image as soon as it gets it, drawn or not)
@@ -736,7 +1230,7 @@ index 2385454..2707988 100644
  
          // present swapchain image
          // Never attach the game's pNext chain here: it can carry a
-@@ -1009,9 +1415,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1009,9 +1667,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      //    (the first one was consumed by that frame's own present). If every
      //    generated frame was skipped no semaphore is needed: the copy fence
      //    wait above already proved the game's rendering finished.
@@ -750,7 +1244,7 @@ index 2385454..2707988 100644
      if (this->statsSeq.size() < 200) {
          this->statsSeq += 'A' + static_cast<char>(presentIdx % 26);
          this->statsSeq += '0' + static_cast<char>(gameRenderSemaphores.size() % 10);
-@@ -1020,24 +1427,71 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1020,24 +1679,71 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      if (lastPresentedGen >= 0)
          finalWaits.push_back(pass.prevPostCopySemaphores
              .at(static_cast<size_t>(lastPresentedGen)).handle());
@@ -838,7 +1332,7 @@ index 2385454..2707988 100644
  
      // Publish measured fps + per-stage timing for the HUD and diagnosis.
      const int64_t statsNow = nowNs();
-@@ -1047,6 +1501,26 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1047,6 +1753,26 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          const double windowSec =
              static_cast<double>(statsNow - this->statsWindowStartNs) / 1e9;
          const double frames = static_cast<double>(this->statsRealPresents);
@@ -865,7 +1359,7 @@ index 2385454..2707988 100644
          writeStats(conf.config_file,
              static_cast<double>(this->statsPresents) / windowSec,
              frames / windowSec,
-@@ -1058,8 +1532,51 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1058,8 +1784,60 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
                  .realPresentMs = static_cast<double>(this->statsRealPresentNs) / 1e6 / frames,
                  .genSkips      = this->statsGenSkips,
                  .seq           = this->statsSeq,
@@ -888,6 +1382,15 @@ index 2385454..2707988 100644
 +                .fpsLimit      = conf.fpsLimit,
 +                .flowScale     = conf.flowScale,
 +                .performance   = conf.performance,
++                .earlyOn       = earlyEnabled() && !this->earlyOff && deferEnabled()
++                    && genDrawnEnabled() && conf.multiplier == 2,
++                .earlyFrames   = this->statsEarlyFrames,
++                .earlyLeadMs   = static_cast<double>(this->statsEarlyLeadNs) / 1e6
++                    / std::max(1.0, static_cast<double>(this->statsEarlyFrames)),
++                .earlyWorkMs   = static_cast<double>(this->statsEarlyWorkNs) / 1e6
++                    / std::max(1.0, static_cast<double>(this->statsEarlyFrames)),
++                .earlyNoImage  = this->statsEarlyNoImage,
++                .earlyDropped  = this->statsEarlyDropped,
              });
 +        if (++this->dbgStatsWindows % 4 == 0) {
 +            if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] stats fps=" << static_cast<double>(this->statsPresents) / windowSec
@@ -917,20 +1420,33 @@ index 2385454..2707988 100644
          this->statsPresents = 0;
          this->statsRealPresents = 0;
          this->statsWorkNs = 0;
-@@ -1068,6 +1585,8 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1068,6 +1846,13 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          this->statsGenPresentNs = 0;
          this->statsRealPresentNs = 0;
          this->statsGenSkips = 0;
 +        this->statsCallNs = 0;
 +        this->statsDeferInline = 0;
++        this->statsEarlyFrames = 0;
++        this->statsEarlyLeadNs = 0;
++        this->statsEarlyWorkNs = 0;
++        this->statsEarlyNoImage = 0;
++        this->statsEarlyDropped = 0;
          this->statsWindowStartNs = statsNow;
      }
  
 diff --git a/src/hooks.cpp b/src/hooks.cpp
-index 681f8e4..f492c57 100644
+index 681f8e4..8de30bb 100644
 --- a/src/hooks.cpp
 +++ b/src/hooks.cpp
-@@ -192,6 +192,15 @@ namespace {
+@@ -7,6 +7,7 @@
+ 
+ #include <vulkan/vulkan_core.h>
+ 
++#include <atomic>
+ #include <unordered_map>
+ #include <filesystem>
+ #include <stdexcept>
+@@ -192,6 +193,15 @@ namespace {
              .physicalDevice = physicalDevice,
              .queue = Utils::findQueue(*pDevice, physicalDevice, pCreateInfo, VK_QUEUE_GRAPHICS_BIT)
          });
@@ -946,7 +1462,22 @@ index 681f8e4..f492c57 100644
          return VK_SUCCESS;
      }
  
-@@ -225,11 +234,31 @@ namespace {
+@@ -205,6 +215,14 @@ namespace {
+ 
+     std::unordered_map<VkSwapchainKHR, LsContext> swapchains;
+     std::unordered_map<VkSwapchainKHR, VkDevice> swapchainToDeviceTable;
++
++    // D2R layer 8: the semaphore the game's last acquire signals, and its
++    // image. The game's submit that waits on it (VKD3D: the blit of the frame
++    // into that image) starts the frame early (LsContext::prepareEarly).
++    std::atomic<VkSemaphore> earlyAcquireSemaphore{VK_NULL_HANDLE};
++    VkSwapchainKHR earlySwapchain{};   // hookMutex
++    uint32_t earlyImage{};             // hookMutex
++    bool earlyBadBlitNoted{false};     // hookMutex
+     std::unordered_map<VkSwapchainKHR, VkPresentModeKHR> swapchainToPresent;
+ 
+     ///
+@@ -225,13 +243,39 @@ namespace {
          }
          Utils::resetLimitN("swapMap");
          auto& deviceInfo = it->second;
@@ -979,8 +1510,16 @@ index 681f8e4..f492c57 100644
 +        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] swapchain: maxImages " << maxImages << "\n";
          createInfo.minImageCount = createInfo.minImageCount + 1
              + static_cast<uint32_t>(deviceInfo.queue.first);
++        // D2R layer 8: a frame started at the game's blit submit takes its
++        // generated frame's image right after the game took its own, while
++        // the frame before still waits for its slot: one image more, so that
++        // acquire doesn't wait (the game holds its queue there)
++        if (LsContext::earlyOn() && Config::activeConf.multiplier == 2)
++            createInfo.minImageCount += 1;
          if (createInfo.minImageCount > maxImages) {
-@@ -262,9 +291,16 @@ namespace {
+             createInfo.minImageCount = maxImages;
+             Utils::logLimitN("swapCount", 10,
+@@ -262,9 +306,16 @@ namespace {
          }
  
          // create swapchain
@@ -999,7 +1538,7 @@ index 681f8e4..f492c57 100644
  
          try {
              swapchainToPresent.emplace(*pSwapchain, createInfo.presentMode);
-@@ -282,6 +318,7 @@ namespace {
+@@ -282,6 +333,7 @@ namespace {
                  throw LSFG::vulkan_error(res, "Failed to get swapchain images");
  
              // create swapchain context
@@ -1007,7 +1546,7 @@ index 681f8e4..f492c57 100644
              swapchainToDeviceTable.emplace(*pSwapchain, device);
              swapchains.emplace(*pSwapchain, LsContext(
                  deviceInfo, *pSwapchain, pCreateInfo->imageExtent,
-@@ -294,22 +331,27 @@ namespace {
+@@ -294,22 +346,27 @@ namespace {
  
              Utils::resetLimitN("swapCtxCreate");
          } catch (const std::exception& e) {
@@ -1038,7 +1577,69 @@ index 681f8e4..f492c57 100644
          // find swapchain device
          auto it = swapchainToDeviceTable.find(*pPresentInfo->pSwapchains);
          if (it == swapchainToDeviceTable.end()) {
-@@ -449,6 +491,53 @@ namespace {
+@@ -362,6 +419,22 @@ namespace {
+         #pragma clang diagnostic pop
+ 
+         // NOLINTEND | present the next frame
++        // D2R layer 8: a present that doesn't go through present() lets an
++        // early-started frame go and waits on its copy instead of the game's
++        // semaphore, which that copy used up
++        std::vector<VkSemaphore> plainSemaphores;
++        VkPresentInfoKHR plainInfo{};
++        const auto plain = [&]() -> const VkPresentInfoKHR* {
++            if (!swapchain.hasEarly())
++                return pPresentInfo;
++            plainSemaphores.assign(pPresentInfo->pWaitSemaphores,
++                pPresentInfo->pWaitSemaphores + pPresentInfo->waitSemaphoreCount);
++            swapchain.dropEarly(plainSemaphores);
++            plainInfo = *pPresentInfo;
++            plainInfo.waitSemaphoreCount = static_cast<uint32_t>(plainSemaphores.size());
++            plainInfo.pWaitSemaphores = plainSemaphores.data();
++            return &plainInfo;
++        };
+         VkResult res{}; // might return VK_SUBOPTIMAL_KHR
+         try {
+             // ensure config is valid
+@@ -400,14 +473,14 @@ namespace {
+                 if (!pacingOnly) {
+                     Utils::logLimitN("swapReconf", 3,
+                         "config changed, forcing swapchain recreation");
+-                    Layer::ovkQueuePresentKHR(queue, pPresentInfo);
++                    Layer::ovkQueuePresentKHR(queue, plain());
+                     return VK_ERROR_OUT_OF_DATE_KHR;
+                 }
+             }
+ 
+             // ensure present mode is still valid
+             if (present != conf.e_present) {
+-                Layer::ovkQueuePresentKHR(queue, pPresentInfo);
++                Layer::ovkQueuePresentKHR(queue, plain());
+                 return VK_ERROR_OUT_OF_DATE_KHR;
+             }
+ 
+@@ -417,18 +490,18 @@ namespace {
+             if (swapchain.isStale()) {
+                 Utils::logLimitN("swapStale", 3,
+                     "stale framegen context, forcing swapchain recreation");
+-                Layer::ovkQueuePresentKHR(queue, pPresentInfo);
++                Layer::ovkQueuePresentKHR(queue, plain());
+                 return VK_ERROR_OUT_OF_DATE_KHR;
+             }
+             Utils::resetLimitN("swapStale");
+ 
+             // no framegen at multiplier <= 1, but the fps cap still applies
+             if (conf.multiplier <= 1)
+-                return swapchain.presentPassthrough(queue, pPresentInfo);
++                return swapchain.presentPassthrough(queue, plain());
+ 
+             // skip if framegen force-disabled itself after repeated sync failures
+             if (swapchain.isDisabled())
+-                return swapchain.presentPassthrough(queue, pPresentInfo);
++                return swapchain.presentPassthrough(queue, plain());
+ 
+             // present the swapchain
+             std::vector<VkSemaphore> semaphores(pPresentInfo->waitSemaphoreCount);
+@@ -449,6 +522,62 @@ namespace {
          return res;
      }
  
@@ -1086,13 +1687,72 @@ index 681f8e4..f492c57 100644
 +            return deferred;
 +        const VkResult res = Layer::ovkAcquireNextImageKHR(device, swapchain, timeout,
 +            semaphore, fence, pImageIndex);
++        if ((res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) && semaphore != VK_NULL_HANDLE
++                && LsContext::earlyOn()) {
++            const std::lock_guard<std::mutex> lock(hookMutex);
++            if (swapchains.find(swapchain) != swapchains.end()) {
++                earlySwapchain = swapchain;
++                earlyImage = *pImageIndex;
++                earlyAcquireSemaphore.store(semaphore);
++            }
++        }
 +        return res == VK_SUCCESS && deferred == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : res;
 +    }
 +
      /// Erase the swapchain context and mapping when the swapchain is destroyed.
      void myvkDestroySwapchainKHR(
              VkDevice device,
-@@ -480,5 +569,6 @@ std::unordered_map<std::string, PFN_vkVoidFunction> Hooks::hooks = {
+@@ -456,6 +585,10 @@ namespace {
+             const VkAllocationCallbacks* pAllocator) noexcept {
+         const std::lock_guard<std::mutex> lock(hookMutex);
+ 
++        if (earlySwapchain == swapchain) {
++            earlyAcquireSemaphore.store(VK_NULL_HANDLE);
++            earlySwapchain = VK_NULL_HANDLE;
++        }
+         const bool hadContext = swapchains.find(swapchain) != swapchains.end();
+         if (hadContext)
+             std::cerr << "lsfg-vk: destroying swapchain context\n";
+@@ -468,6 +601,38 @@ namespace {
+     }
+ }
+ 
++VkSemaphore Hooks::earlyArmedSemaphore() {
++    return earlyAcquireSemaphore.load(std::memory_order_relaxed);
++}
++
++void Hooks::earlyBlitSubmitted(VkQueue queue, VkSemaphore acquireSemaphore,
++        VkSemaphore releaseSemaphore) {
++    VkSemaphore expected = acquireSemaphore;
++    if (!earlyAcquireSemaphore.compare_exchange_strong(expected, VK_NULL_HANDLE))
++        return; // someone else took it
++    const std::lock_guard<std::mutex> lock(hookMutex);
++    if (releaseSemaphore == VK_NULL_HANDLE) {
++        if (!earlyBadBlitNoted)
++            std::cerr << "lsfg-vk: the game's submit after its acquire doesn't signal exactly one "
++                "semaphore: frames start in its present\n";
++        earlyBadBlitNoted = true;
++        return;
++    }
++    auto it = swapchains.find(earlySwapchain);
++    auto itDev = swapchainToDeviceTable.find(earlySwapchain);
++    if (it == swapchains.end() || itDev == swapchainToDeviceTable.end())
++        return;
++    auto itInfo = deviceToInfo.find(itDev->second);
++    if (itInfo == deviceToInfo.end())
++        return;
++    try {
++        it->second.prepareEarly(itInfo->second, queue, releaseSemaphore, earlyImage);
++    } catch (const std::exception& e) {
++        Utils::logLimitN("swapEarly", 5,
++            "An error occurred while starting a frame early:\n- " + std::string(e.what()));
++    }
++}
++
+ std::unordered_map<std::string, PFN_vkVoidFunction> Hooks::hooks = {
+     // instance hooks
+     {"vkCreateInstance", reinterpret_cast<PFN_vkVoidFunction>(myvkCreateInstance)},
+@@ -480,5 +645,6 @@ std::unordered_map<std::string, PFN_vkVoidFunction> Hooks::hooks = {
      // swapchain hooks
      {"vkCreateSwapchainKHR", reinterpret_cast<PFN_vkVoidFunction>(myvkCreateSwapchainKHR)},
      {"vkQueuePresentKHR", reinterpret_cast<PFN_vkVoidFunction>(myvkQueuePresentKHR)},
@@ -1100,7 +1760,7 @@ index 681f8e4..f492c57 100644
      {"vkDestroySwapchainKHR", reinterpret_cast<PFN_vkVoidFunction>(myvkDestroySwapchainKHR)}
  };
 diff --git a/src/layer.cpp b/src/layer.cpp
-index fa9c173..5b161bb 100644
+index fa9c173..1314e57 100644
 --- a/src/layer.cpp
 +++ b/src/layer.cpp
 @@ -11,6 +11,9 @@
@@ -1128,7 +1788,7 @@ index fa9c173..5b161bb 100644
      PFN_vkCreateSwapchainKHR  next_vkCreateSwapchainKHR{};
      PFN_vkQueuePresentKHR     next_vkQueuePresentKHR{};
      PFN_vkDestroySwapchainKHR next_vkDestroySwapchainKHR{};
-@@ -60,6 +71,56 @@ namespace {
+@@ -60,6 +71,103 @@ namespace {
      PFN_vkGetSemaphoreFdKHR next_vkGetSemaphoreFdKHR{};
      PFN_vkGetDeviceQueue next_vkGetDeviceQueue{};
      PFN_vkQueueSubmit next_vkQueueSubmit{};
@@ -1146,28 +1806,75 @@ index fa9c173..5b161bb 100644
 +    std::recursive_mutex g_layerQueueMutex;
 +    VkQueue g_layerQueue{};
 +
++    // D2R layer 8: a game submit that waits on the semaphore of its last
++    // acquire (VKD3D: the blit of the frame into the acquired image) starts
++    // that frame early (Hooks::earlyBlitSubmitted). Runs after the submit,
++    // without the queue lock; the game still holds its own queue lock.
++    void noteSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* pSubmits) {
++        const VkSemaphore armed = Hooks::earlyArmedSemaphore();
++        if (armed == VK_NULL_HANDLE)
++            return;
++        for (uint32_t i = 0; i < count; i++)
++            for (uint32_t w = 0; w < pSubmits[i].waitSemaphoreCount; w++)
++                if (pSubmits[i].pWaitSemaphores[w] == armed) {
++                    Hooks::earlyBlitSubmitted(queue, armed, pSubmits[i].signalSemaphoreCount == 1
++                        ? pSubmits[i].pSignalSemaphores[0] : VK_NULL_HANDLE);
++                    return;
++                }
++    }
++    void noteSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2* pSubmits) {
++        const VkSemaphore armed = Hooks::earlyArmedSemaphore();
++        if (armed == VK_NULL_HANDLE)
++            return;
++        for (uint32_t i = 0; i < count; i++)
++            for (uint32_t w = 0; w < pSubmits[i].waitSemaphoreInfoCount; w++)
++                if (pSubmits[i].pWaitSemaphoreInfos[w].semaphore == armed) {
++                    Hooks::earlyBlitSubmitted(queue, armed, pSubmits[i].signalSemaphoreInfoCount == 1
++                        ? pSubmits[i].pSignalSemaphoreInfos[0].semaphore : VK_NULL_HANDLE);
++                    return;
++                }
++    }
++
 +    VkResult layer_vkQueueSubmit(VkQueue queue, uint32_t count,
 +            const VkSubmitInfo* pSubmits, VkFence fence) {
 +        if (queue != g_layerQueue)
 +            return next_vkQueueSubmit(queue, count, pSubmits, fence);
-+        const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
-+        return next_vkQueueSubmit(queue, count, pSubmits, fence);
++        VkResult res{};
++        {
++            const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
++            res = next_vkQueueSubmit(queue, count, pSubmits, fence);
++        }
++        if (res == VK_SUCCESS)
++            noteSubmit(queue, count, pSubmits);
++        return res;
 +    }
 +    VkResult layer_vkQueueSubmit2(VkQueue queue, uint32_t count,
 +            const VkSubmitInfo2* pSubmits, VkFence fence) {
 +        auto fn = next_vkQueueSubmit2 ? next_vkQueueSubmit2 : next_vkQueueSubmit2KHR;
 +        if (queue != g_layerQueue)
 +            return fn(queue, count, pSubmits, fence);
-+        const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
-+        return fn(queue, count, pSubmits, fence);
++        VkResult res{};
++        {
++            const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
++            res = fn(queue, count, pSubmits, fence);
++        }
++        if (res == VK_SUCCESS)
++            noteSubmit2(queue, count, pSubmits);
++        return res;
 +    }
 +    VkResult layer_vkQueueSubmit2KHR(VkQueue queue, uint32_t count,
 +            const VkSubmitInfo2* pSubmits, VkFence fence) {
 +        auto fn = next_vkQueueSubmit2KHR ? next_vkQueueSubmit2KHR : next_vkQueueSubmit2;
 +        if (queue != g_layerQueue)
 +            return fn(queue, count, pSubmits, fence);
-+        const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
-+        return fn(queue, count, pSubmits, fence);
++        VkResult res{};
++        {
++            const std::lock_guard<std::recursive_mutex> lock(g_layerQueueMutex);
++            res = fn(queue, count, pSubmits, fence);
++        }
++        if (res == VK_SUCCESS)
++            noteSubmit2(queue, count, pSubmits);
++        return res;
 +    }
 +    VkResult layer_vkQueueBindSparse(VkQueue queue, uint32_t count,
 +            const VkBindSparseInfo* pInfo, VkFence fence) {
@@ -1185,7 +1892,7 @@ index fa9c173..5b161bb 100644
      PFN_vkCreateFence next_vkCreateFence{};
      PFN_vkDestroyFence next_vkDestroyFence{};
      PFN_vkWaitForFences next_vkWaitForFences{};
-@@ -169,6 +230,11 @@ namespace {
+@@ -169,6 +277,11 @@ namespace {
              initInstanceFunc(*pInstance,
                  "vkEnumerateDeviceExtensionProperties", &next_vkEnumerateDeviceExtensionProperties);
              g_instanceHandle = *pInstance;
@@ -1197,7 +1904,7 @@ index fa9c173..5b161bb 100644
  
              std::cerr << "lsfg-vk: Vulkan instance layer initialized successfully.\n";
          } catch (const std::exception& e) {
-@@ -255,6 +321,14 @@ namespace {
+@@ -255,6 +368,14 @@ namespace {
              initDeviceFunc(*pDevice, "vkGetSemaphoreFdKHR", &next_vkGetSemaphoreFdKHR);
              success &= initDeviceFunc(*pDevice, "vkGetDeviceQueue", &next_vkGetDeviceQueue);
              success &= initDeviceFunc(*pDevice, "vkQueueSubmit", &next_vkQueueSubmit);
@@ -1212,7 +1919,7 @@ index fa9c173..5b161bb 100644
              success &= initDeviceFunc(*pDevice, "vkCreateFence", &next_vkCreateFence);
              success &= initDeviceFunc(*pDevice, "vkDestroyFence", &next_vkDestroyFence);
              success &= initDeviceFunc(*pDevice, "vkWaitForFences", &next_vkWaitForFences);
-@@ -290,7 +364,63 @@ namespace {
+@@ -290,7 +411,63 @@ namespace {
      } // NOLINTEND
  }
  
@@ -1276,7 +1983,7 @@ index fa9c173..5b161bb 100644
      { "vkCreateInstance",
          reinterpret_cast<PFN_vkVoidFunction>(&layer_vkCreateInstance) },
      { "vkCreateDevice",
-@@ -324,6 +454,23 @@ PFN_vkVoidFunction layer_vkGetDeviceProcAddr(VkDevice device, const char* pName)
+@@ -324,6 +501,23 @@ PFN_vkVoidFunction layer_vkGetDeviceProcAddr(VkDevice device, const char* pName)
      if (it != Hooks::hooks.end() && Config::activeConf.enable)
          return it->second;
  
@@ -1300,7 +2007,7 @@ index fa9c173..5b161bb 100644
      return next_vkGetDeviceProcAddr(device, pName);
  }
  
-@@ -408,13 +555,31 @@ namespace Layer {
+@@ -408,13 +602,31 @@ namespace Layer {
              physicalDevice, nullptr, pPropertyCount, pProperties) == VK_SUCCESS;
      }
      VkInstance ovkInstance() {
@@ -1333,7 +2040,7 @@ index fa9c173..5b161bb 100644
      }
  
      VkResult ovkCreateSwapchainKHR(
-@@ -565,8 +730,15 @@ namespace Layer {
+@@ -565,8 +777,15 @@ namespace Layer {
              uint32_t submitCount,
              const VkSubmitInfo* pSubmits,
              VkFence fence) {
