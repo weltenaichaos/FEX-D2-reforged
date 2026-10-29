@@ -125,6 +125,15 @@ namespace FEX::Windows {
 //                            back by its shared memory reads (one per product). Both fex32 versions sum 8 cells per
 //                            thread and keep the last s2 values in registers: 1 = 4 x by 2 y (local size 2x4x8, 3 reads
 //                            per 8 products), 2 = 8 x in a row (1x8x8, 2 reads per 8 products); alt takes turns.
+//                            VKD3D fex33 (FEX 109 kept): 8 in a row won (2.2 ms per run vs 2.7) and is the only 83e2
+//                            version. D2R's ground clutter compute shader 0e21a3b5088ba1af (1152 x 1152 grid, 1.0-1.2
+//                            ms per frame) gets FEX's version too: its on-screen test and mask texture test, which came
+//                            after two layers of density noise (~330 instructions), now come first with their own early
+//                            returns; nothing before the old test has side effects, so the result is the same. It is
+//                            an edit script applied to vkd3d's own translation (checked by hash before and after). alt:
+//                            binds take turns between FEX's version and the game's own (the 'turnip dispatch' lines
+//                            tell them apart by instruction count, cs2224 = the game's); 1 = FEX's version; 2 = the
+//                            game's own.
 //
 // Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
 // same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader

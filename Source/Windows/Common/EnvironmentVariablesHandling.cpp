@@ -695,7 +695,9 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "is swapped for FEX's own version with the same bindings that samples each distinct value once per "
                       "group of cells (VKD3D fex30 and later; '# shader swap' note); from VKD3D fex31 alt = binds take turns "
                       "between two versions, 1 = first only, 2 = second only (VKD3D fex31: 4 and 2 cells per GPU "
-                      "thread; fex32: 8 cells per thread, 4 x by 2 y and 8 in a row)",
+                      "thread; fex32: 8 cells per thread, 4 x by 2 y and 8 in a row; fex33: 8 in a row only, plus "
+                      "D2R's ground clutter compute shader with its on-screen and mask tests before its density noise, "
+                      "taking turns with the game's own; 1 = FEX's versions, 2 = the game's own clutter shader)",
                       true, "alt|1|2");
   SetupVkd3dShaderCopy();
 
