@@ -54,6 +54,7 @@ namespace {
   constexpr uint32_t FlagMemoryAhead = 0x2000;    // gpu report (VKD3D fex17): GPU memory made ahead is on
   constexpr uint32_t FlagCbvSize = 0x8000;        // gpu report (VKD3D fex29): indexed constant buffers keep their declared size
   constexpr uint32_t FlagShaderSwap = 0x10000;    // gpu report (VKD3D fex30): FEX's versions of listed compute shaders are on
+  constexpr uint32_t FlagShaderSwapTurns = 0x20000; // gpu report (VKD3D fex31): binds take turns between two FEX versions
   constexpr uint32_t FlagDevice = 0x80000000u;
 
   struct Source {
@@ -659,7 +660,10 @@ namespace {
       const char* ResyncState = PresentFlags & FlagLatencyResync ? "on" : "off (or VKD3D older than fex16)";
       const char* AheadState = GpuFlags & FlagMemoryAhead ? "on" : "off (or VKD3D older than fex17)";
       const char* CbvSizeState = GpuFlags & FlagCbvSize ? "on" : "off (or VKD3D older than fex29)";
-      const char* SwapState = GpuFlags & FlagShaderSwap ? "on" : "off (or VKD3D older than fex30)";
+      // fex30 set its flag only at the first swapped pipeline, after this line: off there can also mean fex30.
+      const char* SwapState = !(GpuFlags & FlagShaderSwap)     ? "off (or VKD3D older than fex31)" :
+                              GpuFlags & FlagShaderSwapTurns ? "on, two versions taking turns" :
+                                                               "on";
       CopyHeader CopyH {};
       const bool HasCopy = Copy.Address && ReadMemory(Copy.Address, &CopyH, sizeof(CopyH)) && CopyH.Magic == CopyMagic;
       const char* CopyState = !HasCopy ? "missing (VKD3D older than fex13)" : CopyH.Flags & FlagOn ? "on" : "off";

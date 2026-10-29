@@ -201,7 +201,10 @@ namespace {
     // cell, 30 ms per run, in bursts of up to 19 runs when the game enters an area) made 34 of the 40 frames of 40 ms or
     // more in b107's 147 s of play. FEX's vkd3d-proton build swaps it for FEX's own version that samples each distinct
     // value once per group of cells (see EnvironmentVariablesHandling.h).
-    {"FEX_VKD3D_SHADER_SWAP", "1"},
+    // Build 109 + VKD3D fex31: b108's run took 12-13 ms per run with that version (was 30), now held back by the number
+    // of instructions per summed product. VKD3D fex31 has two faster versions (4 and 2 cells per GPU thread); with alt,
+    // binds of the shader take turns between them, so one session times both.
+    {"FEX_VKD3D_SHADER_SWAP", "alt"},
     // Build 68: the main pass's time grows ~14.6 us per draw at about the same shaded pixel count (b67: 238 draws 5.4 ms,
     // 963 draws 15.9 ms, ~0.85M pixels each), and a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9).
     // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14

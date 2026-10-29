@@ -115,6 +115,12 @@ namespace FEX::Windows {
 //                            never takes that shader from a pipeline cache. A '# shader swap' note in the gpu report
 //                            gives the counts; the '# vkd3d' line names the switch. The 'turnip dispatch' lines show the
 //                            FEX version as its own compute shader (other instruction count).
+//                            Build 109 (VKD3D fex31): the value is passed on. alt (the D2R default from build 109; also
+//                            what VKD3D fex31 does when unset): the pipeline gets two FEX versions, 4 cells per GPU
+//                            thread (local size 4x4x8) and 2 cells per thread (8x4x8), and each bind takes the next one in
+//                            turn; the 'turnip dispatch' lines tell them apart by local size. 1: 4 cells per thread only.
+//                            2: 2 cells per thread only. fex30's version (1 cell per thread, 8x8x8) took 12-13 ms per run
+//                            in b108, held back by its instructions per product (hwave wait 49%).
 //
 // Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
 // same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader

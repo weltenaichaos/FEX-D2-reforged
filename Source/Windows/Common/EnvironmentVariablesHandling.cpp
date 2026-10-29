@@ -7,6 +7,7 @@
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
 
+#include <cstring>
 #include <iterator>
 #include <libloaderapi.h>
 #include <stdlib.h>
@@ -100,8 +101,10 @@ namespace {
   // ZeroWhenOff: with the switch set to 0 (by the user, or by the app's defaults), set the variable to 0 instead of leaving
   // it unset (for a VKD3D feature that is on unless 0). A program without the switch (no default for it, e.g. Steam)
   // leaves the variable alone: build 78 set 0 there too, and D2R, started from it, inherited the 0 and left it as it was.
+  // PassValues: values (separated by '|') that are passed on as they are; any other 'on' value sets 1.
   template<size_t N>
-  void SetupVkd3dFexSwitch(const char* SwitchName, const wchar_t (&VarText)[N], const char* What, bool ZeroWhenOff = false) {
+  void SetupVkd3dFexSwitch(const char* SwitchName, const wchar_t (&VarText)[N], const char* What, bool ZeroWhenOff = false,
+                           const char* PassValues = nullptr) {
     const char* Value = Switch(SwitchName);
     const bool On = Value && !(Value[0] == '0' && !Value[1]);
     const auto Var = Narrow(VarText, N - 1);
@@ -128,11 +131,28 @@ namespace {
       return;
     }
 
-    static constexpr wchar_t OneText[] = L"1";
-    UNICODE_STRING One {sizeof(wchar_t), sizeof(OneText), const_cast<wchar_t*>(OneText)};
-    const NTSTATUS SetStatus = RtlSetEnvironmentVariable(nullptr, &Name, &One);
-    StatsLogNote(fextl::fmt::format("vkd3d: {}=1 (status {:#x}): {} (only FEX's VKD3D build reads it; {}=0 turns it off)", Var,
-                                    static_cast<uint32_t>(SetStatus), What, SwitchName));
+    wchar_t SetText[16] = L"1";
+    size_t SetLen = 1;
+    if (PassValues) {
+      const size_t ValueLen = strlen(Value);
+      for (const char* p = PassValues; *p;) {
+        const char* End = strchr(p, '|');
+        const size_t Len = End ? static_cast<size_t>(End - p) : strlen(p);
+        if (Len == ValueLen && Len < std::size(SetText) && !strncmp(p, Value, Len)) {
+          for (size_t i = 0; i < Len; ++i) {
+            SetText[i] = static_cast<wchar_t>(Value[i]);
+          }
+          SetText[Len] = 0;
+          SetLen = Len;
+          break;
+        }
+        p += Len + (End ? 1 : 0);
+      }
+    }
+    UNICODE_STRING Set {static_cast<USHORT>(SetLen * sizeof(wchar_t)), static_cast<USHORT>((SetLen + 1) * sizeof(wchar_t)), SetText};
+    const NTSTATUS SetStatus = RtlSetEnvironmentVariable(nullptr, &Name, &Set);
+    StatsLogNote(fextl::fmt::format("vkd3d: {}={} (status {:#x}): {} (only FEX's VKD3D build reads it; {}=0 turns it off)", Var,
+                                    Narrow(SetText, SetLen), static_cast<uint32_t>(SetStatus), What, SwitchName));
   }
 
   // See EnvironmentVariablesHandling.h: hands the switch's list of pixel shader hashes to FEX's vkd3d-proton build.
@@ -673,8 +693,9 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
   SetupVkd3dFexSwitch("FEX_VKD3D_SHADER_SWAP", L"VKD3D_FEX_SHADER_SWAP",
                       "D2R's 3D lighting table blur compute shader (83e2eb4a6bf5f03b, 8,192 samples per cell, 30 ms per run) "
                       "is swapped for FEX's own version with the same bindings that samples each distinct value once per "
-                      "group of cells (VKD3D fex30 and later; '# shader swap' note)",
-                      true);
+                      "group of cells (VKD3D fex30 and later; '# shader swap' note); from VKD3D fex31 alt = binds take turns "
+                      "between 4 and 2 cells per GPU thread, 1 = 4 cells only, 2 = 2 cells only",
+                      true, "alt|1|2");
   SetupVkd3dShaderCopy();
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");
