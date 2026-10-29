@@ -103,6 +103,18 @@ namespace FEX::Windows {
 //                            other constants instead of buffer memory (the D3D compiler only makes such indices for
 //                            out-of-range array reads). Part of vkd3d's shader cache key, so a change rebuilds it. The
 //                            '# vkd3d' line names it.
+//   FEX_VKD3D_SHADER_SWAP=1 VKD3D_FEX_SHADER_SWAP=1 (the D2R default, build 108, VKD3D fex30; with the switch at 0 FEX
+//                            sets 0, as vkd3d swaps unless 0). D2R's compute shader 83e2eb4a6bf5f03b blurs a 3D
+//                            lighting table: every cell sums 2 x A x B filtered samples of one volume, 8,192 per cell,
+//                            30 ms per run on the Adreno 740 with the texture unit busy throughout, in bursts of up to 19
+//                            runs when the game enters an area (b107: 34 of the 40 frames of 40 ms or more in 147 s of
+//                            play). Most samples repeat across a group of cells, so FEX's version (same bindings, push
+//                            constants and constant buffer) samples each distinct value once per group into shared
+//                            memory and sums from there; results match up to float rounding. vkd3d swaps it in only when
+//                            its translation of the game's shader is the SPIR-V the FEX version was written for, and
+//                            never takes that shader from a pipeline cache. A '# shader swap' note in the gpu report
+//                            gives the counts; the '# vkd3d' line names the switch. The 'turnip dispatch' lines show the
+//                            FEX version as its own compute shader (other instruction count).
 //
 // Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
 // same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader
@@ -278,7 +290,7 @@ namespace FEX::Windows {
 //                          (one-time recompile of those shaders). Without the stats log nothing rotates, so the first
 //                          setup in the list stays. Build 107: 4 always (build 106: the binary with no preamble raised
 //                          lighting draw overlap 10% and cut the lighting pass about 5%; the others did not help).
-//   FEX_TU_CS_ATOMICS=alt  (the D2R default from build 107, driver fex16 and later) compute shaders whose memory atomics
+//   FEX_TU_CS_ATOMICS=alt  (the D2R default in build 107 only, driver fex16 and later) compute shaders whose memory atomics
 //                          hit one address for the whole wave get a second binary that does each such atomic once per
 //                          wave (one lane adds the wave's total, every lane gets its own slot back), as AMD's, Intel's
 //                          and Apple's Mesa drivers do and Turnip didn't. In D2R that is the ground clutter shader
@@ -288,6 +300,8 @@ namespace FEX::Windows {
 //                          alt stays on); 1 = always; 0 = stock. Read once at device creation (one-time recompile of
 //                          compute shaders). With FEX_TU_SAMPLE_DRAWS above 0, every direct dispatch of 16 or more
 //                          workgroups is timed and counted too ('turnip dispatch' lines; two GPU waits for idle each).
+//                          Build 108: 0 (b107: that binary was 5.9% slower; atomics fell from 2457 to 514 per run, but
+//                          only ~2,500 items are placed per run, so the counter never held the shader up).
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

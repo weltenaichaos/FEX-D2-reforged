@@ -53,6 +53,7 @@ namespace {
   constexpr uint32_t FlagLatencyResync = 0x1000;  // present report (VKD3D fex16): frame credit resync is on
   constexpr uint32_t FlagMemoryAhead = 0x2000;    // gpu report (VKD3D fex17): GPU memory made ahead is on
   constexpr uint32_t FlagCbvSize = 0x8000;        // gpu report (VKD3D fex29): indexed constant buffers keep their declared size
+  constexpr uint32_t FlagShaderSwap = 0x10000;    // gpu report (VKD3D fex30): FEX's versions of listed compute shaders are on
   constexpr uint32_t FlagDevice = 0x80000000u;
 
   struct Source {
@@ -658,17 +659,18 @@ namespace {
       const char* ResyncState = PresentFlags & FlagLatencyResync ? "on" : "off (or VKD3D older than fex16)";
       const char* AheadState = GpuFlags & FlagMemoryAhead ? "on" : "off (or VKD3D older than fex17)";
       const char* CbvSizeState = GpuFlags & FlagCbvSize ? "on" : "off (or VKD3D older than fex29)";
+      const char* SwapState = GpuFlags & FlagShaderSwap ? "on" : "off (or VKD3D older than fex30)";
       CopyHeader CopyH {};
       const bool HasCopy = Copy.Address && ReadMemory(Copy.Address, &CopyH, sizeof(CopyH)) && CopyH.Magic == CopyMagic;
       const char* CopyState = !HasCopy ? "missing (VKD3D older than fex13)" : CopyH.Flags & FlagOn ? "on" : "off";
       Out.insert(0, fextl::fmt::format("# vkd3d: FEX's VKD3D build is loaded (d3d12core.dll at {:X}): clear folding {}, "
                                        "GPU pass meter {}, present timeline {}, cap pre-sleep {}, zero fills of never-used memory "
                                        "skipped {}, frames to the screen only once drawn {}, shader copy {}, frame credit resync {}, "
-                                       "GPU memory made ahead {}, indexed constant buffers at their declared size {}, frame start "
-                                       "pacing {}\n",
+                                       "GPU memory made ahead {}, indexed constant buffers at their declared size {}, FEX's "
+                                       "compute shader versions {}, frame start pacing {}\n",
                                        ModuleAddress, PassFlags & FlagFoldClears ? "on" : "off", PassFlags & FlagOn ? "on" : "off",
                                        PresentState, PresentFlags & FlagCapPresleep ? "on" : "off", FreshState, DrawnState, CopyState,
-                                       ResyncState, AheadState, CbvSizeState,
+                                       ResyncState, AheadState, CbvSizeState, SwapState,
                                        !(PresentFlags & FlagFrameStart) ? "off" :
                                        PresentFlags & FlagMarginCaused ? "on (gradual, margin only from frames it made late: VKD3D fex4 or "
                                                                          "later)" :

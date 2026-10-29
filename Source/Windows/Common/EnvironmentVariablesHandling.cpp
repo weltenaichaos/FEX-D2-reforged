@@ -670,6 +670,11 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "vectors) instead of 64 KiB, so the driver can load it into the shader's constants; with Turnip fex9 "
                       "D2R's lighting shaders then stop reading the root constant buffer set through descriptors (VKD3D "
                       "fex29 and later; part of vkd3d's shader cache key)");
+  SetupVkd3dFexSwitch("FEX_VKD3D_SHADER_SWAP", L"VKD3D_FEX_SHADER_SWAP",
+                      "D2R's 3D lighting table blur compute shader (83e2eb4a6bf5f03b, 8,192 samples per cell, 30 ms per run) "
+                      "is swapped for FEX's own version with the same bindings that samples each distinct value once per "
+                      "group of cells (VKD3D fex30 and later; '# shader swap' note)",
+                      true);
   SetupVkd3dShaderCopy();
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");

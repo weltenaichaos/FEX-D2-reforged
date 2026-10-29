@@ -197,6 +197,11 @@ namespace {
     // descriptor set vkd3d pushes for nearly every draw. With the declared sizes they fit, and with FEX_TU_CP_UBO the
     // driver loads them before the draw (see EnvironmentVariablesHandling.h).
     {"FEX_VKD3D_CBV_SIZE", "1"},
+    // Build 108 + VKD3D fex30: D2R's compute shader 83e2eb4a6bf5f03b (a 3D lighting table blur, 8,192 filtered samples per
+    // cell, 30 ms per run, in bursts of up to 19 runs when the game enters an area) made 34 of the 40 frames of 40 ms or
+    // more in b107's 147 s of play. FEX's vkd3d-proton build swaps it for FEX's own version that samples each distinct
+    // value once per group of cells (see EnvironmentVariablesHandling.h).
+    {"FEX_VKD3D_SHADER_SWAP", "1"},
     // Build 68: the main pass's time grows ~14.6 us per draw at about the same shaded pixel count (b67: 238 draws 5.4 ms,
     // 963 draws 15.9 ms, ~0.85M pixels each), and a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9).
     // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14
@@ -350,7 +355,10 @@ namespace {
     // lane gets its slot from that), as Mesa's AMD, Intel and Apple drivers do; only that shader qualifies (2234 -> 2308
     // instructions). alt = that binary in every other second, compared on the 'turnip dispatch' lines; 1 = always,
     // 0 = stock.
-    {"FEX_TU_CS_ATOMICS", "alt"},
+    // Build 108: off. In b107 the once-per-wave binary was 5.9% slower (1278 vs 1202 us per run, same 4-second blocks):
+    // its atomics fell from 2457 to 514 per run, but only ~2,500 items are placed per run, so the counter never held the
+    // shader up.
+    {"FEX_TU_CS_ATOMICS", "0"},
   };
 
   // In the order the stats log lists them.
@@ -429,6 +437,7 @@ namespace {
     "FEX_VKD3D_LATENCY_RESYNC",
     "FEX_VKD3D_MEMORY_AHEAD",
     "FEX_VKD3D_CBV_SIZE",
+    "FEX_VKD3D_SHADER_SWAP",
     "FEX_TU_NOPREAMBLE",
     "FEX_TU_CHANNEL",
     "FEX_TU_DESC",
