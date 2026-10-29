@@ -179,7 +179,7 @@ namespace FEX::Windows {
 //                        before the draw's waves may start
 //   FEX_TU_NOPREAMBLE=lit  that second binary always
 //
-// GameNative's frame generation layer, FEX's D2R build (build 112, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7). It
+// GameNative's frame generation layer, FEX's D2R build (build 113, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7). It
 // reads these from the Unix environment (__wine_set_unix_env) at its first present; FEX only sets them to turn one off:
 //   FEX_LSFG_DEFER=1       (the D2R default) the layer presents a frame (the generated one and the real one) from a thread
 //                          of its own, and the game's vkQueuePresentKHR returns at once. Before, it slept there until the

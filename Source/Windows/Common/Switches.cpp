@@ -99,7 +99,7 @@ namespace {
     // session: 37 FPS at a 40 FPS cap, every 4th frame one refresh long (also seen in builds 89, 92 and 93) (see
     // ARM64EC/Vkd3dReport.cpp).
     {"FEX_VKD3D_CAP_GRID", "1"},
-    // Build 112: GameNative's frame generation layer, FEX's D2R build (tools/lsfg/, layer 7). At 2x from a 30 FPS limit it
+    // Build 113: GameNative's frame generation layer, FEX's D2R build (tools/lsfg/, layer 7). At 2x from a 30 FPS limit it
     // slept ~17 ms of every frame in the game's vkQueuePresentKHR before the real frame, with VKD3D holding its only
     // VkQueue, so every submit of the game waited (the build 55 problem again). The layer now presents the frame from its
     // own thread and the game's present returns at once. Its generated frame also went to the window system before the

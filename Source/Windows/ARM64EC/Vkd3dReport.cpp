@@ -399,7 +399,7 @@ namespace {
   }
 
   // GameNative's frame generation layer writes stats.txt next to its conf.toml every 500 ms: shown and base frame rates
-  // and per-stage times per real frame (lsfg-vk-android writeStats). FEX's D2R build (tools/lsfg/, layer 7, build 112)
+  // and per-stage times per real frame (lsfg-vk-android writeStats). FEX's D2R build (tools/lsfg/, layer 7, build 113)
   // adds its present thread's: call_ms (time inside the game's vkQueuePresentKHR, VKD3D holds its VkQueue there),
   // defer_* (real frames presented from the layer's thread: late after their slot, time in vkQueuePresentKHR, the game's
   // present/acquire waiting for that thread) and gen_drawn_* (generated frames waiting until the GPU drew them, presented
@@ -409,6 +409,37 @@ namespace {
     char Last[2048];
   };
   FramegenState Framegen {};
+
+  // A number as C++ streams print it ("12.3456", "-0.5", "1e-05"); 0 when there is none. This module has no atof.
+  double ParseNumber(std::string_view Text) {
+    size_t i = 0;
+    const bool Negative = i < Text.size() && Text[i] == '-';
+    i += Negative;
+    double Value = 0;
+    for (; i < Text.size() && Text[i] >= '0' && Text[i] <= '9'; ++i) {
+      Value = Value * 10 + (Text[i] - '0');
+    }
+    if (i < Text.size() && Text[i] == '.') {
+      double Scale = 0.1;
+      for (++i; i < Text.size() && Text[i] >= '0' && Text[i] <= '9'; ++i) {
+        Value += (Text[i] - '0') * Scale;
+        Scale *= 0.1;
+      }
+    }
+    if (i < Text.size() && (Text[i] == 'e' || Text[i] == 'E')) {
+      ++i;
+      const bool NegativeExp = i < Text.size() && Text[i] == '-';
+      i += i < Text.size() && (Text[i] == '-' || Text[i] == '+');
+      int Exp = 0;
+      for (; i < Text.size() && Text[i] >= '0' && Text[i] <= '9' && Exp < 400; ++i) {
+        Exp = Exp * 10 + (Text[i] - '0');
+      }
+      for (int e = 0; e < Exp; ++e) {
+        Value = NegativeExp ? Value / 10 : Value * 10;
+      }
+    }
+    return Negative ? -Value : Value;
+  }
 
   fextl::string FramegenLine() {
     namespace Linux = FEX::Windows::Linux;
@@ -449,7 +480,7 @@ namespace {
       return {};
     };
     const auto Num = [&](std::string_view Key) {
-      return atof(fextl::string(Get(Key)).c_str());
+      return ParseNumber(Get(Key));
     };
     const std::string_view Seq = Get("seq").substr(0, 48);
 
