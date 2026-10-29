@@ -27,9 +27,12 @@ namespace FEX::Windows {
 //                            it all back. With this on, such a clear waits and becomes the clear load op of the next pass
 //                            that draws to the same view in the same layout, covering it whole. Anything else that may
 //                            touch the image first gets the clear as it would have been.
-//   FEX_VKD3D_PASSES=1       VKD3D_FEX_PASSES=1 (the D2R default): GPU time per render pass and command list.
-//   FEX_VKD3D_TIMELINE=1     VKD3D_FEX_TIMELINE=1 (the D2R default): each frame's steps from the game's Present() to the
-//                            window system, and the queue threads' time.
+//   FEX_VKD3D_PASSES=1       VKD3D_FEX_PASSES=1 (the D2R default; 0 in the build without the stats log): GPU time per
+//                            render pass and command list.
+//   FEX_VKD3D_TIMELINE=1     VKD3D_FEX_TIMELINE=1 (the D2R default; 0 in the build without the stats log): each frame's
+//                            steps from the game's Present() to the window system, and the queue threads' time.
+//   FEX_VKD3D_LOG_OFF=1      (the D2R default in the build without the stats log) VKD3D_DEBUG=none and
+//                            VKD3D_SHADER_DEBUG=none unless already set: vkd3d-proton writes no FIXME/INFO text lines.
 //   FEX_VKD3D_CAP_PRESLEEP=1 VKD3D_FEX_PRESENT_PRESLEEP=1 (the D2R default, build 56). GameNative's FPS limit sleeps in
 //                            its Vulkan layer's vkQueuePresentKHR, ~32 ms of each frame at 30 FPS, while vkd3d holds the
 //                            VkQueue; on Adreno the game's compute and copy queues share it and waited (build 55: compute
@@ -200,8 +203,10 @@ namespace FEX::Windows {
 //                          state data, syncs, waits for idle, packets and dwords read), shader front end stalls and
 //                          draw overlap, shader core occupancy/starvation and pixels, primitive control starved by
 //                          the command processor, render backend busy and depth writes waiting for memory); 0 = none
+//                          (also the D2R default in the build without the stats log)
 //   FEX_TU_SAMPLE_DRAWS=N  passes with at least N draws are timed and counted (default 100; the D2R default 0 in builds
-//                          76-101: each sampled pass paid two GPU waits for idle; 100 again in build 102)
+//                          76-101: each sampled pass paid two GPU waits for idle; 100 again in build 102; 0 in the build
+//                          without the stats log)
 //   FEX_TU_EARLY_PREAMBLE=1  (the D2R default from build 71, driver fex2 and later) push descriptor sets count as written,
 //                          so the lighting shaders' reads of vkd3d's root constant buffers can run in the early
 //                          preamble, ahead of the draw's pixel waves, as Qualcomm's driver does for D3D11 games. Build
@@ -338,7 +343,7 @@ namespace FEX::Windows {
 //                          workgroups is timed and counted too ('turnip dispatch' lines; two GPU waits for idle each).
 //                          Build 108: 0 (b107: that binary was 5.9% slower; atomics fell from 2457 to 514 per run, but
 //                          only ~2,500 items are placed per run, so the counter never held the shader up).
-//   FEX_TU_CONST_KEEP=alt  (the D2R default from build 110, driver fex17 and later, needs FEX_TU_CP_UBO's command
+//   FEX_TU_CONST_KEEP=0    (build 111 D2R default; alt in build 110, driver fex17 and later, needs FEX_TU_CP_UBO's command
 //                          processor loads) root constant buffer ranges whose buffer address didn't change stay in the
 //                          shaders' constants instead of being loaded again with every draw. In the lighting pass about
 //                          4 of the GPU's 12 shader cores sit idle between draws while the next draw is set up; every D2R
@@ -349,7 +354,8 @@ namespace FEX::Windows {
 //                          changed ones with the draw (host check: 640 -> 184 vec4 over 8 D2R-like draws). alt = in
 //                          every other second, so one run compares both ways on the 'turnip pass ... keep on/off' lines
 //                          (without the stats log alt stays on); 1 = always; 0 = stock. The 'constants kept' line counts
-//                          the loads per constant state build either way.
+//                          the loads per constant state build either way. Build 110: lighting passes as long with it
+//                          as without (-0.1%, +-1.3%) at ~30% fewer constants loaded, so build 111 turns it off.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

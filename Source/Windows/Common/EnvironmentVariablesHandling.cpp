@@ -155,6 +155,34 @@ namespace {
                                     Narrow(SetText, SetLen), static_cast<uint32_t>(SetStatus), What, SwitchName));
   }
 
+  // FEX_VKD3D_LOG_OFF=1 (D2R default in the build without the stats log): vkd3d-proton's own text log off. By default it
+  // writes its FIXME and INFO lines through Wine's debug output; VKD3D_DEBUG and VKD3D_SHADER_DEBUG set to none stop that.
+  // A variable that is already set is left alone.
+  void SetupVkd3dLogOff() {
+    const char* Value = Switch("FEX_VKD3D_LOG_OFF");
+    if (!Value || (Value[0] == '0' && !Value[1])) {
+      return;
+    }
+    static constexpr struct {
+      const wchar_t* Text;
+      USHORT Bytes;
+    } Vars[] = {
+      {L"VKD3D_DEBUG", sizeof(L"VKD3D_DEBUG") - sizeof(wchar_t)},
+      {L"VKD3D_SHADER_DEBUG", sizeof(L"VKD3D_SHADER_DEBUG") - sizeof(wchar_t)},
+    };
+    static constexpr wchar_t NoneText[] = L"none";
+    for (const auto& Var : Vars) {
+      UNICODE_STRING Name {Var.Bytes, static_cast<USHORT>(Var.Bytes + sizeof(wchar_t)), const_cast<wchar_t*>(Var.Text)};
+      wchar_t Old[32];
+      UNICODE_STRING OldValue {0, sizeof(Old) - sizeof(wchar_t), Old};
+      if (RtlQueryEnvironmentVariable_U(nullptr, &Name, &OldValue) != StatusVariableNotFound) {
+        continue;
+      }
+      UNICODE_STRING None {sizeof(NoneText) - sizeof(wchar_t), sizeof(NoneText), const_cast<wchar_t*>(NoneText)};
+      RtlSetEnvironmentVariable(nullptr, &Name, &None);
+    }
+  }
+
   // See EnvironmentVariablesHandling.h: hands the switch's list of pixel shader hashes to FEX's vkd3d-proton build.
   void SetupVkd3dShaderCopy() {
     const char* Value = Switch("FEX_VKD3D_SHADER_COPY");
@@ -663,6 +691,7 @@ namespace {
 
 void SetupEnvironmentVariableValues(HMODULE NtDll) {
   SetupVkd3dConfig();
+  SetupVkd3dLogOff();
   SetupVkd3dFexSwitch("FEX_VKD3D_FOLD_CLEARS", L"VKD3D_FEX_FOLD_CLEARS",
                       "a full screen clear made between render passes becomes the start of the next pass that draws to "
                       "that image, instead of a pass of its own that writes the whole image to memory for the next pass "

@@ -15,4 +15,6 @@
 namespace Vkd3dReport {
 // Call on the process's first thread, in process init, when the stats log is on.
 void Init();
+// Without the stats log: only the cap's frame time hand-off to VKD3D (FEX_VKD3D_CAP_GRID), on a thread of its own.
+void InitWithoutLog();
 } // namespace Vkd3dReport

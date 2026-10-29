@@ -1000,6 +1000,8 @@ NTSTATUS ProcessInit() {
         return Out;
       });
     }
+  } else {
+    Vkd3dReport::InitWithoutLog();
   }
   NativeRedirect::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog, [](uint64_t Address, uint64_t Size) {
     InvalidationTracker->InvalidateAlignedInterval(Address, Size, false);

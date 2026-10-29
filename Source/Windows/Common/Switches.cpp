@@ -13,12 +13,23 @@ namespace {
     const char* Value;
   };
 
+  // The build without the stats log (thor-clean) also turns off what only measures for the log: the GPU pass meter and
+  // present timeline in FEX's VKD3D build, Turnip's pass sampling and GPU counters, and VKD3D's own text log. Every fix
+  // keeps its default.
+#ifdef FEX_DISABLE_STATSLOG
+  constexpr bool Measuring = false;
+#else
+  constexpr bool Measuring = true;
+#endif
+
   // D2R.exe runs with what its tests have used since build 40, so a test needs no environment variables. Every other
   // program keeps upstream behaviour unless a variable is set. A variable set to 0 still turns a default off.
   constexpr Default D2RDefaults[] = {
 #ifndef FEX_DISABLE_STATSLOG
     {"FEX_STATSLOG", "D:\\"}, // where the tests' logs have gone so far
     {"FEX_STATSLOG_PROFILE", "1"},
+#else
+    {"FEX_VKD3D_LOG_OFF", "1"},
 #endif
     {"FEX_NATIVE_ZLIB", "1"},
     {"FEX_NATIVE_MD5", "1"},
@@ -73,8 +84,8 @@ namespace {
     // bound at its top clock), times every render pass on the GPU and each frame's way from Present() to the window
     // system (see EnvironmentVariablesHandling.h).
     {"FEX_VKD3D_FOLD_CLEARS", "1"},
-    {"FEX_VKD3D_PASSES", "1"},
-    {"FEX_VKD3D_TIMELINE", "1"},
+    {"FEX_VKD3D_PASSES", Measuring ? "1" : "0"},
+    {"FEX_VKD3D_TIMELINE", Measuring ? "1" : "0"},
     // Build 56: the build 55 log showed the frame cap sleeping ~32 ms in every vkQueuePresentKHR on vkd3d's queue thread,
     // with the VkQueue the game's compute and copy queues share held all that time, and each frame waiting ~23 ms for the
     // queue thread after the game was done with it. FEX's vkd3d-proton build sleeps the cap's wait out before the present
@@ -249,8 +260,8 @@ namespace {
     // Build 103: on for a second measuring run with every wave state counter (build 102 left ~40% of a lighting wave's
     // time in states its list didn't count).
     // Build 107: a compute list; with driver fex16 every direct dispatch of 16+ workgroups is timed and counted too.
-    {"FEX_TU_COUNTERS", "1"},
-    {"FEX_TU_SAMPLE_DRAWS", "100"},
+    {"FEX_TU_COUNTERS", Measuring ? "1" : "0"},
+    {"FEX_TU_SAMPLE_DRAWS", Measuring ? "100" : "0"},
     // Build 71: build 70 found the main pass's lighting draws each wait for their setup step (the shader preamble: ~730
     // instructions, ~108 memory reads, 47 branches) inside the draw's first pixel wave. Qualcomm's own driver and stock
     // Turnip run it ahead of the draw ('early preamble'), but Turnip refuses here: with vkd3d's descriptor buffers it
@@ -376,7 +387,9 @@ namespace {
     // meant less draw overlap (+53% vec4: 12% less time with two fragment draws active). FEX's Turnip fex17 keeps ranges
     // whose buffer address didn't change in the shaders' constants and loads only the changed ones with the draw.
     // alt = in every other second, compared on the 'turnip pass ... keep on/off' lines; 1 = always; 0 = stock.
-    {"FEX_TU_CONST_KEEP", "alt"},
+    // Build 111: off. In the build 110 log lighting passes took as long with kept constants as without (-0.1%, +-1.3%)
+    // although ~30% fewer constants were loaded per draw, so constant loading isn't what holds the next draw back.
+    {"FEX_TU_CONST_KEEP", "0"},
   };
 
   // In the order the stats log lists them.
@@ -457,6 +470,7 @@ namespace {
     "FEX_VKD3D_CBV_SIZE",
     "FEX_VKD3D_SHADER_SWAP",
     "FEX_VKD3D_CLEAR_MEMO",
+    "FEX_VKD3D_LOG_OFF",
     "FEX_TU_NOPREAMBLE",
     "FEX_TU_CHANNEL",
     "FEX_TU_DESC",

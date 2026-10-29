@@ -14,6 +14,7 @@ $end_info$
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/vector.h>
+#include <FEXCore/Utils/Threads.h>
 
 #include <algorithm>
 #include <atomic>
@@ -696,5 +697,29 @@ namespace {
 
 void Init() {
   FEX::Windows::StatsLogSetLineProvider(Lines);
+}
+
+namespace {
+  // Without the stats log nothing runs Lines(), but handing the cap's frame time to VKD3D (FEX_VKD3D_CAP_GRID) is a fix,
+  // not a log line: this thread runs it once a second instead and drops the text.
+  void* CapGridThread(void*) {
+    for (;;) {
+      LARGE_INTEGER Interval {.QuadPart = -1000 * 10'000ll};
+      NtDelayExecution(FALSE, &Interval);
+      (void)Lines();
+      if (NotFexBuild) {
+        return nullptr;
+      }
+    }
+  }
+} // namespace
+
+void InitWithoutLog() {
+  const char* Switch = FEX::Windows::Switch("FEX_VKD3D_CAP_GRID");
+  if (!Switch || !strcmp(Switch, "0")) {
+    return;
+  }
+  static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
+  Thread = FEXCore::Threads::Thread::Create(CapGridThread, nullptr, {.LowPriority = false, .Internal = true}, "FEXCapGrid");
 }
 } // namespace Vkd3dReport
