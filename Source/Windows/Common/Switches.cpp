@@ -105,6 +105,8 @@ namespace {
     // own thread and the game's present returns at once. Its generated frame also went to the window system before the
     // GPU drew it (GameNative's window system shows an image as soon as it gets it, see FEX_VKD3D_PRESENT_DRAWN); it now
     // waits on that thread until drawn. 0 turns either off (LSFG_D2R_DEFER / LSFG_D2R_GEN_DRAWN in the Unix environment).
+    // Build 114: set 0 or 1 in the game only; build 113 set 0 in Steam (no defaults there) and the game inherited it, so
+    // its frame generation run had no present thread.
     {"FEX_LSFG_DEFER", "1"},
     {"FEX_LSFG_GEN_DRAWN", "1"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)

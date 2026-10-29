@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "Windows/Common/EnvironmentVariablesHandling.h"
+#include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/Switches.h"
 #include "Windows/Common/TurnipChannel.h"
@@ -409,7 +410,30 @@ namespace {
                               (Arms & (1u << Turnip::FsArmW128)) ? "; the second binary's mode bit follows setup 128-pixel waves" : "");
   }
 
-  // See EnvironmentVariablesHandling.h: the frame generation layer's own defaults are on; FEX only turns one off.
+  // The value this process got for a Linux environment variable when it started (from /proc/self/environ), or "-".
+  fextl::string StartUnixValue(const char* Variable) {
+    static char Env[65536];
+    static int64_t Len = -1;
+    if (Len < 0) {
+      Len = FEX::Windows::Linux::ReadSmallFile("/proc/self/environ", Env, sizeof(Env));
+    }
+    const size_t VarLen = strlen(Variable);
+    for (int64_t i = 0; i < Len;) {
+      const char* Entry = Env + i;
+      const size_t EntryLen = strnlen(Entry, static_cast<size_t>(Len - i));
+      if (EntryLen > VarLen && !strncmp(Entry, Variable, VarLen) && Entry[VarLen] == '=') {
+        return fextl::string(Entry + VarLen + 1, EntryLen - VarLen - 1);
+      }
+      i += static_cast<int64_t>(EntryLen) + 1;
+    }
+    return "-";
+  }
+
+  // See EnvironmentVariablesHandling.h: the frame generation layer's own defaults are on.
+  // Only a process where the switch has a value (D2R's defaults, or the user's setting) touches the variables, and it sets
+  // them both ways: a process inherits its Linux environment from the one that started it, and build 113 set 0 in Steam
+  // (no D2R defaults there, so the switch read as off), so the game ran without layer 7's present thread. Build 78 had the
+  // same leak with a VKD3D switch.
   void SetupLsfgSwitches(FARPROC SetUnixEnv) {
     struct LsfgSwitch {
       const char* Name;
@@ -421,15 +445,20 @@ namespace {
       {"FEX_LSFG_GEN_DRAWN", "LSFG_D2R_GEN_DRAWN", "generated frames presented without waiting until the GPU drew them"},
     };
     for (const auto& S : Switches) {
-      if (!SwitchOff(Switch(S.Name))) {
+      const char* Value = Switch(S.Name);
+      if (!Value) {
         continue;
       }
+      const bool Off = SwitchOff(Value);
+      const auto Before = StartUnixValue(S.Variable);
       if (!SetUnixEnv) {
-        StatsLogNote(fextl::fmt::format("framegen: this Wine has no __wine_set_unix_env, {}=0 can't be set", S.Variable));
+        StatsLogNote(fextl::fmt::format("framegen: this Wine has no __wine_set_unix_env, {} can't be set (it is {})", S.Variable, Before));
         continue;
       }
-      reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv)(S.Variable, "0");
-      StatsLogNote(fextl::fmt::format("framegen: {}=0 -> {}=0: {}", S.Name, S.Variable, S.What));
+      reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv)(S.Variable, Off ? "0" : "1");
+      StatsLogNote(fextl::fmt::format("framegen: {}={} -> {}={} (it was {} when the game started{}){}{}", S.Name, Value, S.Variable,
+                                      Off ? 0 : 1, Before, Before == "-" ? "" : ", set by the program that started it",
+                                      Off ? ": " : "", Off ? S.What : ""));
     }
   }
 
