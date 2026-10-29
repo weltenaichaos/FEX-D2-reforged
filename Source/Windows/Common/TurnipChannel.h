@@ -46,6 +46,10 @@
 //    instructions) run in that command buffer: 0 stock, 1-3 SP_PS_CNTL_1.WAVE_PAIR_MODE 1-3 (CompilePairAlt), 4 the
 //    second binary as 128-pixel waves (CompileW128Alt; FEX sets ModeAltFs with it). Slot::Sysmem bits 4-6 hold the arm
 //    a pass was recorded with. ArmBinds/PairShaders in the extension (ExtSize 0x3a8).
+//  - (fex15 and later) the same arm field picks draw setups: 4 the second binary with no preamble at all
+//    (CompileNoPreAllAlt: push constants loaded by the command processor; FEX sets ModeAltFs with it), 5 a third binary
+//    with one driver-loaded range per root constant buffer (CompileMergeAlt), 6/7 SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS 0 /
+//    EVICT_BUF_MODE 0 (CompileCntlAlt). NopreShaders..MergePipes in the extension (ExtSize 0x3d0).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -68,6 +72,11 @@ constexpr uint32_t ModeAltFs = ModeNoAlias;   // fex13 and later: the same bit p
 constexpr uint32_t ModeFsArmShift = 8;
 constexpr uint32_t ModeFsArmMask = 0x700;
 constexpr uint32_t FsArmW128 = 4;
+// fex15 and later: draw setup arms (4 = the second binary, however it was made).
+constexpr uint32_t FsArmAlt = 4;
+constexpr uint32_t FsArmMerge = 5;
+constexpr uint32_t FsArmDefer = 6;
+constexpr uint32_t FsArmEvict = 7;
 constexpr uint32_t FsArms = 8;
 // Slot::Mode bit (fex3 and later): the pass clears a depth/stencil attachment at its start.
 constexpr uint8_t SlotDepthClear = 0x80;
@@ -81,6 +90,9 @@ constexpr uint32_t CompileNoAliasAlt = 0x20;   // fex12 and later: big fragment 
 constexpr uint32_t CompileNoPreambleAlt = 0x40; // fex13 and later: that second binary is compiled without preamble
 constexpr uint32_t CompilePairAlt = 0x80;       // fex14 and later: big fragment shaders get wave pair mode 1-3 states
 constexpr uint32_t CompileW128Alt = 0x100;      // fex14 and later: their second binary as 128-pixel waves
+constexpr uint32_t CompileNoPreAllAlt = 0x200;  // fex15 and later: second binary with no preamble at all (push consts by CP)
+constexpr uint32_t CompileMergeAlt = 0x400;     // fex15 and later: third binary, one driver-loaded range per root CBV
+constexpr uint32_t CompileCntlAlt = 0x800;      // fex15 and later: draw states with DEFER_WAVE_ALLOC_DIS 0 / EVICT_BUF_MODE 0
 
 constexpr uint32_t StatusAttached = 0x1;
 constexpr uint32_t StatusDescPatch = 0x2;
@@ -105,6 +117,10 @@ constexpr uint32_t StatusNoPreamble = 0x200000;   // fex13 and later: CompileNoP
 constexpr uint32_t StatusPair = 0x400000;         // fex14 and later: CompilePairAlt honored (a7xx)
 constexpr uint32_t StatusW128 = 0x800000;         // fex14 and later: CompileW128Alt honored (double thread size)
 constexpr uint32_t StatusArmStats = 0x1000000;    // fex14 and later: ArmBinds/PairShaders in the extension are written
+constexpr uint32_t StatusNoPreAll = 0x2000000;    // fex15 and later: CompileNoPreAllAlt honored (a7xx, consts by the CP)
+constexpr uint32_t StatusMerge = 0x4000000;       // fex15 and later: CompileMergeAlt honored (needs StatusCpUbo)
+constexpr uint32_t StatusCntl = 0x8000000;        // fex15 and later: CompileCntlAlt honored (a7xx)
+constexpr uint32_t StatusSetupStats = 0x10000000; // fex15 and later: NopreShaders..MergePipes in the extension are written
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -205,6 +221,17 @@ struct Channel {
   // 0x3a0: fragment shaders that got the pair mode states this run
   volatile uint32_t PairShaders;
   uint32_t Pad3a4;
+  // 0x3a8 (fex15 and later, driver, only when ExtSize covers it): fragment shaders made this run whose second binary
+  // has no preamble at all, that got the third binary (merged loads) with the driver-loaded ranges and vec4s of both
+  // binaries ([0] stock, [1] merged), that got the alloc setting states, and second/third binaries compiled but dropped
+  volatile uint32_t NopreShaders;
+  volatile uint32_t MergeShaders;
+  volatile uint32_t MergeRanges[2];
+  volatile uint32_t MergeVec4[2];
+  volatile uint32_t CntlShaders;
+  volatile uint32_t SetupRefused;
+  // 0x3c8: graphics pipelines made whose fragment shader has the third binary: [0] can use it, [1] cannot
+  volatile uint32_t MergePipes[2];
 };
 // 'Size' = the layout before fex11.
 constexpr uint32_t ChannelBaseSize = 0x2a8;
@@ -214,6 +241,8 @@ constexpr uint32_t ChannelSwSize = 0x300;
 constexpr uint32_t ChannelNaSize = 0x358;
 // The fex13 layout (preamble totals).
 constexpr uint32_t ChannelNpSize = 0x360;
+// The fex14 layout (wave setup counts).
+constexpr uint32_t ChannelArmSize = 0x3a8;
 
 struct Slot {
   uint64_t Seq;
@@ -255,7 +284,10 @@ static_assert(offsetof(Channel, NaPipes) == 0x350);
 static_assert(offsetof(Channel, NaPreamble) == ChannelNaSize);
 static_assert(offsetof(Channel, ArmBinds) == ChannelNpSize);
 static_assert(offsetof(Channel, PairShaders) == 0x3a0);
-static_assert(sizeof(Channel) == 0x3a8);
+static_assert(offsetof(Channel, NopreShaders) == ChannelArmSize);
+static_assert(offsetof(Channel, CntlShaders) == 0x3c0);
+static_assert(offsetof(Channel, MergePipes) == 0x3c8);
+static_assert(sizeof(Channel) == 0x3d0);
 static_assert(sizeof(Slot) == 48);
 
 // The channel EnvironmentVariablesHandling set up for this process (FEX_TU_CHANNEL), or nullptr.
@@ -281,4 +313,8 @@ uint32_t NoPreambleSwitch();
 // 0 or 1 (stock only) = off. More than one arm: TurnipReport rotates through them a second each (needs the stats log;
 // without it nothing rotates, so the first arm stays). One arm: always that one.
 uint32_t WavePairArms();
+// FEX_TU_DRAW_SETUP (build 106): true = WavePairArms() came from it, so arm 4 is the second binary with no preamble at
+// all and arms 5-7 are the fex15 setups (merged constant loads, DEFER_WAVE_ALLOC_DIS 0, EVICT_BUF_MODE 0); false = from
+// FEX_TU_WAVE_PAIR (arm 4 = 128-pixel waves).
+bool DrawSetupArms();
 } // namespace FEX::Windows::Turnip

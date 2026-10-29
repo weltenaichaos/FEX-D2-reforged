@@ -114,6 +114,9 @@ namespace {
     {T::GroupSp, 105, "wave_output"},
     {T::GroupSp, 106, "wave_hwave_wait"},
     {T::GroupSp, 107, "wave_hwave_sync"},
+    // build 106 additions
+    {T::GroupHlsq, 3, "hlsq_sp_fs_stall"},
+    {T::GroupHlsq, 39, "hlsq_fs_starving_sp"},
   };
 
   fextl::string CounterLabel(uint32_t Group, uint32_t Countable) {
@@ -163,15 +166,22 @@ namespace {
     return Mode;
   }
 
-  // FEX_TU_WAVE_PAIR asked for wave setup 4: the second binary is the 128-pixel one and its mode bit follows the rotation.
+  // FEX_TU_WAVE_PAIR asked for wave setup 4 (the 128-pixel binary), or FEX_TU_DRAW_SETUP for setup 4 (the binary with no
+  // preamble at all): the second binary's mode bit follows the rotation.
   bool ArmOwnsAlt() {
     return FEX::Windows::Turnip::WavePairArms() & (1u << T::FsArmW128);
+  }
+  bool DrawSetup() {
+    return FEX::Windows::Turnip::DrawSetupArms();
   }
 
   // Name of the second lighting shader binary (fex12: without alias.tex, fex13: without preamble, fex14: 128-pixel waves)
   // for the per-second line, and the short tag of the pass kinds ('na', 'np', or 'alt' with both).
   const char* AltName() {
     const bool Na = FEX::Windows::Turnip::NoAliasSwitch() != 0, Np = FEX::Windows::Turnip::NoPreambleSwitch() >= 2;
+    if (ArmOwnsAlt() && DrawSetup()) {
+      return Na ? "no preamble at all, no alias" : "no preamble at all";
+    }
     if (ArmOwnsAlt()) {
       return Na && Np ? "128-pixel waves, no alias, no preamble" : Np ? "128-pixel waves, no preamble" : Na ? "128-pixel waves, no alias" :
                                                                                                            "128-pixel waves";
@@ -179,10 +189,10 @@ namespace {
     return Na && Np ? "no alias, no preamble" : Np ? "no preamble" : "no alias";
   }
 
-  // Wave setup arm (fex14) of a pass kind or a mode, by name.
+  // Wave setup arm (fex14) or draw setup arm (fex15) of a pass kind or a mode, by name.
   const char* ArmTag(uint32_t Arm) {
-    static constexpr const char* Tags[] = {"stock", "pair1", "pair2", "pair3", "w128", "arm5", "arm6", "arm7"};
-    return Tags[Arm & 7];
+    static constexpr const char* Tags[] = {"stock", "pair1", "pair2", "pair3", "w128", "merge", "defer", "evict"};
+    return (Arm & 7) == T::FsArmAlt && DrawSetup() ? "nopre" : Tags[Arm & 7];
   }
   const char* AltTag() {
     const bool Na = FEX::Windows::Turnip::NoAliasSwitch() != 0, Np = FEX::Windows::Turnip::NoPreambleSwitch() >= 2;
@@ -203,6 +213,7 @@ namespace {
   uint32_t BudgetLastReads {};
   uint32_t LoopPrefetchLast[2] {}; // LoopPrefetchLoads, LoopPrefetchShaders at the last report
   uint64_t ArmBindsLast[T::FsArms] {}; // ArmBinds at the last report (fex14)
+  uint32_t SetupLast[4] {};            // NopreShaders, MergeShaders, CntlShaders, SetupRefused at the last note (fex15)
 
   bool ReadSlot(uint64_t RingCpu, uint32_t Index, uint32_t SlotSize, uint8_t* Out) {
     SIZE_T Read = 0;
@@ -266,25 +277,32 @@ namespace {
                                                                              "ON (FEX_TU_NOPREAMBLE=lit), counts NOT written") :
                         NoPreSw == 2                       ? "in every other second (FEX_TU_NOPREAMBLE=alt)" :
                                                              "ON (FEX_TU_NOPREAMBLE=lit)";
-    // fex14: wave setups of the big fragment shaders (FEX_TU_WAVE_PAIR).
+    // fex14: wave setups of the big fragment shaders (FEX_TU_WAVE_PAIR); fex15: draw setups (FEX_TU_DRAW_SETUP).
     const uint32_t Arms = FEX::Windows::Turnip::WavePairArms();
     fextl::string WaveSetups;
     if (!Arms) {
-      WaveSetups = "stock (FEX_TU_WAVE_PAIR=0)";
-    } else if (Chan->Patch < 14) {
-      WaveSetups = "NOT available (driver older than fex14)";
+      WaveSetups = "stock (FEX_TU_WAVE_PAIR=0, FEX_TU_DRAW_SETUP=0)";
+    } else if (Chan->Patch < 14 || (DrawSetup() && Chan->Patch < 15)) {
+      WaveSetups = DrawSetup() ? "NOT available (driver older than fex15)" : "NOT available (driver older than fex14)";
     } else {
       fextl::string List;
       uint32_t N = 0;
-      for (uint32_t a = 0; a < 5; ++a) {
+      for (uint32_t a = 0; a < T::FsArms; ++a) {
         if (!(Arms & (1u << a))) {
           continue;
         }
-        const bool Ok = a == 0 || (a < T::FsArmW128 ? (Status & T::StatusPair) != 0 : (Status & T::StatusW128) != 0);
+        const uint32_t Need = a == 0                                ? 0 :
+                              a < T::FsArmAlt                       ? T::StatusPair :
+                              a == T::FsArmAlt                      ? (DrawSetup() ? T::StatusNoPreAll : T::StatusW128) :
+                              a == T::FsArmMerge                    ? T::StatusMerge :
+                                                                      T::StatusCntl;
+        const bool Ok = !Need || (Status & Need) != 0;
         List += fextl::fmt::format("{}{}{}", N++ ? ", " : "", ArmTag(a), Ok ? "" : " (NOT honored)");
       }
-      WaveSetups = fextl::fmt::format("{} {}{}", N > 1 ? "rotating a second each:" : "always", List,
-                                      (Status & T::StatusArmStats) ? "" : ", counts NOT written");
+      const uint32_t Stats = DrawSetup() ? (T::StatusArmStats | T::StatusSetupStats) : T::StatusArmStats;
+      WaveSetups = fextl::fmt::format("{} {} ({}){}", N > 1 ? "rotating a second each:" : "always", List,
+                                      DrawSetup() ? "FEX_TU_DRAW_SETUP" : "FEX_TU_WAVE_PAIR",
+                                      (Status & Stats) == Stats ? "" : ", counts NOT written");
     }
     const uint32_t ClearSwitch = FEX::Windows::Turnip::DepthClearSwitch();
     const char* DepthClear = !ClearSwitch                             ? "by the 2D engine as stock (FEX_TU_DEPTH_CLEAR=0)" :
@@ -305,7 +323,7 @@ namespace {
       "turnip: driver '{}' (patch {}) attached, status {:#x}: descriptor fix {}{}, early preamble for root constant buffers {}, "
       "preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the command processor {}, other root "
       "constant buffer reads through the shaders' UBO table {}, pipeline switches send only what changed {}, lighting shaders "
-      "without alias.tex helpers {}, lighting shaders without preamble {}, lighting shader wave setups {}, depth clears at the start "
+      "without alias.tex helpers {}, lighting shaders without preamble {}, lighting shader wave/draw setups {}, depth clears at the start "
       "of direct passes {}, available "
       "memory for the "
       "memory budget {}, {} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
@@ -494,7 +512,8 @@ namespace {
         uint32_t Group, Countable;
         const char* Name;
       } PerCycle[] = {{T::GroupHlsq, 12, "dual fs"},          {T::GroupHlsq, 2, "sp state stall"}, {T::GroupHlsq, 22, "fs stall"},
-                      {T::GroupHlsq, 11, "fs data wait"},     {T::GroupCp, 15, "cp idle"},         {T::GroupCp, 22, "cp pipe stall"}};
+                      {T::GroupHlsq, 11, "fs data wait"},     {T::GroupHlsq, 3, "sp fs stage stall"},
+                      {T::GroupHlsq, 39, "fs starving sp"},   {T::GroupCp, 15, "cp idle"},         {T::GroupCp, 22, "cp pipe stall"}};
       fextl::string Parts;
       for (const auto& P : PerCycle) {
         if (Has(P.Group, P.Countable)) {
@@ -532,7 +551,7 @@ namespace {
     // bunches, state loads = constants/descriptors/shaders, draw packets) and what it waited for (command buffer data
     // or draw state data from memory, syncs, wait for idle); packets and dwords it read. Busy close to the pass's
     // cycles per draw with primitive control waiting for it means the command processor is the limit.
-    if (Has(T::GroupCp, 2) || Has(T::GroupCp, 46)) {
+    if (Has(T::GroupCp, 2) || Has(T::GroupCp, 46) || Has(T::GroupCp, 23)) {
       static constexpr struct {
         uint32_t Countable;
         const char* Name;
@@ -614,8 +633,9 @@ namespace {
         Mode = (Mode & ~T::ModeNoAlias) | (On ? T::ModeNoAlias : 0);
       }
       if (ArmRotate) {
-        // Build 105: the wave setups asked for (FEX_TU_WAVE_PAIR), the next one each second (after the flips above, so
-        // each of their combinations meets every setup).
+        // Build 105: the wave setups asked for (FEX_TU_WAVE_PAIR), build 106 the draw setups (FEX_TU_DRAW_SETUP), the
+        // next one each second (after the flips above, so each of their combinations meets every setup). Setup 4's
+        // second binary (128-pixel waves, or no preamble at all) also takes the second binary's mode bit.
         uint32_t Index = (Seconds >> Bit) % ArmCount;
         uint32_t Arm = 0;
         for (uint32_t a = 0; a < T::FsArms; ++a) {
@@ -709,10 +729,50 @@ namespace {
     // totals for both binaries whenever new ones were made (compiled, or loaded from the driver's cache).
     const bool NoAliasSeen = (NoAliasSw != 0 && Chan->Patch >= 12 && (Status & T::StatusNoAlias)) ||
                              (NoPreSw >= 2 && Chan->Patch >= 13 && (Status & T::StatusNoPreamble)) ||
-                             (ArmOwnsAlt() && Chan->Patch >= 14 && (Status & T::StatusW128));
-    // Wave setups (fex14 and later): pipeline binds whose fragment shader has them, by the setup of the command buffer.
-    const bool WaveSeen = Arms != 0 && Chan->Patch >= 14 && (Status & (T::StatusPair | T::StatusW128));
-    if (WaveSeen && (Status & T::StatusArmStats)) {
+                             (ArmOwnsAlt() && !DrawSetup() && Chan->Patch >= 14 && (Status & T::StatusW128)) ||
+                             (ArmOwnsAlt() && DrawSetup() && Chan->Patch >= 15 && (Status & T::StatusNoPreAll));
+    // Wave setups (fex14 and later) and draw setups (fex15 and later): pipeline binds whose fragment shader has them, by
+    // the setup of the command buffer.
+    const bool WaveSeen = Arms != 0 && Chan->Patch >= 14 &&
+                          (Status & (T::StatusPair | T::StatusW128 | T::StatusNoPreAll | T::StatusMerge | T::StatusCntl));
+    if (WaveSeen && DrawSetup() && (Status & T::StatusArmStats)) {
+      // Build 106: the draw setups (FEX_TU_DRAW_SETUP): binds per setup this second, then this run's shaders that got each
+      // setup's binary or states, the merged binaries' driver-loaded ranges and vec4s (stock -> merged), binaries
+      // compiled but dropped, and pipelines that can or cannot use the merged binary.
+      uint64_t ArmBinds[T::FsArms];
+      bool Any = false;
+      for (uint32_t a = 0; a < T::FsArms; ++a) {
+        const uint64_t V = Chan->ArmBinds[a];
+        ArmBinds[a] = V - ArmBindsLast[a];
+        ArmBindsLast[a] = V;
+        Any |= ArmBinds[a] != 0;
+      }
+      if (Any || ArmRotate) {
+        fextl::string Shaders;
+        if (Status & T::StatusSetupStats) {
+          Shaders = fextl::fmt::format(" | binaries without preamble {}, merged loads {} (ranges {} -> {}, vec4 {} -> {}), alloc states {}, "
+                                       "refused {} | merge pipelines can use {} cannot {}",
+                                       Chan->NopreShaders, Chan->MergeShaders, Chan->MergeRanges[0], Chan->MergeRanges[1], Chan->MergeVec4[0],
+                                       Chan->MergeVec4[1], Chan->CntlShaders, Chan->SetupRefused, Chan->MergePipes[0], Chan->MergePipes[1]);
+        }
+        Out += fextl::fmt::format("  turnip: draw setup {} this second | binds stock {} nopre {} merge {} defer {} evict {}{}\n",
+                                  ArmTag((ModeThisSecond & T::ModeFsArmMask) >> T::ModeFsArmShift), ArmBinds[0], ArmBinds[T::FsArmAlt],
+                                  ArmBinds[T::FsArmMerge], ArmBinds[T::FsArmDefer], ArmBinds[T::FsArmEvict], Shaders);
+      }
+      if (Status & T::StatusSetupStats) {
+        const uint32_t Now[4] = {Chan->NopreShaders, Chan->MergeShaders, Chan->CntlShaders, Chan->SetupRefused};
+        if (memcmp(Now, SetupLast, sizeof(Now)) != 0) {
+          memcpy(SetupLast, Now, sizeof(Now));
+          const uint32_t R0 = Chan->MergeRanges[0], R1 = Chan->MergeRanges[1], V0 = Chan->MergeVec4[0], V1 = Chan->MergeVec4[1];
+          FEX::Windows::StatsLogNote(fextl::fmt::format(
+            "turnip: draw setups: {} lighting shaders have a binary without preamble (push constants by the command processor), {} a "
+            "binary with merged constant loads (driver-loaded ranges {} -> {}, {} -> {} vec4: {:.1f} -> {:.1f} loads per shader), {} "
+            "the alloc setting states; {} binaries dropped; pipelines that can use the merged binary {}, that cannot {}",
+            Now[0], Now[1], R0, R1, V0, V1, Now[1] ? static_cast<double>(R0) / Now[1] : 0.0, Now[1] ? static_cast<double>(R1) / Now[1] : 0.0,
+            Now[2], Now[3], Chan->MergePipes[0], Chan->MergePipes[1]));
+        }
+      }
+    } else if (WaveSeen && (Status & T::StatusArmStats)) {
       uint64_t ArmBinds[T::FsArms];
       bool Any = false;
       for (uint32_t a = 0; a < T::FsArms; ++a) {

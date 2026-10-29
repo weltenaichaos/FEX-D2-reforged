@@ -1,0 +1,984 @@
+diff --git a/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c b/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
+index c48fb67..301960d 100644
+--- a/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
++++ b/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c
+@@ -203,6 +203,43 @@ gather_ubo_ranges(nir_shader *nir, nir_intrinsic_instr *instr,
+    *upload_remaining -= added;
+ }
+ 
++/* FEX (fex15, ir3_shader_key::fex_merge_ranges): the driver-loaded ranges
++ * of each UBO become one range from the first to the last byte read, as long
++ * as the bytes in between fit in the const file. gather_ubo_ranges already
++ * merged ranges that touch, so the ranges of one UBO left here have gaps.
++ */
++static void
++fex_merge_cp_ranges(struct ir3_ubo_analysis_state *state,
++                    uint32_t *upload_remaining)
++{
++   for (int i = 0; i < state->num_enabled; i++) {
++      struct ir3_ubo_range *a = &state->range[i];
++      if (!a->fex_cp)
++         continue;
++      for (int j = i + 1; j < state->num_enabled;) {
++         struct ir3_ubo_range *b = &state->range[j];
++         if (!b->fex_cp || memcmp(&a->ubo, &b->ubo, sizeof(a->ubo))) {
++            j++;
++            continue;
++         }
++         const uint32_t start = MIN2(a->start, b->start);
++         const uint32_t end = MAX2(a->end, b->end);
++         const uint32_t used = (a->end - a->start) + (b->end - b->start);
++         const uint32_t added = end - start > used ? end - start - used : 0;
++         if (added >= *upload_remaining) {
++            j++;
++            continue;
++         }
++         *upload_remaining -= added;
++         a->start = start;
++         a->end = end;
++         a->can_speculate &= b->can_speculate;
++         /* The last range moves into j's slot; look at j again. */
++         *b = state->range[--state->num_enabled];
++      }
++   }
++}
++
+ /* For indirect offset, it is common to see a pattern of multiple
+  * loads with the same base, but different constant offset, ie:
+  *
+@@ -447,13 +484,24 @@ copy_global_to_uniform(nir_shader *nir, struct ir3_ubo_analysis_state *state)
+ 
+ static bool
+ copy_ubo_to_uniform(nir_shader *nir, const struct ir3_const_state *const_state,
+-                    bool loads_first)
++                    bool loads_first, bool fex_no_empty_preamble)
+ {
+    const struct ir3_ubo_analysis_state *state = &const_state->ubo_state;
+ 
+    if (state->num_enabled == 0)
+       return false;
+ 
++   /* FEX (fex15): a variant meant to have no preamble at all
++    * (ir3_shader_key::fex_push_by_driver) gets none just for ranges the
++    * driver loads. */
++   if (fex_no_empty_preamble && !nir_shader_get_entrypoint(nir)->preamble) {
++      bool copies = false;
++      for (unsigned i = 0; i < state->num_enabled; i++)
++         copies |= !state->range[i].fex_cp;
++      if (!copies)
++         return false;
++   }
++
+    nir_function_impl *preamble = nir_shader_get_preamble(nir);
+    /* FEX (fex6): with loads first, put the copies at the start of the
+     * preamble. ir3_sched keeps an ldc.k after every stc that comes before it
+@@ -709,6 +757,10 @@ ir3_nir_analyze_ubo_ranges(nir_shader *nir, struct ir3_shader_variant *v)
+    for (uint32_t i = 0; i < state->num_enabled; i++)
+       state->range[i].fex_cp = fex_cp && fex_cp_ubo(v, &state->range[i].ubo);
+ 
++   /* FEX (fex15): one load per driver-loaded UBO. */
++   if (fex_cp && v->key.fex_merge_ranges)
++      fex_merge_cp_ranges(state, &upload_remaining);
++
+    uint32_t ubo_offset = align(const_state->allocs.max_const_offset_vec4, align_vec4) * 16;
+    assign_offsets(state, ubo_offset, max_upload);
+ 
+@@ -805,7 +857,8 @@ ir3_nir_lower_ubo_loads(nir_shader *nir, struct ir3_shader_variant *v)
+ 
+    if (compiler->has_preamble && push_ubos)
+       progress |= copy_ubo_to_uniform(
+-         nir, const_state, compiler->options.fex_preamble_loads_first);
++         nir, const_state, compiler->options.fex_preamble_loads_first,
++         v->key.fex_push_by_driver);
+ 
+    return progress;
+ }
+diff --git a/src/freedreno/ir3/ir3_shader.c b/src/freedreno/ir3/ir3_shader.c
+index 569fdb1..561c69f 100644
+--- a/src/freedreno/ir3/ir3_shader.c
++++ b/src/freedreno/ir3/ir3_shader.c
+@@ -607,11 +607,16 @@ alloc_variant(struct ir3_shader *shader, const struct ir3_shader_key *key,
+    v->num_ssbos = info->num_ssbos;
+    v->num_uavs = info->num_ssbos + info->num_images;
+    v->shader_options = shader->options;
++   /* FEX (fex15): push constants loaded by the driver into the const file
++    * (no preamble copy from the shared constant registers). */
++   if (v->key.fex_push_by_driver &&
++       v->shader_options.push_consts_type == IR3_PUSH_CONSTS_SHARED_PREAMBLE)
++      v->shader_options.push_consts_type = IR3_PUSH_CONSTS_PER_STAGE;
+ 
+    if (!v->binning_pass) {
+       v->const_state = rzalloc_size(v, sizeof(*v->const_state));
+       v->const_state->allocs = shader->options.const_allocs;
+-      v->const_state->push_consts_type = shader->options.push_consts_type;
++      v->const_state->push_consts_type = v->shader_options.push_consts_type;
+       v->const_state->consts_ubo.idx = -1;
+       v->const_state->driver_params_ubo.idx = -1;
+       v->const_state->primitive_map_ubo.idx = -1;
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index 90bfc68..2c662be 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -491,6 +491,22 @@ struct ir3_shader_key {
+           * shaders once more with it (TU_FEX_COMPILE_W128_ALT).
+           */
+          unsigned fex_wave128 : 1;
++
++         /* FEX (fex15): push constants are read from the const file where
++          * the driver loads them before each draw (CP_LOAD_STATE6, like
++          * IR3_PUSH_CONSTS_PER_STAGE), instead of a preamble copying them
++          * from the shared constant registers. With fex_nopreamble the
++          * variant has no preamble at all. The variant's const_state says
++          * IR3_PUSH_CONSTS_PER_STAGE then.
++          */
++         unsigned fex_push_by_driver : 1;
++
++         /* FEX (fex15): the driver-loaded ranges (ir3_ubo_range::fex_cp) of
++          * each UBO become one range from the first to the last byte read,
++          * so the driver loads each UBO with one CP_LOAD_STATE6: more
++          * constants, fewer loads per draw.
++          */
++         unsigned fex_merge_ranges : 1;
+       };
+       uint32_t global;
+    };
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 2bb169a..2e37473 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1503,8 +1503,11 @@ tu_fex_sw_bind(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+    const uint32_t geom_reset = A7XX_SP_UPDATE_CNTL_HS_STATE |
+                                A7XX_SP_UPDATE_CNTL_DS_STATE |
+                                A7XX_SP_UPDATE_CNTL_GS_STATE;
+-   /* The empty tessellation/geometry stages must be what the GPU has. */
++   /* The empty tessellation/geometry stages must be what the GPU has.
++    * fex15: a binary bound with its own program config takes the stock path
++    * (fex_simple's split config is the stock binary's). */
+    if (!prog->fex_simple || f->sw_stock_pending ||
++       prog->config_state.iova != pipeline->program.config_state.iova ||
+        (f->sw_known & geom) != geom || (f->sw_inval & geom_reset) ||
+        f->sw_exec[TU_DRAW_STATE_HS].iova != (prog->hs_state.size ? prog->hs_state.iova : 0) ||
+        f->sw_exec[TU_DRAW_STATE_DS].iova != (prog->ds_state.size ? prog->ds_state.iova : 0) ||
+@@ -6068,6 +6071,11 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+             &cmd->state.program.link[MESA_SHADER_FRAGMENT];
+          fl->const_state = *ir3_const_state(av);
+          fl->constlen = av->constlen;
++         /* fex15: with its own program config (constlen, shared
++          * constants). */
++         if (cmd->state.program.fex_alt_config_state.size)
++            cmd->state.program.config_state =
++               cmd->state.program.fex_alt_config_state;
+       }
+       cmd->state.fex.na_binds[alt]++;
+    }
+@@ -6075,16 +6083,38 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+     * fragment shader's draw state with WAVE_PAIR_MODE 1-3 (same binary and
+     * constants); arm 4 is the second binary above (FEX sets
+     * TU_FEX_MODE_ALT_FS with it). */
++   /* fex15: arm 5 binds the third binary (one constant load per root
++    * constant buffer) with its constants and program config, arms 6 and 7
++    * the draw states with DEFER_WAVE_ALLOC_DIS 0 / EVICT_BUF_MODE 0. */
+    if (cmd->state.program.fex_pair_fs_state[0].size ||
+-       cmd->state.program.fex_alt_fs_state.size) {
++       cmd->state.program.fex_alt_fs_state.size ||
++       cmd->state.program.fex_alt2_fs_state.size ||
++       cmd->state.program.fex_cntl_fs_state[0].size) {
+       const uint32_t arm = (cmd->state.fex.mode & TU_FEX_MODE_FS_ARM_MASK) >>
+                            TU_FEX_MODE_FS_ARM_SHIFT;
+       /* Not with the second binary bound: its constant layout may differ. */
+-      if (arm >= 1 && arm <= 3 &&
+-          !(cmd->state.fex.mode & TU_FEX_MODE_ALT_FS) &&
+-          cmd->state.program.fex_pair_fs_state[arm - 1].size)
++      const bool alt_bound = cmd->state.fex.mode & TU_FEX_MODE_ALT_FS;
++      if (arm >= 1 && arm <= 3 && !alt_bound &&
++          cmd->state.program.fex_pair_fs_state[arm - 1].size) {
+          cmd->state.program.fs_state =
+             cmd->state.program.fex_pair_fs_state[arm - 1];
++      } else if (arm == TU_FEX_FS_ARM_MERGE && !alt_bound &&
++                 cmd->state.program.fex_alt2_fs_state.size) {
++         const struct ir3_shader_variant *av =
++            cmd->state.program.fex_alt2_fs_variant;
++         struct tu_program_descriptor_linkage *fl =
++            &cmd->state.program.link[MESA_SHADER_FRAGMENT];
++         cmd->state.program.fs_state = cmd->state.program.fex_alt2_fs_state;
++         cmd->state.program.config_state =
++            cmd->state.program.fex_alt2_config_state;
++         fl->const_state = *ir3_const_state(av);
++         fl->constlen = av->constlen;
++      } else if ((arm == TU_FEX_FS_ARM_DEFER || arm == TU_FEX_FS_ARM_EVICT) &&
++                 !alt_bound &&
++                 cmd->state.program.fex_cntl_fs_state[arm - TU_FEX_FS_ARM_DEFER].size) {
++         cmd->state.program.fs_state =
++            cmd->state.program.fex_cntl_fs_state[arm - TU_FEX_FS_ARM_DEFER];
++      }
+       cmd->state.fex.arm_binds[arm]++;
+    }
+ 
+@@ -6144,7 +6174,8 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+       const bool sw = cmd->state.fex.mode & TU_FEX_MODE_SWITCH;
+       cmd->state.fex.mode &= ~TU_FEX_MODE_SWITCH;
+       tu_cs_emit_pkt7(cs, CP_SET_DRAW_STATE, 3 * (10 + util_bitcount(set_state_mask)));
+-      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_PROGRAM_CONFIG, pipeline->program.config_state, -1);
++      /* fex15: cmd->state.program's config (a second or third binary's own). */
++      tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_PROGRAM_CONFIG, cmd->state.program.config_state, -1);
+       tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_VS, pipeline->program.vs_state, -1);
+       tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_VS_BINNING, pipeline->program.vs_binning_state, -1);
+       tu_fex_sw_emit_bind(cmd, cs, TU_DRAW_STATE_HS, pipeline->program.hs_state, -1);
+@@ -8522,6 +8553,9 @@ tu7_emit_shared_preamble_consts(
+                     shared_consts->dwords);
+ }
+ 
++static bool
++tu_fex_push_by_driver(const struct tu_program_descriptor_linkage *link);
++
+ static uint32_t
+ tu6_const_size(struct tu_cmd_buffer *cmd,
+                const struct tu_push_constant_range *shared_consts,
+@@ -8559,12 +8593,62 @@ tu6_const_size(struct tu_cmd_buffer *cmd,
+          }
+          /* fex10: one UBO table entry each */
+          dwords += 6 * cmd->state.program.link[type].const_state.num_fex_ubos;
++         /* fex15: tu_fex_emit_push_by_driver */
++         if (tu_fex_push_by_driver(&cmd->state.program.link[type]))
++            dwords += 4 + 4 * DIV_ROUND_UP(
++               cmd->state.program.link[type].tu_const_state.push_consts.dwords, 4);
+       }
+    }
+ 
+    return dwords;
+ }
+ 
++/* FEX link, fex15 (TU_FEX_COMPILE_NOPRE_ALL_ALT): the bound binary reads
++ * the shared push constants from its const file (ir3_shader_key::
++ * fex_push_by_driver) instead of copying them there in a preamble.
++ */
++static bool
++tu_fex_push_by_driver(const struct tu_program_descriptor_linkage *link)
++{
++   return link->const_state.push_consts_type == IR3_PUSH_CONSTS_PER_STAGE &&
++          link->tu_const_state.push_consts.type ==
++             IR3_PUSH_CONSTS_SHARED_PREAMBLE &&
++          link->tu_const_state.push_consts.dwords;
++}
++
++/* ... so the command processor loads them there before each draw, like
++ * IR3_PUSH_CONSTS_PER_STAGE (whole vec4s, within constlen). */
++static void
++tu_fex_emit_push_by_driver(struct tu_cs *cs,
++                           const struct tu_program_descriptor_linkage *link,
++                           mesa_shader_stage type,
++                           const uint32_t *push_constants)
++{
++   if (!tu_fex_push_by_driver(link))
++      return;
++   const struct tu_push_constant_range *pc = &link->tu_const_state.push_consts;
++   const uint32_t dst_vec4 =
++      link->const_state.allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS].offset_vec4;
++   if (dst_vec4 >= link->constlen)
++      return;
++   const uint32_t num_vec4 =
++      MIN2(DIV_ROUND_UP(pc->dwords, 4), link->constlen - dst_vec4);
++
++   tu_cs_emit_pkt7(cs, tu6_stage2opcode(type), 3 + 4 * num_vec4);
++   tu_cs_emit(cs, CP_LOAD_STATE6_0_DST_OFF(dst_vec4) |
++         CP_LOAD_STATE6_0_STATE_TYPE(ST6_CONSTANTS) |
++         CP_LOAD_STATE6_0_STATE_SRC(SS6_DIRECT) |
++         CP_LOAD_STATE6_0_STATE_BLOCK(tu6_stage2shadersb(type)) |
++         CP_LOAD_STATE6_0_NUM_UNIT(num_vec4));
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   for (uint32_t i = 0; i < 4 * num_vec4; i++) {
++      const uint32_t d = pc->lo_dwords + i;
++      tu_cs_emit(cs, i < pc->dwords && d < MAX_PUSH_CONSTANTS_SIZE / 4
++                        ? push_constants[d] : 0);
++   }
++}
++
+ /* FEX link, fex9 (TU_FEX_COMPILE_CP_UBO): load the stage's push set UBO
+  * ranges (ir3_ubo_range::fex_cp) into its const file, from the UBO addresses
+  * in the pushed descriptors (the CPU copy of the push set, as pushed for this
+@@ -8796,6 +8880,9 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
+          tu_fex_emit_cp_ubos(&cs, &link->const_state, link->constlen,
+                              static_cast<mesa_shader_stage>(type),
+                              descriptors);
++         tu_fex_emit_push_by_driver(&cs, link,
++                                    static_cast<mesa_shader_stage>(type),
++                                    cmd->push_constants);
+       }
+    }
+ 
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index d801a96..5683aca 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -127,11 +127,17 @@ tu_fex_device_init(struct tu_device *dev)
+        tu_fex_readable(chan, TU_FEX_CHANNEL_NP_SIZE))
+       fex->np_stats = true;
+    /* fex14: wave setup statistics only into a block that has them. */
+-   if (fex->np_stats && chan->ext_size >= sizeof(*chan) &&
+-       tu_fex_readable(chan, sizeof(*chan))) {
++   if (fex->np_stats && chan->ext_size >= TU_FEX_CHANNEL_ARM_SIZE &&
++       tu_fex_readable(chan, TU_FEX_CHANNEL_ARM_SIZE)) {
+       fex->arm_stats = true;
+       status |= TU_FEX_STATUS_ARM_STATS;
+    }
++   /* fex15: draw setup statistics only into a block that has them. */
++   if (fex->arm_stats && chan->ext_size >= sizeof(*chan) &&
++       tu_fex_readable(chan, sizeof(*chan))) {
++      fex->setup_stats = true;
++      status |= TU_FEX_STATUS_SETUP_STATS;
++   }
+ 
+    /* Read once: it changes compiled shaders (part of the layout hash). */
+    fex->compile = chan->compile & TU_FEX_COMPILE_MASK;
+@@ -181,6 +187,24 @@ tu_fex_device_init(struct tu_device *dev)
+       fex->w128_alt = true;
+       status |= TU_FEX_STATUS_W128;
+    }
++   /* fex15: the a7xx early preamble and shared constants (like fex13). */
++   if ((fex->compile & TU_FEX_COMPILE_NOPRE_ALL_ALT) &&
++       dev->physical_device->info->chip == 7 &&
++       !dev->physical_device->info->props.load_shader_consts_via_preamble) {
++      fex->nopre_all_alt = true;
++      status |= TU_FEX_STATUS_NOPRE_ALL;
++   }
++   /* fex15: only where the driver loads root constant buffer ranges (fex9). */
++   if ((fex->compile & TU_FEX_COMPILE_MERGE_ALT) && fex->cp_ubo) {
++      fex->merge_alt = true;
++      status |= TU_FEX_STATUS_MERGE;
++   }
++   /* fex15: SP_PS_CNTL_1 is a7xx only. */
++   if ((fex->compile & TU_FEX_COMPILE_CNTL_ALT) &&
++       dev->physical_device->info->chip == 7) {
++      fex->cntl_alt = true;
++      status |= TU_FEX_STATUS_CNTL;
++   }
+    fex->np_min_preamble = TU_FEX_NOPREAMBLE_MIN;
+    const char *np = getenv("TU_FEX_NOPREAMBLE_MIN"); /* host tests */
+    if (np && *np)
+@@ -484,6 +508,58 @@ tu_fex_count_pair_shader(struct tu_device *dev)
+    __atomic_fetch_add(&fex->chan->pair_shaders, 1, __ATOMIC_RELAXED);
+ }
+ 
++void
++tu_fex_count_nopre_shader(struct tu_device *dev)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->setup_stats)
++      return;
++   __atomic_fetch_add(&fex->chan->nopre_shaders, 1, __ATOMIC_RELAXED);
++}
++
++void
++tu_fex_count_merge_shader(struct tu_device *dev, uint32_t ranges_stock,
++                          uint32_t ranges_merged, uint32_t vec4_stock,
++                          uint32_t vec4_merged)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->setup_stats)
++      return;
++   struct tu_fex_channel *c = fex->chan;
++   __atomic_fetch_add(&c->merge_shaders, 1, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->merge_ranges[0], ranges_stock, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->merge_ranges[1], ranges_merged, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->merge_vec4[0], vec4_stock, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->merge_vec4[1], vec4_merged, __ATOMIC_RELAXED);
++}
++
++void
++tu_fex_count_cntl_shader(struct tu_device *dev)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->setup_stats)
++      return;
++   __atomic_fetch_add(&fex->chan->cntl_shaders, 1, __ATOMIC_RELAXED);
++}
++
++void
++tu_fex_count_setup_refused(struct tu_device *dev)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->setup_stats)
++      return;
++   __atomic_fetch_add(&fex->chan->setup_refused, 1, __ATOMIC_RELAXED);
++}
++
++void
++tu_fex_count_merge_pipeline(struct tu_device *dev, bool usable)
++{
++   struct tu_fex_device *fex = dev->fex;
++   if (!fex || !fex->setup_stats)
++      return;
++   __atomic_fetch_add(&fex->chan->merge_pipes[usable ? 0 : 1], 1, __ATOMIC_RELAXED);
++}
++
+ void
+ tu_fex_count_color_clear(struct tu_device *dev, uint64_t pixels)
+ {
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 68b9f43..672c538 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -68,7 +68,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 14
++#define TU_FEX_PATCH 15
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -136,9 +136,23 @@
+  * explains: 64-pixel waves run in pairs that part at texture and branch
+  * blocks and join again, and the one that got ahead waits. The driver
+  * writes WAVE_PAIR_MODE 0; what 1-3 do is not documented. */
++/* fex15: the same field picks the lighting draw setups that build 105 left
++ * open (what keeps the next lighting draw from starting into free wave
++ * slots): 4 = the second binary, which with TU_FEX_COMPILE_NOPRE_ALL_ALT has
++ * no preamble at all (push constants loaded by the command processor, the
++ * fragment stage not reading the shared constant registers), 5 = the third
++ * binary (TU_FEX_COMPILE_MERGE_ALT: one constant load per root constant
++ * buffer instead of one per range), 6 = the draw state with
++ * SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS 0, 7 = with EVICT_BUF_MODE 0
++ * (TU_FEX_COMPILE_CNTL_ALT; the driver writes 1 and 1). Arms 4 and 5 bind
++ * the binary's own program config (constlen, shared constants). */
+ #define TU_FEX_MODE_FS_ARM_SHIFT 8
+ #define TU_FEX_MODE_FS_ARM_MASK 0x700u
+ #define TU_FEX_FS_ARM_W128 4u
++#define TU_FEX_FS_ARM_ALT 4u
++#define TU_FEX_FS_ARM_MERGE 5u
++#define TU_FEX_FS_ARM_DEFER 6u
++#define TU_FEX_FS_ARM_EVICT 7u
+ #define TU_FEX_FS_ARMS 8u
+ /* Mode bits for command buffers (tu_fex_begin_cmdbuf). */
+ #define TU_FEX_MODE_MASK 0x76fu
+@@ -224,7 +238,27 @@
+  * 128-pixel waves (ir3_shader_key::fex_wave128), for TU_FEX_MODE_FS_ARM 4.
+  * Part of the shader keys (tu_shader_key::fex_w128_alt). */
+ #define TU_FEX_COMPILE_W128_ALT 0x100u
+-#define TU_FEX_COMPILE_MASK 0x1ffu
++/* fex15: the second binary of big fragment shaders with a preamble has no
++ * preamble at all: like TU_FEX_COMPILE_NOPREAMBLE_ALT, and push constants
++ * are read from the const file where the command processor loads them before
++ * each draw (ir3_shader_key::fex_push_by_driver), not copied there by a
++ * preamble from the shared constant registers. Build 104's binary without
++ * preamble kept that 6-instruction copy, so the early preamble still ran
++ * before every draw. Part of the shader keys (tu_shader_key::
++ * fex_nopre_all_alt). */
++#define TU_FEX_COMPILE_NOPRE_ALL_ALT 0x200u
++/* fex15: big fragment shaders whose driver-loaded constant ranges
++ * (TU_FEX_COMPILE_CP_UBO) include several of one root constant buffer get
++ * a third binary with one range per buffer (ir3_shader_key::
++ * fex_merge_ranges): D2R's lighting shaders load 12 ranges of 6 buffers
++ * before every draw. Part of the shader keys (tu_shader_key::
++ * fex_merge_alt). */
++#define TU_FEX_COMPILE_MERGE_ALT 0x400u
++/* fex15: big fragment shaders get two more draw states (same binary) with
++ * SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS 0 and EVICT_BUF_MODE 0, for
++ * TU_FEX_MODE_FS_ARM 6 and 7. Not part of the shader keys. */
++#define TU_FEX_COMPILE_CNTL_ALT 0x800u
++#define TU_FEX_COMPILE_MASK 0xfffu
+ #define TU_FEX_NOALIAS_MIN_INSTRS 1024u
+ #define TU_FEX_NOALIAS_MIN_ALIAS 64u
+ #define TU_FEX_NOPREAMBLE_MIN 32u
+@@ -269,6 +303,14 @@
+ #define TU_FEX_STATUS_W128 0x800000u
+ /* fex14: the wave setup statistics in the channel extension are written */
+ #define TU_FEX_STATUS_ARM_STATS 0x1000000u
++/* fex15: TU_FEX_COMPILE_NOPRE_ALL_ALT honored (a7xx) */
++#define TU_FEX_STATUS_NOPRE_ALL 0x2000000u
++/* fex15: TU_FEX_COMPILE_MERGE_ALT honored (needs TU_FEX_STATUS_CP_UBO) */
++#define TU_FEX_STATUS_MERGE 0x4000000u
++/* fex15: TU_FEX_COMPILE_CNTL_ALT honored (a7xx) */
++#define TU_FEX_STATUS_CNTL 0x8000000u
++/* fex15: the draw setup statistics in the channel extension are written */
++#define TU_FEX_STATUS_SETUP_STATS 0x10000000u
+ 
+ struct tu_fex_counter {
+    uint32_t group;     /* FEX: KGSL_PERFCOUNTER_GROUP_* */
+@@ -382,6 +424,23 @@ struct tu_fex_channel {
+    /* 0x3a0: fragment shaders that got the pair mode states, made this run */
+    volatile uint32_t pair_shaders;
+    uint32_t pad_3a4;
++   /* 0x3a8 (fex15, driver; only when ext_size covers it): fragment shaders
++    * made this run whose second binary has no preamble at all
++    * (TU_FEX_COMPILE_NOPRE_ALL_ALT), that got the third binary
++    * (TU_FEX_COMPILE_MERGE_ALT) and the driver-loaded ranges and vec4s of
++    * both binaries ([0] stock, [1] merged), that got the
++    * TU_FEX_COMPILE_CNTL_ALT draw states, and second/third binaries that
++    * were compiled but dropped. */
++   volatile uint32_t nopre_shaders;
++   volatile uint32_t merge_shaders;
++   volatile uint32_t merge_ranges[2];
++   volatile uint32_t merge_vec4[2];
++   volatile uint32_t cntl_shaders;
++   volatile uint32_t setup_refused;
++   /* 0x3c8: graphics pipelines made whose fragment shader has the third
++    * binary, [0] = the pipeline can use it, [1] = it cannot (the pipeline's
++    * constants would not fit with it). */
++   volatile uint32_t merge_pipes[2];
+ };
+ /* Size of the layout before fex11 (what 'size' holds). */
+ #define TU_FEX_CHANNEL_BASE_SIZE 0x2a8u
+@@ -391,6 +450,8 @@ struct tu_fex_channel {
+ #define TU_FEX_CHANNEL_NA_SIZE 0x358u
+ /* Size of the fex13 layout (preamble totals). */
+ #define TU_FEX_CHANNEL_NP_SIZE 0x360u
++/* Size of the fex14 layout (wave setup statistics). */
++#define TU_FEX_CHANNEL_ARM_SIZE 0x3a8u
+ 
+ /* tu_fex_slot::mode bit (fex3): the pass clears a depth/stencil attachment
+  * at its start, so TU_FEX_MODE_DEPTH_CLEAR_3D may change its time. */
+@@ -438,7 +499,10 @@ static_assert(__builtin_offsetof(struct tu_fex_channel, na_pipes) == 0x350, "lay
+ static_assert(__builtin_offsetof(struct tu_fex_channel, na_preamble) == 0x358, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, arm_binds) == TU_FEX_CHANNEL_NP_SIZE, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, pair_shaders) == 0x3a0, "layout shared with FEX");
+-static_assert(sizeof(struct tu_fex_channel) == 0x3a8, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, nopre_shaders) == TU_FEX_CHANNEL_ARM_SIZE, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, cntl_shaders) == 0x3c0, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, merge_pipes) == 0x3c8, "layout shared with FEX");
++static_assert(sizeof(struct tu_fex_channel) == 0x3d0, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
+ 
+ struct tu_device;
+@@ -514,6 +578,10 @@ struct tu_fex_device {
+    bool pair_alt;              /* fex14: TU_FEX_STATUS_PAIR */
+    bool w128_alt;              /* fex14: TU_FEX_STATUS_W128 */
+    bool arm_stats;             /* fex14: channel extension covers arm_binds */
++   bool nopre_all_alt;         /* fex15: TU_FEX_STATUS_NOPRE_ALL */
++   bool merge_alt;             /* fex15: TU_FEX_STATUS_MERGE */
++   bool cntl_alt;              /* fex15: TU_FEX_STATUS_CNTL */
++   bool setup_stats;           /* fex15: channel extension covers nopre_shaders.. */
+    uint32_t counter_count;     /* == chan->counter_count */
+    uint32_t counter_reg[TU_FEX_MAX_COUNTERS]; /* 0 = not reserved */
+    uint32_t counter_reg_hi[TU_FEX_MAX_COUNTERS];
+@@ -587,6 +655,39 @@ tu_fex_w128_alt(const struct tu_fex_device *fex)
+ /* fex14: a fragment shader got its pair mode states. */
+ void tu_fex_count_pair_shader(struct tu_device *dev);
+ 
++/* fex15: the second binary of big fragment shaders has no preamble at all
++ * (false without a channel). */
++static inline bool
++tu_fex_nopre_all_alt(const struct tu_fex_device *fex)
++{
++   return fex && fex->nopre_all_alt;
++}
++
++/* fex15: big fragment shaders get a third binary with one driver-loaded
++ * range per root constant buffer (false without a channel). */
++static inline bool
++tu_fex_merge_alt(const struct tu_fex_device *fex)
++{
++   return fex && fex->merge_alt;
++}
++
++/* fex15: big fragment shaders get draw states with DEFER_WAVE_ALLOC_DIS 0
++ * and EVICT_BUF_MODE 0 (false without a channel). */
++static inline bool
++tu_fex_cntl_alt(const struct tu_fex_device *fex)
++{
++   return fex && fex->cntl_alt;
++}
++
++/* fex15 statistics (no-ops without the channel extension). */
++void tu_fex_count_nopre_shader(struct tu_device *dev);
++void tu_fex_count_merge_shader(struct tu_device *dev, uint32_t ranges_stock,
++                               uint32_t ranges_merged, uint32_t vec4_stock,
++                               uint32_t vec4_merged);
++void tu_fex_count_cntl_shader(struct tu_device *dev);
++void tu_fex_count_setup_refused(struct tu_device *dev);
++void tu_fex_count_merge_pipeline(struct tu_device *dev, bool usable);
++
+ /* fex12: totals of one shader's two binaries for the channel. */
+ struct tu_fex_noalias_stats {
+    uint32_t instr, nops, alias, movs, regs, ss_stall, sy_stall;
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index e0536ca..76853c3 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -2501,6 +2501,52 @@ tu_emit_program_state(struct tu_cs *sub_cs,
+             ? shaders[MESA_SHADER_FRAGMENT]->fex_pair_state[m]
+             : (struct tu_draw_state) {};
+    }
++   /* fex15: same rule for the DEFER_WAVE_ALLOC_DIS / EVICT_BUF_MODE states. */
++   for (unsigned m = 0; m < 2; m++) {
++      prog->fex_cntl_fs_state[m] =
++         (shaders[MESA_SHADER_FRAGMENT] &&
++          !(safe_variants & (1u << MESA_SHADER_FRAGMENT)))
++            ? shaders[MESA_SHADER_FRAGMENT]->fex_cntl_state[m]
++            : (struct tu_draw_state) {};
++   }
++   /* fex15: the second and third binaries are bound with a program config
++    * made from them (their constlen; no shared constants for a binary
++    * without preamble), and only where the pipeline's constants still fit
++    * with them. */
++   prog->fex_alt_config_state = (struct tu_draw_state) {};
++   prog->fex_alt2_config_state = (struct tu_draw_state) {};
++   prog->fex_alt2_fs_state = (struct tu_draw_state) {};
++   prog->fex_alt2_fs_variant = NULL;
++   if (prog->fex_alt_fs_variant) {
++      const struct ir3_shader_variant *alt_variants[MESA_SHADER_STAGES];
++      memcpy(alt_variants, variants, sizeof(alt_variants));
++      alt_variants[MESA_SHADER_FRAGMENT] = prog->fex_alt_fs_variant;
++      if (ir3_trim_constlen(alt_variants, dev->compiler)) {
++         prog->fex_alt_fs_state = (struct tu_draw_state) {};
++         prog->fex_alt_fs_variant = NULL;
++      } else {
++         tu_cs_begin_sub_stream(sub_cs, 512, &prog_cs);
++         tu6_emit_program_config<CHIP>(&prog_cs, prog, shaders, alt_variants);
++         prog->fex_alt_config_state = tu_cs_end_draw_state(sub_cs, &prog_cs);
++      }
++   }
++   if (shaders[MESA_SHADER_FRAGMENT] &&
++       shaders[MESA_SHADER_FRAGMENT]->fex_alt2_variant &&
++       !(safe_variants & (1u << MESA_SHADER_FRAGMENT))) {
++      const struct ir3_shader_variant *alt_variants[MESA_SHADER_STAGES];
++      memcpy(alt_variants, variants, sizeof(alt_variants));
++      alt_variants[MESA_SHADER_FRAGMENT] =
++         shaders[MESA_SHADER_FRAGMENT]->fex_alt2_variant;
++      const bool fits = !ir3_trim_constlen(alt_variants, dev->compiler);
++      if (fits) {
++         prog->fex_alt2_fs_state = shaders[MESA_SHADER_FRAGMENT]->fex_alt2_state;
++         prog->fex_alt2_fs_variant = alt_variants[MESA_SHADER_FRAGMENT];
++         tu_cs_begin_sub_stream(sub_cs, 512, &prog_cs);
++         tu6_emit_program_config<CHIP>(&prog_cs, prog, shaders, alt_variants);
++         prog->fex_alt2_config_state = tu_cs_end_draw_state(sub_cs, &prog_cs);
++      }
++      tu_fex_count_merge_pipeline(sub_cs->device, fits);
++   }
+ 
+    const struct ir3_shader_variant *vs = variants[MESA_SHADER_VERTEX];
+    const struct ir3_shader_variant *hs = variants[MESA_SHADER_TESS_CTRL];
+diff --git a/src/freedreno/vulkan/tu_pipeline.h b/src/freedreno/vulkan/tu_pipeline.h
+index ff3111b..bce891e 100644
+--- a/src/freedreno/vulkan/tu_pipeline.h
++++ b/src/freedreno/vulkan/tu_pipeline.h
+@@ -117,6 +117,16 @@ struct tu_program_state
+        * (tu_shader::fex_pair_state), size 0 = none. Bound instead of fs_state
+        * in command buffers with TU_FEX_MODE_FS_ARM 1-3. */
+       struct tu_draw_state fex_pair_fs_state[3];
++      /* fex15: the program config made with the second binary (its constlen
++       * and shared constants), bound with it; size 0 = none. */
++      struct tu_draw_state fex_alt_config_state;
++      /* fex15: the third binary (tu_shader::fex_alt2_state), its variant and
++       * its program config, for TU_FEX_MODE_FS_ARM 5; size 0 = none. */
++      struct tu_draw_state fex_alt2_fs_state;
++      const struct ir3_shader_variant *fex_alt2_fs_variant;
++      struct tu_draw_state fex_alt2_config_state;
++      /* fex15: tu_shader::fex_cntl_state, for TU_FEX_MODE_FS_ARM 6 and 7. */
++      struct tu_draw_state fex_cntl_fs_state[2];
+ 
+       struct tu_push_constant_range shared_consts;
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index e7bdd00..363c94d 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -2593,6 +2593,9 @@ tu6_tex_opc_to_prefetch_cmd(opc_t tex_opc)
+ /* fex14: WAVE_PAIR_MODE for the fragment shader draw state being made
+  * (tu_upload_shader sets it around the TU_FEX_COMPILE_PAIR_ALT states). */
+ static thread_local uint32_t tu_fex_pair_mode_override = 0;
++/* fex15: 1 = DEFER_WAVE_ALLOC_DIS 0, 2 = EVICT_BUF_MODE 0 for the fragment
++ * shader draw state being made (TU_FEX_COMPILE_CNTL_ALT states). */
++static thread_local uint32_t tu_fex_cntl_override = 0;
+ 
+ template <chip CHIP>
+ static void
+@@ -2697,8 +2700,8 @@ tu6_emit_fs_inputs(struct tu_cs *cs, const struct ir3_shader_variant *fs)
+ 
+       tu_cs_emit_regs(cs, SP_PS_CNTL_1(CHIP,
+          .sysval_regs_count = sysval_regs,
+-         .defer_wave_alloc_dis = true,
+-         .evict_buf_mode = 1,
++         .defer_wave_alloc_dis = tu_fex_cntl_override != 1, /* fex15, stock true */
++         .evict_buf_mode = tu_fex_cntl_override == 2 ? 0u : 1u, /* fex15, stock 1 */
+          .wave_pair_mode = tu_fex_pair_mode_override, /* fex14, stock 0 */
+       ));
+    }
+@@ -3208,20 +3211,35 @@ tu_upload_variant(struct tu_cs *cs,
+  * the fragment shader's own draw state carries (instructions, registers,
+  * register numbers of inputs/outputs, immediates): the pipeline's other
+  * state is made from the stock binary and must fit both. */
++/* fex15: what else a binary may differ in. */
++#define TU_FEX_ALT_W128 0x1u        /* fex14: must be 128 wide (stock 64) */
++#define TU_FEX_ALT_NO_PREAMBLE 0x2u /* fex15: no preamble at all (stock has one) */
++#define TU_FEX_ALT_OWN_CONFIG 0x4u  /* fex15: bound with its own program
++                                     * config, so it may have more constants */
++
+ static bool
+ tu_fex_noalias_ok(const struct ir3_shader_variant *m,
+                   const struct ir3_shader_variant *a,
+-                  bool w128 /* fex14: the second binary must be 128 wide */)
++                  uint32_t flags)
+ {
++   const bool w128 = flags & TU_FEX_ALT_W128;
++   /* fex15: the early preamble bit is in the fragment shader's own draw
++    * state (SP_PS_CNTL_0); a binary without preamble must have none. */
++   if (flags & TU_FEX_ALT_NO_PREAMBLE) {
++      if (a->info.preamble_instrs_count || a->info.early_preamble)
++         return false;
++   } else if (a->info.early_preamble != m->info.early_preamble) {
++      return false;
++   }
++   if (!(flags & TU_FEX_ALT_OWN_CONFIG) && a->constlen > m->constlen)
++      return false;
+    /* fex14: the wave size is in the fragment shader's own draw state
+     * (SP_PS_CNTL_0, SP_PS_WAVE_CNTL), which the second binary has its own of. */
+    if (w128 ? (!a->info.double_threadsize || m->info.double_threadsize)
+             : a->info.double_threadsize != m->info.double_threadsize)
+       return false;
+-   if (a->info.early_preamble != m->info.early_preamble ||
+-       a->mergedregs != m->mergedregs ||
++   if (a->mergedregs != m->mergedregs ||
+        m->pvtmem_size || a->pvtmem_size ||
+-       a->constlen > m->constlen ||
+        a->total_in != m->total_in || a->sysval_in != m->sysval_in ||
+        a->inputs_count != m->inputs_count ||
+        a->outputs_count != m->outputs_count ||
+@@ -3254,6 +3272,27 @@ tu_fex_noalias_ok(const struct ir3_shader_variant *m,
+    return true;
+ }
+ 
++/* fex15: the variant's driver-loaded constant ranges (shared_ubo: only those
++ * of a root constant buffer that has another one). */
++static uint32_t
++tu_fex_cp_ranges(const struct ir3_shader_variant *v, bool shared_ubo)
++{
++   const struct ir3_ubo_analysis_state *us = &ir3_const_state(v)->ubo_state;
++   uint32_t n = 0;
++   for (uint32_t i = 0; i < us->num_enabled; i++) {
++      if (!us->range[i].fex_cp)
++         continue;
++      bool counted = !shared_ubo;
++      for (uint32_t j = 0; j < us->num_enabled && !counted; j++) {
++         counted = j != i && us->range[j].fex_cp &&
++                   !memcmp(&us->range[j].ubo, &us->range[i].ubo,
++                           sizeof(us->range[i].ubo));
++      }
++      n += counted;
++   }
++   return n;
++}
++
+ static void
+ tu_fex_noalias_stats_of(const struct ir3_shader_variant *v,
+                         struct tu_fex_noalias_stats *s)
+@@ -3278,6 +3317,7 @@ tu_upload_shader(struct tu_device *dev,
+    const struct ir3_shader_variant *safe_const_binning =
+       safe_const && v->type == MESA_SHADER_VERTEX ? safe_const->binning : NULL;
+    const struct ir3_shader_variant *fex_alt = shader->fex_alt_variant; /* fex12 */
++   const struct ir3_shader_variant *fex_alt2 = shader->fex_alt2_variant; /* fex15 */
+ 
+    if (v->type == MESA_SHADER_VERTEX && v->stream_output.num_outputs != 0) {
+       binning = v;
+@@ -3291,7 +3331,7 @@ tu_upload_shader(struct tu_device *dev,
+    const unsigned xs_size = 128;
+    const unsigned vpc_size = 64 + (v->stream_output.num_outputs != 0 ? 256 : 0);
+ 
+-   for (auto& variant : {v, binning, safe_const, safe_const_binning, fex_alt}) {
++   for (auto& variant : {v, binning, safe_const, safe_const_binning, fex_alt, fex_alt2}) {
+       if (variant) {
+          size += xs_size + tu_xs_get_additional_cs_size_dwords(variant);
+          size += variant->info.size / 4;
+@@ -3306,6 +3346,13 @@ tu_upload_shader(struct tu_device *dev,
+    if (fex_pair)
+       size += 3 * (xs_size + tu_xs_get_additional_cs_size_dwords(v));
+ 
++   /* fex15: and twice with DEFER_WAVE_ALLOC_DIS 0 / EVICT_BUF_MODE 0. */
++   const bool fex_cntl = tu_fex_cntl_alt(dev->fex) &&
++                         v->type == MESA_SHADER_FRAGMENT &&
++                         v->info.instrs_count >= dev->fex->na_min_instrs;
++   if (fex_cntl)
++      size += 2 * (xs_size + tu_xs_get_additional_cs_size_dwords(v));
++
+    /* We emit an empty VPC including streamout state in the binning draw state */
+    if (binning || v->type == MESA_SHADER_GEOMETRY) {
+       size += vpc_size;
+@@ -3366,6 +3413,7 @@ tu_upload_shader(struct tu_device *dev,
+    uint64_t safe_const_iova = tu_upload_variant(&shader->cs, safe_const);
+    uint64_t safe_const_binning_iova = tu_upload_variant(&shader->cs, safe_const_binning);
+    uint64_t fex_alt_iova = tu_upload_variant(&shader->cs, fex_alt);
++   uint64_t fex_alt2_iova = tu_upload_variant(&shader->cs, fex_alt2);
+ 
+    struct tu_cs sub_cs;
+    tu_cs_begin_sub_stream(&shader->cs, xs_size +
+@@ -3396,6 +3444,20 @@ tu_upload_shader(struct tu_device *dev,
+       tu_fex_count_pair_shader(dev);
+    }
+ 
++   if (fex_cntl) {
++      for (uint32_t m = 0; m < 2; m++) {
++         tu_cs_begin_sub_stream(&shader->cs, xs_size +
++                                tu_xs_get_additional_cs_size_dwords(v), &sub_cs);
++         tu_fex_cntl_override = m + 1;
++         TU_CALLX(dev, tu6_emit_variant)(
++            &sub_cs, shader->variant->type, shader->variant, &pvtmem_config,
++            hw_view_mask, iova);
++         tu_fex_cntl_override = 0;
++         shader->fex_cntl_state[m] = tu_cs_end_draw_state(&shader->cs, &sub_cs);
++      }
++      tu_fex_count_cntl_shader(dev);
++   }
++
+    if (safe_const) {
+       tu_cs_begin_sub_stream(&shader->cs, xs_size +
+                              tu_xs_get_additional_cs_size_dwords(safe_const), &sub_cs);
+@@ -3418,6 +3480,33 @@ tu_upload_shader(struct tu_device *dev,
+       tu_fex_noalias_stats_of(v, &sm);
+       tu_fex_noalias_stats_of(fex_alt, &sa);
+       tu_fex_count_noalias(dev, &sm, &sa);
++      /* fex15: the second binary without any preamble. */
++      if (ir3_const_state(fex_alt)->push_consts_type == IR3_PUSH_CONSTS_PER_STAGE &&
++          ir3_const_state(v)->push_consts_type != IR3_PUSH_CONSTS_PER_STAGE)
++         tu_fex_count_nopre_shader(dev);
++   }
++
++   /* fex15: the third binary (one range per root constant buffer). */
++   if (fex_alt2) {
++      tu_cs_begin_sub_stream(&shader->cs, xs_size +
++                             tu_xs_get_additional_cs_size_dwords(fex_alt2), &sub_cs);
++      TU_CALLX(dev, tu6_emit_variant)(
++         &sub_cs, v->type, fex_alt2, &pvtmem_config, hw_view_mask,
++         fex_alt2_iova);
++      shader->fex_alt2_state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
++
++      uint32_t ranges[2] = {}, vec4[2] = {};
++      const struct ir3_shader_variant *b[2] = { v, fex_alt2 };
++      for (unsigned k = 0; k < 2; k++) {
++         const struct ir3_ubo_analysis_state *us = &ir3_const_state(b[k])->ubo_state;
++         for (uint32_t i = 0; i < us->num_enabled; i++) {
++            if (us->range[i].fex_cp) {
++               ranges[k]++;
++               vec4[k] += (us->range[i].end - us->range[i].start) / 16;
++            }
++         }
++      }
++      tu_fex_count_merge_shader(dev, ranges[0], ranges[1], vec4[0], vec4[1]);
+    }
+ 
+    if (binning) {
+@@ -3543,6 +3632,14 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
+    if (has_fex_alt)
+       io.variant(shader->fex_alt_variant);
+ 
++   /* fex15 */
++   uint8_t has_fex_alt2;
++   if constexpr (IO::is_write())
++      has_fex_alt2 = shader->fex_alt2_variant ? 1 : 0;
++   io.u8(has_fex_alt2);
++   if (has_fex_alt2)
++      io.variant(shader->fex_alt2_variant);
++
+    switch (shader->variant->type) {
+    case MESA_SHADER_TESS_EVAL:
+       io.bytes(&shader->tes, sizeof(shader->tes));
+@@ -3891,8 +3988,9 @@ tu_shader_create(struct tu_device *dev,
+    const bool fex_alt_na =
+       key->fex_noalias_alt && shader->variant &&
+       shader->variant->info.instrs_per_cat[7] >= dev->fex->na_min_alias;
++   /* fex15: or without any preamble (TU_FEX_COMPILE_NOPRE_ALL_ALT). */
+    const bool fex_alt_np =
+-      key->fex_nopreamble_alt && shader->variant &&
++      (key->fex_nopreamble_alt || key->fex_nopre_all_alt) && shader->variant &&
+       shader->variant->info.preamble_instrs_count >= dev->fex->np_min_preamble;
+    /* fex14: or as 128-pixel waves, when ir3 chose 64. */
+    const bool fex_alt_w128 =
+@@ -3903,16 +4001,44 @@ tu_shader_create(struct tu_device *dev,
+        shader->variant->info.instrs_count >= dev->fex->na_min_instrs) {
+       struct ir3_shader_key alt_key = *ir3_key;
+       alt_key.fex_noalias_tex = key->fex_noalias_alt;
+-      alt_key.fex_nopreamble = key->fex_nopreamble_alt;
++      alt_key.fex_nopreamble = key->fex_nopreamble_alt || key->fex_nopre_all_alt;
+       alt_key.fex_wave128 = key->fex_w128_alt;
++      alt_key.fex_push_by_driver = key->fex_nopre_all_alt;
++      const uint32_t flags =
++         (key->fex_w128_alt ? TU_FEX_ALT_W128 : 0) |
++         (key->fex_nopre_all_alt ? TU_FEX_ALT_NO_PREAMBLE | TU_FEX_ALT_OWN_CONFIG : 0);
+       struct ir3_shader_variant *alt =
+          ir3_shader_create_variant(ir3_shader, &alt_key, executable_info);
+-      if (alt && tu_fex_noalias_ok(shader->variant, alt, key->fex_w128_alt)) {
++      if (alt && tu_fex_noalias_ok(shader->variant, alt, flags)) {
+          shader->fex_alt_variant = alt;
+       } else {
+          if (alt)
+             ralloc_free(alt);
+          tu_fex_count_noalias_refused(dev);
++         if (key->fex_nopre_all_alt)
++            tu_fex_count_setup_refused(dev);
++      }
++   }
++
++   /* fex15: big fragment shaders whose driver-loaded constant ranges include
++    * several of one root constant buffer, once more with one range per
++    * buffer (TU_FEX_COMPILE_MERGE_ALT), kept when that makes fewer loads. */
++   if (key->fex_merge_alt && shader->variant &&
++       shader->variant->type == MESA_SHADER_FRAGMENT &&
++       shader->variant->info.instrs_count >= dev->fex->na_min_instrs &&
++       tu_fex_cp_ranges(shader->variant, true) > 0) {
++      struct ir3_shader_key alt2_key = *ir3_key;
++      alt2_key.fex_merge_ranges = true;
++      struct ir3_shader_variant *alt2 =
++         ir3_shader_create_variant(ir3_shader, &alt2_key, executable_info);
++      if (alt2 &&
++          tu_fex_cp_ranges(alt2, false) < tu_fex_cp_ranges(shader->variant, false) &&
++          tu_fex_noalias_ok(shader->variant, alt2, TU_FEX_ALT_OWN_CONFIG)) {
++         shader->fex_alt2_variant = alt2;
++      } else {
++         if (alt2)
++            ralloc_free(alt2);
++         tu_fex_count_setup_refused(dev);
+       }
+    }
+ 
+@@ -4285,6 +4411,8 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
+    key->fex_noalias_alt = tu_fex_noalias_alt(dev->fex);
+    key->fex_nopreamble_alt = tu_fex_nopreamble_alt(dev->fex);
+    key->fex_w128_alt = tu_fex_w128_alt(dev->fex);
++   key->fex_nopre_all_alt = tu_fex_nopre_all_alt(dev->fex);
++   key->fex_merge_alt = tu_fex_merge_alt(dev->fex);
+ }
+ 
+ void
+@@ -4434,6 +4562,8 @@ tu_shader_destroy(struct tu_device *dev,
+       ralloc_free(const_cast<struct ir3_shader_variant *>(shader->safe_const_variant));
+    if (shader->fex_alt_variant)
+       ralloc_free(const_cast<struct ir3_shader_variant *>(shader->fex_alt_variant));
++   if (shader->fex_alt2_variant)
++      ralloc_free(const_cast<struct ir3_shader_variant *>(shader->fex_alt2_variant));
+ 
+    vk_free(&dev->vk.alloc, shader);
+ }
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 6d4143d..870cbb5 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -83,6 +83,14 @@ struct tu_shader
+    /* fex14 (TU_FEX_COMPILE_PAIR_ALT): 'state' again with
+     * SP_PS_CNTL_1.WAVE_PAIR_MODE 1, 2, 3 (same binary); empty if not made. */
+    struct tu_draw_state fex_pair_state[3];
++   /* fex15 (TU_FEX_COMPILE_MERGE_ALT): the third binary, with one
++    * driver-loaded range per root constant buffer (its own constant layout,
++    * maybe more constants than 'variant'), and its draw state. */
++   const struct ir3_shader_variant *fex_alt2_variant;
++   struct tu_draw_state fex_alt2_state;
++   /* fex15 (TU_FEX_COMPILE_CNTL_ALT): 'state' again with
++    * SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS 0, and with EVICT_BUF_MODE 0. */
++   struct tu_draw_state fex_cntl_state[2];
+    struct tu_draw_state binning_state;
+    struct tu_draw_state safe_const_binning_state;
+ 
+@@ -171,7 +179,13 @@ struct tu_shader_key {
+    /* fex14: TU_FEX_COMPILE_W128_ALT (tu_fex_w128_alt): the second binary of
+     * big fragment shaders runs as 128-pixel waves. */
+    bool fex_w128_alt : 1;
+-   uint32_t padding : 15;
++   /* fex15: TU_FEX_COMPILE_NOPRE_ALL_ALT (tu_fex_nopre_all_alt): the second
++    * binary of big fragment shaders has no preamble at all. */
++   bool fex_nopre_all_alt : 1;
++   /* fex15: TU_FEX_COMPILE_MERGE_ALT (tu_fex_merge_alt): big fragment
++    * shaders carry a third binary with one range per root constant buffer. */
++   bool fex_merge_alt : 1;
++   uint32_t padding : 13;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 

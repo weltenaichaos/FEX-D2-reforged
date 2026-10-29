@@ -258,6 +258,21 @@ namespace FEX::Windows {
 //                          follows the rotation (FEX_TU_NOALIAS / FEX_TU_NOPREAMBLE then only change how that binary is
 //                          compiled). Read once at device creation (one-time recompile of those shaders). Without the
 //                          stats log nothing rotates, so the first setup in the list stays.
+//                          Build 106: default 0 (build 105: 128-pixel waves +12% slower, pair modes no reliable gain);
+//                          only read when FEX_TU_DRAW_SETUP=0.
+//   FEX_TU_DRAW_SETUP=alt  (the D2R default from build 106, driver fex15 and later, a7xx) big fragment shaders (1,024+
+//                          instructions, D2R's lighting shaders) run with another draw setup each second, in turn:
+//                          0 stock, 4 a second binary with no preamble at all (push constants loaded by the command
+//                          processor before each draw, the fragment stage not reading the shared constant registers),
+//                          5 a third binary with one constant load per root constant buffer instead of one per range,
+//                          6 SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS 0, 7 EVICT_BUF_MODE 0 (the driver writes 1 and 1; not
+//                          documented). Build 105: about one lighting draw's waves are on the shader cores at a time
+//                          although there is room for more, so the next draw doesn't start into free slots; these are
+//                          the per-draw setup steps that could hold it. A list of digits (e.g. 045) rotates only those
+//                          (1-3 = FEX_TU_WAVE_PAIR's pair modes), one digit = that setup always, 0 = off. With setup 4 in
+//                          the list, the second binary's mode bit follows the rotation. Read once at device creation
+//                          (one-time recompile of those shaders). Without the stats log nothing rotates, so the first
+//                          setup in the list stays.
 // The stats log's 'turnip' lines (ARM64EC/TurnipReport.cpp) report them.
 void SetupEnvironmentVariableValues(HMODULE NtDll);
 }

@@ -272,7 +272,8 @@ namespace {
   bool TurnipBudgetCache {};
   uint32_t TurnipSwitch {};
   uint32_t TurnipNoAlias {};
-  uint32_t TurnipWaveArms {}; // FEX_TU_WAVE_PAIR: bit N = wave setup arm N takes part
+  uint32_t TurnipWaveArms {}; // FEX_TU_DRAW_SETUP or FEX_TU_WAVE_PAIR: bit N = arm N takes part
+  bool TurnipDrawSetup {};    // the arms come from FEX_TU_DRAW_SETUP (arm 4 = no preamble at all, 5-7 fex15 setups)
 
   // FEX_TU_WAVE_PAIR: 0 = off; alt = arms 0-4 a second each; digits 0-4 = those arms (one digit other than 0 = that arm
   // always).
@@ -292,14 +293,58 @@ namespace {
     return Arms == 1 ? 0 : Arms;
   }
 
+  // FEX_TU_DRAW_SETUP: 0 = off; alt = arms 0, 4, 5, 6, 7 a second each; digits 0-7 = those arms (one digit other than 0 =
+  // that arm always).
+  uint32_t ParseDrawSetupArms(const char* Value) {
+    if (!Value || !Value[0]) {
+      return 0;
+    }
+    if (Value[0] == 'a' || Value[0] == 'A') {
+      return 0xf1;
+    }
+    uint32_t Arms = 0;
+    for (const char* c = Value; *c; ++c) {
+      if (*c >= '0' && *c <= '7') {
+        Arms |= 1u << (*c - '0');
+      }
+    }
+    return Arms == 1 ? 0 : Arms;
+  }
+
   bool SwitchOff(const char* Value) {
     return !Value || (Value[0] == '0' && !Value[1]);
   }
 
+  // The draw setups FEX_TU_DRAW_SETUP asked for, for the FEX link note.
+  fextl::string DrawSetupText(uint32_t Arms) {
+    static constexpr const char* Names[] = {"stock",
+                                            "pair mode 1",
+                                            "pair mode 2",
+                                            "pair mode 3",
+                                            "binary with no preamble at all",
+                                            "one constant load per root constant buffer",
+                                            "DEFER_WAVE_ALLOC_DIS 0",
+                                            "EVICT_BUF_MODE 0"};
+    fextl::string List;
+    uint32_t N = 0;
+    for (uint32_t a = 0; a < Turnip::FsArms; ++a) {
+      if (Arms & (1u << a)) {
+        List += fextl::fmt::format("{}{}", N++ ? ", " : "", Names[a]);
+      }
+    }
+    return fextl::fmt::format("{} {} (FEX_TU_DRAW_SETUP, driver fex15 and later; one-time recompile of those shaders{})",
+                              N > 1 ? "rotating a second each:" : "always", List,
+                              (Arms & (1u << Turnip::FsArmAlt)) ? "; the second binary's mode bit follows the setup without preamble" :
+                                                                  "");
+  }
+
   // The wave setups FEX_TU_WAVE_PAIR asked for, for the FEX link note.
   fextl::string WaveArmsText(uint32_t Arms) {
+    if (TurnipDrawSetup) {
+      return DrawSetupText(Arms);
+    }
     if (!Arms) {
-      return "stock (FEX_TU_WAVE_PAIR=0)";
+      return "stock (FEX_TU_WAVE_PAIR=0, FEX_TU_DRAW_SETUP=0)";
     }
     static constexpr const char* Names[] = {"stock", "pair mode 1", "pair mode 2", "pair mode 3", "128-pixel waves"};
     fextl::string List;
@@ -376,9 +421,13 @@ namespace {
     // stats log alt stays on.
     const char* NoAlias = Switch("FEX_TU_NOALIAS");
     TurnipNoAlias = SwitchOff(NoAlias) ? 0 : (NoAlias[0] == 'a' || NoAlias[0] == 'A' || NoAlias[0] == '2') ? 2 : 1;
-    // FEX_TU_WAVE_PAIR (see EnvironmentVariablesHandling.h): the wave setup of big fragment shaders, starting with the
-    // lowest arm asked for; TurnipReport moves to the next one each second.
-    TurnipWaveArms = ParseWaveArms(Switch("FEX_TU_WAVE_PAIR"));
+    // FEX_TU_DRAW_SETUP, or without it FEX_TU_WAVE_PAIR (see EnvironmentVariablesHandling.h): the draw or wave setup of
+    // big fragment shaders, starting with the lowest arm asked for; TurnipReport moves to the next one each second.
+    TurnipWaveArms = ParseDrawSetupArms(Switch("FEX_TU_DRAW_SETUP"));
+    TurnipDrawSetup = TurnipWaveArms != 0;
+    if (!TurnipDrawSetup) {
+      TurnipWaveArms = ParseWaveArms(Switch("FEX_TU_WAVE_PAIR"));
+    }
     const uint32_t FirstArm = TurnipWaveArms ? static_cast<uint32_t>(__builtin_ctz(TurnipWaveArms)) : 0;
     // FEX_TU_NOPREAMBLE alt/lit (SetupTurnipNoPreamble): the second binary without preamble, picked with the same mode bit.
     // With wave setup 4 (the 128-pixel binary) asked for, that bit follows the wave setup instead.
@@ -398,40 +447,45 @@ namespace {
     // wave), and the wave spending 15% on math, 3% on idle issue slots, 27% waiting for texture/memory data and ~40% in
     // states that list didn't count. The texture counters are dropped (102 has them: 40% L1 misses, 25% L2 misses);
     // these are all the shader core's wave state counters, so the shares add up and the biggest state is named.
-    // Build 105: special math (efu, 0.4%) and join (~1%) make room for the 64/128-pixel wave counts, which show whether
-    // the 128-pixel wave setup (FEX_TU_WAVE_PAIR) ran.
+    // Build 105: special math (efu, 0.4%) and join (~1%) made room for the 64/128-pixel wave counts.
+    // Build 106: build 105 found about one lighting draw's waves on the cores at a time (5.9 waves per busy core with
+    // room for 8, cycles per draw = one wave life), so this list adds what the front end that starts draws and their
+    // waves does: the HLSQ (dual fs = two fragment programs active at once, i.e. two draws overlapping; waits for shader
+    // state and constant programming; stalls by the cores' fragment stage; starving the cores), cores starved by it,
+    // primitive control waiting for the command processor or draw setup, and the command processor's sync waits. The
+    // smallest wave states go (csp, wait, ctrl, end, input, output, idle, half-wave sync, 64/128-pixel counts).
     if (!SwitchOff(Switch("FEX_TU_COUNTERS"))) {
       static constexpr struct {
         uint32_t Group, Countable;
       } List[] = {
         {Turnip::GroupCp, 0}, // CP_ALWAYS_COUNT (GPU cycles, shared with KGSL)
-        // Shader cores: busy, resident waves (integral over cycles), fragment wave lives.
+        // Shader cores: busy, resident waves (integral over cycles), fragment wave lives, starved by the front end.
         {Turnip::GroupSp, 0},  // SP_BUSY_CYCLES
         {Turnip::GroupSp, 8},  // SP_WAVE_CONTEXTS
         {Turnip::GroupSp, 10}, // SP_STAGE_WAVE_CYCLES (fragment wave lives)
         {Turnip::GroupSp, 11}, // SP_STAGE_WAVE_SAMPLES (fragment waves)
-        // Build 105: fragment waves launched as 64 (1x) and 128 (2x) pixels, so the 128-pixel setup shows it ran.
-        {Turnip::GroupSp, 97}, // SP_FS_STAGE_1X_WAVES
-        {Turnip::GroupSp, 98}, // SP_FS_STAGE_2X_WAVES
-        // Issuing, by unit.
-        {Turnip::GroupSp, 89}, // SP_WAVE_ALU_CYCLES (float math)
-        {Turnip::GroupSp, 91}, // SP_WAVE_INT_CYCLES (integer math)
-        {Turnip::GroupSp, 92}, // SP_WAVE_CSP_CYCLES
-        {Turnip::GroupSp, 19}, // SP_WAVE_NOP_CYCLES (idle issue slots the compiler put in)
-        // Waiting and the rest of a wave's life.
-        {Turnip::GroupSp, 20},  // SP_WAVE_WAIT_CYCLES
-        {Turnip::GroupSp, 21},  // SP_WAVE_FETCH_CYCLES (instruction fetch)
-        {Turnip::GroupSp, 22},  // SP_WAVE_IDLE_CYCLES
-        {Turnip::GroupSp, 24},  // SP_WAVE_LONG_SYNC_CYCLES (texture/memory results)
-        {Turnip::GroupSp, 25},  // SP_WAVE_SHORT_SYNC_CYCLES
-        {Turnip::GroupSp, 16},  // SP_WAVE_CTRL_CYCLES
-        {Turnip::GroupSp, 17},  // SP_WAVE_LOAD_CYCLES
-        {Turnip::GroupSp, 18},  // SP_WAVE_EMIT_CYCLES
-        {Turnip::GroupSp, 23},  // SP_WAVE_END_CYCLES
-        {Turnip::GroupSp, 104}, // SP_WAVE_INPUT_CYCLES
-        {Turnip::GroupSp, 105}, // SP_WAVE_OUTPUT_CYCLES
-        {Turnip::GroupSp, 106}, // SP_WAVE_HWAVE_WAIT_CYCLES
-        {Turnip::GroupSp, 107}, // SP_WAVE_HWAVE_SYNC
+        {Turnip::GroupSp, 69}, // SP_STARVE_CYCLES_HLSQ
+        // Wave states, biggest first in build 105's lighting pass.
+        {Turnip::GroupSp, 106}, // SP_WAVE_HWAVE_WAIT_CYCLES (30%)
+        {Turnip::GroupSp, 24},  // SP_WAVE_LONG_SYNC_CYCLES (texture/memory results, 26%)
+        {Turnip::GroupSp, 89},  // SP_WAVE_ALU_CYCLES (float math, 15%)
+        {Turnip::GroupSp, 21},  // SP_WAVE_FETCH_CYCLES (instruction fetch, 6%)
+        {Turnip::GroupSp, 17},  // SP_WAVE_LOAD_CYCLES (5%)
+        {Turnip::GroupSp, 18},  // SP_WAVE_EMIT_CYCLES (5%)
+        {Turnip::GroupSp, 25},  // SP_WAVE_SHORT_SYNC_CYCLES (3%)
+        {Turnip::GroupSp, 19},  // SP_WAVE_NOP_CYCLES (2%)
+        {Turnip::GroupSp, 91},  // SP_WAVE_INT_CYCLES (2%)
+        // The front end (HLSQ, at most 6 counters).
+        {Turnip::GroupHlsq, 12}, // HLSQ_DUAL_FS_PROG_ACTIVE
+        {Turnip::GroupHlsq, 11}, // HLSQ_FS_DATA_WAIT_PROGRAMMING
+        {Turnip::GroupHlsq, 2},  // HLSQ_STALL_CYCLES_SP_STATE
+        {Turnip::GroupHlsq, 3},  // HLSQ_STALL_CYCLES_SP_FS_STAGE
+        {Turnip::GroupHlsq, 22}, // HLSQ_FS_STALL_CYCLES
+        {Turnip::GroupHlsq, 39}, // HLSQ_FS_STARVING_SP
+        // Primitive control and the command processor between draws.
+        {Turnip::GroupPc, 13}, // PC_STARVE_CYCLES_DI (waits for the command processor's next draw)
+        {Turnip::GroupPc, 48}, // PC_STARVE_CYCLES_PREDRAW (waits for draw setup)
+        {Turnip::GroupCp, 23}, // CP_SYNC_STALL
       };
       static_assert(std::size(List) <= Turnip::MaxCounters);
       for (const auto& C : List) {
@@ -484,8 +538,20 @@ namespace {
     if (TurnipWaveArms & 0xe) {
       Chan->Compile |= Turnip::CompilePairAlt;
     }
-    if (TurnipWaveArms & (1u << Turnip::FsArmW128)) {
+    if (!TurnipDrawSetup && (TurnipWaveArms & (1u << Turnip::FsArmW128))) {
       Chan->Compile |= Turnip::CompileW128Alt;
+    }
+    // FEX_TU_DRAW_SETUP (driver fex15 and later): arm 4 = the second binary with no preamble at all, arm 5 = the third
+    // binary with merged constant loads (both part of the shader keys: one-time recompile), arms 6/7 = the alloc setting
+    // states (made when a shader is uploaded).
+    if (TurnipDrawSetup && (TurnipWaveArms & (1u << Turnip::FsArmAlt))) {
+      Chan->Compile |= Turnip::CompileNoPreAllAlt;
+    }
+    if (TurnipDrawSetup && (TurnipWaveArms & (1u << Turnip::FsArmMerge))) {
+      Chan->Compile |= Turnip::CompileMergeAlt;
+    }
+    if (TurnipDrawSetup && (TurnipWaveArms & ((1u << Turnip::FsArmDefer) | (1u << Turnip::FsArmEvict)))) {
+      Chan->Compile |= Turnip::CompileCntlAlt;
     }
 
     const auto Text = fextl::fmt::format("{:x}", reinterpret_cast<uintptr_t>(Chan));
@@ -501,7 +567,7 @@ namespace {
                                     "buffers {}, preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the "
                                     "command processor {}, other root constant buffer reads through the shaders' UBO table {}, pipeline "
                                     "switches send only what changed {}, lighting shaders without alias.tex helpers {}, lighting "
-                                    "shaders without preamble {}, lighting shader wave setups {}, depth clears at pass start {}, "
+                                    "shaders without preamble {}, lighting shader wave/draw setups {}, depth clears at pass start {}, "
                                     "memory budget {}, {} GPU counters asked for, passes with {}+ draws timed and counted; only FEX's "
                                     "Turnip build (fex1 and later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
@@ -635,6 +701,9 @@ namespace Turnip {
   }
   uint32_t WavePairArms() {
     return TurnipWaveArms;
+  }
+  bool DrawSetupArms() {
+    return TurnipDrawSetup;
   }
 } // namespace Turnip
 } // namespace FEX::Windows

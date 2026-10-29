@@ -19,7 +19,9 @@
 # a second binary of big fragment shaders without alias.tex helpers, picked per second,
 # (fex13) that second binary without preamble instead, with its own constant layout, and
 # (fex14) other wave setups for big fragment shaders, picked per second (wave pair mode 1-3 or
-# a second binary as 128-pixel waves).
+# a second binary as 128-pixel waves), and (fex15) other draw setups for them, picked per
+# second (a binary with no preamble at all, a binary with one constant load per root constant
+# buffer, or wave allocation settings the driver always turns off).
 # Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
@@ -34,7 +36,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex14
+  FEX_PATCH: fex15
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -141,7 +143,13 @@ jobs:
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "tu_fex_color_clear_3d_index" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 14" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 15" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "fex_merge_cp_ranges" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir_analyze_ubo_ranges.c"
+          grep -q "fex_push_by_driver" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_shader.c"
+          grep -q "tu_fex_emit_push_by_driver" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "fex_alt2_config_state" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_pipeline.cc"
+          grep -q "tu_fex_cntl_override" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_shader.cc"
+          grep -q "TU_FEX_COMPILE_MERGE_ALT" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.cc"
           grep -q "fex_wave128" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3.c"
           grep -q "TU_FEX_COMPILE_PAIR_ALT" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.cc"
           grep -q "fex_pair_fs_state" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
@@ -314,6 +322,22 @@ jobs:
             SP_PS_CNTL_0 and SP_PS_WAVE_CNTL (same 7120 instructions and 24 registers for 5ff3). Status bits
             0x400000 (pair modes), 0x800000 (128-pixel binary), 0x1000000 (counts); the channel extension
             (0x3a8) adds pipeline binds per setting and the count of shaders with pair mode states.
+            fex15 (FEX build 106 and later, FEX_TU_DRAW_SETUP=alt or a list of settings): the same arm
+            bits pick other draw setups for big fragment shaders. Build 105 found that about one D2R
+            lighting draw's waves are on the GPU at a time although there is room for more, so these test
+            what keeps the next draw from starting: 4 a second binary with no preamble at all (push
+            constants loaded by the command processor before each draw, the fragment stage not reading
+            the shared constant registers; build 104's binary kept a 6-instruction push constant copy, so
+            the early preamble still ran before every draw), 5 a third binary with one driver-loaded
+            constant range per root constant buffer (5ff3: 12 ranges of 6 buffers, merged 6 ranges, 100 ->
+            152 vec4), 6 the same binary with SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS 0 and 7 with
+            EVICT_BUF_MODE 0 (the driver writes 1 and 1; not documented). Arms 4 and 5 bind the binary's
+            own program config. Host check (drawtest, a 9-range shader): stock CONSTLEN 136 with
+            READ_IMM_SHARED_CONSTS and EARLYPREAMBLE; arm 4 CONSTLEN 104, neither flag, push constants as
+            one CP_LOAD_STATE6 to the fragment stage; arm 5 CONSTLEN 192 and 5 loads; arms 6 and 7 change
+            only their bit. Status bits 0x2000000 (no preamble binary), 0x4000000 (merged loads),
+            0x8000000 (alloc states), 0x10000000 (counts); the channel extension (0x3d0) adds the
+            counts.
             Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

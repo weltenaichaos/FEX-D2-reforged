@@ -386,3 +386,33 @@ pixels); with 0x1df (no preamble too) preamble 137 -> 6 as in fex13. `drawtest_s
 direct: arms 1, 2 and 3 differ from stock only in `SP_PS_CNTL_1.WAVE_PAIR_MODE`; arm 4 (mode 0x440) only
 in the binary's address and `THREADSIZE = THREAD128` in `SP_PS_CNTL_0` and `SP_PS_WAVE_CNTL`; arm binds
 count 8 in the right arm; without the compile bits nothing changes.
+
+- `0015-fex15-draw-setup.patch` (fex15, with FEX build 106): other draw setups for big fragment shaders,
+  picked with the same arm bits (FEX_TU_DRAW_SETUP=alt rotates them a second each). Build 105 found that
+  about one D2R lighting draw's waves are on the GPU at a time (cycles per draw about one wave life, 5.9
+  waves per busy core with room for 8), so these test what keeps the next draw from starting.
+  - Arm 4 with `TU_FEX_COMPILE_NOPRE_ALL_ALT` 0x200 (a7xx without consts via preamble, status 0x2000000):
+    the second binary has no preamble at all. Push constants are read from the const file where the
+    command processor loads them before each draw (`ir3_shader_key::fex_push_by_driver`: push constant
+    type per stage instead of the shared constant registers, `tu_fex_emit_push_by_driver`), and ir3 no
+    longer makes an empty preamble when every UBO range is loaded by the driver. Build 104's binary kept a
+    6-instruction push constant copy, so the early preamble still ran before every draw. FEX sets fex12's
+    mode bit with arm 4; that bind also uses the binary's own program config (`fex_alt_config_state`).
+  - Arm 5 with `TU_FEX_COMPILE_MERGE_ALT` 0x400 (needs fex9's driver-loaded ranges, status 0x4000000): a
+    third binary (`ir3_shader_key::fex_merge_ranges`, `fex_merge_cp_ranges`) with one driver-loaded range
+    per root constant buffer where the gaps fit, bound with its own program config and fragment constant
+    layout (`tu_program_state::fex_alt2_*`). Pipelines whose constants would not fit keep the stock binary.
+  - Arms 6 and 7 with `TU_FEX_COMPILE_CNTL_ALT` 0x800 (a7xx, status 0x8000000): two more fragment stage
+    draw states from the same binary with `SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS` 0 and `EVICT_BUF_MODE` 0
+    (the driver always writes 1 and 1; not documented).
+  - Counts in the channel extension (`ext_size` >= 0x3d0, status 0x10000000): `nopre_shaders` 0x3a8,
+    `merge_shaders` 0x3ac, `merge_ranges[2]` 0x3b0, `merge_vec4[2]` 0x3b8, `cntl_shaders` 0x3c0,
+    `setup_refused` 0x3c4, `merge_pipes[2]` 0x3c8. Pipeline binds per arm stay in fex14's `arm_binds`.
+
+Host check (fex15): `eptest` (EPTEST_FEX=0xe1f EPTEST_EXT=0x3d0) with 5ff3: second binary preamble 137 -> 0,
+7120 -> 7204 instructions, 24 registers; third binary 12 -> 6 driver-loaded ranges, 100 -> 152 vec4, constlen
+164 -> 216, same instructions; refused 0. `drawtest_sw15` with 0e15 (9 ranges), direct: stock CONSTLEN 136 with
+READ_IMM_SHARED_CONSTS and EARLYPREAMBLE; arm 4 (mode 0x440) CONSTLEN 104, neither flag, plus one
+CP_LOAD_STATE6_FRAG with the push constants; arm 5 (0x500) CONSTLEN 192 and 5 loads; arms 6 and 7 change only
+their bit. Mixed pipelines with dynamic state, rebinds, sysmem and gmem ran without asserts and counted binds
+in the right arm.

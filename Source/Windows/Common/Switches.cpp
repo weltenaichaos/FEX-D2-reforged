@@ -324,7 +324,20 @@ namespace {
     // (SP_PS_CNTL_1.WAVE_PAIR_MODE, undocumented), 4 the shaders compiled as 128-pixel waves (one wave, no partner;
     // same instructions and registers). A list of digits (e.g. 04) rotates only those, one digit = that setup always,
     // 0 = stock. Pass kinds carry the setup ('stock', 'pair1'..'pair3', 'w128').
-    {"FEX_TU_WAVE_PAIR", "alt"},
+    // Build 106: off. Build 105 measured it: 128-pixel waves halve the half-wave wait but make the lighting pass 12%
+    // slower, pair modes 1-3 gave no reliable change (-3% pooled, halves +3% and -4.5%). FEX_TU_WAVE_PAIR=alt or digits
+    // still turn it on when FEX_TU_DRAW_SETUP=0.
+    {"FEX_TU_WAVE_PAIR", "0"},
+    // Build 106: build 105 found about one lighting draw's waves on the shader cores at a time (5.9 waves per busy core
+    // with room for 8, a draw costs one wave life), so the next draw doesn't start into the free slots. FEX's Turnip fex15
+    // gives the big fragment shaders other draw setups, and alt rotates them a second each: 0 stock, 4 a second binary
+    // with no preamble at all (push constants loaded by the command processor; build 104's binary kept a 6-instruction
+    // copy, so the early preamble still ran before every draw), 5 a third binary with one constant load per root constant
+    // buffer (12 loads of 6 buffers -> 6 for the main lighting shader), 6 SP_PS_CNTL_1.DEFER_WAVE_ALLOC_DIS 0, 7
+    // EVICT_BUF_MODE 0 (the driver always writes 1 and 1; not documented). Digits pick a list (e.g. 045), one digit =
+    // that setup always, 0 = off (then FEX_TU_WAVE_PAIR decides). Pass kinds carry the setup ('stock', 'nopre', 'merge',
+    // 'defer', 'evict').
+    {"FEX_TU_DRAW_SETUP", "alt"},
   };
 
   // In the order the stats log lists them.
@@ -418,6 +431,7 @@ namespace {
     "FEX_TU_SWITCH",
     "FEX_TU_NOALIAS",
     "FEX_TU_WAVE_PAIR",
+    "FEX_TU_DRAW_SETUP",
   };
 
   bool UseD2RDefaults {};
