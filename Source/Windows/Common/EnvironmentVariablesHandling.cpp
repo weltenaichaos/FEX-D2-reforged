@@ -694,7 +694,8 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "D2R's 3D lighting table blur compute shader (83e2eb4a6bf5f03b, 8,192 samples per cell, 30 ms per run) "
                       "is swapped for FEX's own version with the same bindings that samples each distinct value once per "
                       "group of cells (VKD3D fex30 and later; '# shader swap' note); from VKD3D fex31 alt = binds take turns "
-                      "between 4 and 2 cells per GPU thread, 1 = 4 cells only, 2 = 2 cells only",
+                      "between two versions, 1 = first only, 2 = second only (VKD3D fex31: 4 and 2 cells per GPU "
+                      "thread; fex32: 8 cells per thread, 4 x by 2 y and 8 in a row)",
                       true, "alt|1|2");
   SetupVkd3dShaderCopy();
 

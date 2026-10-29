@@ -121,6 +121,10 @@ namespace FEX::Windows {
 //                            turn; the 'turnip dispatch' lines tell them apart by local size. 1: 4 cells per thread only.
 //                            2: 2 cells per thread only. fex30's version (1 cell per thread, 8x8x8) took 12-13 ms per run
 //                            in b108, held back by its instructions per product (hwave wait 49%).
+//                            VKD3D fex32 (with FEX 109, no FEX change): b109's 4-cell version took 8.5 ms per run, held
+//                            back by its shared memory reads (one per product). Both fex32 versions sum 8 cells per
+//                            thread and keep the last s2 values in registers: 1 = 4 x by 2 y (local size 2x4x8, 3 reads
+//                            per 8 products), 2 = 8 x in a row (1x8x8, 2 reads per 8 products); alt takes turns.
 //
 // Turnip, the Vulkan driver behind GameNative's wrapper (build 68). Its shader compiler (ir3) moves work that is the
 // same for every pixel of a draw into a "preamble": before the draw's pixels are shaded, the first wave on each shader
