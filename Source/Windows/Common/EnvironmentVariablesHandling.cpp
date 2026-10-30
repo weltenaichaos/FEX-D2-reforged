@@ -465,6 +465,10 @@ namespace {
        "every pixel where the real frame differs at all from its frame without the UI layer is taken from the real frame "
        "(the number: 1/255 steps a pixel may differ by and still count as the same, up to 64)",
        true},
+      {"FEX_LSFG_UI_MOTION", "LSFG_D2R_UI_MOTION",
+       "the UI on generated frames as in the newest real frame, as in layer 11 (the number: the largest UI move per "
+       "frame searched, pixels, up to 32)",
+       true},
     };
     for (const auto& S : Switches) {
       const char* Value = Switch(S.Name);

@@ -224,6 +224,12 @@ namespace FEX::Windows {
 //   FEX_LSFG_UI_TOL=0      (layer 11) a pixel counts as UI when the real frame differs from the frame without the UI layer
 //                          by more than this many 1/255 steps in any colour (LSFG_D2R_UI_TOL, at most 64; 0 = any
 //                          difference: both are 8-bit pictures of the same frame, equal where there is no UI).
+//   FEX_LSFG_UI_MOTION=24  (the D2R default from build 124, layer 12) the UI on a generated frame is drawn halfway along
+//                          how it moved between the two real frames, worked out per 16 x 16 tile from the UI's pixels and
+//                          its bright text, up to this many pixels per real frame (LSFG_D2R_UI_MOTION, at most 32). Build
+//                          123: item names on the ground stepped at the game's 30 FPS, as the UI of each generated frame
+//                          came from the newest real frame. The UI is still copied from the real frame, never generated.
+//                          0 or "off" = the UI as in the newest real frame (layer 11).
 //   FEX_LSFG_GEN_GAP=50    (the D2R default from build 117, layer 10) a game frame that comes more than this many ms after
 //                          the one before (a freeze) gets no generated frame, only itself at the generated frame's slot: a
 //                          frame made between two pictures that far apart in time guesses a big jump (build 116: once a

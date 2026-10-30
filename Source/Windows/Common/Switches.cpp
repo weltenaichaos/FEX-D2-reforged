@@ -176,6 +176,13 @@ namespace {
     // same, 0 = any difference). The UI itself then moves at the game's frame rate.
     {"FEX_LSFG_UI", "1"},
     {"FEX_LSFG_UI_TOL", "0"},
+    // Build 124 (layer 12): in the b123 run the map overlay was clean, but item names on the ground stepped at the game's
+    // 30 FPS while the world moved at 60: the layer pasted the whole UI from the newest real frame into each generated
+    // frame. The layer now works out per 16 x 16 tile how the UI moved between the two real frames (its pixels and its
+    // bright text) and draws each UI pixel halfway along that move, still copied from the real frame (never guessed by
+    // frame generation). Labels move with the world, the map stays or scrolls, the HUD stays; UI it can't match stays
+    // as before. The number is the largest move searched per real frame, in pixels (at most 32).
+    {"FEX_LSFG_UI_MOTION", "24"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -557,6 +564,7 @@ namespace {
     "FEX_LSFG_GEN_GAP",
     "FEX_LSFG_UI",
     "FEX_LSFG_UI_TOL",
+    "FEX_LSFG_UI_MOTION",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",

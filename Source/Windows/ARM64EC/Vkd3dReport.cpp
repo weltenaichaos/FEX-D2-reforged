@@ -412,6 +412,9 @@ namespace {
   // as shown (ui_plain_reason bits: 1 no hand-over image from VKD3D, 2 its size differs from the swapchain's, 4 its
   // format isn't 8-bit, 8 the layer's debug_inputs), the share of pixels taken from the real frame (1 frame in 4 counted)
   // and the GPU time of that step.
+  // Layer 12 (build 124) adds how the UI moved: tiles of 16 x 16 pixels with UI per counted frame and their share that
+  // moved (with the mean move, |dx| + |dy| per real frame), stayed, matched nothing or had no frame before; the share of
+  // pixels placed along a move, placed still or left as in the real frame; and the GPU time of the UI bits and motion.
   struct FramegenState {
     fextl::string Path; // empty: not known yet
     char Last[4096];
@@ -533,6 +536,21 @@ namespace {
                                    "more than {}/255 taken; {} frames counted), GPU {:.3f} ms per frame",
                                    Get("ui"), Get("ui_frames"), Get("ui_plain"), Get("ui_plain_reason"), Num("ui_px_taken_pct"),
                                    Num("ui_px_any_pct"), Num("ui_px_strong_pct"), Get("ui_tol"), Get("ui_px_frames"), Num("gpu_ui_ms"));
+    }
+    // Layer 12: the UI on generated frames halfway along its motion
+    if (!Get("ui_motion").empty()) {
+      if (Num("ui_motion") <= 0) {
+        Timing += "; UI on generated frames as in the newest real frame (layer 12 motion off)";
+      } else {
+        Timing += fextl::fmt::format("; UI moved halfway along its motion (up to {} px per frame): {:.1f} UI tiles per frame, moved {:.1f}% "
+                                     "(by {:.1f} px), still {:.1f}%, not matched {:.1f}%, no frame before {:.1f}%; pixels placed moved "
+                                     "{:.2f}%, still {:.2f}%, left as in the real frame {:.2f}%; frames without the frame before {}; GPU "
+                                     "UI bits + motion {:.3f} ms per frame",
+                                     Get("ui_motion"), Num("ui_tiles"), Num("ui_tiles_moved_pct"), Num("ui_move_px"),
+                                     Num("ui_tiles_still_pct"), Num("ui_tiles_nomatch_pct"), Num("ui_tiles_noprev_pct"),
+                                     Num("ui_px_moved_pct"), Num("ui_px_still_pct"), Num("ui_px_left_pct"), Get("ui_noprev_frames"),
+                                     Num("gpu_ui_motion_ms"));
+      }
     }
 
     if (Get("layer").empty()) {
