@@ -2,30 +2,32 @@
 >
 > *Fork by weltenaichaos, built on [Dmage22/FEX-D2](https://github.com/Dmage22/FEX-D2). Not the FEX project. The upstream FEX readme follows further below.*
 >
-> Runs **Diablo II: Resurrected (Steam)** in **GameNative** on the **AYN Thor** (Snapdragon 8 Gen 2) at a steady **60 FPS shown**: 30 real frames plus Lossless Scaling frame generation 2x, also in fights. No anti-cheat changes. Use at your own risk.
+> Runs **Diablo II: Resurrected (Steam)** in **GameNative** on the **AYN Thor** (Snapdragon 8 Gen 2, Adreno 740) at **60 FPS shown**: a steady 30 real frames plus frame generation 2x. In the last test run, 3 minutes of play went by without a single frame over 41 ms. No anti-cheat changes. Use at your own risk.
 >
-> - **Download:** the latest [`d2r-thor` release](https://github.com/weltenaichaos/FEX-D2-reforged/releases/tag/d2r-thor-2). It holds all four files: FEX for play (`thor-clean`), FEX with a stats log (`thor`), vkd3d-proton ARM64EC, and the fixed frame gen layer.
+> - **Download:** [TEST version 4](https://github.com/weltenaichaos/FEX-D2-reforged/releases/tag/d2r-thor-test-4) (2026-10-30). It holds all parts: FEX build 127 in two versions (clean for playing, logging for reports), VKD3D fex37, Turnip fex17 and the frame generation layer. Its notes list what changed and what is still open.
 > - **Install and settings:** step by step in [docs/d2r-thor-setup.md](docs/d2r-thor-setup.md).
 > - **What we changed and measured:** [docs/d2r-thor-findings.md](docs/d2r-thor-findings.md).
-> - **Source:** branch [`d2r/clean`](https://github.com/weltenaichaos/FEX-D2-reforged/tree/d2r/clean). The frame gen layer patch is `tools/lsfg/d2r.patch`.
+> - **Source:** this branch (`main`). Our VKD3D and Turnip changes are the patch series in `vkd3d-patches/` and `turnip-patches/`, the frame generation layer patch is `tools/lsfg/d2r.patch`.
 >
 > **Short version of the setup**
 >
 > | | |
 > |---|---|
-> | FEX | `2610-d2rfix28-thor-clean`, CPU cores 3 to 7, `FEX_DISKCACHE=1` |
+> | FEX | `2610-d2rfix28-thor-clean` (or `2610-d2rfix28s-thor` for a log), CPU cores 3 to 7, `FEX_DISKCACHE=1` |
 > | Proton | GameNative proton-11.0-1-arm64ec (GameNative's 11.0-2 crashes D2R) |
-> | DX12 | vkd3d-proton 3.0b ARM64EC, DXVK 2.7.1; never set `VKD3D_DISABLE_EXTENSIONS` |
-> | Frame gen | 2x, flow scale 0.25, Performance Mode on, Mailbox, fixed `liblsfg-vk-layer.so` copied over GameNative's |
-> | Limiter | GameNative FPS limiter 30, set before launch |
-> | In game | VSync off, frame cap unlimited |
+> | DX12 | VKD3D `3.0b-arm64ec-fex37`, DXVK 2.7.1; never set `VKD3D_DISABLE_EXTENSIONS` |
+> | Graphics driver | Turnip `26.3.0-rc2 FEX fex17` |
+> | Frame gen | 2x, FPS limit 30, flow scale 0.5, Performance Mode on, our `liblsfg-vk-layer.so` copied over GameNative's |
+> | Screen | 120 Hz |
+> | In game | VSync off |
 >
 > **What this fork adds on top of Dmage22's D2R fixes**
 >
-> - Thor-tuned FEX builds (armv8.4-a, Cortex-X3), plus a per-second stats log for diagnosis.
-> - Faster FEX disk cache loading on GameNative (cache file mapping without the unixlib).
-> - vkd3d-proton built as native ARM64EC (about +5 FPS).
-> - Four fixes to GameNative's frame gen layer: the D2R crash, the 12/15 FPS locks and the late-frame stutter.
+> - Thor-tuned FEX builds with D2R defaults built in (no environment variables needed beyond the three in the guide), plus a per-second stats log for diagnosis.
+> - Hitch fixes in FEX: the game's main thread gets the fastest core and leaves it within milliseconds when Android's own work lands there; job workers, the wineserver and VKD3D's frame threads get priority; FEX's code locks wait in the kernel; game data and translated code are read in ahead at loading screens.
+> - Our VKD3D (vkd3d-proton 3.0b as native ARM64EC): frame pacing for low input lag, frames shown only once drawn, a present thread, GPU memory made ahead, faster versions of two of D2R's compute shaders, and frames without the game's UI for frame generation.
+> - Our Turnip (Mesa 26.3.0-rc2): cheaper per-draw constants for D2R's lighting, clears as 3D draws, early preambles.
+> - Our frame generation layer (GameNative's Lossless Scaling layer): no crash, no FPS locks, presents from its own thread and on time, no smearing around the map overlay, HUD and item names.
 >
 > ---
 >
