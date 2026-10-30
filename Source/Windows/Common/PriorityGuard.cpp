@@ -898,6 +898,9 @@ namespace {
   // now checks every 2 ms whether the thread waits right now: its state is "R" (ready to run) at two checks in a row
   // and its exact CPU time (its thread CPU clock) didn't grow in between, so it was ready and without a CPU all that
   // time. Once that has lasted FEX_MAINCORE_ESCAPE ms it moves, while still waiting, and runs on another core at once.
+  // Build 119: both build 118 runs failed (one crashed after the character screen, one froze at a loading screen with
+  // the game's threads spinning in Wine's wait and wake calls, seen in no earlier log). The live check was build 118's only
+  // change, so it is off by default now (FEX_MAINCORE_ESCAPE_LIVE=1 turns it back on) and the watcher works as in build 117.
   constexpr int NiceUnchanged = 1000;
   struct EscapeState {
     std::mutex Lock; // held while the watcher, or the guard's 250 ms keeper, decides and sets the main thread's cores and nice
@@ -917,6 +920,7 @@ namespace {
     std::atomic<uint32_t> HoldMs {100};
     std::atomic<uint64_t> TotalEscapes {}, TotalAwayNs {};
     std::atomic<bool> Live {}; // set by the watcher before its first check: it sees waits while they last (build 118)
+    bool LiveWanted {};        // FEX_MAINCORE_ESCAPE_LIVE (build 119: off by default)
   };
   EscapeState* Escape {};
 
@@ -932,14 +936,15 @@ namespace {
       StatsLogNote(fextl::fmt::format("cores: main thread's schedstat can't be opened (error {}), no escape from its core", -Fd));
       return nullptr;
     }
-    // Build 118: whether it waits right now, from its state and its exact CPU time (see above).
-    const int StatFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/stat", E.Tid).c_str());
-    const int64_t CpuProbe = Linux::ThreadCpuNs(E.Tid);
-    const char StateProbe = Linux::PreadTaskState(StatFd);
-    const bool Live = StatFd >= 0 && CpuProbe >= 0 && StateProbe != 0;
+    // Build 118: whether it waits right now, from its state and its exact CPU time (see above). Build 119: only with
+    // FEX_MAINCORE_ESCAPE_LIVE; without it nothing of that is opened or read, as in build 117.
+    const int StatFd = E.LiveWanted ? Linux::Open(fextl::fmt::format("/proc/self/task/{}/stat", E.Tid).c_str()) : -1;
+    const int64_t CpuProbe = E.LiveWanted ? Linux::ThreadCpuNs(E.Tid) : -1;
+    const char StateProbe = E.LiveWanted ? Linux::PreadTaskState(StatFd) : 0;
+    const bool Live = E.LiveWanted && StatFd >= 0 && CpuProbe >= 0 && StateProbe != 0;
     E.Live.store(Live, std::memory_order_relaxed);
     const uint64_t PollNs = Live ? std::clamp<uint64_t>(E.TriggerNs / 2, 1'000'000, 2'000'000) : 4'000'000;
-    if (!Live) {
+    if (E.LiveWanted && !Live) {
       StatsLogNote(fextl::fmt::format("cores: main thread's state or CPU time can't be read (stat file {}, CPU clock {}, state '{}'): its "
                                       "waits count once they end, checked every 4 ms (as in build 117)",
                                       StatFd >= 0 ? fextl::string("open") : fextl::fmt::format("error {}", -StatFd),
@@ -2246,6 +2251,8 @@ void StartPriorityGuard(std::string_view AppName) {
   const char* EscapeSwitch = Switch("FEX_MAINCORE_ESCAPE");
   const uint32_t EscapeMs =
     EscapeSwitch && EscapeSwitch[0] >= '0' && EscapeSwitch[0] <= '9' ? static_cast<uint32_t>(std::clamp(atoi(EscapeSwitch), 0, 100)) : 0;
+  const char* LiveSwitch = Switch("FEX_MAINCORE_ESCAPE_LIVE");
+  const bool EscapeLive = LiveSwitch && (LiveSwitch[0] == '1' || (LiveSwitch[0] == 'o' && LiveSwitch[1] == 'n'));
   int EscapeNice = -20;
   if (const char* N = Switch("FEX_MAINCORE_ESCAPE_NICE"); N) {
     EscapeNice = N[0] == '-' || (N[0] >= '0' && N[0] <= '9') ? std::clamp(atoi(N), -20, 19) : NiceUnchanged;
@@ -2326,10 +2333,18 @@ void StartPriorityGuard(std::string_view AppName) {
                    "(FEX_MAINCORE_OTHERS=process; =user moves steam.exe and the rest of this user's threads too)" :
                    "cores: other programs' threads left alone, they may run on the main thread's core (FEX_MAINCORE_OTHERS=off)");
     StatsLogNote(
-      EscapeMs ? fextl::fmt::format("cores: main thread checked every 2 ms (build 118: while it waits); once it has been ready to "
-                                    "run on its core without a CPU for {} ms it goes to the game's other big cores{} for 100 ms "
-                                    "(doubling up to 1.6 s while it has to leave again soon), then back; FEX_MAINCORE_WAIT's "
-                                    "once-a-second widening is off then (FEX_MAINCORE_ESCAPE=off turns this off)",
+      EscapeMs && EscapeLive ?
+        fextl::fmt::format("cores: main thread checked every 2 ms (build 118: while it waits, FEX_MAINCORE_ESCAPE_LIVE=1); once it has "
+                           "been ready to run on its core without a CPU for {} ms it goes to the game's other big cores{} for 100 ms "
+                           "(doubling up to 1.6 s while it has to leave again soon), then back; FEX_MAINCORE_WAIT's "
+                           "once-a-second widening is off then (FEX_MAINCORE_ESCAPE=off turns this off)",
+                           EscapeMs, EscapeNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", EscapeNice) : fextl::string {}) :
+      EscapeMs ? fextl::fmt::format("cores: main thread's waits for its core read every 4 ms, each counted once it has ended (as "
+                                    "in build 117); after {} ms or more within 8 ms it goes to the game's other big cores{} for "
+                                    "100 ms (doubling up to 1.6 s while it has to leave again soon), then back; FEX_MAINCORE_WAIT's "
+                                    "once-a-second widening is off then (FEX_MAINCORE_ESCAPE=off turns this off). Build 119: "
+                                    "build 118's check while it waits is off (FEX_MAINCORE_ESCAPE_LIVE=1 turns it on): both "
+                                    "build 118 runs crashed or froze",
                                     EscapeMs, EscapeNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", EscapeNice) : fextl::string {}) :
                  fextl::string("cores: main thread stays on its core however short the waits (FEX_MAINCORE_ESCAPE=4 lets it "
                                "leave within milliseconds)"));
@@ -2400,6 +2415,7 @@ void StartPriorityGuard(std::string_view AppName) {
     Escape->Tid = C->MainLinuxTid;
     Escape->TriggerNs = static_cast<uint64_t>(EscapeMs) * 1'000'000;
     Escape->AwayNice = EscapeNice;
+    Escape->LiveWanted = EscapeLive;
     StatsLogSetLineProvider(EscapeStatsLine);
     static fextl::unique_ptr<FEXCore::Threads::Thread> WatchThread;
     WatchThread = FEXCore::Threads::Thread::Create(EscapeThread, Escape, {.LowPriority = false, .Internal = true}, "FEXMainWatch");

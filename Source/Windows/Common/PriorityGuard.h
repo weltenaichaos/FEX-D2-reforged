@@ -60,6 +60,13 @@ namespace FEX::Windows {
 //                      between. Once it has been ready to run without a CPU for N ms it moves, still waiting, and runs on
 //                      another core at once. The 'main escape' line adds how long the waits it left lasted in all and
 //                      how soon it ran after the move. Without the stat file or the CPU clock it works as in build 117.
+//   FEX_MAINCORE_ESCAPE_LIVE=0  build 119 (D2R default 0): the watcher works as in build 117 (waits counted once they
+//                      end, read every 4 ms). Both build 118 runs failed: one crashed after the character screen (the game's
+//                      own crash handler ran), one froze at a loading screen with the main thread, the job workers and the
+//                      loader thread spinning inside Wine's wait and wake calls (RtlWakeConditionVariable,
+//                      SleepConditionVariableSRW, RtlReleaseSRWLockShared) for 17 s, a pattern in no earlier log. No path from
+//                      the live check to that was found (it had been idle for 25 s then), but it was build 118's only change.
+//                      "1" or "on" = build 118's check while it waits.
 //   FEX_MAINCORE_ESCAPE_NICE=-20  its nice while away (D2R default -20, above the game's job workers at -10 there: on
 //                      those cores they are in the same CPU group, so nice counts); "off" leaves it at FEX_MAIN_NICE.
 //   FEX_MAINCORE_OTHERS=user  with "fast": every other thread of the app's Linux user stays off the main thread's core

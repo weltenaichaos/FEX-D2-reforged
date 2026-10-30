@@ -77,6 +77,10 @@ namespace {
     // every 2 ms whether the main thread is ready to run without a CPU right now (its state and its exact CPU time) and
     // moves it once that has lasted N ms, while it still waits.
     {"FEX_MAINCORE_ESCAPE", "4"},
+    // Build 119: build 118's check while the main thread waits is off again. Both build 118 runs failed (a crash after the
+    // character screen, a freeze at a loading screen with the game's threads spinning in Wine's wait and wake calls, seen in
+    // no earlier log), and that check was build 118's only change. "1" turns it on.
+    {"FEX_MAINCORE_ESCAPE_LIVE", "0"},
     {"FEX_MAINCORE_ESCAPE_NICE", "-20"},
     // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
     // PriorityGuard.h). In the build 75 log the main thread waited for its core 7 ms per slow frame, nearly always inside
@@ -490,6 +494,7 @@ namespace {
     "FEX_MAINCORE",
     "FEX_MAINCORE_WAIT",
     "FEX_MAINCORE_ESCAPE",
+    "FEX_MAINCORE_ESCAPE_LIVE",
     "FEX_MAINCORE_ESCAPE_NICE",
     "FEX_MAINCORE_OTHERS",
     "FEX_HELPER_CORES",
