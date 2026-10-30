@@ -1,0 +1,403 @@
+From 3b32ae167f33adc42cdd5ecbd8337707b11df813 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 16:01:01 +0000
+Subject: [PATCH] FEX: UI split finds the UI layer pass in any command list
+
+In the FEX build 123 run (VKD3D fex36) the composite was taken every
+frame (blend off, so drawn again with the UI layer cleared) but its
+command list never held the UI layer's pass: "no cleared full-size pass
+before the back buffer's" 30 a second, so still no frame was made without
+the UI layer.
+
+The UI layer pass found by any list is now also kept for the device (under
+the UI split mutex) and a composite whose own list has none uses it; the
+record is dropped when its image is destroyed. Targets bound without a
+view no longer count as other targets. The 'ui split' line counts every
+back-buffer-sized pass: taken, or not taken by reason (other targets,
+depth, multisampled, layers, no clear, not color, resumed), and the
+captures whose UI layer came from another list.
+---
+ libs/vkd3d/command.c       | 103 +++++++++++++++++++++++--------------
+ libs/vkd3d/fex_ui_split.c  |  52 ++++++++++++++++---
+ libs/vkd3d/resource.c      |   4 ++
+ libs/vkd3d/vkd3d_private.h |  34 +++++++++---
+ 4 files changed, 140 insertions(+), 53 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index c57db99..6fb2f43 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8124,42 +8124,59 @@ static bool d3d12_command_list_fex_ds_store_ops(struct d3d12_command_list *list)
+ 
+ /* VKD3D fex35 (VKD3D_FEX_UI_SPLIT, see struct vkd3d_fex_ui_frame): called before a render pass begins (not when a
+  * suspended one resumes). A back buffer pass waits for its first draw; a single-target pass of the back buffers' size
+- * that starts with a clear is taken as the game's UI layer for this list. */
+-static void d3d12_command_list_fex_ui_pass_begin(struct d3d12_command_list *list)
++ * that starts with a clear is taken as the game's UI layer for this list. fex37: and for the device, since in the
++ * build 123 run the composite's list never held that pass (every frame "no cleared full-size pass before"); targets
++ * bound without a view no longer count, and each back-buffer-sized pass not taken counts under its reason. */
++static void d3d12_command_list_fex_ui_pass_begin(struct d3d12_command_list *list, bool resumed)
+ {
+     struct vkd3d_fex_ui *ui = list->device->fex_ui;
+     const struct d3d12_rtv_desc *rtv = &list->rtvs[0];
+-    uint32_t width, height;
++    enum vkd3d_fex_ui_event reason;
++    uint32_t width, height, i;
++    bool others = false;
+ 
+     list->fex_ui.pending = NULL;
+-    if (list->rendering_info.rtv_mask != 1u || !rtv->view || !rtv->resource ||
+-            d3d12_command_list_has_depth_stencil_view(list) || rtv->sample_count != VK_SAMPLE_COUNT_1_BIT)
++    if (!(list->rendering_info.rtv_mask & 1u) || !rtv->view || !rtv->resource)
+         return;
++    for (i = 1; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
++        others |= (list->rendering_info.rtv_mask & (1u << i)) && list->rtvs[i].view;
+ 
+     if (rtv->resource->fex_ui_frame)
+     {
+-        list->fex_ui.pending = rtv->resource;
++        if (!resumed && !others && !d3d12_command_list_has_depth_stencil_view(list) &&
++                rtv->sample_count == VK_SAMPLE_COUNT_1_BIT)
++            list->fex_ui.pending = rtv->resource;
+         return;
+     }
+ 
+     width = vkd3d_atomic_uint32_load_explicit(&ui->width, vkd3d_memory_order_relaxed);
+     height = vkd3d_atomic_uint32_load_explicit(&ui->height, vkd3d_memory_order_relaxed);
+-    if (!width || rtv->width != width || rtv->height != height || rtv->layer_count != 1 ||
+-            list->rendering_info.rtv[0].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR ||
+-            !(rtv->view->format->vk_aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT))
++    if (!width || rtv->width != width || rtv->height != height)
++        return;
++    reason = resumed ? VKD3D_FEX_UI_PASS_RESUMED :
++            others ? VKD3D_FEX_UI_PASS_TARGETS :
++            d3d12_command_list_has_depth_stencil_view(list) ? VKD3D_FEX_UI_PASS_DEPTH :
++            rtv->sample_count != VK_SAMPLE_COUNT_1_BIT ? VKD3D_FEX_UI_PASS_SAMPLES :
++            rtv->layer_count != 1 ? VKD3D_FEX_UI_PASS_LAYERS :
++            list->rendering_info.rtv[0].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR ? VKD3D_FEX_UI_PASS_NOT_CLEARED :
++            !(rtv->view->format->vk_aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) ? VKD3D_FEX_UI_PASS_FORMAT :
++            VKD3D_FEX_UI_PASS_TAKEN;
++    vkd3d_fex_ui_event(list->device, reason);
++    if (reason != VKD3D_FEX_UI_PASS_TAKEN)
+         return;
+ 
+-    list->fex_ui.ui_image = rtv->resource->res.vk_image;
+-    list->fex_ui.ui_layout = d3d12_resource_pick_layout(rtv->resource, rtv->resource->common_layout);
+-    list->fex_ui.ui_subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+-    list->fex_ui.ui_subresource.mipLevel = rtv->view->info.texture.miplevel_idx;
+-    list->fex_ui.ui_subresource.baseArrayLayer = rtv->view->info.texture.layer_idx;
+-    list->fex_ui.ui_subresource.layerCount = 1;
+-    list->fex_ui.ui_format = rtv->resource->format->vk_format;
+-    list->fex_ui.ui_width = rtv->width;
+-    list->fex_ui.ui_height = rtv->height;
+-    list->fex_ui.ui_clear = list->rendering_info.rtv[0].clearValue.color;
++    list->fex_ui.ui.image = rtv->resource->res.vk_image;
++    list->fex_ui.ui.layout = d3d12_resource_pick_layout(rtv->resource, rtv->resource->common_layout);
++    list->fex_ui.ui.subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    list->fex_ui.ui.subresource.mipLevel = rtv->view->info.texture.miplevel_idx;
++    list->fex_ui.ui.subresource.baseArrayLayer = rtv->view->info.texture.layer_idx;
++    list->fex_ui.ui.subresource.layerCount = 1;
++    list->fex_ui.ui.format = rtv->resource->format->vk_format;
++    list->fex_ui.ui.width = rtv->width;
++    list->fex_ui.ui.height = rtv->height;
++    list->fex_ui.ui.clear = list->rendering_info.rtv[0].clearValue.color;
+     list->fex_ui.ui_valid = true;
++    vkd3d_fex_ui_layer_set(list->device, &list->fex_ui.ui);
+ }
+ 
+ static void fex_ui_barrier(VkImageMemoryBarrier2 *barrier, VkImage image, const VkImageSubresourceLayers *layers,
+@@ -8250,7 +8267,7 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+     VkImage save = VK_NULL_HANDLE;
+     enum vkd3d_fex_ui_event other;
+     uint32_t width, height;
+-    bool redraw, queries;
++    bool redraw, queries, other_list;
+ 
+     list->fex_ui.pending = NULL;
+     /* fex36: in the build 122 run every back buffer pass's first draw (3 vertices or indices, one instance on the pass
+@@ -8275,14 +8292,18 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+     /* Blending over what the back buffer holds: that is the frame without the UI layer. Else the draw is made again
+      * with the UI layer cleared, which needs to know the UI layer. */
+     redraw = !blend->blendEnable || blend->dstColorBlendFactor == VK_BLEND_FACTOR_ZERO;
++    /* fex37: the UI layer's pass may be in another list (recorded before this one runs). */
++    other_list = false;
++    if (redraw && !list->fex_ui.ui_valid && vkd3d_fex_ui_layer_get(device, &list->fex_ui.ui))
++        list->fex_ui.ui_valid = other_list = true;
+     if (redraw && !list->fex_ui.ui_valid)
+     {
+         vkd3d_fex_ui_event(device, VKD3D_FEX_UI_NO_UI);
+         return;
+     }
+ 
+-    if (redraw && !(save = vkd3d_fex_ui_save_image(device, list->fex_ui.ui_format,
+-            list->fex_ui.ui_width, list->fex_ui.ui_height)))
++    if (redraw && !(save = vkd3d_fex_ui_save_image(device, list->fex_ui.ui.format,
++            list->fex_ui.ui.width, list->fex_ui.ui.height)))
+     {
+         vkd3d_fex_ui_event(device, VKD3D_FEX_UI_NO_SAVE);
+         return;
+@@ -8295,7 +8316,7 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+     whole.mipLevel = 0;
+     whole.baseArrayLayer = 0;
+     whole.layerCount = 1;
+-    ui_layers = list->fex_ui.ui_subresource;
++    ui_layers = list->fex_ui.ui.subresource;
+ 
+     /* The game's queries inside this pass end with it and start again in the pass begun below, as when vkd3d itself
+      * ends and resumes a pass; the extra draw isn't counted. */
+@@ -8314,10 +8335,10 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     if (redraw)
+     {
+-        fex_ui_barrier(&barriers[2], list->fex_ui.ui_image, &ui_layers,
++        fex_ui_barrier(&barriers[2], list->fex_ui.ui.image, &ui_layers,
+                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+-                list->fex_ui.ui_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++                list->fex_ui.ui.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+         fex_ui_barrier(&barriers[3], save, &whole,
+                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+@@ -8328,10 +8349,10 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+ 
+     if (redraw)
+     {
+-        fex_ui_copy(list, list->fex_ui.ui_image, &ui_layers, save, &whole,
+-                list->fex_ui.ui_width, list->fex_ui.ui_height);
++        fex_ui_copy(list, list->fex_ui.ui.image, &ui_layers, save, &whole,
++                list->fex_ui.ui.width, list->fex_ui.ui.height);
+ 
+-        fex_ui_barrier(&barriers[0], list->fex_ui.ui_image, &ui_layers,
++        fex_ui_barrier(&barriers[0], list->fex_ui.ui.image, &ui_layers,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+         fex_ui_barrier(&barriers[1], frame->vk_image, &whole,
+@@ -8340,19 +8361,19 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+         fex_ui_barriers(list, barriers, 2);
+ 
+-        clear = list->fex_ui.ui_clear;
++        clear = list->fex_ui.ui.clear;
+         range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+         range.baseMipLevel = ui_layers.mipLevel;
+         range.levelCount = 1;
+         range.baseArrayLayer = ui_layers.baseArrayLayer;
+         range.layerCount = 1;
+-        VK_CALL(vkCmdClearColorImage(cmd, list->fex_ui.ui_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++        VK_CALL(vkCmdClearColorImage(cmd, list->fex_ui.ui.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 &clear, 1, &range));
+ 
+-        fex_ui_barrier(&barriers[0], list->fex_ui.ui_image, &ui_layers,
++        fex_ui_barrier(&barriers[0], list->fex_ui.ui.image, &ui_layers,
+                 VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 shader_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, list->fex_ui.ui_layout);
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, list->fex_ui.ui.layout);
+         fex_ui_barriers(list, barriers, 1);
+ 
+         memset(&attachment, 0, sizeof(attachment));
+@@ -8378,22 +8399,22 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+-        fex_ui_barrier(&barriers[1], list->fex_ui.ui_image, &ui_layers,
++        fex_ui_barrier(&barriers[1], list->fex_ui.ui.image, &ui_layers,
+                 shader_stages, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+-                list->fex_ui.ui_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++                list->fex_ui.ui.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+         fex_ui_barrier(&barriers[2], save, &whole,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+         fex_ui_barriers(list, barriers, 3);
+ 
+-        fex_ui_copy(list, save, &whole, list->fex_ui.ui_image, &ui_layers,
+-                list->fex_ui.ui_width, list->fex_ui.ui_height);
++        fex_ui_copy(list, save, &whole, list->fex_ui.ui.image, &ui_layers,
++                list->fex_ui.ui.width, list->fex_ui.ui.height);
+ 
+-        fex_ui_barrier(&barriers[0], list->fex_ui.ui_image, &ui_layers,
++        fex_ui_barrier(&barriers[0], list->fex_ui.ui.image, &ui_layers,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, list->fex_ui.ui_layout);
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, list->fex_ui.ui.layout);
+     }
+     else
+     {
+@@ -8422,6 +8443,8 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+     vkd3d_fex_ui_event(device, redraw ? VKD3D_FEX_UI_CAPTURE_REDRAW : VKD3D_FEX_UI_CAPTURE_COPY);
+     if (indexed)
+         vkd3d_fex_ui_event(device, VKD3D_FEX_UI_CAPTURE_INDEXED);
++    if (redraw && other_list)
++        vkd3d_fex_ui_event(device, VKD3D_FEX_UI_LAYER_OTHER_LIST);
+ }
+ 
+ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list,
+@@ -8507,8 +8530,8 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+         d3d12_command_list_fex_memo_dirty(list, list->dsv.resource);
+ 
+     /* VKD3D fex35: the UI layer's pass, or the back buffer's (its first draw may be the composite). */
+-    if (list->device->fex_ui && fex_pass_kind != VKD3D_FEX_PASS_KIND_RESUMED)
+-        d3d12_command_list_fex_ui_pass_begin(list);
++    if (list->device->fex_ui)
++        d3d12_command_list_fex_ui_pass_begin(list, fex_pass_kind == VKD3D_FEX_PASS_KIND_RESUMED);
+ 
+     d3d12_command_list_debug_mark_begin_region(list, "RenderPass");
+     VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, &list->rendering_info.info));
+diff --git a/libs/vkd3d/fex_ui_split.c b/libs/vkd3d/fex_ui_split.c
+index b9282af..342afc6 100644
+--- a/libs/vkd3d/fex_ui_split.c
++++ b/libs/vkd3d/fex_ui_split.c
+@@ -55,6 +55,40 @@ void vkd3d_fex_ui_event(struct d3d12_device *device, enum vkd3d_fex_ui_event eve
+         vkd3d_atomic_uint32_increment(&device->fex_ui->events[event], vkd3d_memory_order_relaxed);
+ }
+ 
++void vkd3d_fex_ui_layer_set(struct d3d12_device *device, const struct vkd3d_fex_ui_layer *layer)
++{
++    struct vkd3d_fex_ui *ui = device->fex_ui;
++
++    pthread_mutex_lock(&ui->mutex);
++    ui->layer = *layer;
++    pthread_mutex_unlock(&ui->mutex);
++}
++
++bool vkd3d_fex_ui_layer_get(struct d3d12_device *device, struct vkd3d_fex_ui_layer *layer)
++{
++    struct vkd3d_fex_ui *ui = device->fex_ui;
++    bool found;
++
++    pthread_mutex_lock(&ui->mutex);
++    found = ui->layer.image != VK_NULL_HANDLE;
++    if (found)
++        *layer = ui->layer;
++    pthread_mutex_unlock(&ui->mutex);
++    return found;
++}
++
++void vkd3d_fex_ui_forget_image(struct d3d12_device *device, VkImage image)
++{
++    struct vkd3d_fex_ui *ui = device->fex_ui;
++
++    if (!ui || image == VK_NULL_HANDLE)
++        return;
++    pthread_mutex_lock(&ui->mutex);
++    if (ui->layer.image == image)
++        memset(&ui->layer, 0, sizeof(ui->layer));
++    pthread_mutex_unlock(&ui->mutex);
++}
++
+ HRESULT vkd3d_fex_ui_create_image(struct d3d12_device *device, uint32_t width, uint32_t height, VkFormat format,
+         bool hand_over, VkImage *image, VkImageView *view, struct vkd3d_device_memory_allocation *memory)
+ {
+@@ -267,14 +301,20 @@ size_t vkd3d_fex_ui_report(struct d3d12_device *device, char *text, size_t size,
+     other = vkd3d_atomic_uint32_load_explicit(&ui->other, vkd3d_memory_order_relaxed);
+ 
+     len = vkd3d_fex_report_append(text, size, len,
+-            "  ui split (VKD3D fex36: each frame also handed to frame generation without the game's UI layer): presents"
++            "  ui split (VKD3D fex37: each frame also handed to frame generation without the game's UI layer): presents"
+             " with it %u, as shown %u | made: copy before a composite that blends %u, composite drawn again with the UI"
+-            " layer cleared %u (indexed %u, with the game's queries paused %u) | not made: no cleared full-size pass"
+-            " before the back buffer's %u, its first draw: not 3 vertices %u, instanced %u, predicated %u, stream"
+-            " output %u, no pipeline or target %u, no save image %u",
++            " layer cleared %u (UI layer pass in another list %u, indexed %u, with the game's queries paused %u) |"
++            " back-buffer-sized passes: taken as the UI layer %u, not taken: other targets %u, depth %u,"
++            " multisampled %u, layers %u, no clear %u, not color %u, resumed %u | not made: no UI layer known %u,"
++            " its first draw: not 3 vertices %u, instanced %u, predicated %u, stream output %u, no pipeline or"
++            " target %u, no save image %u",
+             events[VKD3D_FEX_UI_PRESENT_SPLIT], events[VKD3D_FEX_UI_PRESENT_PLAIN],
+-            events[VKD3D_FEX_UI_CAPTURE_COPY], events[VKD3D_FEX_UI_CAPTURE_REDRAW], events[VKD3D_FEX_UI_CAPTURE_INDEXED],
+-            events[VKD3D_FEX_UI_CAPTURE_QUERIES], events[VKD3D_FEX_UI_NO_UI], events[VKD3D_FEX_UI_OTHER_COUNT],
++            events[VKD3D_FEX_UI_CAPTURE_COPY], events[VKD3D_FEX_UI_CAPTURE_REDRAW],
++            events[VKD3D_FEX_UI_LAYER_OTHER_LIST], events[VKD3D_FEX_UI_CAPTURE_INDEXED],
++            events[VKD3D_FEX_UI_CAPTURE_QUERIES], events[VKD3D_FEX_UI_PASS_TAKEN], events[VKD3D_FEX_UI_PASS_TARGETS],
++            events[VKD3D_FEX_UI_PASS_DEPTH], events[VKD3D_FEX_UI_PASS_SAMPLES], events[VKD3D_FEX_UI_PASS_LAYERS],
++            events[VKD3D_FEX_UI_PASS_NOT_CLEARED], events[VKD3D_FEX_UI_PASS_FORMAT], events[VKD3D_FEX_UI_PASS_RESUMED],
++            events[VKD3D_FEX_UI_NO_UI], events[VKD3D_FEX_UI_OTHER_COUNT],
+             events[VKD3D_FEX_UI_OTHER_INSTANCES], events[VKD3D_FEX_UI_OTHER_PREDICATED], events[VKD3D_FEX_UI_OTHER_XFB],
+             events[VKD3D_FEX_UI_OTHER_STATE], events[VKD3D_FEX_UI_NO_SAVE]);
+     if (other)
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 2711959..29411f2 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -3717,6 +3717,10 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
+             vkd3d_va_map_remove(&device->memory_allocator.va_map, &resource->res);
+     }
+ 
++    /* VKD3D fex37: a UI layer remembered for the device must not outlive its image. */
++    if (d3d12_resource_is_texture(resource) && device->fex_ui)
++        vkd3d_fex_ui_forget_image(device, resource->res.vk_image);
++
+     if (d3d12_resource_is_texture(resource))
+         VK_CALL(vkDestroyImage(device->vk_device, resource->res.vk_image, NULL));
+     else if (resource->flags & VKD3D_RESOURCE_RESERVED)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 9290174..7ddb4e7 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3382,14 +3382,34 @@ enum vkd3d_fex_ui_event
+     VKD3D_FEX_UI_OTHER_STATE,    /* ... without a pipeline or color target */
+     VKD3D_FEX_UI_CAPTURE_INDEXED, /* fex36: captures whose composite was an indexed draw */
+     VKD3D_FEX_UI_CAPTURE_QUERIES, /* fex36: captures made with the game's queries active (paused around them) */
++    VKD3D_FEX_UI_LAYER_OTHER_LIST, /* fex37: captures whose UI layer pass was in another command list */
++    VKD3D_FEX_UI_PASS_TAKEN,     /* fex37: back-buffer-sized passes taken as the UI layer */
++    VKD3D_FEX_UI_PASS_TARGETS,   /* ... not taken: more than one bound target */
++    VKD3D_FEX_UI_PASS_DEPTH,     /* ... a depth-stencil target */
++    VKD3D_FEX_UI_PASS_SAMPLES,   /* ... multisampled */
++    VKD3D_FEX_UI_PASS_LAYERS,    /* ... more than one layer */
++    VKD3D_FEX_UI_PASS_NOT_CLEARED, /* ... doesn't start with a clear */
++    VKD3D_FEX_UI_PASS_FORMAT,    /* ... not a color format */
++    VKD3D_FEX_UI_PASS_RESUMED,   /* back-buffer-sized passes resumed (not looked at) */
+     VKD3D_FEX_UI_NO_SAVE,        /* no image to save the UI layer in */
+     VKD3D_FEX_UI_PRESENT_SPLIT,  /* blits that handed over the frame without the UI layer */
+     VKD3D_FEX_UI_PRESENT_PLAIN,  /* blits that handed over the frame as shown (no copy since the last Present()) */
+     VKD3D_FEX_UI_EVENTS
+ };
++/* The game's UI layer as a render pass found it (fex37: kept per device too, for a composite in another list). */
++struct vkd3d_fex_ui_layer
++{
++    VkImage image;
++    VkImageLayout layout;        /* its layout outside render passes */
++    VkImageSubresourceLayers subresource;
++    VkFormat format;
++    uint32_t width, height;
++    VkClearColorValue clear;
++};
+ struct vkd3d_fex_ui
+ {
+-    pthread_mutex_t mutex;       /* the save image */
++    pthread_mutex_t mutex;       /* the save image, layer */
++    struct vkd3d_fex_ui_layer layer; /* fex37: the last UI layer pass any list began, image VK_NULL_HANDLE = none */
+     VkImage save_image;
+     struct vkd3d_device_memory_allocation save_memory;
+     VkFormat save_format;
+@@ -3403,6 +3423,11 @@ struct vkd3d_fex_ui
+ void vkd3d_fex_ui_init(struct d3d12_device *device);
+ void vkd3d_fex_ui_cleanup(struct d3d12_device *device);
+ void vkd3d_fex_ui_event(struct d3d12_device *device, enum vkd3d_fex_ui_event event);
++/* fex37: the device's UI layer, set by a list that began its pass, read by a composite in another list; forgotten when
++ * its image is destroyed. */
++void vkd3d_fex_ui_layer_set(struct d3d12_device *device, const struct vkd3d_fex_ui_layer *layer);
++bool vkd3d_fex_ui_layer_get(struct d3d12_device *device, struct vkd3d_fex_ui_layer *layer);
++void vkd3d_fex_ui_forget_image(struct d3d12_device *device, VkImage image);
+ /* An image of the back buffer's format and size: the frame copy (render target + transfer) or the swapchain's
+  * hand-over image (transfer only, with a one-format list: how the layer tells it from the game's images). */
+ HRESULT vkd3d_fex_ui_create_image(struct d3d12_device *device, uint32_t width, uint32_t height, VkFormat format,
+@@ -3651,12 +3676,7 @@ struct d3d12_command_list
+      * layer, as far as we can tell), and the back buffer whose pass just began (its first draw may be the composite). */
+     struct
+     {
+-        VkImage ui_image;
+-        VkImageLayout ui_layout;   /* its layout outside render passes */
+-        VkImageSubresourceLayers ui_subresource;
+-        VkFormat ui_format;
+-        uint32_t ui_width, ui_height;
+-        VkClearColorValue ui_clear;
++        struct vkd3d_fex_ui_layer ui;
+         bool ui_valid;
+         struct d3d12_resource *pending;
+     } fex_ui;
+-- 
+2.43.0
+
