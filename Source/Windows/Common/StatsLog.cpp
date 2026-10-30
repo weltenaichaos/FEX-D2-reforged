@@ -396,7 +396,8 @@ namespace {
   // with no idle state entered in the second and not paused, it shows as "?" and is left out of the sums. Busy on the
   // game's CPUs minus this process's and the wineserver's run time is what other processes and the kernel used there
   // (Wine's other processes included, see "sched procs"). Paused: the share of 10 ms samples in which the kernel had a
-  // CPU out of use (core control or heat), from sched_getaffinity of the main and log threads against their own masks.
+  // CPU out of use (core control or heat), from sched_getaffinity of the main and log threads against their own masks;
+  // not for the main thread's core while FEX_MAINCORE_ESCAPE has it elsewhere (its CPUs don't show that core then).
   // Also the number of runnable tasks of the whole system (/proc/loadavg) and the share of the second some task waited
   // for a CPU (/proc/pressure/cpu), when readable.
   constexpr int MaxIdleStates = 10;
@@ -600,13 +601,16 @@ namespace {
                                     Core.PsiFd >= 0 ? "from /proc/pressure/cpu" : "not readable"));
   }
 
+  // The main thread's core while FEX_MAINCORE_ESCAPE has it elsewhere (see StatsLogSetMainAwayFrom).
+  std::atomic<uint64_t> MainAwayFrom {};
+
   // Every 10ms: which of the game's CPUs the kernel has out of use.
   void CorePauseSample() {
     if (!Core.On || !Core.Allowed) {
       return;
     }
     const uint64_t Usable = Linux::GetAffinity(Sched.Pid) | Linux::GetAffinity(Core.LogTid);
-    const uint64_t Paused = Core.Allowed & ~Usable;
+    const uint64_t Paused = Core.Allowed & ~Usable & ~MainAwayFrom.load(std::memory_order_relaxed);
     ++Core.PauseSamples;
     for (int i = 0; Paused && i < Linux::MaxCPUs; ++i) {
       if (Paused & (1ull << i)) {
@@ -4022,7 +4026,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "the power levels allowed (0 = fastest; a launcher's power control or heat raises the first), temperature; "
                        "cores busy% = how busy each CPU was, whoever ran there (? = can't tell), the game's CPUs' busy time split "
                        "into this process, the wineserver and others (other apps, Android, the launcher, the kernel), paused = "
-                       "share of the second the kernel had a CPU out of use, main core N = the main thread's core: busy, the main "
+                       "share of the second the kernel had a CPU out of use (not counted for the main thread's core while it is "
+                       "away from it), main core N = the main thread's core: busy, the main "
                        "thread's share, interrupts, other threads, and from the kernel's count (/proc/schedstat) how many times "
                        "other tasks ran there, for how long, how long tasks other than the main thread waited in its run queue "
                        "and how many times the main thread ran there; runnable = runnable tasks of the whole system, cpu "
@@ -4151,6 +4156,10 @@ void StatsLogSetLineProvider(fextl::string (*Provider)()) {
       return;
     }
   }
+}
+
+void StatsLogSetMainAwayFrom(uint64_t CoreMask) {
+  MainAwayFrom.store(CoreMask, std::memory_order_relaxed);
 }
 
 uint64_t StatsLogSecond() {

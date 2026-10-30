@@ -37,6 +37,11 @@ void StatsLogDiskCacheHit(uint64_t GuestRIP);
 // Sets the image the preload probe watches (the main executable). Call before StartStatsLog.
 void StatsLogWatchImage(uint64_t Base);
 
+// The main thread's own core while FEX_MAINCORE_ESCAPE has it on other cores, 0 while it is home. The per-core line's
+// "paused" (CPUs the kernel took out of use, seen from the main and log threads' CPUs) leaves that core out meanwhile:
+// the main thread's CPUs don't hold it then (build 117 counted those times as paused).
+void StatsLogSetMainAwayFrom(uint64_t CoreMask);
+
 // Adds the lines Provider returns (each indented and ending in a newline, or nothing) to every per-second block.
 // Provider runs on the log thread. Up to sixteen providers, in the order they were set.
 void StatsLogSetLineProvider(fextl::string (*Provider)());

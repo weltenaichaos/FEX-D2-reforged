@@ -27,6 +27,7 @@ namespace {
   constexpr int64_t NR_gettid = 178;
   constexpr int64_t NR_getrusage = 165;
   constexpr int64_t NR_nanosleep = 101;
+  constexpr int64_t NR_clock_gettime = 113;
   constexpr int64_t RUSAGE_THREAD = 1;
   constexpr int64_t NR_fadvise64 = 223;
   constexpr int64_t NR_preadv2 = 286;
@@ -258,6 +259,30 @@ void SleepNs(uint64_t Ns) {
     int64_t Nanoseconds;
   } Time {static_cast<int64_t>(Ns / 1'000'000'000), static_cast<int64_t>(Ns % 1'000'000'000)};
   Syscall(NR_nanosleep, reinterpret_cast<intptr_t>(&Time), 0);
+}
+
+int64_t ThreadCpuNs(int Tid) {
+  // A thread CPU clock (MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED) of linux/posix-timers.h): its exact run time, brought up
+  // to date even while it runs on another CPU. Only threads of this process can be read.
+  const int32_t Clock = static_cast<int32_t>((~static_cast<uint32_t>(Tid) << 3) | 6);
+  struct {
+    int64_t Seconds;
+    int64_t Nanoseconds;
+  } Time {};
+  const int64_t Result = Syscall(NR_clock_gettime, Clock, reinterpret_cast<intptr_t>(&Time));
+  return Result < 0 ? Result : Time.Seconds * 1'000'000'000 + Time.Nanoseconds;
+}
+
+char PreadTaskState(int Fd) {
+  char Buffer[256];
+  const int64_t Len = Fd >= 0 ? Pread(Fd, Buffer, sizeof(Buffer) - 1, 0) : -9;
+  if (Len <= 0) {
+    return 0;
+  }
+  Buffer[Len] = 0;
+  // "pid (comm) state ...": comm may hold spaces and parentheses, so the state follows the last ')'.
+  const char* CloseParen = strrchr(Buffer, ')');
+  return CloseParen && CloseParen[1] == ' ' ? CloseParen[2] : 0;
 }
 
 int SetNice(int Tid, int Nice) {

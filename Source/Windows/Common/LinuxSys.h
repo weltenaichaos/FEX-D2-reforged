@@ -63,6 +63,11 @@ int GetNice(int Tid);
 int SetNice(int Tid, int Nice);
 // Sleeps the calling thread (nanosleep, no Wine call in between); a signal may end it early.
 void SleepNs(uint64_t Ns);
+// The run time of a thread of this process in ns, exact even while it runs (its thread CPU clock), or a negative errno.
+int64_t ThreadCpuNs(int Tid);
+// The state letter of a thread's stat file kept open ("/proc/self/task/<tid>/stat": 'R' = running or ready to run, 'S'
+// sleeping, 'D' waiting for storage ...), or 0 when it can't be read.
+char PreadTaskState(int Fd);
 // CPUs a Linux thread may run on now (the first 64; the kernel leaves out paused CPUs), or 0 on failure.
 uint64_t GetAffinity(int Tid);
 // The CPUs a thread's own mask allows (the "Cpus_allowed" line of its /proc status file, e.g. "/proc/self/task/<tid>/status"),

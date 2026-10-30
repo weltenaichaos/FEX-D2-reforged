@@ -53,6 +53,13 @@ namespace FEX::Windows {
 //                      and it got about half the core: it waited 30-115 ms within single frames (48-156 ms frames). The
 //                      once-a-second widening reacted a second late and didn't help: allowed the other big cores too, the
 //                      kernel kept it on core 7 (98%), waiting 278 ms that second. 0 or "off" = no watcher.
+//                      Build 118: the build 117 watcher saw each wait only once it had ended (the kernel adds a wait to
+//                      run_delay when the thread gets a CPU back), so the 23-93 ms waits that made slow frames in play
+//                      ran their full length before it moved. It now checks every 2 ms whether the thread waits right
+//                      now: state "R" at two checks in a row and its exact CPU time (its thread CPU clock) unchanged in
+//                      between. Once it has been ready to run without a CPU for N ms it moves, still waiting, and runs on
+//                      another core at once. The 'main escape' line adds how long the waits it left lasted in all and
+//                      how soon it ran after the move. Without the stat file or the CPU clock it works as in build 117.
 //   FEX_MAINCORE_ESCAPE_NICE=-20  its nice while away (D2R default -20, above the game's job workers at -10 there: on
 //                      those cores they are in the same CPU group, so nice counts); "off" leaves it at FEX_MAIN_NICE.
 //   FEX_MAINCORE_OTHERS=user  with "fast": every other thread of the app's Linux user stays off the main thread's core

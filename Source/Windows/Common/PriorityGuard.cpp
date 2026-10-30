@@ -893,6 +893,11 @@ namespace {
   // FEX_MAINCORE_WAIT's once-a-second widening, which the kernel ignored (it kept the thread on its core, waiting).
   // /proc's run_delay grows when the thread gets a CPU back, so each wait counts once it ends: the watcher sees a 4 ms
   // or longer wait within its last two 4 ms checks.
+  // Build 118: in the build 117 run that came too late for the waits that made slow frames (23-93 ms each in play): it
+  // saw each only once it was over, then moved the thread for 100 ms when nothing was in its way any more. The watcher
+  // now checks every 2 ms whether the thread waits right now: its state is "R" (ready to run) at two checks in a row
+  // and its exact CPU time (its thread CPU clock) didn't grow in between, so it was ready and without a CPU all that
+  // time. Once that has lasted FEX_MAINCORE_ESCAPE ms it moves, while still waiting, and runs on another core at once.
   constexpr int NiceUnchanged = 1000;
   struct EscapeState {
     std::mutex Lock; // held while the watcher, or the guard's 250 ms keeper, decides and sets the main thread's cores and nice
@@ -906,8 +911,12 @@ namespace {
     // per second, read and reset by EscapeStatsLine
     std::atomic<uint32_t> Escapes {}, Returns {}, Again {}, Failures {};
     std::atomic<uint64_t> AwayNs {}, HomeWaitNs {}, AwayWaitNs {}, TriggerMaxNs {}, Checks {};
+    // Build 118: the waits it left, measured when it next ran (count, sum, longest), and the time from the move to that run.
+    std::atomic<uint32_t> Ended {};
+    std::atomic<uint64_t> EndedNs {}, EndedMaxNs {}, MoveToRunMaxNs {};
     std::atomic<uint32_t> HoldMs {100};
     std::atomic<uint64_t> TotalEscapes {}, TotalAwayNs {};
+    std::atomic<bool> Live {}; // set by the watcher before its first check: it sees waits while they last (build 118)
   };
   EscapeState* Escape {};
 
@@ -923,9 +932,28 @@ namespace {
       StatsLogNote(fextl::fmt::format("cores: main thread's schedstat can't be opened (error {}), no escape from its core", -Fd));
       return nullptr;
     }
+    // Build 118: whether it waits right now, from its state and its exact CPU time (see above).
+    const int StatFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/stat", E.Tid).c_str());
+    const int64_t CpuProbe = Linux::ThreadCpuNs(E.Tid);
+    const char StateProbe = Linux::PreadTaskState(StatFd);
+    const bool Live = StatFd >= 0 && CpuProbe >= 0 && StateProbe != 0;
+    E.Live.store(Live, std::memory_order_relaxed);
+    const uint64_t PollNs = Live ? std::clamp<uint64_t>(E.TriggerNs / 2, 1'000'000, 2'000'000) : 4'000'000;
+    if (!Live) {
+      StatsLogNote(fextl::fmt::format("cores: main thread's state or CPU time can't be read (stat file {}, CPU clock {}, state '{}'): its "
+                                      "waits count once they end, checked every 4 ms (as in build 117)",
+                                      StatFd >= 0 ? fextl::string("open") : fextl::fmt::format("error {}", -StatFd),
+                                      CpuProbe >= 0 ? fextl::string("read") : fextl::fmt::format("error {}", -CpuProbe),
+                                      StateProbe ? StateProbe : '-'));
+    }
     const uint64_t Freq = CounterFrequency();
     const auto TicksToNs = [Freq](uint64_t Ticks) {
       return Ticks / Freq * 1'000'000'000 + Ticks % Freq * 1'000'000'000 / Freq;
+    };
+    const auto Max = [](std::atomic<uint64_t>& A, uint64_t V) {
+      if (V > A.load(std::memory_order_relaxed)) {
+        A.store(V, std::memory_order_relaxed);
+      }
     };
     constexpr uint32_t HoldFirstMs = 100;
     constexpr uint32_t HoldMaxMs = 1600;
@@ -935,16 +963,49 @@ namespace {
     uint64_t LastT = Counter();
     uint64_t AwayUntil {}, ReturnedAt {}, LastEscapeAt {};
     uint32_t HoldMs = HoldFirstMs;
+    // The live view: CPU time and state at the last check, and since when it has been ready without a CPU (0: it isn't).
+    int64_t LastCpu = -1;
+    bool LastReady {};
+    uint64_t WaitFrom {};
+    // After a move: its wait then and how many times it had run, to see the whole wait it left once it runs again.
+    bool FollowUp {};
+    uint64_t MovedAt {}, WaitAtMove {}, SlicesAtMove {};
     for (;;) {
-      Linux::SleepNs(4'000'000);
+      Linux::SleepNs(PollNs);
       if (!Linux::PreadSchedStat(Fd, S)) {
         break; // the main thread ended
       }
       const uint64_t Now = Counter();
+      uint64_t WaitingNs {};
+      if (Live) {
+        const int64_t Cpu = Linux::ThreadCpuNs(E.Tid);
+        const bool Ready = Linux::PreadTaskState(StatFd) == 'R';
+        // Ready at both checks and not a nanosecond on a CPU in between: ready and without a CPU all that time (it can't
+        // have gone to sleep and woken up again without running).
+        if (Ready && LastReady && Cpu >= 0 && Cpu == LastCpu) {
+          if (!WaitFrom) {
+            WaitFrom = LastT;
+          }
+          WaitingNs = TicksToNs(Now - WaitFrom);
+        } else {
+          WaitFrom = 0;
+        }
+        LastCpu = Cpu;
+        LastReady = Ready;
+      }
       const uint64_t Tick = Have && S.WaitNs >= LastWait ? S.WaitNs - LastWait : 0;
       LastWait = S.WaitNs;
       Have = true;
       E.Checks.fetch_add(1, std::memory_order_relaxed);
+      if (FollowUp && S.Slices != SlicesAtMove) {
+        // It ran again: run_delay now holds the whole wait it was moved out of, from its start to the run on the other core.
+        FollowUp = false;
+        const uint64_t Whole = S.WaitNs >= WaitAtMove ? S.WaitNs - WaitAtMove : 0;
+        E.Ended.fetch_add(1, std::memory_order_relaxed);
+        E.EndedNs.fetch_add(Whole, std::memory_order_relaxed);
+        Max(E.EndedMaxNs, Whole);
+        Max(E.MoveToRunMaxNs, TicksToNs(Now - MovedAt));
+      }
       const uint64_t Home = E.Home.load(std::memory_order_acquire);
       if (E.Away.load(std::memory_order_acquire)) {
         E.AwayWaitNs.fetch_add(Tick, std::memory_order_relaxed);
@@ -963,9 +1024,11 @@ namespace {
             }
             E.SavedNice = NiceUnchanged;
             E.Away.store(0, std::memory_order_release);
+            StatsLogSetMainAwayFrom(0);
           }
           ReturnedAt = Now;
           PrevTick = 0;
+          WaitFrom = 0;
           E.Returns.fetch_add(1, std::memory_order_relaxed);
           LastT = Now;
           continue;
@@ -973,7 +1036,8 @@ namespace {
       } else {
         E.HomeWaitNs.fetch_add(Tick, std::memory_order_relaxed);
         const uint64_t AwayMask = E.AwayMask.load(std::memory_order_acquire);
-        if (Home && AwayMask && Tick + PrevTick >= E.TriggerNs) {
+        const uint64_t Waited = Live ? WaitingNs : Tick + PrevTick;
+        if (Home && AwayMask && Waited >= E.TriggerNs) {
           // The hold doubles when it has to leave again within 1 s of coming back, and starts over after 10 s at home.
           if (ReturnedAt && Now - ReturnedAt < Freq) {
             HoldMs = std::min(HoldMs * 2, HoldMaxMs);
@@ -983,35 +1047,48 @@ namespace {
           }
           std::scoped_lock Lock {E.Lock};
           if (E.Home.load(std::memory_order_relaxed) == Home && !E.Away.load(std::memory_order_relaxed)) {
+            // The nice first: a thread moved while it waits is placed on its new core with the weight it has then.
+            int Before = NiceUnchanged;
+            if (E.AwayNice != NiceUnchanged) {
+              Before = Linux::GetNice(E.Tid);
+              Linux::SetNice(E.Tid, E.AwayNice);
+            }
             const int Result = Linux::SetAffinity(E.Tid, AwayMask);
             if (Result == 0) {
-              if (E.AwayNice != NiceUnchanged) {
-                const int Before = Linux::GetNice(E.Tid);
-                E.SavedNice = Before == -1000 ? NiceUnchanged : Before;
-                Linux::SetNice(E.Tid, E.AwayNice);
-              }
+              E.SavedNice = Before == -1000 ? NiceUnchanged : Before;
               E.Away.store(AwayMask, std::memory_order_release);
+              StatsLogSetMainAwayFrom(Home);
               AwayUntil = Now + static_cast<uint64_t>(HoldMs) * Freq / 1000;
               LastEscapeAt = Now;
               E.Escapes.fetch_add(1, std::memory_order_relaxed);
               E.HoldMs.store(HoldMs, std::memory_order_relaxed);
-              const uint64_t Waited = Tick + PrevTick;
-              if (Waited > E.TriggerMaxNs.load(std::memory_order_relaxed)) {
-                E.TriggerMaxNs.store(Waited, std::memory_order_relaxed);
+              Max(E.TriggerMaxNs, Waited);
+              if (Live && WaitingNs) {
+                FollowUp = true;
+                MovedAt = Now;
+                WaitAtMove = S.WaitNs;
+                SlicesAtMove = S.Slices;
               }
               const uint64_t Total = E.TotalEscapes.fetch_add(1, std::memory_order_relaxed) + 1;
               if (Total <= 5 || Total % 100 == 0) {
-                StatsLogNote(fextl::fmt::format("cores: main thread waited {:.1f} ms for its core {:#x} within 8 ms: on {:#x}{} for {} ms, "
-                                                "#{} (FEX_MAINCORE_ESCAPE=off keeps it there)",
-                                                static_cast<double>(Waited) / 1e6, Home, AwayMask,
-                                                E.AwayNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", E.AwayNice) : fextl::string {},
-                                                HoldMs, Total));
+                StatsLogNote(fextl::fmt::format(
+                  "cores: main thread {}: on {:#x}{} for {} ms, #{} (FEX_MAINCORE_ESCAPE=off keeps it there)",
+                  Live ? fextl::fmt::format("ready to run on its core {:#x} without a CPU for {:.1f} ms so far", Home,
+                                            static_cast<double>(Waited) / 1e6) :
+                         fextl::fmt::format("waited {:.1f} ms for its core {:#x} within 8 ms", static_cast<double>(Waited) / 1e6, Home),
+                  AwayMask, E.AwayNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", E.AwayNice) : fextl::string {}, HoldMs, Total));
               }
-            } else if (E.Failures.fetch_add(1, std::memory_order_relaxed) < 3) {
-              StatsLogNote(fextl::fmt::format("cores: main thread can't leave its core for {:#x}, error {}", AwayMask, -Result));
+            } else {
+              if (Before != NiceUnchanged && Before != -1000) {
+                Linux::SetNice(E.Tid, Before);
+              }
+              if (E.Failures.fetch_add(1, std::memory_order_relaxed) < 3) {
+                StatsLogNote(fextl::fmt::format("cores: main thread can't leave its core for {:#x}, error {}", AwayMask, -Result));
+              }
             }
           }
           PrevTick = 0;
+          WaitFrom = 0;
           LastT = Now;
           continue;
         }
@@ -1020,6 +1097,9 @@ namespace {
       LastT = Now;
     }
     Linux::Close(Fd);
+    if (StatFd >= 0) {
+      Linux::Close(StatFd);
+    }
     return nullptr;
   }
 
@@ -1037,16 +1117,27 @@ namespace {
     const uint64_t AwayWait = E.AwayWaitNs.exchange(0, std::memory_order_relaxed);
     const uint64_t TriggerMax = E.TriggerMaxNs.exchange(0, std::memory_order_relaxed);
     const uint64_t Checks = E.Checks.exchange(0, std::memory_order_relaxed);
+    const uint32_t Ended = E.Ended.exchange(0, std::memory_order_relaxed);
+    const uint64_t EndedNs = E.EndedNs.exchange(0, std::memory_order_relaxed);
+    const uint64_t EndedMax = E.EndedMaxNs.exchange(0, std::memory_order_relaxed);
+    const uint64_t MoveToRunMax = E.MoveToRunMaxNs.exchange(0, std::memory_order_relaxed);
     const bool AwayNow = E.Away.load(std::memory_order_relaxed) != 0;
     if (!Escapes && !AwayNs && !AwayNow && HomeWait < 20'000'000) {
       return {};
     }
     return fextl::fmt::format("  main escape: left its core {} times this second ({} in all), away {:.0f} ms{} (hold {} ms, {} of them "
                               "within 1 s of coming back), came back {} times; waited for a CPU {:.1f} ms on its core, {:.1f} ms away; "
-                              "longest wait that sent it off {:.1f} ms; {} checks\n",
+                              "longest wait that sent it off {:.1f} ms ({}){}; {} checks\n",
                               Escapes, E.TotalEscapes.load(std::memory_order_relaxed), static_cast<double>(AwayNs) / 1e6,
                               AwayNow ? " (away now)" : "", E.HoldMs.load(std::memory_order_relaxed), Again, Returns,
                               static_cast<double>(HomeWait) / 1e6, static_cast<double>(AwayWait) / 1e6, static_cast<double>(TriggerMax) / 1e6,
+                              E.Live.load(std::memory_order_relaxed) ? "seen while it lasted" : "seen once it ended",
+                              Ended ? fextl::fmt::format("; the waits it left ended {:.1f} ms after they began on average "
+                                                         "(longest {:.1f}), its first run on the other cores at most {:.1f} ms after "
+                                                         "the move",
+                                                         static_cast<double>(EndedNs) / 1e6 / Ended, static_cast<double>(EndedMax) / 1e6,
+                                                         static_cast<double>(MoveToRunMax) / 1e6) :
+                                      fextl::string {},
                               Checks);
   }
 
@@ -2234,14 +2325,14 @@ void StartPriorityGuard(std::string_view AppName) {
                    "cores: this process's threads Wine doesn't list kept off the main thread's core, other programs left alone "
                    "(FEX_MAINCORE_OTHERS=process; =user moves steam.exe and the rest of this user's threads too)" :
                    "cores: other programs' threads left alone, they may run on the main thread's core (FEX_MAINCORE_OTHERS=off)");
-    StatsLogNote(EscapeMs ? fextl::fmt::format("cores: main thread checked every 4 ms; when it waited {} ms or more for its core within 8 ms "
-                                               "it goes to the game's other big cores{} for 100 ms (doubling up to 1.6 s while it has to "
-                                               "leave again soon), then back; FEX_MAINCORE_WAIT's once-a-second widening is off then "
-                                               "(FEX_MAINCORE_ESCAPE=off turns this off)",
-                                               EscapeMs,
-                                               EscapeNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", EscapeNice) : fextl::string {}) :
-                            fextl::string("cores: main thread stays on its core however short the waits (FEX_MAINCORE_ESCAPE=4 lets it "
-                                          "leave within milliseconds)"));
+    StatsLogNote(
+      EscapeMs ? fextl::fmt::format("cores: main thread checked every 2 ms (build 118: while it waits); once it has been ready to "
+                                    "run on its core without a CPU for {} ms it goes to the game's other big cores{} for 100 ms "
+                                    "(doubling up to 1.6 s while it has to leave again soon), then back; FEX_MAINCORE_WAIT's "
+                                    "once-a-second widening is off then (FEX_MAINCORE_ESCAPE=off turns this off)",
+                                    EscapeMs, EscapeNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", EscapeNice) : fextl::string {}) :
+                 fextl::string("cores: main thread stays on its core however short the waits (FEX_MAINCORE_ESCAPE=4 lets it "
+                               "leave within milliseconds)"));
   }
   StatsLogNote(C->ServerNiceOn ? fextl::fmt::format("server: wineserver to nice {} (FEX_SERVER_NICE=off leaves it alone)", C->ServerNice) :
                                  fextl::string("server: wineserver nice left alone"));

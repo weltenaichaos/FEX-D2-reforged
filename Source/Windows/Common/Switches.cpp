@@ -71,6 +71,11 @@ namespace {
     // for core 7 within the last 8 ms it moves to the game's other big cores (not core 7) at nice -20 for 100 ms (doubling up
     // to 1.6 s while it keeps having to leave), then goes back. 0 or "off" turns it off (FEX_MAINCORE_WAIT then works as
     // before).
+    // Build 118: in the build 117 run the watcher saw each wait only once it had ended (run_delay grows when the thread
+    // gets its CPU back), so the 23-93 ms waits in play (6 slow frames in ~10 min, during memory reclaim) ran their full
+    // length before it moved, and its 60 moves after short waits came when nothing was in the way any more. It now checks
+    // every 2 ms whether the main thread is ready to run without a CPU right now (its state and its exact CPU time) and
+    // moves it once that has lasted N ms, while it still waits.
     {"FEX_MAINCORE_ESCAPE", "4"},
     {"FEX_MAINCORE_ESCAPE_NICE", "-20"},
     // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
