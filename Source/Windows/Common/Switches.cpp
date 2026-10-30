@@ -189,6 +189,14 @@ namespace {
     // spun on that spin lock for ~120 ms, which kept the stuck thread off a CPU longer still. FEX's code lock and memory
     // lock now sleep and wake in the Linux kernel (futex), whose wait lists can't be held by a thread that isn't running.
     {"FEX_KERNEL_FUTEX", "1"},
+    // Build 126: the longest hitch of the build 125 run (161 ms at 3:50) was VKD3D's queue thread, which hands every frame's
+    // GPU work to the driver: at nice 0 it waited 163 ms for a CPU on the main thread's core (open to the game's threads
+    // while the main thread is away) while the kernel reclaimed memory there. VKD3D's frame threads (vkd3d_queue,
+    // vkd3d_fence, its present, frame start and frame done threads, vkd3d-swapchain-sync) and the frame gen layer's
+    // present thread are kept at this nice or better (never lowered; they use 2-10% of a core each) and off the main
+    // thread's core while it is open to others. "off" leaves their nice; FEX_FRAME_THREADS_OFFCORE=0 lets them on it.
+    {"FEX_FRAME_THREADS", "-10"},
+    {"FEX_FRAME_THREADS_OFFCORE", "1"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -572,6 +580,8 @@ namespace {
     "FEX_LSFG_UI_TOL",
     "FEX_LSFG_UI_MOTION",
     "FEX_KERNEL_FUTEX",
+    "FEX_FRAME_THREADS",
+    "FEX_FRAME_THREADS_OFFCORE",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",

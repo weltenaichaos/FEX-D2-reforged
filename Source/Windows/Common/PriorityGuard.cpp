@@ -992,6 +992,145 @@ namespace {
   uint64_t Counter();
   uint64_t CounterFrequency();
 
+  // Build 126, FEX_FRAME_THREADS / FEX_FRAME_THREADS_OFFCORE: the threads each frame passes through after the game's main
+  // thread hands it to VKD3D (GPU submits, fence waits, frame start and frame done pacing, present) and the frame gen
+  // layer's present thread. In the build 125 run a 161 ms frame was vkd3d_queue (nice 0) waiting 163 ms for a CPU on the
+  // main thread's core, open to the game's threads while the main thread was away (build 123), while the kernel reclaimed
+  // memory there. They need little CPU (2-10% of a core each) but every frame waits for them: they are kept at FEX_FRAME_THREADS's
+  // nice or better (never lowered: the layer's present thread runs at -20) and off the main thread's core while it is open.
+  // Found by their Linux names (Wine passes VKD3D's thread names on, cut to 15 characters) every 2 s.
+  constexpr size_t MaxFrameThreads = 16;
+  constexpr const char* FrameThreadNames[] = {"vkd3d_queue",     "vkd3d_fence",     "vkd3d-fex-prese", "vkd3d-fex-start",
+                                              "vkd3d-fex-done",  "vkd3d-swapchain", "lsfg-present"};
+  struct FrameThreadKeeper {
+    int Nice;     // NiceUnchanged = left alone
+    bool OffCore; // kept off the main thread's core while it is open to others
+    // Written by the guard (under the escape lock when there is one), read by the share sweeps.
+    std::atomic<uint32_t> Count;
+    std::atomic<int> Tids[MaxFrameThreads];
+    // Guard thread only.
+    char Names[MaxFrameThreads][16];
+    int Found[MaxFrameThreads]; // nice when found
+    uint32_t NiceSets, NiceFailures, Notes, Lists;
+    int NiceError;
+    // Share sweeps (under the escape lock).
+    std::atomic<uint32_t> CoreSets, CoreFailures;
+    std::atomic<int> CoreError;
+  };
+  FrameThreadKeeper* FrameThreads {};
+
+  // A frame thread to keep off the main thread's core (any thread, under the escape lock).
+  bool KeptOffSharedCore(int Tid) {
+    const auto* K = FrameThreads;
+    if (!K || !K->OffCore) {
+      return false;
+    }
+    const uint32_t N = K->Count.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < N; ++i) {
+      if (K->Tids[i].load(std::memory_order_relaxed) == Tid) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  struct FrameScan {
+    int Tids[MaxFrameThreads];
+    char Names[MaxFrameThreads][16];
+    uint32_t Count;
+  };
+
+  void FrameScanTask(const char* Name, void* Arg) {
+    auto* S = static_cast<FrameScan*>(Arg);
+    const int Tid = atoi(Name);
+    if (Tid <= 0 || S->Count == MaxFrameThreads) {
+      return;
+    }
+    char Path[64];
+    snprintf(Path, sizeof(Path), "/proc/self/task/%d/comm", Tid);
+    char Comm[32];
+    int64_t Len = Linux::ReadSmallFile(Path, Comm, sizeof(Comm));
+    if (Len <= 0) {
+      return;
+    }
+    if (Comm[Len - 1] == '\n') {
+      Comm[--Len] = 0;
+    }
+    for (const char* Want : FrameThreadNames) {
+      if (strcmp(Comm, Want) == 0) {
+        S->Tids[S->Count] = Tid;
+        snprintf(S->Names[S->Count], sizeof(S->Names[0]), "%s", Comm);
+        ++S->Count;
+        return;
+      }
+    }
+  }
+
+  // Keeps one thread's nice at K.Nice or better. Its nice before, or a value below -100 when it is gone.
+  int KeepFrameNice(FrameThreadKeeper& K, int Tid) {
+    const int Now = Linux::GetNice(Tid);
+    if (Now < -100 || K.Nice == NiceUnchanged || Now <= K.Nice) {
+      return Now;
+    }
+    const int Result = Linux::SetNice(Tid, K.Nice);
+    if (Result == 0) {
+      ++K.NiceSets;
+    } else {
+      ++K.NiceFailures;
+      K.NiceError = Result;
+    }
+    return Now;
+  }
+
+  // Every 2 s on the guard's thread: finds the frame threads by name; notes the list when it changed.
+  void FindFrameThreads(FrameThreadKeeper& K, EscapeState* E) {
+    FrameScan S {};
+    Linux::ForEachEntry("/proc/self/task", FrameScanTask, &S);
+    const uint32_t Old = K.Count.load(std::memory_order_relaxed);
+    bool Same = Old == S.Count;
+    for (uint32_t i = 0; i < S.Count && Same; ++i) {
+      Same = K.Tids[i].load(std::memory_order_relaxed) == S.Tids[i];
+    }
+    if (Same) {
+      return;
+    }
+    {
+      std::unique_lock<std::mutex> Lock;
+      if (E) {
+        Lock = std::unique_lock<std::mutex>(E->Lock);
+      }
+      for (uint32_t i = 0; i < S.Count; ++i) {
+        K.Tids[i].store(S.Tids[i], std::memory_order_relaxed);
+      }
+      K.Count.store(S.Count, std::memory_order_release);
+    }
+    fextl::string Text;
+    for (uint32_t i = 0; i < S.Count; ++i) {
+      memcpy(K.Names[i], S.Names[i], sizeof(K.Names[0]));
+      K.Found[i] = KeepFrameNice(K, S.Tids[i]);
+      const int After = Linux::GetNice(S.Tids[i]);
+      Text += fextl::fmt::format(" {}/{} nice {}{}", S.Names[i], S.Tids[i], K.Found[i],
+                                 After != K.Found[i] ? fextl::fmt::format(" -> {}", After) : fextl::string {});
+    }
+    ++K.Lists;
+    if (K.Notes < 12) {
+      ++K.Notes;
+      StatsLogNote(fextl::fmt::format("frame threads: {} found (list #{}):{}{}", S.Count, K.Lists, S.Count ? Text : fextl::string(" none"),
+                                      K.OffCore ? "; kept off the main thread's core while it is open to the game's threads" : ""));
+    }
+  }
+
+  // Every 250 ms on the guard's thread: keeps their nice (Wine or the game may set it back).
+  void KeepFrameThreads(FrameThreadKeeper& K) {
+    if (K.Nice == NiceUnchanged) {
+      return;
+    }
+    const uint32_t N = K.Count.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < N; ++i) {
+      KeepFrameNice(K, K.Tids[i].load(std::memory_order_relaxed));
+    }
+  }
+
   // Build 123, FEX_MAINCORE_AWAY_SHARE: one process's threads while the main thread is away from its core.
   struct ShareSweep {
     const EscapeState* E;
@@ -1011,9 +1150,12 @@ namespace {
     if (Tid <= 0 || (S->Pid == S->E->SelfPid && Tid == S->E->Tid)) {
       return;
     }
+    // Build 126: frame threads never get the core; one that has it (it got it before it was found) loses it.
+    const bool Open = S->Open && !(S->Pid == S->E->SelfPid && KeptOffSharedCore(Tid));
+    const bool KeepOff = S->Open && !Open;
     // GetAffinity leaves out CPUs the kernel has paused; the status file has the mask as set (see OthersTask).
     const uint64_t Usable = Linux::GetAffinity(Tid);
-    if (S->Open) {
+    if (Open) {
       if (Usable & S->Core) {
         ++S->Has;
         return;
@@ -1033,7 +1175,7 @@ namespace {
       return;
     }
     uint64_t Want = Mask;
-    if (S->Open) {
+    if (Open) {
       if (Mask & S->Core) {
         ++S->Has; // it has the core, paused at the moment
         return;
@@ -1043,7 +1185,9 @@ namespace {
       if (!(Mask & S->Core)) {
         return;
       }
-      ++S->Has;
+      if (!KeepOff) {
+        ++S->Has;
+      }
       Want = Mask & ~S->Core;
       if (!Want) {
         Want = S->Big;
@@ -1053,6 +1197,15 @@ namespace {
       return;
     }
     const int Result = Linux::SetAffinity(Tid, Want);
+    if (KeepOff) {
+      if (Result == 0) {
+        FrameThreads->CoreSets.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        FrameThreads->CoreFailures.fetch_add(1, std::memory_order_relaxed);
+        FrameThreads->CoreError.store(Result, std::memory_order_relaxed);
+      }
+      return;
+    }
     if (Result == 0) {
       ++S->Set;
       if (S->Open) {
@@ -2477,6 +2630,23 @@ namespace {
       if (C->Loader != LoaderMode::Off) {
         LoaderRound(Finder, Threads, Round);
       }
+      if (FrameThreads) {
+        FindFrameThreads(*FrameThreads, Escape);
+        // Once a minute: what keeping them took.
+        if (Round % 30 == 0) {
+          auto& K = *FrameThreads;
+          const uint32_t CoreFailures = K.CoreFailures.load(std::memory_order_relaxed);
+          StatsLogNote(fextl::fmt::format("frame threads: s={} {} kept, nice set {} times{}, taken off the main thread's core {} "
+                                          "times{}",
+                                          Round * 2, K.Count.load(std::memory_order_relaxed), K.NiceSets,
+                                          K.NiceFailures ? fextl::fmt::format(" ({} failed, errno {})", K.NiceFailures, -K.NiceError) :
+                                                           fextl::string {},
+                                          K.CoreSets.load(std::memory_order_relaxed),
+                                          CoreFailures ? fextl::fmt::format(" ({} failed, errno {})", CoreFailures,
+                                                                            -K.CoreError.load(std::memory_order_relaxed)) :
+                                                         fextl::string {}));
+        }
+      }
 
       if (Handles.empty() && !ReportedWalkFailure) {
         ReportedWalkFailure = true;
@@ -2531,6 +2701,9 @@ namespace {
         }
         if (Workers) {
           KeepWorkers(*Workers, *C, C->Loader != LoaderMode::Off ? &Finder : nullptr);
+        }
+        if (FrameThreads) {
+          KeepFrameThreads(*FrameThreads);
         }
       }
     }
@@ -2619,6 +2792,14 @@ void StartPriorityGuard(std::string_view AppName) {
       WorkerNice = std::clamp(atoi(Number), -20, 19);
     }
   }
+
+  // Build 126: VKD3D's frame threads and the frame gen layer's present thread.
+  int FrameNice = NiceUnchanged;
+  if (const char* F = Switch("FEX_FRAME_THREADS"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
+    FrameNice = std::clamp(atoi(F), -20, 19);
+  }
+  const char* FrameCoreSwitch = Switch("FEX_FRAME_THREADS_OFFCORE");
+  const bool FrameOffCore = FrameCoreSwitch && (FrameCoreSwitch[0] == '1' || (FrameCoreSwitch[0] == 'o' && FrameCoreSwitch[1] == 'n'));
 
   StatsLogNote(C->Prio == PrioMode::Keep ? fextl::fmt::format("prio: off, Windows thread priorities pass through to Linux nice "
                                                                "(FEX_PRIO=normal keeps every thread at nice 0)") :
@@ -2715,6 +2896,19 @@ void StartPriorityGuard(std::string_view AppName) {
                                     WorkerNice) :
                  fextl::string("workers: the game's job workers' nice left alone (FEX_WORKER_NICE=alt raises it in every other 10 s window)"));
 
+  StatsLogNote(FrameNice != NiceUnchanged || FrameOffCore ?
+                 fextl::fmt::format("frame threads: build 126: VKD3D's frame threads (vkd3d_queue, vkd3d_fence, its present, frame start, "
+                                    "frame done and swapchain sync threads) and the frame gen layer's present thread {}{}{}, found by "
+                                    "name every 2 s; in the build 125 run vkd3d_queue (nice 0) waited 163 ms for a CPU on the main "
+                                    "thread's shared core (a 161 ms frame). FEX_FRAME_THREADS=off leaves their nice, "
+                                    "FEX_FRAME_THREADS_OFFCORE=0 lets them on that core",
+                                    FrameNice != NiceUnchanged ? fextl::fmt::format("kept at nice {} or better, checked every 250 ms", FrameNice) :
+                                                                 fextl::string("left at their nice"),
+                                    FrameNice != NiceUnchanged && FrameOffCore ? " and " : "",
+                                    FrameOffCore ? "kept off the main thread's core while it is open to the game's threads (build 123)" : "") :
+                 fextl::string("frame threads: left alone (FEX_FRAME_THREADS=-10 keeps VKD3D's frame threads at nice -10, "
+                               "FEX_FRAME_THREADS_OFFCORE=1 keeps them off the main thread's core while it is open)"));
+
   const fextl::string Exe = fextl::fmt::format("main exe {:X}-{:X}", C->ExeBase, C->ExeEnd);
   StatsLogNote(C->Loader == LoaderMode::Little ?
                  fextl::fmt::format("loader: threads running at 25% of a core or more whose own code is mostly protection code (not in the {} "
@@ -2740,9 +2934,14 @@ void StartPriorityGuard(std::string_view AppName) {
   }
 
   if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && !C->MainNiceOn &&
-      C->Loader == LoaderMode::Off && WorkerNiceMode == WorkerMode::Off) {
+      C->Loader == LoaderMode::Off && WorkerNiceMode == WorkerMode::Off && FrameNice == NiceUnchanged && !FrameOffCore) {
     delete C;
     return;
+  }
+  if (FrameNice != NiceUnchanged || FrameOffCore) {
+    FrameThreads = new FrameThreadKeeper {};
+    FrameThreads->Nice = FrameNice;
+    FrameThreads->OffCore = FrameOffCore;
   }
   if (WorkerNiceMode != WorkerMode::Off) {
     Workers = new WorkerKeeper {};
