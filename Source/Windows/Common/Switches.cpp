@@ -183,6 +183,12 @@ namespace {
     // frame generation). Labels move with the world, the map stays or scrolls, the HUD stays; UI it can't match stays
     // as before. The number is the largest move searched per real frame, in pixels (at most 32).
     {"FEX_LSFG_UI_MOTION", "24"},
+    // Build 125: the one hitch of the layer 13 run (144 ms at 1:25) was FEX's code lock: a game thread queuing for it on a
+    // crowded core was pushed off its CPU inside Wine's wait-list spin lock (Wine keeps waiters in 256 shared lists, each
+    // guarded by a spin lock in user code), and three job workers plus the protection thread (holding FEX's memory lock)
+    // spun on that spin lock for ~120 ms, which kept the stuck thread off a CPU longer still. FEX's code lock and memory
+    // lock now sleep and wake in the Linux kernel (futex), whose wait lists can't be held by a thread that isn't running.
+    {"FEX_KERNEL_FUTEX", "1"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -565,6 +571,7 @@ namespace {
     "FEX_LSFG_UI",
     "FEX_LSFG_UI_TOL",
     "FEX_LSFG_UI_MOTION",
+    "FEX_KERNEL_FUTEX",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",

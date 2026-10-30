@@ -3451,14 +3451,18 @@ namespace {
     const uint64_t MaxWaitAt = Take(CodeLockStats.MaxWaitAt);
     const uint64_t MaxHold = Take(CodeLockStats.MaxHold);
     const uint64_t MaxHoldAt = Take(CodeLockStats.MaxHoldAt);
-    if (!Locks && !GiveUps) {
+    const uint64_t ReaderSleeps = Take(CodeLockStats.ReaderSleeps);
+    const uint64_t WriterSleeps = Take(CodeLockStats.WriterSleeps);
+    if (!Locks && !GiveUps && !ReaderSleeps && !WriterSleeps) {
       return {};
     }
     auto Bin = [State](uint64_t At) {
       return At > State->SecondStart ? static_cast<int64_t>((At - State->SecondStart) * TimelineBins / State->CounterFreq) : -1;
     };
-    return fextl::fmt::format("  codelock writes={} slow={} giveup={} wait={:.1f}ms@{} hold={:.1f}ms@{}\n", Locks, Slow, GiveUps,
-                              MaxWait * MsPerTick, Bin(MaxWaitAt), MaxHold * MsPerTick, Bin(MaxHoldAt));
+    // Build 125: how often a compile (reader) or a writer had to sleep for the lock, and through what.
+    return fextl::fmt::format("  codelock writes={} slow={} giveup={} wait={:.1f}ms@{} hold={:.1f}ms@{} sleeps readers={} writers={} ({})\n",
+                              Locks, Slow, GiveUps, MaxWait * MsPerTick, Bin(MaxWaitAt), MaxHold * MsPerTick, Bin(MaxHoldAt),
+                              ReaderSleeps, WriterSleeps, FEXCore::Utils::WritePriorityMutex::KernelFutex ? "kernel" : "wine");
   }
 
   // Whether Wine's fast event paths (esync, fsync or ntsync) are on. Without them every event and wait call (SetEvent,

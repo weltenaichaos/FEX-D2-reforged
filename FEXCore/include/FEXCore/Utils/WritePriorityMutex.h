@@ -27,6 +27,34 @@ namespace FEXCore::Utils::WritePriorityMutex {
 #define FEX_WRITE_PRIORITY_MUTEX_EXTRAS 1
 #endif
 
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+// Kernel waits (FEX_KERNEL_FUTEX, set once at process start before any thread can wait): sleep and wake through the
+// Linux kernel's futex call, as the Linux build does, instead of Wine's WaitOnAddress. Wine keeps its waiters in 256
+// shared lists, each guarded by a plain spin lock taken in user code; a thread pushed off its CPU while it holds one
+// (in the build 124 log a game thread on a crowded core, ~120 ms) leaves every thread that waits or wakes through that
+// list spinning, and those spinners kept it off the CPU even longer. The kernel's own wait lists can't be held that way.
+inline bool KernelFutex = false;
+
+// Linux arm64 futex call, straight to the kernel.
+inline int64_t KernelFutexCall(void* Address, int64_t Op, uint32_t Value, const void* Timeout, uint32_t Value3) {
+  register int64_t X8 asm("x8") = 98; // __NR_futex
+  register int64_t X0 asm("x0") = reinterpret_cast<int64_t>(Address);
+  register int64_t X1 asm("x1") = Op;
+  register int64_t X2 asm("x2") = Value;
+  register int64_t X3 asm("x3") = reinterpret_cast<int64_t>(Timeout);
+  register int64_t X4 asm("x4") = 0;
+  register int64_t X5 asm("x5") = Value3;
+  asm volatile("svc #0" : "+r"(X0) : "r"(X8), "r"(X1), "r"(X2), "r"(X3), "r"(X4), "r"(X5) : "memory", "cc");
+  return X0;
+}
+
+constexpr int64_t KFUTEX_WAIT = 0;
+constexpr int64_t KFUTEX_WAKE = 1;
+constexpr int64_t KFUTEX_WAIT_BITSET = 9;
+constexpr int64_t KFUTEX_WAKE_BITSET = 10;
+constexpr int64_t KFUTEX_PRIVATE_FLAG = 128;
+#endif
+
 // Exclusive lock timings for one mutex, read and reset by the stats log. Durations and times are in cycle counter
 // ticks; each "At" is the cycle counter when that longest one ended.
 struct ContentionStats {
@@ -37,6 +65,8 @@ struct ContentionStats {
   std::atomic<uint64_t> MaxWaitAt;
   std::atomic<uint64_t> MaxHold;
   std::atomic<uint64_t> MaxHoldAt;
+  std::atomic<uint64_t> ReaderSleeps; // shared locks that had to sleep (all of them counted, not only exclusive ones)
+  std::atomic<uint64_t> WriterSleeps;
 };
 
 // A custom mutex that prioritizes exclusive locks.
@@ -373,21 +403,52 @@ private:
 #else
   // Writers wait for the full 32-bit futex.
   void FutexWaitForWriteAvailable(uint32_t Expected) {
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+    if (Stats) {
+      Stats->WriterSleeps.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (KernelFutex) {
+      // As on Linux: the whole word, writers' wake bit. A signal or a changed word just sends it round the loop again.
+      KernelFutexCall(&Futex, KFUTEX_WAIT_BITSET | KFUTEX_PRIVATE_FLAG, Expected, nullptr, FUTEX_BITSET_WAIT_WRITERS);
+      return;
+    }
+#endif
     WaitOnAddress(&Futex, &Expected, sizeof(Futex), INFINITE);
   }
 
   // Readers wait for Futex bits [31:16] to be zero.
   void FutexWaitForReadAvailable(uint32_t Expected) {
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+    if (Stats) {
+      Stats->ReaderSleeps.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (KernelFutex) {
+      KernelFutexCall(&Futex, KFUTEX_WAIT_BITSET | KFUTEX_PRIVATE_FLAG, Expected, nullptr, FUTEX_BITSET_WAIT_READERS);
+      return;
+    }
+#endif
     auto ReadWaiterAddress = reinterpret_cast<uint8_t*>(&Futex) + 2;
     uint16_t smol_Expected = Expected >> 16;
     WaitOnAddress(ReadWaiterAddress, &smol_Expected, sizeof(smol_Expected), INFINITE);
   }
 
   void FutexWakeWriter() {
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+    if (KernelFutex) {
+      KernelFutexCall(&Futex, KFUTEX_WAKE_BITSET | KFUTEX_PRIVATE_FLAG, 1, nullptr, FUTEX_BITSET_WAIT_WRITERS);
+      return;
+    }
+#endif
     WakeByAddressSingle(&Futex);
   }
 
   void FutexWakeReaders() {
+#ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
+    if (KernelFutex) {
+      KernelFutexCall(&Futex, KFUTEX_WAKE_BITSET | KFUTEX_PRIVATE_FLAG, INT_MAX, nullptr, FUTEX_BITSET_WAIT_READERS);
+      return;
+    }
+#endif
     auto ReadWaiterAddress = reinterpret_cast<uint8_t*>(&Futex) + 2;
     WakeByAddressAll(ReadWaiterAddress);
   }
@@ -491,6 +552,12 @@ private:
       if (Waited < SpinCycles) {
         // Most reader holds are short: wait for the lock word to change.
         FEXCore::Utils::SpinWaitLock::OneShotWFEBitComparison(&Futex, WRITE_OWNED_BIT | READ_OWNER_COUNT_MASK, 0U);
+      } else if (KernelFutex) {
+        struct {
+          int64_t Seconds;
+          int64_t Nanoseconds;
+        } OneMs {0, 1'000'000};
+        KernelFutexCall(&PoliteWaitSequence, KFUTEX_WAIT | KFUTEX_PRIVATE_FLAG, Sequence, &OneMs, 0);
       } else {
         WaitOnAddress(&PoliteWaitSequence, &Sequence, sizeof(Sequence), 1);
       }
@@ -506,7 +573,11 @@ private:
   void WakePoliteWriters() {
     if (std::atomic_ref<uint32_t>(PoliteWaiters).load() != 0) {
       std::atomic_ref<uint32_t>(PoliteWaitSequence).fetch_add(1);
-      WakeByAddressAll(&PoliteWaitSequence);
+      if (KernelFutex) {
+        KernelFutexCall(&PoliteWaitSequence, KFUTEX_WAKE | KFUTEX_PRIVATE_FLAG, INT_MAX, nullptr, 0);
+      } else {
+        WakeByAddressAll(&PoliteWaitSequence);
+      }
     }
   }
 

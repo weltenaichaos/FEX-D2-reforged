@@ -173,7 +173,81 @@ std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
 
-std::recursive_mutex ThreadCreationMutex;
+// Build 125: FEX's memory/SMC lock. With FEX_KERNEL_FUTEX (the default) a thread that has to wait for it sleeps in the
+// Linux kernel (futex) instead of in Wine's critical section, whose waits and wakes go through Wine's shared wait lists:
+// each is guarded by a spin lock taken in user code, and one thread pushed off its CPU while holding it left the other
+// threads spinning for ~120 ms in the build 124 log (see WritePriorityMutex.h, KernelFutex). Off: a std::recursive_mutex
+// as before. Chosen once in ProcessInit, before any thread can take it.
+class MemoryLock final {
+public:
+  void lock() {
+    if (!FEXCore::Utils::WritePriorityMutex::KernelFutex) {
+      Fallback.lock();
+      return;
+    }
+    const uint32_t Self = GetCurrentThreadId();
+    // Only the owner ever stores its own id here, so reading it back means this thread holds the lock.
+    if (Owner.load(std::memory_order_relaxed) == Self) {
+      ++Depth;
+      return;
+    }
+    // 0 free, 1 held, 2 held with sleepers (U. Drepper, "Futexes Are Tricky", mutex 3).
+    uint32_t Current = 0;
+    if (!State.compare_exchange_strong(Current, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+      if (Current != 2) {
+        Current = State.exchange(2, std::memory_order_acquire);
+      }
+      while (Current != 0) {
+        FEXCore::Utils::WritePriorityMutex::KernelFutexCall(
+          &State, FEXCore::Utils::WritePriorityMutex::KFUTEX_WAIT | FEXCore::Utils::WritePriorityMutex::KFUTEX_PRIVATE_FLAG, 2, nullptr, 0);
+        Current = State.exchange(2, std::memory_order_acquire);
+      }
+    }
+    Owner.store(Self, std::memory_order_relaxed);
+    Depth = 1;
+  }
+
+  bool try_lock() {
+    if (!FEXCore::Utils::WritePriorityMutex::KernelFutex) {
+      return Fallback.try_lock();
+    }
+    const uint32_t Self = GetCurrentThreadId();
+    if (Owner.load(std::memory_order_relaxed) == Self) {
+      ++Depth;
+      return true;
+    }
+    uint32_t Current = 0;
+    if (!State.compare_exchange_strong(Current, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+      return false;
+    }
+    Owner.store(Self, std::memory_order_relaxed);
+    Depth = 1;
+    return true;
+  }
+
+  void unlock() {
+    if (!FEXCore::Utils::WritePriorityMutex::KernelFutex) {
+      Fallback.unlock();
+      return;
+    }
+    if (--Depth) {
+      return;
+    }
+    Owner.store(0, std::memory_order_relaxed);
+    if (State.exchange(0, std::memory_order_release) == 2) {
+      FEXCore::Utils::WritePriorityMutex::KernelFutexCall(
+        &State, FEXCore::Utils::WritePriorityMutex::KFUTEX_WAKE | FEXCore::Utils::WritePriorityMutex::KFUTEX_PRIVATE_FLAG, 1, nullptr, 0);
+    }
+  }
+
+private:
+  std::atomic<uint32_t> State {};
+  std::atomic<uint32_t> Owner {};
+  uint32_t Depth {}; // only the owner touches it
+  std::recursive_mutex Fallback;
+};
+
+MemoryLock ThreadCreationMutex;
 // Where a thread that stops for a suspend request at a block start points the stats log's native-call sampler (CPU area
 // +0x50, see ExitFunctionEC), so the time it spends suspended shows as "fex:suspended" rather than its last native call.
 alignas(16) const uint8_t SuspendedMarker[16] {};
@@ -881,6 +955,12 @@ NTSTATUS ProcessInit() {
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
   FEX::Windows::InitSwitches(AppConfigName);
+  // FEX_KERNEL_FUTEX=1 (build 125 default): FEX's code lock and memory lock sleep and wake in the Linux kernel, not
+  // through Wine's wait lists (see WritePriorityMutex.h). Set here, before a second thread or any wait exists.
+  {
+    const char* KernelFutexSwitch = FEX::Windows::Switch("FEX_KERNEL_FUTEX");
+    FEXCore::Utils::WritePriorityMutex::KernelFutex = KernelFutexSwitch && KernelFutexSwitch[0] == '1';
+  }
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
@@ -967,6 +1047,13 @@ NTSTATUS ProcessInit() {
     FEX::Windows::StatsLogSetLockProbe([] { std::scoped_lock Lock(ThreadCreationMutex); });
     FEX::Windows::StatsLogNote(PoliteMs ? fextl::fmt::format("codelock: writers wait up to {}ms without blocking compiles", PoliteMs) :
                                           fextl::string("codelock: writers queue at once (upstream)"));
+    FEX::Windows::StatsLogNote(
+      FEXCore::Utils::WritePriorityMutex::KernelFutex ?
+        "locks: FEX's code lock and memory lock (fexlock) wait in the Linux kernel (futex), not through Wine's shared wait lists "
+        "whose spin locks a thread pushed off its CPU can hold for everyone (build 124: 144 ms hitch); 'sleeps' on the codelock "
+        "line (FEX_KERNEL_FUTEX=0 turns this off)" :
+        "locks: FEX's code lock and memory lock wait through Wine (WaitOnAddress, critical section), as up to build 124 "
+        "(FEX_KERNEL_FUTEX=0)");
   } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
