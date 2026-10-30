@@ -404,9 +404,12 @@ namespace {
   // defer_* (real frames presented from the layer's thread: late after their slot, time in vkQueuePresentKHR, the game's
   // present/acquire waiting for that thread) and gen_drawn_* (generated frames waiting until the GPU drew them, presented
   // late after their slot). A 'framegen' line shows it once a second while it changes.
+  // Layer 9 (build 116) adds the latest present after its slot, presents 1 ms / 4 ms or more late (totals since the game
+  // started: the line shows the difference to the last read), the present thread's wake-ups and CPUs, and gpu_* times.
   struct FramegenState {
     fextl::string Path; // empty: not known yet
-    char Last[2048];
+    char Last[4096];
+    double PrevTotals[6] {}; // late_total, late_1ms_total, late_4ms_total, gen_late_total, gen_late_1ms_total, gen_late_4ms_total
   };
   FramegenState Framegen {};
 
@@ -450,7 +453,7 @@ namespace {
       const size_t Slash = Grid.ConfigPath.rfind('/');
       Framegen.Path = (Slash == fextl::string::npos ? fextl::string {} : Grid.ConfigPath.substr(0, Slash + 1)) + "stats.txt";
     }
-    static char Text[2048];
+    static char Text[4096];
     if (Linux::ReadSmallFile(Framegen.Path.c_str(), Text, sizeof(Text)) <= 0 || !strcmp(Text, Framegen.Last)) {
       return {};
     }
@@ -459,7 +462,7 @@ namespace {
     struct Field {
       std::string_view Key, Value;
     };
-    Field Fields[48];
+    Field Fields[96];
     size_t Count = 0;
     std::string_view All {Text};
     while (!All.empty() && Count < std::size(Fields)) {
@@ -484,6 +487,27 @@ namespace {
     };
     const std::string_view Seq = Get("seq").substr(0, 48);
 
+    // Layer 9: present timing and GPU times (empty before layer 9)
+    fextl::string Timing;
+    if (!Get("present_early_us").empty()) {
+      static constexpr std::string_view TotalKeys[6] = {"late_total",     "late_1ms_total",     "late_4ms_total",
+                                                        "gen_late_total", "gen_late_1ms_total", "gen_late_4ms_total"};
+      double Delta[6];
+      for (size_t i = 0; i < 6; ++i) {
+        const double Now = Num(TotalKeys[i]);
+        Delta[i] = Now >= Framegen.PrevTotals[i] ? Now - Framegen.PrevTotals[i] : Now;
+        Framegen.PrevTotals[i] = Now;
+      }
+      Timing = fextl::fmt::format(
+        "; present timing: waited on the CPU from {} us before the slot, latest real {:.2f} generated {:.2f} ms, late 1+/4+ ms "
+        "since the last line: real {:.0f}/{:.0f} of {:.0f}, generated {:.0f}/{:.0f} of {:.0f}, thread woke late {:.3f} (latest "
+        "{:.2f}) ms, waited on the CPU {:.1f} ms/s, on CPUs {}; GPU {}: copy {:.2f} frame generation {:.2f} ms per frame, frame to "
+        "frame {:.2f} ms ({} frames)",
+        Get("present_early_us"), Num("late_max_ms"), Num("gen_late_max_ms"), Delta[1], Delta[2], Delta[0], Delta[4], Delta[5], Delta[3],
+        Num("woke_late_ms"), Num("woke_late_max_ms"), Num("spin_ms"), Get("present_cpus").empty() ? std::string_view {"-"} : Get("present_cpus"),
+        Get("gpu_times"), Num("gpu_copy_ms"), Num("gpu_framegen_ms"), Num("gpu_frame_ms"), Get("gpu_samples"));
+    }
+
     if (Get("layer").empty()) {
       return fextl::fmt::format("framegen (a layer without FEX's present thread): {:.1f} FPS shown from {:.1f}, work {:.2f} ms, generated "
                                 "frames slept {:.2f} late {:.2f} ms, presents generated {:.2f} real {:.2f} ms, skipped {}, seq {}\n",
@@ -495,7 +519,7 @@ namespace {
                               "{:.2f} late {:.2f} present {:.2f} ms (drawn wait {}), the game waited for it: present {:.2f} acquire {:.2f} "
                               "ms; skipped {}, not drawn in 100 ms {}, inline {}, errors {}; inline presents generated {:.2f} real {:.2f} "
                               "ms; frames start at the game's blit {}: {} frames, {:.2f} ms before its present, {:.2f} ms in its "
-                              "submit, no free image {}, let go {}; seq {}\n",
+                              "submit, no free image {}, let go {}{}; seq {}\n",
                               Get("layer"), Num("fps"), Num("base"), Get("multiplier"), Get("fps_limit"), Get("flow_scale"),
                               Get("performance") == "1" ? "performance mode" : "quality mode", Num("work_ms"), Num("call_ms"),
                               Get("defer"), Get("defer_frames"), Num("defer_late_ms"), Num("defer_present_ms"), Get("defer_gen_frames"),
@@ -503,7 +527,7 @@ namespace {
                               Num("defer_wait_ms"), Num("defer_acquire_wait_ms"), Get("gen_skips"), Get("gen_drawn_timeouts"),
                               Get("defer_inline"), Get("defer_errors"), Num("gen_present_ms"), Num("real_present_ms"),
                               Get("early").empty() ? std::string_view {"-"} : Get("early"), Get("early_frames"),
-                              Num("early_lead_ms"), Num("early_work_ms"), Get("early_no_image"), Get("early_dropped"), Seq);
+                              Num("early_lead_ms"), Num("early_work_ms"), Get("early_no_image"), Get("early_dropped"), Timing, Seq);
   }
 
   enum class ReadResult { Gone, Unchanged, New };

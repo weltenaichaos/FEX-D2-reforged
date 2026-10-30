@@ -179,7 +179,7 @@ namespace FEX::Windows {
 //                        before the draw's waves may start
 //   FEX_TU_NOPREAMBLE=lit  that second binary always
 //
-// GameNative's frame generation layer, FEX's D2R build (build 113, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7-8). It
+// GameNative's frame generation layer, FEX's D2R build (build 113, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7-9). It
 // reads these from the Unix environment (__wine_set_unix_env) at its first present. From build 114 FEX sets them to 0 or 1
 // only in the game (where the switch has a value): build 113 set 0 in Steam, which has no D2R defaults, and the game
 // inherited it (the '# framegen:' note says what the variable was when the game started):
@@ -195,6 +195,13 @@ namespace FEX::Windows {
 //                          (the first submit waiting on the semaphore of the game's acquire), ahead of the game's next
 //                          frame on the GPU, instead of in the game's present after VKD3D's cap pre-sleep (build 114 run:
 //                          generated frames ~11 ms late). The swapchain gets one image more. 0 = LSFG_D2R_EARLY=0.
+//   FEX_LSFG_PRESENT_EARLY=1000 (the D2R default from build 116, layer 9) the layer's present thread sleeps until 1000 us
+//                          before a present's slot and waits the rest on the CPU, so a late wake-up doesn't make the frame
+//                          late (build 115 runs: real frames 0.5-0.9 ms late on average in stretches). The number goes to
+//                          LSFG_D2R_PRESENT_EARLY_US (layer: at most 4000); 0 = sleep until the slot, as before.
+//   FEX_LSFG_GPU_TIMES=1   (the D2R default from build 116, layer 9) GPU timestamps around the layer's copy and frame
+//                          generation (before only with LSFG_DEBUG): the framegen line shows their GPU time per frame.
+//                          0 = LSFG_D2R_GPU_TIMES=0.
 // The layer writes stats.txt next to its conf.toml every 500 ms; with the stats log a 'framegen' line shows it each second
 // (ARM64EC/Vkd3dReport.cpp).
 //

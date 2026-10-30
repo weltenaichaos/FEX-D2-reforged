@@ -59,6 +59,8 @@ jobs:
           strings out/liblsfg-vk-layer.so | grep -c "lsfg-present"
           strings out/liblsfg-vk-layer.so | grep -c "LSFG_D2R_DEFER"
           strings out/liblsfg-vk-layer.so | grep -c "LSFG_D2R_EARLY"
+          strings out/liblsfg-vk-layer.so | grep -c "LSFG_D2R_PRESENT_EARLY_US"
+          strings out/liblsfg-vk-layer.so | grep -c "d2r-9"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -73,4 +75,4 @@ jobs:
           gh release create "$TAG" out/liblsfg-vk-layer.so \
             --repo "${{ github.repository }}" --target "${{ github.sha }}" \
             --title "$TAG" --prerelease \
-            --notes "GameNative lsfg-vk layer ($LSFG_COMMIT) with the D2R fixes (instance tracking, queue lock, pacer; layer 7: a frame's presents go out from the layer's own present thread instead of inside the game's vkQueuePresentKHR, and a generated frame only once the GPU drew it; LSFG_D2R_DEFER=0 / LSFG_D2R_GEN_DRAWN=0 turn them off; stats.txt gets call_ms, defer_* and gen_drawn_* fields; layer 8: a frame's copy and frame generation start at the game's submit that blits it into its swapchain image, ahead of the game's next frame on the GPU, with one swapchain image more; LSFG_D2R_EARLY=0 turns it off; stats.txt gets early_* fields). Set LSFG_DEBUG=1 for diagnostic logging. Replace Z:\\home\\xuser-STEAM_2536520\\.local\\lib\\liblsfg-vk-layer.so with this file."
+            --notes "GameNative lsfg-vk layer ($LSFG_COMMIT) with the D2R fixes (instance tracking, queue lock, pacer; layer 7: a frame's presents go out from the layer's own present thread instead of inside the game's vkQueuePresentKHR, and a generated frame only once the GPU drew it; LSFG_D2R_DEFER=0 / LSFG_D2R_GEN_DRAWN=0 turn them off; stats.txt gets call_ms, defer_* and gen_drawn_* fields; layer 8: a frame's copy and frame generation start at the game's submit that blits it into its swapchain image, ahead of the game's next frame on the GPU, with one swapchain image more; LSFG_D2R_EARLY=0 turns it off; stats.txt gets early_* fields; layer 9: the present thread's sleep ends 1 ms before a present's slot and it waits the rest on the CPU, so a late wake-up doesn't make the frame late (LSFG_D2R_PRESENT_EARLY_US, 0 = sleep until the slot), and GPU times of the copy and frame generation without LSFG_DEBUG (LSFG_D2R_GPU_TIMES=0 turns them off); stats.txt gets the latest present after its slot, late counts, the present thread's CPUs and gpu_* fields). Set LSFG_DEBUG=1 for diagnostic logging. Replace Z:\\home\\xuser-STEAM_2536520\\.local\\lib\\liblsfg-vk-layer.so with this file."

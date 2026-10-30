@@ -114,6 +114,14 @@ namespace {
     // present, after VKD3D's cap pre-sleep, and VKD3D had given the GPU the game's next frame meanwhile. The layer now
     // starts them at the game's submit that blits the frame into its swapchain image (LSFG_D2R_EARLY).
     {"FEX_LSFG_EARLY", "1"},
+    // Build 116 (layer 9): in the build 115 runs the real frames went out 0.5-0.9 ms after their slot on average in stretches
+    // of 5-10 s (0.07 otherwise; 37 of 166 play seconds in one run), the layer's present thread waking late from its
+    // sleep. Presents are timed onto the display's refresh grid, so a late one can miss its refresh. The thread's sleep now
+    // ends 1000 us before the slot and it waits the rest on the CPU (LSFG_D2R_PRESENT_EARLY_US, 0 = as before). The layer
+    // also times its copy and frame generation on the GPU (LSFG_D2R_GPU_TIMES, before only with LSFG_DEBUG), for the cost of
+    // the flow scale.
+    {"FEX_LSFG_PRESENT_EARLY", "1000"},
+    {"FEX_LSFG_GPU_TIMES", "1"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -480,6 +488,8 @@ namespace {
     "FEX_LSFG_DEFER",
     "FEX_LSFG_GEN_DRAWN",
     "FEX_LSFG_EARLY",
+    "FEX_LSFG_PRESENT_EARLY",
+    "FEX_LSFG_GPU_TIMES",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",

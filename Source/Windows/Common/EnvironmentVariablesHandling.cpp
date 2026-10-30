@@ -439,12 +439,18 @@ namespace {
       const char* Name;
       const char* Variable;
       const char* What;
+      bool Number; // layer 9: the variable gets the switch's number (0 when off) instead of 0 or 1
     };
     static constexpr LsfgSwitch Switches[] = {
-      {"FEX_LSFG_DEFER", "LSFG_D2R_DEFER", "frames presented inside the game's vkQueuePresentKHR, as before layer 7"},
-      {"FEX_LSFG_GEN_DRAWN", "LSFG_D2R_GEN_DRAWN", "generated frames presented without waiting until the GPU drew them"},
+      {"FEX_LSFG_DEFER", "LSFG_D2R_DEFER", "frames presented inside the game's vkQueuePresentKHR, as before layer 7", false},
+      {"FEX_LSFG_GEN_DRAWN", "LSFG_D2R_GEN_DRAWN", "generated frames presented without waiting until the GPU drew them", false},
       {"FEX_LSFG_EARLY", "LSFG_D2R_EARLY",
-       "a frame's copy and frame generation start in the game's present, after VKD3D's cap pre-sleep, as up to layer 7"},
+       "a frame's copy and frame generation start in the game's present, after VKD3D's cap pre-sleep, as up to layer 7", false},
+      {"FEX_LSFG_PRESENT_EARLY", "LSFG_D2R_PRESENT_EARLY_US",
+       "the layer's present thread sleeps until a present's slot, as up to layer 8 (the number: microseconds before the slot "
+       "it waits on the CPU from)",
+       true},
+      {"FEX_LSFG_GPU_TIMES", "LSFG_D2R_GPU_TIMES", "no GPU times of the layer's copy and frame generation", false},
     };
     for (const auto& S : Switches) {
       const char* Value = Switch(S.Name);
@@ -452,15 +458,24 @@ namespace {
         continue;
       }
       const bool Off = SwitchOff(Value);
+      // A number switch passes its digits (up to 6); anything else sets 0 or 1 as the other switches.
+      char Digits[8] {};
+      size_t DigitCount = 0;
+      if (S.Number && !Off) {
+        for (const char* c = Value; *c >= '0' && *c <= '9' && DigitCount < 6; ++c) {
+          Digits[DigitCount++] = *c;
+        }
+      }
+      const char* Set = Off ? "0" : (DigitCount ? Digits : "1");
       const auto Before = StartUnixValue(S.Variable);
       if (!SetUnixEnv) {
         StatsLogNote(fextl::fmt::format("framegen: this Wine has no __wine_set_unix_env, {} can't be set (it is {})", S.Variable, Before));
         continue;
       }
-      reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv)(S.Variable, Off ? "0" : "1");
-      StatsLogNote(fextl::fmt::format("framegen: {}={} -> {}={} (it was {} when the game started{}){}{}", S.Name, Value, S.Variable,
-                                      Off ? 0 : 1, Before, Before == "-" ? "" : ", set by the program that started it",
-                                      Off ? ": " : "", Off ? S.What : ""));
+      reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv)(S.Variable, Set);
+      StatsLogNote(fextl::fmt::format("framegen: {}={} -> {}={} (it was {} when the game started{}){}{}", S.Name, Value, S.Variable, Set,
+                                      Before, Before == "-" ? "" : ", set by the program that started it", Off ? ": " : "",
+                                      Off ? S.What : ""));
     }
   }
 
