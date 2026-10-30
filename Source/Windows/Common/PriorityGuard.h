@@ -67,6 +67,13 @@ namespace FEX::Windows {
 //                      SleepConditionVariableSRW, RtlReleaseSRWLockShared) for 17 s, a pattern in no earlier log. No path from
 //                      the live check to that was found (it had been idle for 25 s then), but it was build 118's only change.
 //                      "1" or "on" = build 118's check while it waits.
+//   FEX_MAINCORE_ESCAPE_REPEAT=3  build 120 (D2R default 3, seconds): leaving again within this long of coming back
+//                      doubles the hold, up to 10 s; it starts over at 100 ms after 30 s without leaving. Build 119 run:
+//                      from 1:47 on something outside the app (Android's root user, 0.1-0.2 cores) took the main thread's
+//                      core every 1.49 s for 20-95 ms, a 40-120 ms game frame every 1.5 s (the judder seen on the map
+//                      overlay; builds 115-117 had no such period). The watcher moved the thread off after each one for
+//                      200 ms and it came back 1.3 s before the next, outside the 1 s that let the hold grow, so it was
+//                      caught every time. "off" or 0 = up to 1.6 s within 1 s, 10 s to start over (builds 117-119).
 //   FEX_MAINCORE_ESCAPE_NICE=-20  its nice while away (D2R default -20, above the game's job workers at -10 there: on
 //                      those cores they are in the same CPU group, so nice counts); "off" leaves it at FEX_MAIN_NICE.
 //   FEX_MAINCORE_OTHERS=user  with "fast": every other thread of the app's Linux user stays off the main thread's core

@@ -901,6 +901,11 @@ namespace {
   // Build 119: both build 118 runs failed (one crashed after the character screen, one froze at a loading screen with
   // the game's threads spinning in Wine's wait and wake calls, seen in no earlier log). The live check was build 118's only
   // change, so it is off by default now (FEX_MAINCORE_ESCAPE_LIVE=1 turns it back on) and the watcher works as in build 117.
+  // Build 120, FEX_MAINCORE_ESCAPE_REPEAT: in the build 119 run something outside the app (Android's root user) took the
+  // main thread's core every 1.49 s for 20-95 ms from 1:47 on, a 40-120 ms game frame every 1.5 s. The watcher moved the
+  // thread off after each one, but for 200 ms only: it came back 1.3 s before the next one, outside the 1 s that let the
+  // hold grow. Now a wait within N s (default 3) of coming back doubles the hold, up to 10 s, and the hold starts over
+  // after 30 s without leaving; then the thread stays on the other big cores while such waits keep coming.
   constexpr int NiceUnchanged = 1000;
   struct EscapeState {
     std::mutex Lock; // held while the watcher, or the guard's 250 ms keeper, decides and sets the main thread's cores and nice
@@ -921,6 +926,9 @@ namespace {
     std::atomic<uint64_t> TotalEscapes {}, TotalAwayNs {};
     std::atomic<bool> Live {}; // set by the watcher before its first check: it sees waits while they last (build 118)
     bool LiveWanted {};        // FEX_MAINCORE_ESCAPE_LIVE (build 119: off by default)
+    // FEX_MAINCORE_ESCAPE_REPEAT (build 120): leaving again within AgainMs of coming back doubles the hold up to HoldMaxMs;
+    // the hold starts over after ResetMs without leaving. Builds 117-119: 1 s, 1.6 s, 10 s.
+    uint32_t AgainMs {1000}, HoldMaxMs {1600}, ResetMs {10000};
   };
   EscapeState* Escape {};
 
@@ -961,7 +969,9 @@ namespace {
       }
     };
     constexpr uint32_t HoldFirstMs = 100;
-    constexpr uint32_t HoldMaxMs = 1600;
+    const uint32_t HoldMaxMs = E.HoldMaxMs;
+    const uint64_t AgainTicks = static_cast<uint64_t>(E.AgainMs) * Freq / 1000;
+    const uint64_t ResetTicks = static_cast<uint64_t>(E.ResetMs) * Freq / 1000;
     Linux::SchedStat S {};
     bool Have {};
     uint64_t LastWait {}, PrevTick {};
@@ -1043,11 +1053,12 @@ namespace {
         const uint64_t AwayMask = E.AwayMask.load(std::memory_order_acquire);
         const uint64_t Waited = Live ? WaitingNs : Tick + PrevTick;
         if (Home && AwayMask && Waited >= E.TriggerNs) {
-          // The hold doubles when it has to leave again within 1 s of coming back, and starts over after 10 s at home.
-          if (ReturnedAt && Now - ReturnedAt < Freq) {
+          // The hold doubles when it has to leave again soon after coming back (AgainMs), and starts over after ResetMs
+          // without leaving.
+          if (ReturnedAt && Now - ReturnedAt < AgainTicks) {
             HoldMs = std::min(HoldMs * 2, HoldMaxMs);
             E.Again.fetch_add(1, std::memory_order_relaxed);
-          } else if (!LastEscapeAt || Now - LastEscapeAt > 10 * Freq) {
+          } else if (!LastEscapeAt || Now - LastEscapeAt > ResetTicks) {
             HoldMs = HoldFirstMs;
           }
           std::scoped_lock Lock {E.Lock};
@@ -1131,11 +1142,12 @@ namespace {
       return {};
     }
     return fextl::fmt::format("  main escape: left its core {} times this second ({} in all), away {:.0f} ms{} (hold {} ms, {} of them "
-                              "within 1 s of coming back), came back {} times; waited for a CPU {:.1f} ms on its core, {:.1f} ms away; "
+                              "within {:g} s of coming back), came back {} times; waited for a CPU {:.1f} ms on its core, {:.1f} ms away; "
                               "longest wait that sent it off {:.1f} ms ({}){}; {} checks\n",
                               Escapes, E.TotalEscapes.load(std::memory_order_relaxed), static_cast<double>(AwayNs) / 1e6,
-                              AwayNow ? " (away now)" : "", E.HoldMs.load(std::memory_order_relaxed), Again, Returns,
-                              static_cast<double>(HomeWait) / 1e6, static_cast<double>(AwayWait) / 1e6, static_cast<double>(TriggerMax) / 1e6,
+                              AwayNow ? " (away now)" : "", E.HoldMs.load(std::memory_order_relaxed), Again,
+                              static_cast<double>(E.AgainMs) / 1000.0, Returns, static_cast<double>(HomeWait) / 1e6,
+                              static_cast<double>(AwayWait) / 1e6, static_cast<double>(TriggerMax) / 1e6,
                               E.Live.load(std::memory_order_relaxed) ? "seen while it lasted" : "seen once it ended",
                               Ended ? fextl::fmt::format("; the waits it left ended {:.1f} ms after they began on average "
                                                          "(longest {:.1f}), its first run on the other cores at most {:.1f} ms after "
@@ -2251,6 +2263,10 @@ void StartPriorityGuard(std::string_view AppName) {
   const char* EscapeSwitch = Switch("FEX_MAINCORE_ESCAPE");
   const uint32_t EscapeMs =
     EscapeSwitch && EscapeSwitch[0] >= '0' && EscapeSwitch[0] <= '9' ? static_cast<uint32_t>(std::clamp(atoi(EscapeSwitch), 0, 100)) : 0;
+  // Build 120: seconds after coming back within which leaving again lets the hold grow (up to 10 s); 0/off = build 119.
+  const char* RepeatSwitch = Switch("FEX_MAINCORE_ESCAPE_REPEAT");
+  const uint32_t RepeatS =
+    RepeatSwitch && RepeatSwitch[0] >= '0' && RepeatSwitch[0] <= '9' ? static_cast<uint32_t>(std::clamp(atoi(RepeatSwitch), 0, 30)) : 0;
   const char* LiveSwitch = Switch("FEX_MAINCORE_ESCAPE_LIVE");
   const bool EscapeLive = LiveSwitch && (LiveSwitch[0] == '1' || (LiveSwitch[0] == 'o' && LiveSwitch[1] == 'n'));
   int EscapeNice = -20;
@@ -2332,22 +2348,29 @@ void StartPriorityGuard(std::string_view AppName) {
                    "cores: this process's threads Wine doesn't list kept off the main thread's core, other programs left alone "
                    "(FEX_MAINCORE_OTHERS=process; =user moves steam.exe and the rest of this user's threads too)" :
                    "cores: other programs' threads left alone, they may run on the main thread's core (FEX_MAINCORE_OTHERS=off)");
+    const fextl::string HoldText = RepeatS ? fextl::fmt::format("doubling up to 10 s while it has to leave again within {} s of coming "
+                                                                "back, from 100 ms again after 30 s without leaving (build 120; "
+                                                                "FEX_MAINCORE_ESCAPE_REPEAT=off: up to 1.6 s within 1 s, as up to "
+                                                                "build 119)",
+                                                                RepeatS) :
+                                             fextl::string("doubling up to 1.6 s while it has to leave again within 1 s of coming back "
+                                                           "(FEX_MAINCORE_ESCAPE_REPEAT=off)");
     StatsLogNote(
       EscapeMs && EscapeLive ?
         fextl::fmt::format("cores: main thread checked every 2 ms (build 118: while it waits, FEX_MAINCORE_ESCAPE_LIVE=1); once it has "
                            "been ready to run on its core without a CPU for {} ms it goes to the game's other big cores{} for 100 ms "
-                           "(doubling up to 1.6 s while it has to leave again soon), then back; FEX_MAINCORE_WAIT's "
-                           "once-a-second widening is off then (FEX_MAINCORE_ESCAPE=off turns this off)",
-                           EscapeMs, EscapeNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", EscapeNice) : fextl::string {}) :
-      EscapeMs ? fextl::fmt::format("cores: main thread's waits for its core read every 4 ms, each counted once it has ended (as "
-                                    "in build 117); after {} ms or more within 8 ms it goes to the game's other big cores{} for "
-                                    "100 ms (doubling up to 1.6 s while it has to leave again soon), then back; FEX_MAINCORE_WAIT's "
-                                    "once-a-second widening is off then (FEX_MAINCORE_ESCAPE=off turns this off). Build 119: "
-                                    "build 118's check while it waits is off (FEX_MAINCORE_ESCAPE_LIVE=1 turns it on): both "
-                                    "build 118 runs crashed or froze",
-                                    EscapeMs, EscapeNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", EscapeNice) : fextl::string {}) :
-                 fextl::string("cores: main thread stays on its core however short the waits (FEX_MAINCORE_ESCAPE=4 lets it "
-                               "leave within milliseconds)"));
+                           "({}), then back; FEX_MAINCORE_WAIT's once-a-second widening is off then (FEX_MAINCORE_ESCAPE=off turns "
+                           "this off)",
+                           EscapeMs, EscapeNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", EscapeNice) : fextl::string {}, HoldText) :
+      EscapeMs ?
+        fextl::fmt::format("cores: main thread's waits for its core read every 4 ms, each counted once it has ended (as "
+                           "in build 117); after {} ms or more within 8 ms it goes to the game's other big cores{} for "
+                           "100 ms ({}), then back; FEX_MAINCORE_WAIT's once-a-second widening is off then "
+                           "(FEX_MAINCORE_ESCAPE=off turns this off). Build 119: build 118's check while it waits is off "
+                           "(FEX_MAINCORE_ESCAPE_LIVE=1 turns it on): both build 118 runs crashed or froze",
+                           EscapeMs, EscapeNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", EscapeNice) : fextl::string {}, HoldText) :
+        fextl::string("cores: main thread stays on its core however short the waits (FEX_MAINCORE_ESCAPE=4 lets it "
+                      "leave within milliseconds)"));
   }
   StatsLogNote(C->ServerNiceOn ? fextl::fmt::format("server: wineserver to nice {} (FEX_SERVER_NICE=off leaves it alone)", C->ServerNice) :
                                  fextl::string("server: wineserver nice left alone"));
@@ -2416,6 +2439,11 @@ void StartPriorityGuard(std::string_view AppName) {
     Escape->TriggerNs = static_cast<uint64_t>(EscapeMs) * 1'000'000;
     Escape->AwayNice = EscapeNice;
     Escape->LiveWanted = EscapeLive;
+    if (RepeatS) {
+      Escape->AgainMs = RepeatS * 1000;
+      Escape->HoldMaxMs = 10'000;
+      Escape->ResetMs = 30'000;
+    }
     StatsLogSetLineProvider(EscapeStatsLine);
     static fextl::unique_ptr<FEXCore::Threads::Thread> WatchThread;
     WatchThread = FEXCore::Threads::Thread::Create(EscapeThread, Escape, {.LowPriority = false, .Internal = true}, "FEXMainWatch");

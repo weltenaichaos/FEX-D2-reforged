@@ -81,6 +81,11 @@ namespace {
     // character screen, a freeze at a loading screen with the game's threads spinning in Wine's wait and wake calls, seen in
     // no earlier log), and that check was build 118's only change. "1" turns it on.
     {"FEX_MAINCORE_ESCAPE_LIVE", "0"},
+    // Build 120: in the build 119 run something outside the app took the main thread's core every 1.49 s for 20-95 ms
+    // (a 40-120 ms game frame every 1.5 s, the map overlay's judder). The thread left after each one for 200 ms only and
+    // came back 1.3 s before the next. Leaving again within 3 s of coming back now doubles the hold up to 10 s (from 100 ms
+    // again after 30 s without leaving). "off" = build 119 (1 s, up to 1.6 s).
+    {"FEX_MAINCORE_ESCAPE_REPEAT", "3"},
     {"FEX_MAINCORE_ESCAPE_NICE", "-20"},
     // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
     // PriorityGuard.h). In the build 75 log the main thread waited for its core 7 ms per slow frame, nearly always inside
@@ -146,7 +151,7 @@ namespace {
     // game's job workers (also nice -10) kept busy. It now runs at nice -20 (LSFG_D2R_DEFER_NICE; "off" leaves the nice
     // the thread starts with). The run also had 48-156 ms game frames (the main thread waiting for its core, see
     // FEX_MAINCORE_ESCAPE); the generated frame after such a freeze is made between two pictures far apart in time and
-    // guesses a big jump (Jesse saw a chest's button label halfway across the screen once). A game frame that comes more
+    // guesses a big jump (a chest's button label showed halfway across the screen once). A game frame that comes more
     // than FEX_LSFG_GEN_GAP ms after the one before now gets no generated frame, only itself at the generated frame's slot
     // (LSFG_D2R_GEN_GAP_MS, 0 = off).
     {"FEX_LSFG_PRESENT_NICE", "-20"},
@@ -495,6 +500,7 @@ namespace {
     "FEX_MAINCORE_WAIT",
     "FEX_MAINCORE_ESCAPE",
     "FEX_MAINCORE_ESCAPE_LIVE",
+    "FEX_MAINCORE_ESCAPE_REPEAT",
     "FEX_MAINCORE_ESCAPE_NICE",
     "FEX_MAINCORE_OTHERS",
     "FEX_HELPER_CORES",
