@@ -240,7 +240,7 @@ index 2990194..22471f4 100644
      /// Call to the original vkQueueSubmit function.
      VkResult ovkQueueSubmit(
 diff --git a/src/context.cpp b/src/context.cpp
-index 2385454..5050001 100644
+index 2385454..143a003 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
 @@ -47,6 +47,11 @@ bool LsContext::isStale() const {
@@ -255,7 +255,20 @@ index 2385454..5050001 100644
  
  namespace {
      // Every GPU wait is bounded so an incompatible sync path degrades to
-@@ -98,14 +103,15 @@ namespace {
+@@ -60,6 +65,12 @@ namespace {
+         return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
+     }
+ 
++    // Layer 9: presents late after their slot by 1 ms or more / 4 ms or more,
++    // counted since the game started (swapchains come and go), real and
++    // generated: the stats file has the totals, FEX takes differences.
++    std::atomic<uint64_t> g_lateTotals[4]{};
++    std::atomic<uint64_t> g_presentTotals[2]{};
++
+     // Present-thread watchdog: the present hook publishes the stage it is
+     // about to block in; a background thread reports any stage held for more
+     // than 2 seconds. "idle" means the layer returned to the game — a freeze
+@@ -98,14 +109,15 @@ namespace {
          }).detach();
      }
  
@@ -277,7 +290,7 @@ index 2385454..5050001 100644
      }
  
      void imageBarrier(VkCommandBuffer cmd, VkImage img,
-@@ -245,6 +251,44 @@ namespace {
+@@ -245,6 +257,44 @@ namespace {
          double workMs, genSleepMs, genLateMs, genPresentMs, realPresentMs;
          uint64_t genSkips;
          std::string seq;
@@ -322,7 +335,7 @@ index 2385454..5050001 100644
      };
  
      void writeStats(const std::filesystem::path& configFile, double fps, double baseFps,
-@@ -259,8 +303,392 @@ namespace {
+@@ -259,11 +309,389 @@ namespace {
              << "\ngen_present_ms=" << d.genPresentMs
              << "\nreal_present_ms=" << d.realPresentMs
              << "\ngen_skips=" << d.genSkips
@@ -372,7 +385,7 @@ index 2385454..5050001 100644
 +            << "\ngpu_copy_ms=" << d.gpuCopyMs
 +            << "\ngpu_framegen_ms=" << d.gpuFramegenMs
 +            << "\ngpu_frame_ms=" << d.gpuFrameMs << '\n';
-     }
++    }
 +
 +    // D2R: the real frame's present waits for its slot on a thread of the
 +    // layer instead of inside the game's vkQueuePresentKHR, where VKD3D holds
@@ -450,12 +463,6 @@ index 2385454..5050001 100644
 +        asm volatile("yield" ::: "memory");
 +#endif
 +    }
-+
-+    // Layer 9: presents late after their slot by 1 ms or more / 4 ms or more,
-+    // counted since the game started (swapchains come and go), real and
-+    // generated: the stats file has the totals, FEX takes differences.
-+    std::atomic<uint64_t> g_lateTotals[4]{};
-+    std::atomic<uint64_t> g_presentTotals[2]{};
 +
 +    // Waits until dueNs: sleeps until presentEarlyNs() before it (from
 +    // sleepFromNs on, when the thread was ready for the job), then waits the
@@ -674,10 +681,10 @@ index 2385454..5050001 100644
 +        }
 +        s.done = true;
 +        s.cv.notify_all();
-+    }
-+}
-+#endif
-+
+     }
+ }
+ #endif
+ 
 +VkResult LsContext::takeDeferred(bool fromAcquire) {
 +#ifdef __ANDROID__
 +    if (!this->defer)
@@ -713,9 +720,12 @@ index 2385454..5050001 100644
 +    if (state->started
 +            && !state->cv.wait_for(lk, std::chrono::seconds(1), [&] { return state->done; }))
 +        std::cerr << "lsfg-vk: present thread didn't end within 1 s\n";
- }
- #endif
- 
++}
++#endif
++
+ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+         VkExtent2D extent, const std::vector<VkImage>& swapchainImages)
+         : swapchain(swapchain), swapchainImages(swapchainImages),
 @@ -318,7 +746,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
      // Android: single-device framegen on the game's own device and queue —
      // two ICDs interpret shared AHB memory differently and scramble it.
