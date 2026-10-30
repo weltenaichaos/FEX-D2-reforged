@@ -1,5 +1,5 @@
 diff --git a/include/context.hpp b/include/context.hpp
-index ae382de..17d6f59 100644
+index ae382de..c3b28d1 100644
 --- a/include/context.hpp
 +++ b/include/context.hpp
 @@ -20,6 +20,11 @@
@@ -14,7 +14,22 @@ index ae382de..17d6f59 100644
  ///
  /// This class is the frame generation context. There should be one instance per swapchain.
  ///
-@@ -69,12 +74,47 @@ class LsContext {
+@@ -32,11 +37,13 @@ class LsContext {
+     /// @param swapchain The Vulkan swapchain to use.
+     /// @param extent The extent of the swapchain images.
+     /// @param swapchainImages The swapchain images to use.
++    /// @param swapchainFormat The format of the swapchain images.
+     ///
+     /// @throws LSFG::vulkan_error if any Vulkan call fails.
+     ///
+     LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+-        VkExtent2D extent, const std::vector<VkImage>& swapchainImages);
++        VkExtent2D extent, const std::vector<VkImage>& swapchainImages,
++        VkFormat swapchainFormat);
+ 
+     ///
+     /// Custom present logic.
+@@ -69,16 +76,56 @@ class LsContext {
      ///
      VkResult presentPassthrough(VkQueue queue, const VkPresentInfoKHR* pPresentInfo);
  
@@ -48,6 +63,10 @@ index ae382de..17d6f59 100644
 +    void dropEarly(std::vector<VkSemaphore>& semaphores);
 +    /// LSFG_D2R_EARLY (on unless it starts with 0).
 +    static bool earlyOn();
++    /// D2R layer 11: LSFG_D2R_UI (on unless it starts with 0): frame
++    /// generation runs on VKD3D's frames without the game's UI layer, and the
++    /// UI is put back on the generated frames from the real frame.
++    static bool uiOn();
 +
      // Non-copyable, trivially moveable and destructible
      LsContext(const LsContext&) = delete;
@@ -62,7 +81,12 @@ index ae382de..17d6f59 100644
  private:
      VkSwapchainKHR swapchain;
      std::vector<VkImage> swapchainImages;
-@@ -118,10 +158,23 @@ class LsContext {
+     VkExtent2D extent;
++    VkFormat swapchainFormat{};
+ 
+     std::shared_ptr<int32_t> lsfgCtxId; // lsfg context id
+     uint64_t lsfgEpoch{0}; // framegen module epoch this context was built against
+@@ -118,10 +165,24 @@ class LsContext {
      uint64_t statsWorkNs{0};        // copy fence wait + framegen + waitIdle
      uint64_t statsGenSleepNs{0};    // slept before generated presents
      uint64_t statsGenLateNs{0};     // generated present lateness vs its slot
@@ -74,6 +98,7 @@ index ae382de..17d6f59 100644
 +    uint64_t dbgPrevT0{0};
 +    uint64_t dbgGpuSamples{0};
 +    double dbgGpuCopyNs{0}, dbgGpuLsfgNs{0}, dbgGpuIntervalNs{0};
++    double dbgGpuUiNs{0}; // layer 11: putting the UI back on the first generated frame
 +    PFN_vkCmdWriteTimestamp dbgCmdWriteTimestamp{};
 +    PFN_vkCmdResetQueryPool dbgCmdResetQueryPool{};
 +    PFN_vkGetQueryPoolResults dbgGetQueryPoolResults{};
@@ -86,12 +111,13 @@ index ae382de..17d6f59 100644
  
      void dumpFrameImages(const Hooks::DeviceInfo& info, uint32_t presentIdx);
      int dumpDoneFrames{0};          // presents already dumped (debug_dump)
-@@ -141,6 +194,109 @@ class LsContext {
+@@ -141,6 +202,123 @@ class LsContext {
          std::vector<Mini::CommandBuffer> postCopyBufs; // copy from out_n to swapchain image
          std::vector<Mini::Semaphore> postCopySemaphores; // signal when postCopyBuf is done
          std::vector<Mini::Semaphore> prevPostCopySemaphores; // signal for previous postCopyBuf
 +#ifdef __ANDROID__
 +        Mini::Fence genDrawnFence; // D2R: the generated frame's copy (multiplier 2 only)
++        bool uiSplit{false}; // layer 11: frame generation got the frame without the UI layer
 +#endif
      }; // data for a single render pass
      std::array<RenderPassInfo, 8> passInfos; // allocate 8 because why not
@@ -184,6 +210,19 @@ index ae382de..17d6f59 100644
 +    int64_t lastWorkStartNs{0};
 +    bool gapSkip{false};
 +
++    // layer 11: frame generation on VKD3D's frames without the game's UI
++    // layer; the UI goes back on the generated frames from the real frame
++    // (uiFrame: the real frame, as frame generation's format)
++    struct UiCompose;
++    std::shared_ptr<UiCompose> ui;   // null: off or not made
++    Mini::Image uiFrame;
++    const char* uiOffReason{nullptr}; // why it's off for this swapchain (once known)
++    uint64_t statsUiFrames{0};       // frames that went to frame generation without the UI layer
++    uint64_t statsUiPlain{0};        // frames that went as shown (no usable hand-over image)
++    uint32_t uiPlainReason{0};       // the last such frame's reason (bit set)
++    std::array<uint32_t, 4> uiPrevCounts{}; // the compose shader's pixel counts at the last stats window
++    void makeUiCompose(const Hooks::DeviceInfo& info);
++
 +    bool startFrameWork(const Hooks::DeviceInfo& info, VkQueue queue,
 +        const std::vector<VkSemaphore>& gameRenderSemaphores, uint32_t presentIdx,
 +        uint64_t fenceTimeoutNs, bool countTimeouts, bool& started);
@@ -197,10 +236,10 @@ index ae382de..17d6f59 100644
 +#endif
  };
 diff --git a/include/hooks.hpp b/include/hooks.hpp
-index e38212c..073a798 100644
+index e38212c..870101b 100644
 --- a/include/hooks.hpp
 +++ b/include/hooks.hpp
-@@ -19,4 +19,14 @@ namespace Hooks {
+@@ -19,4 +19,25 @@ namespace Hooks {
      /// Map of hooked Vulkan functions.
      extern std::unordered_map<std::string, PFN_vkVoidFunction> hooks;
  
@@ -213,6 +252,17 @@ index e38212c..073a798 100644
 +    /// after the submit, without the layer queue lock.
 +    void earlyBlitSubmitted(VkQueue queue, VkSemaphore acquireSemaphore,
 +        VkSemaphore releaseSemaphore);
++
++    /// D2R layer 11: VKD3D's hand-over image (VKD3D fex35,
++    /// VKD3D_FEX_UI_SPLIT=1): the swapchain blit copies each frame without
++    /// the game's UI layer into it and leaves it in GENERAL.
++    struct UiImage {
++        VkImage image{};      // VK_NULL_HANDLE: none seen (or destroyed)
++        VkExtent2D extent{};
++        VkFormat format{};
++    };
++    /// The hand-over image the game created last on this device.
++    UiImage uiImage(VkDevice device);
 +
  }
 diff --git a/include/layer.hpp b/include/layer.hpp
@@ -245,11 +295,92 @@ index 2990194..22471f4 100644
  
      /// Call to the original vkQueueSubmit function.
      VkResult ovkQueueSubmit(
+diff --git a/shaders/ui_compose.comp b/shaders/ui_compose.comp
+new file mode 100644
+index 0000000..02b5bea
+--- /dev/null
++++ b/shaders/ui_compose.comp
+@@ -0,0 +1,67 @@
++#version 450
++// D2R layer 11: puts the game's UI back on a generated frame. Frame
++// generation ran on frames without the UI layer (VKD3D's hand-over image);
++// every pixel where the real frame differs from its frame without the UI
++// layer by more than tol is taken from the real frame.
++// Built with: glslangValidator -V --target-env vulkan1.1 -o ui_compose.spv ui_compose.comp
++//             xxd -i ui_compose.spv > ../src/extract/ui_compose_spv.h
++layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
++
++layout(set = 0, binding = 0, rgba16f) uniform image2D genImg;            // generated frame (out_n)
++layout(set = 0, binding = 1, rgba16f) uniform readonly image2D sceneImg; // this frame without the UI layer
++layout(set = 0, binding = 2, rgba16f) uniform readonly image2D realImg;  // this frame as shown
++layout(set = 0, binding = 3, std430) buffer Stats {
++    uint counts[4]; // pixels: differing at all, taken, differing by 16/255 or more, all
++} stats;
++
++layout(push_constant) uniform Push {
++    ivec2 size;
++    float tol;
++    uint count; // nonzero: add this frame's pixels to the counters (1 frame in 4)
++} pc;
++
++shared uint sAny;
++shared uint sTaken;
++shared uint sStrong;
++shared uint sAll;
++
++void main() {
++    if (gl_LocalInvocationIndex == 0u) {
++        sAny = 0u;
++        sTaken = 0u;
++        sStrong = 0u;
++        sAll = 0u;
++    }
++    barrier();
++
++    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (p.x < pc.size.x && p.y < pc.size.y) {
++        const vec4 f = imageLoad(realImg, p);
++        const vec3 d = abs(f.rgb - imageLoad(sceneImg, p).rgb);
++        const float m = max(d.r, max(d.g, d.b));
++        const bool take = m > pc.tol;
++        if (take)
++            imageStore(genImg, p, f);
++        if (pc.count != 0u) {
++            atomicAdd(sAll, 1u);
++            if (m > 0.0)
++                atomicAdd(sAny, 1u);
++            if (take)
++                atomicAdd(sTaken, 1u);
++            if (m >= 16.0 / 255.0)
++                atomicAdd(sStrong, 1u);
++        }
++    }
++    barrier();
++
++    if (pc.count != 0u && gl_LocalInvocationIndex == 0u) {
++        if (sAny != 0u)
++            atomicAdd(stats.counts[0], sAny);
++        if (sTaken != 0u)
++            atomicAdd(stats.counts[1], sTaken);
++        if (sStrong != 0u)
++            atomicAdd(stats.counts[2], sStrong);
++        if (sAll != 0u)
++            atomicAdd(stats.counts[3], sAll);
++    }
++}
 diff --git a/src/context.cpp b/src/context.cpp
-index 2385454..edfc0b5 100644
+index 2385454..1587a5d 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
-@@ -47,6 +47,11 @@ bool LsContext::isStale() const {
+@@ -4,6 +4,7 @@
+ #include "extract/extract.hpp"
+ #include "extract/trans.hpp"
+ #include "extract/mipmaps_replacement_spv.h"
++#include "extract/ui_compose_spv.h"
+ #include "utils/utils.hpp"
+ #include "hooks.hpp"
+ #include "layer.hpp"
+@@ -47,6 +48,11 @@ bool LsContext::isStale() const {
  #include <cstring>
  #include <cerrno>
  #include <ctime>
@@ -261,7 +392,7 @@ index 2385454..edfc0b5 100644
  
  namespace {
      // Every GPU wait is bounded so an incompatible sync path degrades to
-@@ -60,6 +65,16 @@ namespace {
+@@ -60,6 +66,16 @@ namespace {
          return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
      }
  
@@ -278,7 +409,7 @@ index 2385454..edfc0b5 100644
      // Present-thread watchdog: the present hook publishes the stage it is
      // about to block in; a background thread reports any stage held for more
      // than 2 seconds. "idle" means the layer returned to the game — a freeze
-@@ -98,14 +113,15 @@ namespace {
+@@ -98,14 +114,15 @@ namespace {
          }).detach();
      }
  
@@ -300,7 +431,26 @@ index 2385454..edfc0b5 100644
      }
  
      void imageBarrier(VkCommandBuffer cmd, VkImage img,
-@@ -245,6 +261,47 @@ namespace {
+@@ -134,7 +151,8 @@ namespace {
+     }
+ 
+     void blitFull(VkCommandBuffer cmd, VkImage src, VkImage dst,
+-            uint32_t width, uint32_t height) {
++            uint32_t width, uint32_t height,
++            VkImageLayout srcLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+         const VkImageBlit blit{
+             .srcSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1 },
+             .srcOffsets = { {0, 0, 0},
+@@ -144,7 +162,7 @@ namespace {
+                 { static_cast<int32_t>(width), static_cast<int32_t>(height), 1 } },
+         };
+         Layer::ovkCmdBlitImage(cmd,
+-            src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++            src, srcLayout,
+             dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+             1, &blit, VK_FILTER_NEAREST);
+     }
+@@ -245,6 +263,58 @@ namespace {
          double workMs, genSleepMs, genLateMs, genPresentMs, realPresentMs;
          uint64_t genSkips;
          std::string seq;
@@ -345,16 +495,27 @@ index 2385454..edfc0b5 100644
 +        // layer 10
 +        int presentNice;          // the present thread's nice (-100: not known yet)
 +        int64_t genGapMs;         // no generated frame after a game frame longer than this (0: off)
++        // layer 11
++        std::string uiState;      // "on", or "off (why)"
++        uint64_t uiFrames;        // frames that went to frame generation without the UI layer
++        uint64_t uiPlain;         // frames that went as shown while it's on
++        uint32_t uiPlainReason;   // the last such frame's reasons (bits)
++        int uiTolLsb;             // pixels differing by more than this many 1/255 steps are taken from the real frame
++        double uiPxAnyPct;        // composed pixels: real frame differs from the frame without the UI layer
++        double uiPxTakenPct;      // ... taken from the real frame
++        double uiPxStrongPct;     // ... differing by 16/255 or more
++        uint64_t uiPxFrames;      // composed frames (pixels / frame size)
++        double gpuUiMs;           // GPU time of putting the UI back, per frame with GPU times
      };
  
      void writeStats(const std::filesystem::path& configFile, double fps, double baseFps,
-@@ -259,11 +316,414 @@ namespace {
+@@ -259,15 +329,727 @@ namespace {
              << "\ngen_present_ms=" << d.genPresentMs
              << "\nreal_present_ms=" << d.realPresentMs
              << "\ngen_skips=" << d.genSkips
 -            << "\nseq=" << d.seq << '\n';
 +            << "\nseq=" << d.seq
-+            << "\nlayer=d2r-10"
++            << "\nlayer=d2r-11"
 +            << "\ncall_ms=" << d.callMs
 +            << "\ndefer=" << (d.deferOn ? "on" : "off")
 +            << "\ndefer_frames=" << d.deferFrames
@@ -400,7 +561,17 @@ index 2385454..edfc0b5 100644
 +            << "\ngpu_frame_ms=" << d.gpuFrameMs
 +            << "\npresent_nice=" << d.presentNice
 +            << "\ngen_gap_ms=" << d.genGapMs
-+            << "\ngen_gap_skips_total=" << g_gapSkipTotal.load(std::memory_order_relaxed) << '\n';
++            << "\ngen_gap_skips_total=" << g_gapSkipTotal.load(std::memory_order_relaxed)
++            << "\nui=" << d.uiState
++            << "\nui_frames=" << d.uiFrames
++            << "\nui_plain=" << d.uiPlain
++            << "\nui_plain_reason=" << d.uiPlainReason
++            << "\nui_tol=" << d.uiTolLsb
++            << "\nui_px_any_pct=" << d.uiPxAnyPct
++            << "\nui_px_taken_pct=" << d.uiPxTakenPct
++            << "\nui_px_strong_pct=" << d.uiPxStrongPct
++            << "\nui_px_frames=" << d.uiPxFrames
++            << "\ngpu_ui_ms=" << d.gpuUiMs << '\n';
 +    }
 +
 +    // D2R: the real frame's present waits for its slot on a thread of the
@@ -491,6 +662,42 @@ index 2385454..edfc0b5 100644
 +            return std::clamp<int64_t>(ms, 0, 1000) * 1'000'000;
 +        }();
 +        return ns;
++    }
++
++    // Layer 11, LSFG_D2R_UI=0 (FEX: FEX_LSFG_UI=0): frame generation runs on
++    // the finished frame, the game's UI included, as up to layer 10. On: it
++    // runs on VKD3D's frames without the UI layer (VKD3D fex35, FEX:
++    // FEX_VKD3D_UI_SPLIT), and every pixel where the real frame differs from
++    // its frame without the UI layer is taken from the real frame. Frame
++    // generation guesses motion from the pictures it gets; D2R's map overlay
++    // and HUD barely move while the world under them does, and the guess
++    // smeared a zone around them in every generated frame (build 121).
++    bool uiEnabled() {
++        static const bool on = [] {
++            const char* v = std::getenv("LSFG_D2R_UI");
++            return !(v && v[0] == '0');
++        }();
++        return on;
++    }
++
++    // Layer 11, LSFG_D2R_UI_TOL (FEX: FEX_LSFG_UI_TOL): pixels whose real
++    // frame differs from the frame without the UI layer by more than this
++    // many 1/255 steps (in any colour) are taken from the real frame. Both are
++    // 8-bit pictures, so where there is no UI they are equal. Default 0 (any
++    // difference), at most 64.
++    int uiTolLsb() {
++        static const int lsb = [] {
++            const char* v = std::getenv("LSFG_D2R_UI_TOL");
++            return v ? std::clamp(std::atoi(v), 0, 64) : 0;
++        }();
++        return lsb;
++    }
++
++    // 8-bit UNORM formats: a blit to frame generation's RGBA16F gives the
++    // same values for the same picture in any of them.
++    bool uiPlain8(VkFormat format) {
++        return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM
++            || format == VK_FORMAT_A8B8G8R8_UNORM_PACK32;
 +    }
 +
 +    inline void cpuRelax() {
@@ -719,10 +926,10 @@ index 2385454..edfc0b5 100644
 +        }
 +        s.done = true;
 +        s.cv.notify_all();
-     }
- }
- #endif
- 
++    }
++}
++#endif
++
 +VkResult LsContext::takeDeferred(bool fromAcquire) {
 +#ifdef __ANDROID__
 +    if (!this->defer)
@@ -748,6 +955,268 @@ index 2385454..edfc0b5 100644
 +}
 +
 +#ifdef __ANDROID__
++// Layer 11: the compute step that puts the game's UI back on a generated
++// frame (shaders/ui_compose.comp), with its views, descriptor sets and pixel
++// counters.
++struct LsContext::UiCompose {
++    VkDevice device{};
++    PFN_vkDestroyImageView destroyImageView{};
++    PFN_vkDestroyShaderModule destroyShaderModule{};
++    PFN_vkDestroyPipeline destroyPipeline{};
++    PFN_vkDestroyPipelineLayout destroyPipelineLayout{};
++    PFN_vkDestroyDescriptorSetLayout destroySetLayout{};
++    PFN_vkDestroyDescriptorPool destroyPool{};
++    PFN_vkCmdBindPipeline cmdBindPipeline{};
++    PFN_vkCmdBindDescriptorSets cmdBindSets{};
++    PFN_vkCmdPushConstants cmdPushConstants{};
++    PFN_vkCmdDispatch cmdDispatch{};
++    VkShaderModule module{};
++    VkDescriptorSetLayout setLayout{};
++    VkPipelineLayout pipeLayout{};
++    VkPipeline pipeline{};
++    VkDescriptorPool pool{};
++    std::vector<VkImageView> views;
++    std::vector<VkDescriptorSet> sets; // [input image (frameIdx % 2) * outCount + generated frame]
++    size_t outCount{0};
++    VkBuffer statsBuffer{};
++    VkDeviceMemory statsMemory{};
++    volatile uint32_t* counts{nullptr}; // any, taken, strong, all (totals, wrap around)
++
++    UiCompose() = default;
++    UiCompose(const UiCompose&) = delete;
++    UiCompose& operator=(const UiCompose&) = delete;
++    UiCompose(UiCompose&&) = delete;
++    UiCompose& operator=(UiCompose&&) = delete;
++    ~UiCompose() {
++        if (!this->device)
++            return;
++        if (this->counts)
++            Layer::ovkUnmapMemory(this->device, this->statsMemory);
++        if (this->statsBuffer)
++            Layer::ovkDestroyBuffer(this->device, this->statsBuffer, nullptr);
++        if (this->statsMemory)
++            Layer::ovkFreeMemory(this->device, this->statsMemory, nullptr);
++        if (this->pipeline && this->destroyPipeline)
++            this->destroyPipeline(this->device, this->pipeline, nullptr);
++        if (this->pool && this->destroyPool)
++            this->destroyPool(this->device, this->pool, nullptr);
++        if (this->pipeLayout && this->destroyPipelineLayout)
++            this->destroyPipelineLayout(this->device, this->pipeLayout, nullptr);
++        if (this->setLayout && this->destroySetLayout)
++            this->destroySetLayout(this->device, this->setLayout, nullptr);
++        if (this->module && this->destroyShaderModule)
++            this->destroyShaderModule(this->device, this->module, nullptr);
++        for (const VkImageView view : this->views)
++            if (view && this->destroyImageView)
++                this->destroyImageView(this->device, view, nullptr);
+     }
++};
++
++namespace {
++    template <typename T>
++    T deviceProc(VkDevice device, const char* name) {
++        return reinterpret_cast<T>(Layer::ovkGetDeviceProcAddr(device, name));
++    }
++
++    void uiCheck(VkResult res, const char* what) {
++        if (res != VK_SUCCESS)
++            throw LSFG::vulkan_error(res, std::string("UI step: ") + what);
++    }
++}
++
++// Layer 11: views of frame_0/frame_1 (this frame without the UI layer), out_n
++// (the generated frames) and uiFrame (this frame as shown), the compose
++// pipeline, one descriptor set per input image and generated frame, and a
++// host-visible buffer for the pixel counters. Throws on failure (this->ui
++// stays null).
++void LsContext::makeUiCompose(const Hooks::DeviceInfo& info) {
++    const VkDevice device = info.device;
++    auto u = std::make_shared<UiCompose>();
++    u->device = device;
++    u->destroyImageView = deviceProc<PFN_vkDestroyImageView>(device, "vkDestroyImageView");
++    u->destroyShaderModule = deviceProc<PFN_vkDestroyShaderModule>(device, "vkDestroyShaderModule");
++    u->destroyPipeline = deviceProc<PFN_vkDestroyPipeline>(device, "vkDestroyPipeline");
++    u->destroyPipelineLayout = deviceProc<PFN_vkDestroyPipelineLayout>(device, "vkDestroyPipelineLayout");
++    u->destroySetLayout = deviceProc<PFN_vkDestroyDescriptorSetLayout>(device, "vkDestroyDescriptorSetLayout");
++    u->destroyPool = deviceProc<PFN_vkDestroyDescriptorPool>(device, "vkDestroyDescriptorPool");
++    u->cmdBindPipeline = deviceProc<PFN_vkCmdBindPipeline>(device, "vkCmdBindPipeline");
++    u->cmdBindSets = deviceProc<PFN_vkCmdBindDescriptorSets>(device, "vkCmdBindDescriptorSets");
++    u->cmdPushConstants = deviceProc<PFN_vkCmdPushConstants>(device, "vkCmdPushConstants");
++    u->cmdDispatch = deviceProc<PFN_vkCmdDispatch>(device, "vkCmdDispatch");
++    auto createImageView = deviceProc<PFN_vkCreateImageView>(device, "vkCreateImageView");
++    auto createShaderModule = deviceProc<PFN_vkCreateShaderModule>(device, "vkCreateShaderModule");
++    auto createSetLayout = deviceProc<PFN_vkCreateDescriptorSetLayout>(device, "vkCreateDescriptorSetLayout");
++    auto createPipelineLayout = deviceProc<PFN_vkCreatePipelineLayout>(device, "vkCreatePipelineLayout");
++    auto createComputePipelines = deviceProc<PFN_vkCreateComputePipelines>(device, "vkCreateComputePipelines");
++    auto createPool = deviceProc<PFN_vkCreateDescriptorPool>(device, "vkCreateDescriptorPool");
++    auto allocateSets = deviceProc<PFN_vkAllocateDescriptorSets>(device, "vkAllocateDescriptorSets");
++    auto updateSets = deviceProc<PFN_vkUpdateDescriptorSets>(device, "vkUpdateDescriptorSets");
++    if (!u->destroyImageView || !u->destroyShaderModule || !u->destroyPipeline
++            || !u->destroyPipelineLayout || !u->destroySetLayout || !u->destroyPool
++            || !u->cmdBindPipeline || !u->cmdBindSets || !u->cmdPushConstants || !u->cmdDispatch
++            || !createImageView || !createShaderModule || !createSetLayout || !createPipelineLayout
++            || !createComputePipelines || !createPool || !allocateSets || !updateSets)
++        throw LSFG::vulkan_error(VK_ERROR_INITIALIZATION_FAILED, "UI step: device functions missing");
++
++    const auto makeView = [&](VkImage image) {
++        const VkImageViewCreateInfo viewInfo{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++            .image = image,
++            .viewType = VK_IMAGE_VIEW_TYPE_2D,
++            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
++            .subresourceRange = {
++                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                .levelCount = 1,
++                .layerCount = 1
++            }
++        };
++        VkImageView view{};
++        uiCheck(createImageView(device, &viewInfo, nullptr, &view), "image view");
++        u->views.push_back(view);
++        return view;
++    };
++    const std::array<VkImageView, 2> inputViews{
++        makeView(this->frame_0.handle()), makeView(this->frame_1.handle()) };
++    const VkImageView realView = makeView(this->uiFrame.handle());
++    std::vector<VkImageView> outViews;
++    for (const auto& out : this->out_n)
++        outViews.push_back(makeView(out.handle()));
++    u->outCount = outViews.size();
++    if (u->outCount == 0)
++        throw LSFG::vulkan_error(VK_ERROR_INITIALIZATION_FAILED, "UI step: no generated frames");
++
++    std::vector<uint32_t> code(ui_compose_spv_len / 4);
++    std::memcpy(code.data(), static_cast<const void*>(ui_compose_spv), code.size() * 4);
++    const VkShaderModuleCreateInfo moduleInfo{
++        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++        .codeSize = code.size() * 4,
++        .pCode = code.data()
++    };
++    uiCheck(createShaderModule(device, &moduleInfo, nullptr, &u->module), "shader module");
++
++    std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
++    for (uint32_t b = 0; b < 4; b++)
++        bindings.at(b) = VkDescriptorSetLayoutBinding{
++            .binding = b,
++            .descriptorType = b == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++            .descriptorCount = 1,
++            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
++        };
++    const VkDescriptorSetLayoutCreateInfo setLayoutInfo{
++        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++        .bindingCount = static_cast<uint32_t>(bindings.size()),
++        .pBindings = bindings.data()
++    };
++    uiCheck(createSetLayout(device, &setLayoutInfo, nullptr, &u->setLayout), "descriptor set layout");
++    const VkPushConstantRange pushRange{
++        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++        .offset = 0,
++        .size = 16
++    };
++    const VkPipelineLayoutCreateInfo pipeLayoutInfo{
++        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++        .setLayoutCount = 1,
++        .pSetLayouts = &u->setLayout,
++        .pushConstantRangeCount = 1,
++        .pPushConstantRanges = &pushRange
++    };
++    uiCheck(createPipelineLayout(device, &pipeLayoutInfo, nullptr, &u->pipeLayout), "pipeline layout");
++    const VkComputePipelineCreateInfo pipeInfo{
++        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++        .stage = {
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
++            .module = u->module,
++            .pName = "main"
++        },
++        .layout = u->pipeLayout
++    };
++    uiCheck(createComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &u->pipeline),
++        "compute pipeline");
++
++    const VkBufferCreateInfo bufferInfo{
++        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++        .size = 16,
++        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
++    };
++    uiCheck(Layer::ovkCreateBuffer(device, &bufferInfo, nullptr, &u->statsBuffer), "counter buffer");
++    VkMemoryRequirements req{};
++    Layer::ovkGetBufferMemoryRequirements(device, u->statsBuffer, &req);
++    VkPhysicalDeviceMemoryProperties memProps{};
++    Layer::ovkGetPhysicalDeviceMemoryProperties(info.physicalDevice, &memProps);
++    constexpr VkMemoryPropertyFlags hostFlags =
++        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    uint32_t memType = UINT32_MAX;
++    for (uint32_t t = 0; t < memProps.memoryTypeCount; t++)
++        if ((req.memoryTypeBits & (1U << t)) != 0
++                && (memProps.memoryTypes[t].propertyFlags & hostFlags) == hostFlags) {
++            memType = t;
++            break;
++        }
++    if (memType == UINT32_MAX)
++        throw LSFG::vulkan_error(VK_ERROR_FEATURE_NOT_PRESENT, "UI step: no host-visible memory");
++    const VkMemoryAllocateInfo allocInfo{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++        .allocationSize = req.size,
++        .memoryTypeIndex = memType
++    };
++    uiCheck(Layer::ovkAllocateMemory(device, &allocInfo, nullptr, &u->statsMemory), "counter memory");
++    uiCheck(Layer::ovkBindBufferMemory(device, u->statsBuffer, u->statsMemory, 0), "counter memory bind");
++    void* mapped{};
++    uiCheck(Layer::ovkMapMemory(device, u->statsMemory, 0, VK_WHOLE_SIZE, 0, &mapped), "counter map");
++    u->counts = static_cast<volatile uint32_t*>(mapped);
++    for (size_t k = 0; k < 4; k++)
++        u->counts[k] = 0;
++
++    const auto setCount = static_cast<uint32_t>(2 * u->outCount);
++    const std::array<VkDescriptorPoolSize, 2> poolSizes{{
++        { .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 3 * setCount },
++        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = setCount }
++    }};
++    const VkDescriptorPoolCreateInfo poolInfo{
++        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
++        .maxSets = setCount,
++        .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
++        .pPoolSizes = poolSizes.data()
++    };
++    uiCheck(createPool(device, &poolInfo, nullptr, &u->pool), "descriptor pool");
++    const std::vector<VkDescriptorSetLayout> layouts(setCount, u->setLayout);
++    u->sets.resize(setCount);
++    const VkDescriptorSetAllocateInfo setInfo{
++        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
++        .descriptorPool = u->pool,
++        .descriptorSetCount = setCount,
++        .pSetLayouts = layouts.data()
++    };
++    uiCheck(allocateSets(device, &setInfo, u->sets.data()), "descriptor sets");
++    for (size_t parity = 0; parity < 2; parity++)
++        for (size_t i = 0; i < u->outCount; i++) {
++            const VkDescriptorSet set = u->sets.at(parity * u->outCount + i);
++            const std::array<VkDescriptorImageInfo, 3> images{{
++                { .imageView = outViews.at(i), .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
++                { .imageView = inputViews.at(parity), .imageLayout = VK_IMAGE_LAYOUT_GENERAL },
++                { .imageView = realView, .imageLayout = VK_IMAGE_LAYOUT_GENERAL }
++            }};
++            const VkDescriptorBufferInfo buffer{
++                .buffer = u->statsBuffer, .offset = 0, .range = VK_WHOLE_SIZE };
++            std::array<VkWriteDescriptorSet, 4> writes{};
++            for (uint32_t b = 0; b < 4; b++)
++                writes.at(b) = VkWriteDescriptorSet{
++                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++                    .dstSet = set,
++                    .dstBinding = b,
++                    .descriptorCount = 1,
++                    .descriptorType = b == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
++                        : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
++                    .pImageInfo = b == 3 ? nullptr : &images.at(b),
++                    .pBufferInfo = b == 3 ? &buffer : nullptr
++                };
++            updateSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
++        }
++    this->ui = u;
++}
++
 +LsContext::~LsContext() {
 +    if (!this->defer)
 +        return;
@@ -758,13 +1227,20 @@ index 2385454..edfc0b5 100644
 +    if (state->started
 +            && !state->cv.wait_for(lk, std::chrono::seconds(1), [&] { return state->done; }))
 +        std::cerr << "lsfg-vk: present thread didn't end within 1 s\n";
-+}
-+#endif
-+
+ }
+ #endif
+ 
  LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
-         VkExtent2D extent, const std::vector<VkImage>& swapchainImages)
+-        VkExtent2D extent, const std::vector<VkImage>& swapchainImages)
++        VkExtent2D extent, const std::vector<VkImage>& swapchainImages,
++        VkFormat swapchainFormat)
          : swapchain(swapchain), swapchainImages(swapchainImages),
-@@ -318,7 +778,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+-          extent(extent) {
++          extent(extent), swapchainFormat(swapchainFormat) {
+     // get updated configuration
+     auto& conf = Config::activeConf;
+     if (!conf.config_file.empty()
+@@ -318,7 +1100,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
      // Android: single-device framegen on the game's own device and queue —
      // two ICDs interpret shared AHB memory differently and scramble it.
  
@@ -774,17 +1250,30 @@ index 2385454..edfc0b5 100644
  
      const VkImageUsageFlags sharedUsage = VK_IMAGE_USAGE_STORAGE_BIT
          | VK_IMAGE_USAGE_SAMPLED_BIT
-@@ -333,7 +795,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -333,7 +1117,22 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          this->out_n.emplace_back(Mini::Image::createDeviceLocal(info.device, info.physicalDevice,
              extent, format, sharedUsage, VK_IMAGE_ASPECT_COLOR_BIT));
  
++    // layer 11: the real frame as frame generation's format, for putting the
++    // UI back on the generated frames
++    if (!uiEnabled())
++        this->uiOffReason = "LSFG_D2R_UI=0";
++    else if (format != VK_FORMAT_R16G16B16A16_SFLOAT)
++        this->uiOffReason = "frame generation's images aren't RGBA16F (hdr on)";
++    else if (!uiPlain8(swapchainFormat))
++        this->uiOffReason = "the swapchain's format isn't 8-bit UNORM";
++    else
++        this->uiFrame = Mini::Image::createDeviceLocal(info.device, info.physicalDevice,
++            extent, format, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++            VK_IMAGE_ASPECT_COLOR_BIT);
++
 +    if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] ctx: images ok\n";
      setenv("DISABLE_LSFG", "1", 1); // NOLINT
 +    const std::lock_guard<std::recursive_mutex> qlockInit(Layer::layerQueueMutex());
  
      const auto shaderLoader = [](const std::string& name) {
          // debug override: override_<name>.spv next to conf.toml (brackets -> underscores)
-@@ -364,22 +828,24 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -364,22 +1163,24 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          return spirv;
      };
      if (conf.performance)
@@ -811,13 +1300,30 @@ index 2385454..edfc0b5 100644
      if (conf.performance)
          ctxId = LSFG_3_1P::createContextFromImages(
              this->frame_0.handle(), this->frame_1.handle(),
-@@ -431,7 +897,16 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -425,13 +1226,38 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+         toGeneral(this->frame_0.handle());
+         toGeneral(this->frame_1.handle());
+         for (auto& out : this->out_n) toGeneral(out.handle());
++        if (!this->uiOffReason) toGeneral(this->uiFrame.handle());
+         initCmd.end();
+         initCmd.submit(info.queue.second, {}, {}, initFence.handle());
+         if (initFence.wait(1'000'000'000ull) != VK_SUCCESS)
              throw LSFG::vulkan_error(VK_TIMEOUT, "Timed out initializing shared image layouts");
      }
  
 -    std::cerr << "lsfg-vk: single-device framegen context created (id=" << ctxId << ")\n";
++    if (!this->uiOffReason) {
++        try {
++            this->makeUiCompose(info);
++        } catch (const std::exception& e) {
++            this->ui.reset();
++            this->uiOffReason = "its compute step couldn't be made";
++            std::cerr << "lsfg-vk: " << e.what() << '\n';
++        }
++    }
++
 +    std::cerr << "lsfg-vk: single-device framegen context created (id=" << ctxId
-+        << ", D2R layer 10, real frame presented " << (deferEnabled() ? "from the layer's present thread" : "inline")
++        << ", D2R layer 11, real frame presented " << (deferEnabled() ? "from the layer's present thread" : "inline")
 +        << ", frames start " << (earlyEnabled() && deferEnabled() && genDrawnEnabled() && conf.multiplier == 2
 +            ? "at the game's blit submit" : "in the game's present")
 +        << ", presents waited on the CPU from " << presentEarlyNs() / 1000 << " us before their slot"
@@ -825,11 +1331,16 @@ index 2385454..edfc0b5 100644
 +        << ", present thread nice " << deferNice()
 +        << ", no generated frame after a game frame longer than "
 +        << (genGapNs() > 0 ? std::to_string(genGapNs() / 1'000'000) + " ms" : std::string("- (off)"))
++        << ", frame generation on frames without the UI layer "
++        << (this->ui ? "on (pixels differing by more than " + std::to_string(uiTolLsb())
++                + "/255 taken from the real frame)"
++            : std::string("off (") + (this->uiOffReason ? this->uiOffReason : "-") + ")")
++        << ", swapchain format " << swapchainFormat
 +        << ")\n";
  
  #else
      // Desktop Linux path: use OPAQUE_FD-based image sharing
-@@ -500,6 +975,10 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -500,6 +1326,10 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          pass.postCopyBufs.resize(conf.multiplier - 1);
          pass.postCopySemaphores.resize(conf.multiplier - 1);
          pass.prevPostCopySemaphores.resize(conf.multiplier - 1);
@@ -840,7 +1351,7 @@ index 2385454..edfc0b5 100644
      }
  }
  
-@@ -524,7 +1003,17 @@ void LsContext::paceBaseFrame(int fpsLimit) {
+@@ -524,7 +1354,17 @@ void LsContext::paceBaseFrame(int fpsLimit) {
          const int64_t stepNs = std::max<int64_t>(1,
              (targetNs + this->vsyncPeriodNs / 2) / this->vsyncPeriodNs) * this->vsyncPeriodNs;
          int64_t due = this->pacerNextDueNs;
@@ -859,7 +1370,7 @@ index 2385454..edfc0b5 100644
              due = this->vsyncPhaseNs
                  + ((entryNs - this->vsyncPhaseNs) / stepNs + 1) * stepNs;
          }
-@@ -731,64 +1220,89 @@ VkResult LsContext::presentPassthrough(VkQueue queue, const VkPresentInfoKHR* pP
+@@ -731,64 +1571,91 @@ VkResult LsContext::presentPassthrough(VkQueue queue, const VkPresentInfoKHR* pP
  #endif
  }
  
@@ -956,7 +1467,7 @@ index 2385454..edfc0b5 100644
 +        const VkQueryPoolCreateInfo qpInfo{
 +            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
 +            .queryType = VK_QUERY_TYPE_TIMESTAMP,
-+            .queryCount = 8 * 3,
++            .queryCount = 8 * 4,
 +        };
 +        if (!createPool || !this->dbgCmdWriteTimestamp || !this->dbgCmdResetQueryPool
 +                || !this->dbgGetQueryPoolResults
@@ -965,16 +1476,18 @@ index 2385454..edfc0b5 100644
 +        if (Layer::lsfgDebug()) std::cerr << "lsfg-vk: [dbg] gpu timestamps " << (this->dbgQueryPool ? "on" : "off")
 +            << " period " << this->dbgTsPeriodNs << "ns\n";
 +    }
-+    // read the GPU timestamps of the pass 4 frames ago (non-blocking)
++    // read the GPU timestamps of the pass 4 frames ago (non-blocking); layer
++    // 11: [3] after putting the UI back on the first generated frame
 +    if (this->dbgQueryPool && this->frameIdx >= 4) {
-+        uint64_t ts[3]{};
++        uint64_t ts[4]{};
 +        const uint32_t slot = static_cast<uint32_t>((this->frameIdx - 4) % 8);
-+        if (this->dbgGetQueryPoolResults(info.device, this->dbgQueryPool, slot * 3, 3,
++        if (this->dbgGetQueryPoolResults(info.device, this->dbgQueryPool, slot * 4, 4,
 +                sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS
-+                && ts[1] >= ts[0] && ts[2] >= ts[1]) {
++                && ts[1] >= ts[0] && ts[2] >= ts[1] && ts[3] >= ts[2]) {
 +            if (this->dbgPrevT0 != 0 && ts[0] > this->dbgPrevT0) {
 +                this->dbgGpuCopyNs += static_cast<double>(ts[1] - ts[0]) * this->dbgTsPeriodNs;
 +                this->dbgGpuLsfgNs += static_cast<double>(ts[2] - ts[1]) * this->dbgTsPeriodNs;
++                this->dbgGpuUiNs += static_cast<double>(ts[3] - ts[2]) * this->dbgTsPeriodNs;
 +                this->dbgGpuIntervalNs += static_cast<double>(ts[0] - this->dbgPrevT0) * this->dbgTsPeriodNs;
 +                this->dbgGpuSamples++;
 +            }
@@ -990,30 +1503,85 @@ index 2385454..edfc0b5 100644
  
      // 1. copy swapchain image to frame_0/frame_1
      //    Use a simple semaphore (no fd export) to synchronize the copy.
-@@ -799,6 +1313,12 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -799,6 +1666,36 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      pass.preCopySemaphores.at(1) = Mini::Semaphore(info.device);
      pass.preCopyBuf = Mini::CommandBuffer(info.device, this->cmdPool);
      pass.preCopyBuf.begin();
 +    const uint32_t dbgSlot = static_cast<uint32_t>(this->frameIdx % 8);
 +    if (this->dbgQueryPool) {
-+        this->dbgCmdResetQueryPool(pass.preCopyBuf.handle(), this->dbgQueryPool, dbgSlot * 3, 3);
++        this->dbgCmdResetQueryPool(pass.preCopyBuf.handle(), this->dbgQueryPool, dbgSlot * 4, 4);
 +        this->dbgCmdWriteTimestamp(pass.preCopyBuf.handle(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-+            this->dbgQueryPool, dbgSlot * 3 + 0);
++            this->dbgQueryPool, dbgSlot * 4 + 0);
 +    }
++    // layer 11: frame generation gets VKD3D's frame without the UI layer when
++    // it handed one over for this swapchain's size; the frame as shown goes
++    // to uiFrame for putting the UI back
++    VkImage handOver{};
++    if (this->ui) {
++        const Hooks::UiImage h = Hooks::uiImage(info.device);
++        uint32_t reason = 0;
++        if (h.image == VK_NULL_HANDLE)
++            reason |= 1; // VKD3D made none (FEX_VKD3D_UI_SPLIT=0 or an older VKD3D)
++        else if (h.extent.width != this->extent.width || h.extent.height != this->extent.height)
++            reason |= 2;
++        else if (!uiPlain8(h.format))
++            reason |= 4;
++        if (conf.debugInputs != 0)
++            reason |= 8;
++        if (reason == 0) {
++            handOver = h.image;
++            this->statsUiFrames++;
++        } else {
++            this->statsUiPlain++;
++            this->uiPlainReason = reason;
++        }
++    }
++    pass.uiSplit = handOver != VK_NULL_HANDLE;
      {
          VkCommandBuffer cmd = pass.preCopyBuf.handle();
          VkImage inputImg = this->frameIdx % 2 == 0
-@@ -822,6 +1342,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -811,8 +1708,28 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-        blitFull(cmd, this->swapchainImages.at(presentIdx), inputImg,
+-            this->extent.width, this->extent.height);
++        if (handOver != VK_NULL_HANDLE) {
++            // VKD3D's blit (waited on) copied it there and left it in GENERAL
++            imageBarrier(cmd, handOver,
++                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
++            imageBarrier(cmd, this->uiFrame.handle(),
++                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
++                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++            blitFull(cmd, handOver, inputImg,
++                this->extent.width, this->extent.height, VK_IMAGE_LAYOUT_GENERAL);
++            blitFull(cmd, this->swapchainImages.at(presentIdx), this->uiFrame.handle(),
++                this->extent.width, this->extent.height);
++            imageBarrier(cmd, this->uiFrame.handle(),
++                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
++        } else {
++            blitFull(cmd, this->swapchainImages.at(presentIdx), inputImg,
++                this->extent.width, this->extent.height);
++        }
+         imageBarrier(cmd, this->swapchainImages.at(presentIdx),
+             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+@@ -822,6 +1739,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
      }
 +    if (this->dbgQueryPool)
 +        this->dbgCmdWriteTimestamp(pass.preCopyBuf.handle(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-+            this->dbgQueryPool, dbgSlot * 3 + 1);
++            this->dbgQueryPool, dbgSlot * 4 + 1);
      pass.preCopyBuf.end();
  
      std::vector<VkSemaphore> gameRenderSemaphores2 = gameRenderSemaphores;
-@@ -839,6 +1362,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -839,6 +1759,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          { pass.preCopySemaphores.at(0).handle(),
            pass.preCopySemaphores.at(1).handle() },
          this->preCopyFence.handle());
@@ -1021,7 +1589,7 @@ index 2385454..edfc0b5 100644
      const int64_t workStartNs = nowNs();
  
      // 2. Tell framegen to generate intermediary frames. Graph-side fence
-@@ -846,6 +1370,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -846,6 +1767,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      std::vector<int> noOutSems;  // empty
      setStage("framegen submit");
      try {
@@ -1029,7 +1597,7 @@ index 2385454..edfc0b5 100644
          if (conf.performance)
              LSFG_3_1P::presentContext(*this->lsfgCtxId, -1, noOutSems);
          else
-@@ -871,6 +1396,282 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -871,6 +1793,334 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      if (conf.debugDump > 0 && this->dumpDoneFrames < conf.debugDump
              && !this->dumpFailed)
          this->dumpFrameImages(info, presentIdx);
@@ -1056,14 +1624,58 @@ index 2385454..edfc0b5 100644
 +                ? this->frame_1.handle() : this->frame_0.handle();
 +        else if (conf.debugInputs == 2)
 +            genSrc = this->swapchainImages.at(presentIdx);
++        // layer 11: the UI goes back on the generated frame: pixels where
++        // the real frame differs from its frame without the UI layer (the
++        // one frame generation got) are taken from the real frame
++        const bool uiStep = pass.uiSplit && this->ui && conf.debugInputs == 0
++            && i < this->ui->outCount;
++        if (uiStep) {
++            UiCompose& u = *this->ui;
++            imageBarrier(cmd, genSrc,
++                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
++            if (this->dbgQueryPool && i == 0)
++                this->dbgCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                    this->dbgQueryPool, dbgSlot * 4 + 2);
++            const VkDescriptorSet set = u.sets.at((this->frameIdx % 2) * u.outCount + i);
++            struct {
++                int32_t width, height;
++                float tol;
++                uint32_t count;
++            } push{
++                static_cast<int32_t>(this->extent.width), static_cast<int32_t>(this->extent.height),
++                (static_cast<float>(uiTolLsb()) + 0.5F) / 255.0F,
++                this->frameIdx % 4 == 0 && i == 0 ? 1U : 0U
++            };
++            u.cmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, u.pipeline);
++            u.cmdBindSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, u.pipeLayout, 0, 1, &set, 0, nullptr);
++            u.cmdPushConstants(cmd, u.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
++            u.cmdDispatch(cmd, (this->extent.width + 15) / 16, (this->extent.height + 15) / 16, 1);
++            if (push.count != 0) {
++                // the counters are read by the stats window without a wait
++                const VkMemoryBarrier toHost{
++                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                    .dstAccessMask = VK_ACCESS_HOST_READ_BIT
++                };
++                Layer::ovkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                    VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0, nullptr);
++            }
++        }
 +        imageBarrier(cmd, genSrc,
 +            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
 +            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
 +            conf.debugInputs == 2 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_GENERAL,
 +            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-+        if (this->dbgQueryPool && i == 0)
++        if (this->dbgQueryPool && i == 0) {
++            if (!uiStep)
++                this->dbgCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                    this->dbgQueryPool, dbgSlot * 4 + 2);
 +            this->dbgCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-+                this->dbgQueryPool, dbgSlot * 3 + 2);
++                this->dbgQueryPool, dbgSlot * 4 + 3);
++        }
 +        imageBarrier(cmd, this->swapchainImages.at(imageIdx),
 +            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
 +            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1089,6 +1701,14 @@ index 2385454..edfc0b5 100644
 +bool LsContext::earlyOn() {
 +#ifdef __ANDROID__
 +    return earlyEnabled();
++#else
++    return false;
++#endif
++}
++
++bool LsContext::uiOn() {
++#ifdef __ANDROID__
++    return uiEnabled();
 +#else
 +    return false;
 +#endif
@@ -1312,7 +1932,7 @@ index 2385454..edfc0b5 100644
  
      // Late-frame guard interval: 1/multiplier of the measured base interval,
      // anchored on the paced real frame. Presents are not delayed to it — a
-@@ -880,9 +1681,48 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -880,9 +2130,48 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          baseIntervalNs = 1'000'000'000ull / static_cast<uint64_t>(conf.fpsLimit);
      const uint64_t outIntervalNs = baseIntervalNs / conf.multiplier;
  
@@ -1363,7 +1983,7 @@ index 2385454..edfc0b5 100644
          // A generated frame far past its slot is dropped to hold cadence
          // (presenting it late would push everything after it off-pace).
          // Present as early as possible and let the FIFO queue space the frames
-@@ -898,6 +1738,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -898,6 +2187,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          if (outIntervalNs > 0) {
              const int64_t dueNs = this->pacerAnchorNs
                  + static_cast<int64_t>(i * outIntervalNs);
@@ -1371,7 +1991,7 @@ index 2385454..edfc0b5 100644
              const int64_t nowGenNs = nowNs();
              if (nowGenNs > dueNs + static_cast<int64_t>(outIntervalNs) * 3 / 2) {
                  this->statsGenSkips++;
-@@ -934,48 +1775,38 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -934,48 +2224,38 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
  
          // copy output image to swapchain image (same device: plain
          // compute->transfer barriers order the read after framegen's write)
@@ -1449,7 +2069,7 @@ index 2385454..edfc0b5 100644
  
          // present swapchain image
          // Never attach the game's pNext chain here: it can carry a
-@@ -1009,9 +1840,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1009,9 +2289,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      //    (the first one was consumed by that frame's own present). If every
      //    generated frame was skipped no semaphore is needed: the copy fence
      //    wait above already proved the game's rendering finished.
@@ -1463,7 +2083,7 @@ index 2385454..edfc0b5 100644
      if (this->statsSeq.size() < 200) {
          this->statsSeq += 'A' + static_cast<char>(presentIdx % 26);
          this->statsSeq += '0' + static_cast<char>(gameRenderSemaphores.size() % 10);
-@@ -1020,24 +1852,71 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1020,24 +2301,71 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      if (lastPresentedGen >= 0)
          finalWaits.push_back(pass.prevPostCopySemaphores
              .at(static_cast<size_t>(lastPresentedGen)).handle());
@@ -1551,7 +2171,7 @@ index 2385454..edfc0b5 100644
  
      // Publish measured fps + per-stage timing for the HUD and diagnosis.
      const int64_t statsNow = nowNs();
-@@ -1047,6 +1926,46 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1047,6 +2375,59 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          const double windowSec =
              static_cast<double>(statsNow - this->statsWindowStartNs) / 1e9;
          const double frames = static_cast<double>(this->statsRealPresents);
@@ -1593,12 +2213,25 @@ index 2385454..edfc0b5 100644
 +        }
 +        if (cpusText.empty()) cpusText = "-";
 +        const double gpuN = std::max(1.0, static_cast<double>(this->dbgGpuSamples));
++        // layer 11: the compose shader's pixel counters (totals that wrap
++        // around; 1 frame in 4 counted), as differences since the last window
++        std::array<uint32_t, 4> uiDelta{};
++        if (this->ui && this->ui->counts) {
++            for (size_t k = 0; k < 4; k++) {
++                const uint32_t now = this->ui->counts[k];
++                uiDelta.at(k) = now - this->uiPrevCounts.at(k);
++                this->uiPrevCounts.at(k) = now;
++            }
++        }
++        const double uiAll = std::max(1.0, static_cast<double>(uiDelta[3]));
++        const double framePixels = std::max(1.0,
++            static_cast<double>(this->extent.width) * static_cast<double>(this->extent.height));
 +        const double deferFrames = std::max(1.0, static_cast<double>(deferStats.frames));
 +        const double deferGenFrames = std::max(1.0, static_cast<double>(deferStats.genFrames));
          writeStats(conf.config_file,
              static_cast<double>(this->statsPresents) / windowSec,
              frames / windowSec,
-@@ -1058,8 +1977,80 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1058,8 +2439,94 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
                  .realPresentMs = static_cast<double>(this->statsRealPresentNs) / 1e6 / frames,
                  .genSkips      = this->statsGenSkips,
                  .seq           = this->statsSeq,
@@ -1645,6 +2278,17 @@ index 2385454..edfc0b5 100644
 +                .gpuFrameMs    = this->dbgGpuIntervalNs / gpuN / 1e6,
 +                .presentNice   = deferStats.presentNice,
 +                .genGapMs      = genGapNs() / 1'000'000,
++                .uiState       = this->ui ? std::string("on")
++                    : std::string("off (") + (this->uiOffReason ? this->uiOffReason : "-") + ")",
++                .uiFrames      = this->statsUiFrames,
++                .uiPlain       = this->statsUiPlain,
++                .uiPlainReason = this->uiPlainReason,
++                .uiTolLsb      = uiTolLsb(),
++                .uiPxAnyPct    = 100.0 * static_cast<double>(uiDelta[0]) / uiAll,
++                .uiPxTakenPct  = 100.0 * static_cast<double>(uiDelta[1]) / uiAll,
++                .uiPxStrongPct = 100.0 * static_cast<double>(uiDelta[2]) / uiAll,
++                .uiPxFrames    = static_cast<uint64_t>(static_cast<double>(uiDelta[3]) / framePixels + 0.5),
++                .gpuUiMs       = this->dbgGpuUiNs / gpuN / 1e6,
              });
 +        this->prevLateMaxNs = deferStats.lateMaxNs;
 +        this->prevGenLateMaxNs = deferStats.genLateMaxNs;
@@ -1674,12 +2318,15 @@ index 2385454..edfc0b5 100644
 +        // layer 9: the GPU times go to the stats file each window
 +        this->dbgGpuSamples = 0;
 +        this->dbgGpuCopyNs = this->dbgGpuLsfgNs = this->dbgGpuIntervalNs = 0;
++        this->dbgGpuUiNs = 0;
++        this->statsUiFrames = 0;
++        this->statsUiPlain = 0;
          this->statsSeq.clear();
 +        this->dbgPacerLate = 0;
          this->statsPresents = 0;
          this->statsRealPresents = 0;
          this->statsWorkNs = 0;
-@@ -1068,6 +2059,13 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1068,6 +2535,13 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          this->statsGenPresentNs = 0;
          this->statsRealPresentNs = 0;
          this->statsGenSkips = 0;
@@ -1693,8 +2340,381 @@ index 2385454..edfc0b5 100644
          this->statsWindowStartNs = statsNow;
      }
  
+diff --git a/src/extract/ui_compose_spv.h b/src/extract/ui_compose_spv.h
+new file mode 100644
+index 0000000..83220ad
+--- /dev/null
++++ b/src/extract/ui_compose_spv.h
+@@ -0,0 +1,367 @@
++unsigned char ui_compose_spv[] = {
++  0x03, 0x02, 0x23, 0x07, 0x00, 0x03, 0x01, 0x00, 0x0b, 0x00, 0x08, 0x00,
++  0xad, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x02, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00,
++  0x47, 0x4c, 0x53, 0x4c, 0x2e, 0x73, 0x74, 0x64, 0x2e, 0x34, 0x35, 0x30,
++  0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x07, 0x00, 0x05, 0x00, 0x00, 0x00,
++  0x04, 0x00, 0x00, 0x00, 0x6d, 0x61, 0x69, 0x6e, 0x00, 0x00, 0x00, 0x00,
++  0x08, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x06, 0x00,
++  0x04, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
++  0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x03, 0x00,
++  0x02, 0x00, 0x00, 0x00, 0xc2, 0x01, 0x00, 0x00, 0x05, 0x00, 0x04, 0x00,
++  0x04, 0x00, 0x00, 0x00, 0x6d, 0x61, 0x69, 0x6e, 0x00, 0x00, 0x00, 0x00,
++  0x05, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0x67, 0x6c, 0x5f, 0x4c,
++  0x6f, 0x63, 0x61, 0x6c, 0x49, 0x6e, 0x76, 0x6f, 0x63, 0x61, 0x74, 0x69,
++  0x6f, 0x6e, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x00, 0x05, 0x00, 0x04, 0x00,
++  0x10, 0x00, 0x00, 0x00, 0x73, 0x41, 0x6e, 0x79, 0x00, 0x00, 0x00, 0x00,
++  0x05, 0x00, 0x04, 0x00, 0x11, 0x00, 0x00, 0x00, 0x73, 0x54, 0x61, 0x6b,
++  0x65, 0x6e, 0x00, 0x00, 0x05, 0x00, 0x04, 0x00, 0x12, 0x00, 0x00, 0x00,
++  0x73, 0x53, 0x74, 0x72, 0x6f, 0x6e, 0x67, 0x00, 0x05, 0x00, 0x04, 0x00,
++  0x13, 0x00, 0x00, 0x00, 0x73, 0x41, 0x6c, 0x6c, 0x00, 0x00, 0x00, 0x00,
++  0x05, 0x00, 0x03, 0x00, 0x19, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00,
++  0x05, 0x00, 0x08, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x67, 0x6c, 0x5f, 0x47,
++  0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x49, 0x6e, 0x76, 0x6f, 0x63, 0x61, 0x74,
++  0x69, 0x6f, 0x6e, 0x49, 0x44, 0x00, 0x00, 0x00, 0x05, 0x00, 0x04, 0x00,
++  0x25, 0x00, 0x00, 0x00, 0x50, 0x75, 0x73, 0x68, 0x00, 0x00, 0x00, 0x00,
++  0x06, 0x00, 0x05, 0x00, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x73, 0x69, 0x7a, 0x65, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x04, 0x00,
++  0x25, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x74, 0x6f, 0x6c, 0x00,
++  0x06, 0x00, 0x05, 0x00, 0x25, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
++  0x63, 0x6f, 0x75, 0x6e, 0x74, 0x00, 0x00, 0x00, 0x05, 0x00, 0x03, 0x00,
++  0x27, 0x00, 0x00, 0x00, 0x70, 0x63, 0x00, 0x00, 0x05, 0x00, 0x03, 0x00,
++  0x3a, 0x00, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00, 0x05, 0x00, 0x04, 0x00,
++  0x3d, 0x00, 0x00, 0x00, 0x72, 0x65, 0x61, 0x6c, 0x49, 0x6d, 0x67, 0x00,
++  0x05, 0x00, 0x03, 0x00, 0x43, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00,
++  0x05, 0x00, 0x05, 0x00, 0x46, 0x00, 0x00, 0x00, 0x73, 0x63, 0x65, 0x6e,
++  0x65, 0x49, 0x6d, 0x67, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x03, 0x00,
++  0x4e, 0x00, 0x00, 0x00, 0x6d, 0x00, 0x00, 0x00, 0x05, 0x00, 0x04, 0x00,
++  0x58, 0x00, 0x00, 0x00, 0x74, 0x61, 0x6b, 0x65, 0x00, 0x00, 0x00, 0x00,
++  0x05, 0x00, 0x04, 0x00, 0x62, 0x00, 0x00, 0x00, 0x67, 0x65, 0x6e, 0x49,
++  0x6d, 0x67, 0x00, 0x00, 0x05, 0x00, 0x04, 0x00, 0x8e, 0x00, 0x00, 0x00,
++  0x53, 0x74, 0x61, 0x74, 0x73, 0x00, 0x00, 0x00, 0x06, 0x00, 0x05, 0x00,
++  0x8e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x6f, 0x75, 0x6e,
++  0x74, 0x73, 0x00, 0x00, 0x05, 0x00, 0x04, 0x00, 0x90, 0x00, 0x00, 0x00,
++  0x73, 0x74, 0x61, 0x74, 0x73, 0x00, 0x00, 0x00, 0x47, 0x00, 0x04, 0x00,
++  0x08, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x00, 0x00,
++  0x47, 0x00, 0x04, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00,
++  0x1c, 0x00, 0x00, 0x00, 0x47, 0x00, 0x03, 0x00, 0x25, 0x00, 0x00, 0x00,
++  0x02, 0x00, 0x00, 0x00, 0x48, 0x00, 0x05, 0x00, 0x25, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x48, 0x00, 0x05, 0x00, 0x25, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
++  0x23, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x48, 0x00, 0x05, 0x00,
++  0x25, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00,
++  0x0c, 0x00, 0x00, 0x00, 0x47, 0x00, 0x03, 0x00, 0x3d, 0x00, 0x00, 0x00,
++  0x18, 0x00, 0x00, 0x00, 0x47, 0x00, 0x04, 0x00, 0x3d, 0x00, 0x00, 0x00,
++  0x21, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x47, 0x00, 0x04, 0x00,
++  0x3d, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x47, 0x00, 0x03, 0x00, 0x46, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00,
++  0x47, 0x00, 0x04, 0x00, 0x46, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x47, 0x00, 0x04, 0x00, 0x46, 0x00, 0x00, 0x00,
++  0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x47, 0x00, 0x04, 0x00,
++  0x62, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x47, 0x00, 0x04, 0x00, 0x62, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x47, 0x00, 0x04, 0x00, 0x8d, 0x00, 0x00, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x47, 0x00, 0x03, 0x00,
++  0x8e, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x48, 0x00, 0x05, 0x00,
++  0x8e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x47, 0x00, 0x04, 0x00, 0x90, 0x00, 0x00, 0x00,
++  0x21, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x47, 0x00, 0x04, 0x00,
++  0x90, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x47, 0x00, 0x04, 0x00, 0xac, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00,
++  0x19, 0x00, 0x00, 0x00, 0x13, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00,
++  0x21, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
++  0x15, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00, 0x07, 0x00, 0x00, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00,
++  0x07, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
++  0x2b, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x02, 0x00, 0x0b, 0x00, 0x00, 0x00,
++  0x20, 0x00, 0x04, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00, 0x0f, 0x00, 0x00, 0x00,
++  0x10, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00,
++  0x0f, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++  0x3b, 0x00, 0x04, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00,
++  0x04, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00, 0x0f, 0x00, 0x00, 0x00,
++  0x13, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
++  0x2b, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x15, 0x00, 0x00, 0x00,
++  0x08, 0x01, 0x00, 0x00, 0x15, 0x00, 0x04, 0x00, 0x16, 0x00, 0x00, 0x00,
++  0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x17, 0x00, 0x04, 0x00,
++  0x17, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
++  0x20, 0x00, 0x04, 0x00, 0x18, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
++  0x17, 0x00, 0x00, 0x00, 0x17, 0x00, 0x04, 0x00, 0x1a, 0x00, 0x00, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
++  0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00,
++  0x3b, 0x00, 0x04, 0x00, 0x1b, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x17, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x00, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
++  0x21, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00,
++  0x16, 0x00, 0x03, 0x00, 0x24, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
++  0x1e, 0x00, 0x05, 0x00, 0x25, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00,
++  0x24, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
++  0x26, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x25, 0x00, 0x00, 0x00,
++  0x3b, 0x00, 0x04, 0x00, 0x26, 0x00, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00,
++  0x09, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x04, 0x00, 0x16, 0x00, 0x00, 0x00,
++  0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
++  0x29, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00,
++  0x2b, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x17, 0x00, 0x04, 0x00, 0x38, 0x00, 0x00, 0x00,
++  0x24, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
++  0x39, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00,
++  0x19, 0x00, 0x09, 0x00, 0x3b, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
++  0x20, 0x00, 0x04, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x3b, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00, 0x3c, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17, 0x00, 0x04, 0x00,
++  0x41, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
++  0x20, 0x00, 0x04, 0x00, 0x42, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
++  0x41, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00, 0x3c, 0x00, 0x00, 0x00,
++  0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
++  0x4d, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00,
++  0x20, 0x00, 0x04, 0x00, 0x57, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
++  0x0b, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x04, 0x00, 0x16, 0x00, 0x00, 0x00,
++  0x5a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
++  0x5b, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00,
++  0x3b, 0x00, 0x04, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x62, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x04, 0x00, 0x16, 0x00, 0x00, 0x00,
++  0x66, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
++  0x67, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
++  0x2b, 0x00, 0x04, 0x00, 0x24, 0x00, 0x00, 0x00, 0x6f, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x04, 0x00, 0x24, 0x00, 0x00, 0x00,
++  0x79, 0x00, 0x00, 0x00, 0x81, 0x80, 0x80, 0x3d, 0x2b, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x8c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++  0x1c, 0x00, 0x04, 0x00, 0x8d, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
++  0x8c, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x03, 0x00, 0x8e, 0x00, 0x00, 0x00,
++  0x8d, 0x00, 0x00, 0x00, 0x20, 0x00, 0x04, 0x00, 0x8f, 0x00, 0x00, 0x00,
++  0x0c, 0x00, 0x00, 0x00, 0x8e, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00,
++  0x8f, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,
++  0x20, 0x00, 0x04, 0x00, 0x91, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x04, 0x00, 0x16, 0x00, 0x00, 0x00,
++  0xa7, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0xab, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
++  0x2c, 0x00, 0x06, 0x00, 0x1a, 0x00, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00,
++  0xab, 0x00, 0x00, 0x00, 0xab, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00,
++  0x36, 0x00, 0x05, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00,
++  0x05, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00, 0x18, 0x00, 0x00, 0x00,
++  0x19, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00,
++  0x39, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
++  0x3b, 0x00, 0x04, 0x00, 0x42, 0x00, 0x00, 0x00, 0x43, 0x00, 0x00, 0x00,
++  0x07, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00, 0x4d, 0x00, 0x00, 0x00,
++  0x4e, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x3b, 0x00, 0x04, 0x00,
++  0x57, 0x00, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
++  0x08, 0x00, 0x00, 0x00, 0xaa, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00,
++  0x0c, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0xf7, 0x00, 0x03, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0xfa, 0x00, 0x04, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00,
++  0x0e, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00, 0x0d, 0x00, 0x00, 0x00,
++  0x3e, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0x3e, 0x00, 0x03, 0x00, 0x11, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0x3e, 0x00, 0x03, 0x00, 0x12, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0x3e, 0x00, 0x03, 0x00, 0x13, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0xf9, 0x00, 0x02, 0x00, 0x0e, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00,
++  0x0e, 0x00, 0x00, 0x00, 0xe0, 0x00, 0x04, 0x00, 0x14, 0x00, 0x00, 0x00,
++  0x14, 0x00, 0x00, 0x00, 0x15, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x1a, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00,
++  0x4f, 0x00, 0x07, 0x00, 0x1d, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00,
++  0x1e, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x7c, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00,
++  0x20, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x03, 0x00,
++  0x19, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x41, 0x00, 0x05, 0x00,
++  0x21, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00,
++  0x0a, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00, 0x16, 0x00, 0x00, 0x00,
++  0x23, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x41, 0x00, 0x06, 0x00,
++  0x29, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00,
++  0x28, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x16, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00,
++  0xb1, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00,
++  0x23, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00,
++  0x2e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00,
++  0x2c, 0x00, 0x00, 0x00, 0x2d, 0x00, 0x00, 0x00, 0x2e, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x2d, 0x00, 0x00, 0x00, 0x41, 0x00, 0x05, 0x00,
++  0x21, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00,
++  0x2f, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00, 0x16, 0x00, 0x00, 0x00,
++  0x31, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x41, 0x00, 0x06, 0x00,
++  0x29, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00,
++  0x28, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x16, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00,
++  0xb1, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00,
++  0x31, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00,
++  0x2e, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00, 0x2e, 0x00, 0x00, 0x00,
++  0xf5, 0x00, 0x07, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x35, 0x00, 0x00, 0x00,
++  0x2c, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00,
++  0x2d, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00, 0x37, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00, 0x35, 0x00, 0x00, 0x00,
++  0x36, 0x00, 0x00, 0x00, 0x37, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00,
++  0x36, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00, 0x3b, 0x00, 0x00, 0x00,
++  0x3e, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x17, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00,
++  0x62, 0x00, 0x05, 0x00, 0x38, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
++  0x3e, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x03, 0x00,
++  0x3a, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x38, 0x00, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x00,
++  0x4f, 0x00, 0x08, 0x00, 0x41, 0x00, 0x00, 0x00, 0x45, 0x00, 0x00, 0x00,
++  0x44, 0x00, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x3b, 0x00, 0x00, 0x00, 0x47, 0x00, 0x00, 0x00, 0x46, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00,
++  0x19, 0x00, 0x00, 0x00, 0x62, 0x00, 0x05, 0x00, 0x38, 0x00, 0x00, 0x00,
++  0x49, 0x00, 0x00, 0x00, 0x47, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00,
++  0x4f, 0x00, 0x08, 0x00, 0x41, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00,
++  0x49, 0x00, 0x00, 0x00, 0x49, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x83, 0x00, 0x05, 0x00,
++  0x41, 0x00, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x00, 0x45, 0x00, 0x00, 0x00,
++  0x4a, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x06, 0x00, 0x41, 0x00, 0x00, 0x00,
++  0x4c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++  0x4b, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x03, 0x00, 0x43, 0x00, 0x00, 0x00,
++  0x4c, 0x00, 0x00, 0x00, 0x41, 0x00, 0x05, 0x00, 0x4d, 0x00, 0x00, 0x00,
++  0x4f, 0x00, 0x00, 0x00, 0x43, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x24, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00,
++  0x4f, 0x00, 0x00, 0x00, 0x41, 0x00, 0x05, 0x00, 0x4d, 0x00, 0x00, 0x00,
++  0x51, 0x00, 0x00, 0x00, 0x43, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x24, 0x00, 0x00, 0x00, 0x52, 0x00, 0x00, 0x00,
++  0x51, 0x00, 0x00, 0x00, 0x41, 0x00, 0x05, 0x00, 0x4d, 0x00, 0x00, 0x00,
++  0x53, 0x00, 0x00, 0x00, 0x43, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x24, 0x00, 0x00, 0x00, 0x54, 0x00, 0x00, 0x00,
++  0x53, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x07, 0x00, 0x24, 0x00, 0x00, 0x00,
++  0x55, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00,
++  0x52, 0x00, 0x00, 0x00, 0x54, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x07, 0x00,
++  0x24, 0x00, 0x00, 0x00, 0x56, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
++  0x28, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x55, 0x00, 0x00, 0x00,
++  0x3e, 0x00, 0x03, 0x00, 0x4e, 0x00, 0x00, 0x00, 0x56, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x24, 0x00, 0x00, 0x00, 0x59, 0x00, 0x00, 0x00,
++  0x4e, 0x00, 0x00, 0x00, 0x41, 0x00, 0x05, 0x00, 0x5b, 0x00, 0x00, 0x00,
++  0x5c, 0x00, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00, 0x5a, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x24, 0x00, 0x00, 0x00, 0x5d, 0x00, 0x00, 0x00,
++  0x5c, 0x00, 0x00, 0x00, 0xba, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00,
++  0x5e, 0x00, 0x00, 0x00, 0x59, 0x00, 0x00, 0x00, 0x5d, 0x00, 0x00, 0x00,
++  0x3e, 0x00, 0x03, 0x00, 0x58, 0x00, 0x00, 0x00, 0x5e, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x5f, 0x00, 0x00, 0x00,
++  0x58, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00, 0x61, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00, 0x5f, 0x00, 0x00, 0x00,
++  0x60, 0x00, 0x00, 0x00, 0x61, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00,
++  0x60, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00, 0x3b, 0x00, 0x00, 0x00,
++  0x63, 0x00, 0x00, 0x00, 0x62, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x17, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x38, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00,
++  0x3a, 0x00, 0x00, 0x00, 0x63, 0x00, 0x04, 0x00, 0x63, 0x00, 0x00, 0x00,
++  0x64, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00,
++  0x61, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00, 0x61, 0x00, 0x00, 0x00,
++  0x41, 0x00, 0x05, 0x00, 0x67, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00,
++  0x27, 0x00, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x69, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00,
++  0xab, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x6a, 0x00, 0x00, 0x00,
++  0x69, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00,
++  0x6c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00,
++  0x6a, 0x00, 0x00, 0x00, 0x6b, 0x00, 0x00, 0x00, 0x6c, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x6b, 0x00, 0x00, 0x00, 0xea, 0x00, 0x07, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x6d, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00,
++  0x2f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x24, 0x00, 0x00, 0x00, 0x6e, 0x00, 0x00, 0x00,
++  0x4e, 0x00, 0x00, 0x00, 0xba, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00,
++  0x70, 0x00, 0x00, 0x00, 0x6e, 0x00, 0x00, 0x00, 0x6f, 0x00, 0x00, 0x00,
++  0xf7, 0x00, 0x03, 0x00, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0xfa, 0x00, 0x04, 0x00, 0x70, 0x00, 0x00, 0x00, 0x71, 0x00, 0x00, 0x00,
++  0x72, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00, 0x71, 0x00, 0x00, 0x00,
++  0xea, 0x00, 0x07, 0x00, 0x06, 0x00, 0x00, 0x00, 0x73, 0x00, 0x00, 0x00,
++  0x10, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0x2f, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00, 0x72, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x72, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x0b, 0x00, 0x00, 0x00, 0x74, 0x00, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00,
++  0xf7, 0x00, 0x03, 0x00, 0x76, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0xfa, 0x00, 0x04, 0x00, 0x74, 0x00, 0x00, 0x00, 0x75, 0x00, 0x00, 0x00,
++  0x76, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00, 0x75, 0x00, 0x00, 0x00,
++  0xea, 0x00, 0x07, 0x00, 0x06, 0x00, 0x00, 0x00, 0x77, 0x00, 0x00, 0x00,
++  0x11, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0x2f, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00, 0x76, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x76, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x24, 0x00, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x4e, 0x00, 0x00, 0x00,
++  0xbe, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x7a, 0x00, 0x00, 0x00,
++  0x78, 0x00, 0x00, 0x00, 0x79, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00,
++  0x7c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00,
++  0x7a, 0x00, 0x00, 0x00, 0x7b, 0x00, 0x00, 0x00, 0x7c, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x7b, 0x00, 0x00, 0x00, 0xea, 0x00, 0x07, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00,
++  0x2f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00,
++  0xf9, 0x00, 0x02, 0x00, 0x7c, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00,
++  0x7c, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00, 0x6c, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x6c, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00,
++  0x37, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00, 0x37, 0x00, 0x00, 0x00,
++  0xe0, 0x00, 0x04, 0x00, 0x14, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
++  0x15, 0x00, 0x00, 0x00, 0x41, 0x00, 0x05, 0x00, 0x67, 0x00, 0x00, 0x00,
++  0x7e, 0x00, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x7f, 0x00, 0x00, 0x00,
++  0x7e, 0x00, 0x00, 0x00, 0xab, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00,
++  0x80, 0x00, 0x00, 0x00, 0x7f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0xf7, 0x00, 0x03, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0xfa, 0x00, 0x04, 0x00, 0x80, 0x00, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00,
++  0x82, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00, 0x81, 0x00, 0x00, 0x00,
++  0x3d, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x83, 0x00, 0x00, 0x00,
++  0x08, 0x00, 0x00, 0x00, 0xaa, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00,
++  0x84, 0x00, 0x00, 0x00, 0x83, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0xf9, 0x00, 0x02, 0x00, 0x82, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00,
++  0x82, 0x00, 0x00, 0x00, 0xf5, 0x00, 0x07, 0x00, 0x0b, 0x00, 0x00, 0x00,
++  0x85, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x37, 0x00, 0x00, 0x00,
++  0x84, 0x00, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00,
++  0x87, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00,
++  0x85, 0x00, 0x00, 0x00, 0x86, 0x00, 0x00, 0x00, 0x87, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x86, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x88, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
++  0xab, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x89, 0x00, 0x00, 0x00,
++  0x88, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00,
++  0x8b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00,
++  0x89, 0x00, 0x00, 0x00, 0x8a, 0x00, 0x00, 0x00, 0x8b, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x8a, 0x00, 0x00, 0x00, 0x41, 0x00, 0x06, 0x00,
++  0x91, 0x00, 0x00, 0x00, 0x92, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00,
++  0x28, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x93, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
++  0xea, 0x00, 0x07, 0x00, 0x06, 0x00, 0x00, 0x00, 0x94, 0x00, 0x00, 0x00,
++  0x92, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0x93, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00, 0x8b, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x8b, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x95, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00,
++  0xab, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x96, 0x00, 0x00, 0x00,
++  0x95, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00,
++  0x98, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00,
++  0x96, 0x00, 0x00, 0x00, 0x97, 0x00, 0x00, 0x00, 0x98, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x97, 0x00, 0x00, 0x00, 0x41, 0x00, 0x06, 0x00,
++  0x91, 0x00, 0x00, 0x00, 0x99, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00,
++  0x28, 0x00, 0x00, 0x00, 0x5a, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x9a, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00,
++  0xea, 0x00, 0x07, 0x00, 0x06, 0x00, 0x00, 0x00, 0x9b, 0x00, 0x00, 0x00,
++  0x99, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0x9a, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00, 0x98, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x98, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0x9c, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00,
++  0xab, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x9d, 0x00, 0x00, 0x00,
++  0x9c, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00,
++  0x9f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00,
++  0x9d, 0x00, 0x00, 0x00, 0x9e, 0x00, 0x00, 0x00, 0x9f, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x9e, 0x00, 0x00, 0x00, 0x41, 0x00, 0x06, 0x00,
++  0x91, 0x00, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00,
++  0x28, 0x00, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0xa1, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00,
++  0xea, 0x00, 0x07, 0x00, 0x06, 0x00, 0x00, 0x00, 0xa2, 0x00, 0x00, 0x00,
++  0xa0, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0xa1, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00, 0x9f, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0x9f, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0xa3, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00,
++  0xab, 0x00, 0x05, 0x00, 0x0b, 0x00, 0x00, 0x00, 0xa4, 0x00, 0x00, 0x00,
++  0xa3, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x03, 0x00,
++  0xa6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x04, 0x00,
++  0xa4, 0x00, 0x00, 0x00, 0xa5, 0x00, 0x00, 0x00, 0xa6, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0xa5, 0x00, 0x00, 0x00, 0x41, 0x00, 0x06, 0x00,
++  0x91, 0x00, 0x00, 0x00, 0xa8, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00,
++  0x28, 0x00, 0x00, 0x00, 0xa7, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x04, 0x00,
++  0x06, 0x00, 0x00, 0x00, 0xa9, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00,
++  0xea, 0x00, 0x07, 0x00, 0x06, 0x00, 0x00, 0x00, 0xaa, 0x00, 0x00, 0x00,
++  0xa8, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++  0xa9, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00, 0xa6, 0x00, 0x00, 0x00,
++  0xf8, 0x00, 0x02, 0x00, 0xa6, 0x00, 0x00, 0x00, 0xf9, 0x00, 0x02, 0x00,
++  0x87, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x02, 0x00, 0x87, 0x00, 0x00, 0x00,
++  0xfd, 0x00, 0x01, 0x00, 0x38, 0x00, 0x01, 0x00
++};
++unsigned int ui_compose_spv_len = 4364;
 diff --git a/src/hooks.cpp b/src/hooks.cpp
-index 681f8e4..8de30bb 100644
+index 681f8e4..104a8a1 100644
 --- a/src/hooks.cpp
 +++ b/src/hooks.cpp
 @@ -7,6 +7,7 @@
@@ -1797,7 +2817,7 @@ index 681f8e4..8de30bb 100644
  
          try {
              swapchainToPresent.emplace(*pSwapchain, createInfo.presentMode);
-@@ -282,6 +333,7 @@ namespace {
+@@ -282,10 +333,11 @@ namespace {
                  throw LSFG::vulkan_error(res, "Failed to get swapchain images");
  
              // create swapchain context
@@ -1805,6 +2825,11 @@ index 681f8e4..8de30bb 100644
              swapchainToDeviceTable.emplace(*pSwapchain, device);
              swapchains.emplace(*pSwapchain, LsContext(
                  deviceInfo, *pSwapchain, pCreateInfo->imageExtent,
+-                swapchainImages
++                swapchainImages, pCreateInfo->imageFormat
+             ));
+ 
+             std::cerr << "lsfg-vk: Swapchain context " <<
 @@ -294,22 +346,27 @@ namespace {
  
              Utils::resetLimitN("swapCtxCreate");
@@ -1898,7 +2923,7 @@ index 681f8e4..8de30bb 100644
  
              // present the swapchain
              std::vector<VkSemaphore> semaphores(pPresentInfo->waitSemaphoreCount);
-@@ -449,6 +522,62 @@ namespace {
+@@ -449,6 +522,123 @@ namespace {
          return res;
      }
  
@@ -1958,10 +2983,71 @@ index 681f8e4..8de30bb 100644
 +        return res == VK_SUCCESS && deferred == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : res;
 +    }
 +
++    // D2R layer 11: VKD3D's hand-over image of the frame without the game's
++    // UI layer (VKD3D fex35). It is known by how VKD3D creates it: a plain 2D
++    // image with transfer usage only and a format list of its own format
++    // alone; no other image of VKD3D's is made like that.
++    std::mutex uiImageMutex;
++    std::atomic<VkImage> uiImageHandle{VK_NULL_HANDLE};
++    VkDevice uiImageDevice{};      // uiImageMutex
++    VkExtent2D uiImageExtent{};    // uiImageMutex
++    VkFormat uiImageFormat{};      // uiImageMutex
++    uint32_t uiImagesSeen{0};      // uiImageMutex
++
++    bool isUiHandOver(const VkImageCreateInfo* info) {
++        if (info->imageType != VK_IMAGE_TYPE_2D || info->flags != 0
++                || info->usage != (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
++                || info->mipLevels != 1 || info->arrayLayers != 1
++                || info->samples != VK_SAMPLE_COUNT_1_BIT || info->tiling != VK_IMAGE_TILING_OPTIMAL
++                || info->extent.depth != 1)
++            return false;
++        for (auto* node = reinterpret_cast<const VkBaseInStructure*>(info->pNext);
++                node != nullptr; node = node->pNext) {
++            if (node->sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)
++                continue;
++            const auto* list = reinterpret_cast<const VkImageFormatListCreateInfo*>(node);
++            return list->viewFormatCount == 1 && list->pViewFormats
++                && list->pViewFormats[0] == info->format;
++        }
++        return false;
++    }
++
++    VkResult myvkCreateImage(
++            VkDevice device,
++            const VkImageCreateInfo* pCreateInfo,
++            const VkAllocationCallbacks* pAllocator,
++            VkImage* pImage) noexcept {
++        const VkResult res = Layer::ovkCreateImage(device, pCreateInfo, pAllocator, pImage);
++        if (res != VK_SUCCESS || !LsContext::uiOn() || !isUiHandOver(pCreateInfo))
++            return res;
++        const std::lock_guard<std::mutex> lock(uiImageMutex);
++        uiImageHandle.store(*pImage);
++        uiImageDevice = device;
++        uiImageExtent = { pCreateInfo->extent.width, pCreateInfo->extent.height };
++        uiImageFormat = pCreateInfo->format;
++        if (uiImagesSeen++ < 8)
++            std::cerr << "lsfg-vk: VKD3D's frames without the UI layer come in an image of "
++                << uiImageExtent.width << "x" << uiImageExtent.height
++                << " (format " << uiImageFormat << ")\n";
++        return res;
++    }
++
++    void myvkDestroyImage(
++            VkDevice device,
++            VkImage image,
++            const VkAllocationCallbacks* pAllocator) noexcept {
++        if (image != VK_NULL_HANDLE && image == uiImageHandle.load(std::memory_order_relaxed)) {
++            const std::lock_guard<std::mutex> lock(uiImageMutex);
++            if (image == uiImageHandle.load())
++                uiImageHandle.store(VK_NULL_HANDLE);
++        }
++        Layer::ovkDestroyImage(device, image, pAllocator);
++    }
++
      /// Erase the swapchain context and mapping when the swapchain is destroyed.
      void myvkDestroySwapchainKHR(
              VkDevice device,
-@@ -456,6 +585,10 @@ namespace {
+@@ -456,6 +646,10 @@ namespace {
              const VkAllocationCallbacks* pAllocator) noexcept {
          const std::lock_guard<std::mutex> lock(hookMutex);
  
@@ -1972,10 +3058,18 @@ index 681f8e4..8de30bb 100644
          const bool hadContext = swapchains.find(swapchain) != swapchains.end();
          if (hadContext)
              std::cerr << "lsfg-vk: destroying swapchain context\n";
-@@ -468,6 +601,38 @@ namespace {
+@@ -468,6 +662,46 @@ namespace {
      }
  }
  
++Hooks::UiImage Hooks::uiImage(VkDevice device) {
++    const std::lock_guard<std::mutex> lock(uiImageMutex);
++    const VkImage image = uiImageHandle.load();
++    if (image == VK_NULL_HANDLE || uiImageDevice != device)
++        return {};
++    return { .image = image, .extent = uiImageExtent, .format = uiImageFormat };
++}
++
 +VkSemaphore Hooks::earlyArmedSemaphore() {
 +    return earlyAcquireSemaphore.load(std::memory_order_relaxed);
 +}
@@ -2011,12 +3105,17 @@ index 681f8e4..8de30bb 100644
  std::unordered_map<std::string, PFN_vkVoidFunction> Hooks::hooks = {
      // instance hooks
      {"vkCreateInstance", reinterpret_cast<PFN_vkVoidFunction>(myvkCreateInstance)},
-@@ -480,5 +645,6 @@ std::unordered_map<std::string, PFN_vkVoidFunction> Hooks::hooks = {
+@@ -480,5 +714,10 @@ std::unordered_map<std::string, PFN_vkVoidFunction> Hooks::hooks = {
      // swapchain hooks
      {"vkCreateSwapchainKHR", reinterpret_cast<PFN_vkVoidFunction>(myvkCreateSwapchainKHR)},
      {"vkQueuePresentKHR", reinterpret_cast<PFN_vkVoidFunction>(myvkQueuePresentKHR)},
+-    {"vkDestroySwapchainKHR", reinterpret_cast<PFN_vkVoidFunction>(myvkDestroySwapchainKHR)}
 +    {"vkAcquireNextImageKHR", reinterpret_cast<PFN_vkVoidFunction>(myvkAcquireNextImageKHR)},
-     {"vkDestroySwapchainKHR", reinterpret_cast<PFN_vkVoidFunction>(myvkDestroySwapchainKHR)}
++    {"vkDestroySwapchainKHR", reinterpret_cast<PFN_vkVoidFunction>(myvkDestroySwapchainKHR)},
++
++    // D2R layer 11: VKD3D's hand-over image of the frame without the UI layer
++    {"vkCreateImage", reinterpret_cast<PFN_vkVoidFunction>(myvkCreateImage)},
++    {"vkDestroyImage", reinterpret_cast<PFN_vkVoidFunction>(myvkDestroyImage)}
  };
 diff --git a/src/layer.cpp b/src/layer.cpp
 index fa9c173..1314e57 100644

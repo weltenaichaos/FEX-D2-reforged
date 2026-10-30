@@ -457,6 +457,14 @@ namespace {
        "every game frame gets its generated frame, however long it took (the number: milliseconds since the frame before "
        "after which a frame gets none)",
        true},
+      {"FEX_LSFG_UI", "LSFG_D2R_UI",
+       "frame generation runs on the frames as shown, the game's UI included, as up to layer 10 (a zone around the map "
+       "overlay smears while the world moves under it)",
+       false},
+      {"FEX_LSFG_UI_TOL", "LSFG_D2R_UI_TOL",
+       "every pixel where the real frame differs at all from its frame without the UI layer is taken from the real frame "
+       "(the number: 1/255 steps a pixel may differ by and still count as the same, up to 64)",
+       true},
     };
     for (const auto& S : Switches) {
       const char* Value = Switch(S.Name);
@@ -830,6 +838,11 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
                       "empty second shadow map, 0.55-0.69 ms per frame; 'gpu clear memo' line; alt = on and off by turns "
                       "every second)",
                       true, "alt|1");
+  SetupVkd3dFexSwitch("FEX_VKD3D_UI_SPLIT", L"VKD3D_FEX_UI_SPLIT",
+                      "each frame is also made without the game's UI layer (D2R: a cleared back-buffer-sized RGBA16F pass "
+                      "mixed in by one 3-vertex draw) and handed to the frame generation layer, which runs on those and puts "
+                      "the UI back from the real frame (VKD3D fex35 and later, layer 11; 'ui split' line)",
+                      true);
   SetupVkd3dShaderCopy();
 
   auto Sym = GetProcAddress(NtDll, "__wine_set_unix_env");

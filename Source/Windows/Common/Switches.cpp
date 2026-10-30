@@ -160,6 +160,14 @@ namespace {
     // (LSFG_D2R_GEN_GAP_MS, 0 = off).
     {"FEX_LSFG_PRESENT_NICE", "-20"},
     {"FEX_LSFG_GEN_GAP", "50"},
+    // Build 122 (layer 11 + VKD3D fex35): in the build 121 run a zone around the map overlay smeared wherever trees moved
+    // under it. Frame generation guesses motion from the pictures it gets, and the overlay and HUD barely move while the
+    // world does. VKD3D now hands each frame over without D2R's UI layer too (FEX_VKD3D_UI_SPLIT), frame generation runs
+    // on those, and the layer takes every pixel where the real frame differs from its frame without the UI layer from the
+    // real frame (LSFG_D2R_UI; FEX_LSFG_UI_TOL: how many 1/255 steps a pixel may differ by and still count as the
+    // same, 0 = any difference). The UI itself then moves at the game's frame rate.
+    {"FEX_LSFG_UI", "1"},
+    {"FEX_LSFG_UI_TOL", "0"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -285,6 +293,8 @@ namespace {
     // (0.55-0.69 ms of GPU time), though nothing draws into it. vkd3d remembers on the GPU when that image still holds
     // the cleared value and the GPU then skips the clear (see EnvironmentVariablesHandling.h).
     {"FEX_VKD3D_CLEAR_MEMO", "1"},
+    // Build 122 + VKD3D fex35: each frame also without D2R's UI layer, for the frame generation layer (see FEX_LSFG_UI).
+    {"FEX_VKD3D_UI_SPLIT", "1"},
     // Build 68: the main pass's time grows ~14.6 us per draw at about the same shaded pixel count (b67: 238 draws 5.4 ms,
     // 963 draws 15.9 ms, ~0.85M pixels each), and a draw timed alone takes 23-33 us even with 64 vertices or fewer (fex9).
     // Before any pixel of a draw is shaded, Turnip runs the shader's preamble on one thread: in the lighting shaders 6-14
@@ -535,6 +545,8 @@ namespace {
     "FEX_LSFG_GPU_TIMES",
     "FEX_LSFG_PRESENT_NICE",
     "FEX_LSFG_GEN_GAP",
+    "FEX_LSFG_UI",
+    "FEX_LSFG_UI_TOL",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",
@@ -543,6 +555,7 @@ namespace {
     "FEX_VKD3D_CBV_SIZE",
     "FEX_VKD3D_SHADER_SWAP",
     "FEX_VKD3D_CLEAR_MEMO",
+    "FEX_VKD3D_UI_SPLIT",
     "FEX_VKD3D_LOG_OFF",
     "FEX_TU_NOPREAMBLE",
     "FEX_TU_CHANNEL",

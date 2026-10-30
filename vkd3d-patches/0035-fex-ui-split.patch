@@ -1,0 +1,1075 @@
+From d7a368afd666cb15569168ddf4c7712af0df0af8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 14:14:03 +0000
+Subject: [PATCH] FEX: each frame also handed to frame generation without the
+ game's UI layer
+
+Frame generation guesses motion from the finished frame. D2R's map overlay
+and HUD barely move while the world under them does, so the guess smears a
+zone around them in every generated frame.
+
+D2R draws its UI into a back-buffer-sized RGBA16F image that starts with a
+clear, then mixes it into the back buffer with one 3-vertex draw. With
+VKD3D_FEX_UI_SPLIT=1, the first draw of a back buffer's pass, if it is one
+3-vertex draw, gets a copy of the back buffer made first, into an image of
+its own per back buffer. If that draw doesn't blend over the back buffer,
+it is also drawn into that copy with the list's last cleared single-target
+pass of the back buffers' size (the UI layer) cleared again; the UI layer
+is saved before and put back after. The pass is ended for that and begun
+again with LOAD; bound state stays.
+
+Present() notes whether that back buffer got its copy since its last
+Present(); the swapchain blit then copies it, or the back buffer itself,
+into one hand-over image made with transfer usage only and a one-format
+list, which FEX's frame generation layer knows it by, left in GENERAL.
+
+The pass meter report gets an 'ui split' line: presents with the copy and
+without, copies made by kind, why none was made, and the composite's blend.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WZVGoVEaHJ78mpf2D3MiER
+---
+ libs/vkd3d/command.c        | 299 ++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/device.c         |   2 +
+ libs/vkd3d/fex_pass_meter.c |   3 +
+ libs/vkd3d/fex_ui_split.c   | 284 ++++++++++++++++++++++++++++++++++
+ libs/vkd3d/meson.build      |   2 +-
+ libs/vkd3d/swapchain.c      | 173 +++++++++++++++++++++
+ libs/vkd3d/vkd3d_private.h  |  70 +++++++++
+ 7 files changed, 832 insertions(+), 1 deletion(-)
+ create mode 100644 libs/vkd3d/fex_ui_split.c
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 4cd839c..9186bdc 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2123,6 +2123,8 @@ static HRESULT d3d12_command_list_begin_command_buffer(struct d3d12_command_list
+     list->fex_clears.drawn_count = 0;
+     list->fex_memo.count = 0;
+     list->fex_memo.pending_count = 0;
++    list->fex_ui.ui_valid = false;
++    list->fex_ui.pending = NULL;
+ 
+     return S_OK;
+ }
+@@ -5724,6 +5726,9 @@ void d3d12_command_list_end_current_render_pass_line(struct d3d12_command_list *
+     if (list->fex_clears.count && !list->fex_clears.keep)
+         d3d12_command_list_fex_flush_clears(list, VKD3D_FEX_BIG_CLEAR_MADE_AT_PASS_END, line);
+ 
++    /* VKD3D fex35: only a back buffer pass's first draw may be the composite. */
++    list->fex_ui.pending = NULL;
++
+     d3d12_command_list_handle_active_queries(list, true);
+ 
+ #ifdef VKD3D_ENABLE_PROFILING
+@@ -8117,6 +8122,284 @@ static bool d3d12_command_list_fex_ds_store_ops(struct d3d12_command_list *list)
+     return split;
+ }
+ 
++/* VKD3D fex35 (VKD3D_FEX_UI_SPLIT, see struct vkd3d_fex_ui_frame): called before a render pass begins (not when a
++ * suspended one resumes). A back buffer pass waits for its first draw; a single-target pass of the back buffers' size
++ * that starts with a clear is taken as the game's UI layer for this list. */
++static void d3d12_command_list_fex_ui_pass_begin(struct d3d12_command_list *list)
++{
++    struct vkd3d_fex_ui *ui = list->device->fex_ui;
++    const struct d3d12_rtv_desc *rtv = &list->rtvs[0];
++    uint32_t width, height;
++
++    list->fex_ui.pending = NULL;
++    if (list->rendering_info.rtv_mask != 1u || !rtv->view || !rtv->resource ||
++            d3d12_command_list_has_depth_stencil_view(list) || rtv->sample_count != VK_SAMPLE_COUNT_1_BIT)
++        return;
++
++    if (rtv->resource->fex_ui_frame)
++    {
++        list->fex_ui.pending = rtv->resource;
++        return;
++    }
++
++    width = vkd3d_atomic_uint32_load_explicit(&ui->width, vkd3d_memory_order_relaxed);
++    height = vkd3d_atomic_uint32_load_explicit(&ui->height, vkd3d_memory_order_relaxed);
++    if (!width || rtv->width != width || rtv->height != height || rtv->layer_count != 1 ||
++            list->rendering_info.rtv[0].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR ||
++            !(rtv->view->format->vk_aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT))
++        return;
++
++    list->fex_ui.ui_image = rtv->resource->res.vk_image;
++    list->fex_ui.ui_layout = d3d12_resource_pick_layout(rtv->resource, rtv->resource->common_layout);
++    list->fex_ui.ui_subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    list->fex_ui.ui_subresource.mipLevel = rtv->view->info.texture.miplevel_idx;
++    list->fex_ui.ui_subresource.baseArrayLayer = rtv->view->info.texture.layer_idx;
++    list->fex_ui.ui_subresource.layerCount = 1;
++    list->fex_ui.ui_format = rtv->resource->format->vk_format;
++    list->fex_ui.ui_width = rtv->width;
++    list->fex_ui.ui_height = rtv->height;
++    list->fex_ui.ui_clear = list->rendering_info.rtv[0].clearValue.color;
++    list->fex_ui.ui_valid = true;
++}
++
++static void fex_ui_barrier(VkImageMemoryBarrier2 *barrier, VkImage image, const VkImageSubresourceLayers *layers,
++        VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
++        VkAccessFlags2 dst_access, VkImageLayout old_layout, VkImageLayout new_layout)
++{
++    memset(barrier, 0, sizeof(*barrier));
++    barrier->sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++    barrier->srcStageMask = src_stage;
++    barrier->srcAccessMask = src_access;
++    barrier->dstStageMask = dst_stage;
++    barrier->dstAccessMask = dst_access;
++    barrier->oldLayout = old_layout;
++    barrier->newLayout = new_layout;
++    barrier->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barrier->image = image;
++    barrier->subresourceRange.aspectMask = layers->aspectMask;
++    barrier->subresourceRange.baseMipLevel = layers->mipLevel;
++    barrier->subresourceRange.levelCount = 1;
++    barrier->subresourceRange.baseArrayLayer = layers->baseArrayLayer;
++    barrier->subresourceRange.layerCount = layers->layerCount;
++}
++
++static void fex_ui_barriers(struct d3d12_command_list *list, const VkImageMemoryBarrier2 *barriers, uint32_t count)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkDependencyInfo dep_info;
++
++    memset(&dep_info, 0, sizeof(dep_info));
++    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep_info.imageMemoryBarrierCount = count;
++    dep_info.pImageMemoryBarriers = barriers;
++    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
++}
++
++static void fex_ui_copy(struct d3d12_command_list *list, VkImage src, const VkImageSubresourceLayers *src_layers,
++        VkImage dst, const VkImageSubresourceLayers *dst_layers, uint32_t width, uint32_t height)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkCopyImageInfo2 copy_info;
++    VkImageCopy2 region;
++
++    memset(&region, 0, sizeof(region));
++    region.sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2;
++    region.srcSubresource = *src_layers;
++    region.dstSubresource = *dst_layers;
++    region.extent.width = width;
++    region.extent.height = height;
++    region.extent.depth = 1;
++
++    memset(&copy_info, 0, sizeof(copy_info));
++    copy_info.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2;
++    copy_info.srcImage = src;
++    copy_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    copy_info.dstImage = dst;
++    copy_info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    copy_info.regionCount = 1;
++    copy_info.pRegions = &region;
++    VK_CALL(vkCmdCopyImage2(list->cmd.vk_command_buffer, &copy_info));
++}
++
++/* VKD3D fex35: the first draw of a back buffer pass, inside the pass, before its vkCmdDraw. If it is the composite
++ * (one 3-vertex draw), the back buffer goes into its frame copy first; if the draw doesn't blend over the back buffer,
++ * it is drawn into that copy too, with the UI layer cleared (saved before, put back after). The pass is ended for
++ * that and begun again with LOAD; bound state stays. */
++static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list, uint32_t vertex_count,
++        uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
++{
++    const VkPipelineStageFlags2 shader_stages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
++            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
++    const VkAccessFlags2 attachment_access = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
++            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    struct d3d12_resource *backbuffer = list->fex_ui.pending;
++    struct vkd3d_fex_ui_frame *frame = backbuffer->fex_ui_frame;
++    struct d3d12_device *device = list->device;
++    const VkPipelineColorBlendAttachmentState *blend;
++    VkCommandBuffer cmd = list->cmd.vk_command_buffer;
++    VkImageSubresourceLayers whole, ui_layers;
++    VkRenderingAttachmentInfo attachment;
++    VkImageMemoryBarrier2 barriers[4];
++    VkImageLayout backbuffer_layout;
++    VkAttachmentLoadOp load_op;
++    VkRenderingInfo rendering;
++    VkClearColorValue clear;
++    VkImageSubresourceRange range;
++    VkImage save = VK_NULL_HANDLE;
++    uint32_t width, height;
++    bool redraw;
++
++    list->fex_ui.pending = NULL;
++    if (vertex_count != 3 || instance_count != 1 || list->predication.fallback_enabled ||
++            list->active_queries_count || list->xfb_buffer_count || !list->state ||
++            list->rendering_info.info.colorAttachmentCount < 1)
++    {
++        vkd3d_fex_ui_event(device, VKD3D_FEX_UI_OTHER_DRAW);
++        return;
++    }
++    blend = &list->state->graphics.blend_attachments[0];
++    vkd3d_atomic_uint32_store_explicit(&device->fex_ui->blend, 1u + ((blend->blendEnable ? 1u : 0u) |
++            ((uint32_t)blend->srcColorBlendFactor << 8) | ((uint32_t)blend->dstColorBlendFactor << 16)),
++            vkd3d_memory_order_relaxed);
++    /* Blending over what the back buffer holds: that is the frame without the UI layer. Else the draw is made again
++     * with the UI layer cleared, which needs to know the UI layer. */
++    redraw = !blend->blendEnable || blend->dstColorBlendFactor == VK_BLEND_FACTOR_ZERO;
++    if (redraw && !list->fex_ui.ui_valid)
++    {
++        vkd3d_fex_ui_event(device, VKD3D_FEX_UI_NO_UI);
++        return;
++    }
++
++    if (redraw && !(save = vkd3d_fex_ui_save_image(device, list->fex_ui.ui_format,
++            list->fex_ui.ui_width, list->fex_ui.ui_height)))
++    {
++        vkd3d_fex_ui_event(device, VKD3D_FEX_UI_NO_SAVE);
++        return;
++    }
++
++    width = backbuffer->desc.Width;
++    height = backbuffer->desc.Height;
++    backbuffer_layout = list->rendering_info.rtv[0].imageLayout;
++    whole.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    whole.mipLevel = 0;
++    whole.baseArrayLayer = 0;
++    whole.layerCount = 1;
++    ui_layers = list->fex_ui.ui_subresource;
++
++    VK_CALL(vkCmdEndRendering(cmd));
++
++    fex_ui_barrier(&barriers[0], backbuffer->res.vk_image, &whole,
++            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
++            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
++            backbuffer_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    /* The last swapchain blit of this copy may still read it. */
++    fex_ui_barrier(&barriers[1], frame->vk_image, &whole,
++            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    if (redraw)
++    {
++        fex_ui_barrier(&barriers[2], list->fex_ui.ui_image, &ui_layers,
++                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
++                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
++                list->fex_ui.ui_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        fex_ui_barrier(&barriers[3], save, &whole,
++                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    }
++    fex_ui_barriers(list, barriers, redraw ? 4 : 2);
++
++    fex_ui_copy(list, backbuffer->res.vk_image, &whole, frame->vk_image, &whole, width, height);
++
++    if (redraw)
++    {
++        fex_ui_copy(list, list->fex_ui.ui_image, &ui_layers, save, &whole,
++                list->fex_ui.ui_width, list->fex_ui.ui_height);
++
++        fex_ui_barrier(&barriers[0], list->fex_ui.ui_image, &ui_layers,
++                VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++        fex_ui_barrier(&barriers[1], frame->vk_image, &whole,
++                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, attachment_access,
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++        fex_ui_barriers(list, barriers, 2);
++
++        clear = list->fex_ui.ui_clear;
++        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        range.baseMipLevel = ui_layers.mipLevel;
++        range.levelCount = 1;
++        range.baseArrayLayer = ui_layers.baseArrayLayer;
++        range.layerCount = 1;
++        VK_CALL(vkCmdClearColorImage(cmd, list->fex_ui.ui_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                &clear, 1, &range));
++
++        fex_ui_barrier(&barriers[0], list->fex_ui.ui_image, &ui_layers,
++                VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                shader_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, list->fex_ui.ui_layout);
++        fex_ui_barriers(list, barriers, 1);
++
++        memset(&attachment, 0, sizeof(attachment));
++        attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
++        attachment.imageView = frame->vk_view;
++        attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++        memset(&rendering, 0, sizeof(rendering));
++        rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
++        rendering.renderArea = list->rendering_info.info.renderArea;
++        rendering.layerCount = 1;
++        rendering.colorAttachmentCount = 1;
++        rendering.pColorAttachments = &attachment;
++        VK_CALL(vkCmdBeginRendering(cmd, &rendering));
++        VK_CALL(vkCmdDraw(cmd, vertex_count, instance_count, first_vertex, first_instance));
++        VK_CALL(vkCmdEndRendering(cmd));
++
++        fex_ui_barrier(&barriers[0], frame->vk_image, &whole,
++                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
++                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
++                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        fex_ui_barrier(&barriers[1], list->fex_ui.ui_image, &ui_layers,
++                shader_stages, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                list->fex_ui.ui_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++        fex_ui_barrier(&barriers[2], save, &whole,
++                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        fex_ui_barriers(list, barriers, 3);
++
++        fex_ui_copy(list, save, &whole, list->fex_ui.ui_image, &ui_layers,
++                list->fex_ui.ui_width, list->fex_ui.ui_height);
++
++        fex_ui_barrier(&barriers[0], list->fex_ui.ui_image, &ui_layers,
++                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, list->fex_ui.ui_layout);
++    }
++    else
++    {
++        fex_ui_barrier(&barriers[0], frame->vk_image, &whole,
++                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
++                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    }
++    fex_ui_barrier(&barriers[1], backbuffer->res.vk_image, &whole,
++            VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, attachment_access,
++            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, backbuffer_layout);
++    fex_ui_barriers(list, barriers, 2);
++
++    /* The game's pass again: what it held is in the image now. */
++    load_op = list->rendering_info.rtv[0].loadOp;
++    list->rendering_info.rtv[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++    VK_CALL(vkCmdBeginRendering(cmd, &list->rendering_info.info));
++    list->rendering_info.rtv[0].loadOp = load_op;
++
++    vkd3d_atomic_uint32_store_explicit(&frame->captured, 1u, vkd3d_memory_order_release);
++    vkd3d_fex_ui_event(device, redraw ? VKD3D_FEX_UI_CAPTURE_REDRAW : VKD3D_FEX_UI_CAPTURE_COPY);
++}
++
+ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list,
+         enum vkd3d_pipeline_type pipeline_type)
+ {
+@@ -8199,6 +8482,10 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+             list->rendering_info.dsv.storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE))
+         d3d12_command_list_fex_memo_dirty(list, list->dsv.resource);
+ 
++    /* VKD3D fex35: the UI layer's pass, or the back buffer's (its first draw may be the composite). */
++    if (list->device->fex_ui && fex_pass_kind != VKD3D_FEX_PASS_KIND_RESUMED)
++        d3d12_command_list_fex_ui_pass_begin(list);
++
+     d3d12_command_list_debug_mark_begin_region(list, "RenderPass");
+     VK_CALL(vkCmdBeginRendering(list->cmd.vk_command_buffer, &list->rendering_info.info));
+     vkd3d_fex_pass_meter_inside_pass(list);
+@@ -8528,6 +8815,11 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
+ 
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
+ 
++    /* VKD3D fex35: the back buffer pass's first draw may be the game's composite of scene and UI layer. */
++    if (list->fex_ui.pending)
++        d3d12_command_list_fex_ui_composite(list, vertex_count_per_instance, instance_count,
++                start_vertex_location, start_instance_location);
++
+     if (!list->predication.fallback_enabled)
+     {
+         VK_CALL(vkCmdDraw(list->cmd.vk_command_buffer, vertex_count_per_instance,
+@@ -8619,6 +8911,13 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
+ 
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
+ 
++    /* VKD3D fex35: the game's composite is one non-indexed draw. */
++    if (list->fex_ui.pending)
++    {
++        list->fex_ui.pending = NULL;
++        vkd3d_fex_ui_event(list->device, VKD3D_FEX_UI_OTHER_DRAW);
++    }
++
+     d3d12_command_list_check_index_buffer_strip_cut_value(list);
+ 
+     if (!list->predication.fallback_enabled)
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index b8ac8b9..9d9c80a 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4292,6 +4292,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
+ #endif
+     vkd3d_fex_pass_meter_deinit(device->fex_pass_meter);
+     vkd3d_fex_clear_memo_cleanup(device);
++    vkd3d_fex_ui_cleanup(device);
+ #ifdef VKD3D_ENABLE_BREADCRUMBS
+     vkd3d_breadcrumb_tracer_cleanup_barrier_hashes(&device->breadcrumb_tracer);
+     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS)
+@@ -10078,6 +10079,7 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+     device->fex_fold_clears = vkd3d_fex_fold_clears_enabled();
+     device->fex_ds_store_none = vkd3d_fex_ds_store_none_enabled();
+     vkd3d_fex_clear_memo_init(device);
++    vkd3d_fex_ui_init(device);
+     vkd3d_fex_timeline_init();
+     vkd3d_fex_shader_copy_init();
+     vkd3d_fex_root_dedupe_init();
+diff --git a/libs/vkd3d/fex_pass_meter.c b/libs/vkd3d/fex_pass_meter.c
+index 7315c6d..28b969c 100644
+--- a/libs/vkd3d/fex_pass_meter.c
++++ b/libs/vkd3d/fex_pass_meter.c
+@@ -2507,6 +2507,9 @@ static void fex_pass_publish(struct vkd3d_fex_pass_meter *meter, double seconds)
+         vkd3d_fex_clear_memo_flip(meter->device);
+     }
+ 
++    /* VKD3D fex35: frames handed to frame generation without the game's UI layer. */
++    len = vkd3d_fex_ui_report(meter->device, text, sizeof(text), len);
++
+     /* The last draw sample, once. */
+     draw_sample = meter->draw_text_len != 0;
+     if (draw_sample)
+diff --git a/libs/vkd3d/fex_ui_split.c b/libs/vkd3d/fex_ui_split.c
+new file mode 100644
+index 0000000..e4d74a3
+--- /dev/null
++++ b/libs/vkd3d/fex_ui_split.c
+@@ -0,0 +1,284 @@
++/*
++ * FEX UI split (VKD3D fex35, VKD3D_FEX_UI_SPLIT): each swapchain frame also handed over without the game's UI layer,
++ * for FEX's frame generation layer (see struct vkd3d_fex_ui_frame in vkd3d_private.h). The command list side (finding
++ * the UI layer and the composite draw, the copy and the second draw) is in command.c, the hand-over in swapchain.c.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "vkd3d_private.h"
++#include <string.h>
++
++void vkd3d_fex_ui_init(struct d3d12_device *device)
++{
++    struct vkd3d_fex_ui *ui;
++    char env[16];
++
++    device->fex_ui = NULL;
++
++    /* Off unless FEX asks for it: only FEX's frame generation layer uses the hand-over image. */
++    if (!vkd3d_get_env_var("VKD3D_FEX_UI_SPLIT", env, sizeof(env)) || !strcmp(env, "0"))
++        return;
++
++    if (!(ui = vkd3d_calloc(1, sizeof(*ui))))
++        return;
++    if (pthread_mutex_init(&ui->mutex, NULL))
++    {
++        vkd3d_free(ui);
++        return;
++    }
++    device->fex_ui = ui;
++    INFO("FEX: each frame is also handed over without the game's UI layer (VKD3D_FEX_UI_SPLIT).\n");
++}
++
++void vkd3d_fex_ui_cleanup(struct d3d12_device *device)
++{
++    struct vkd3d_fex_ui *ui = device->fex_ui;
++
++    if (!ui)
++        return;
++    if (ui->save_image)
++        vkd3d_fex_ui_destroy_image(device, ui->save_image, VK_NULL_HANDLE, &ui->save_memory);
++    pthread_mutex_destroy(&ui->mutex);
++    vkd3d_free(ui);
++    device->fex_ui = NULL;
++}
++
++void vkd3d_fex_ui_event(struct d3d12_device *device, enum vkd3d_fex_ui_event event)
++{
++    if (device->fex_ui)
++        vkd3d_atomic_uint32_increment(&device->fex_ui->events[event], vkd3d_memory_order_relaxed);
++}
++
++HRESULT vkd3d_fex_ui_create_image(struct d3d12_device *device, uint32_t width, uint32_t height, VkFormat format,
++        bool hand_over, VkImage *image, VkImageView *view, struct vkd3d_device_memory_allocation *memory)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkImageFormatListCreateInfo format_list;
++    VkMemoryRequirements requirements;
++    VkImageViewCreateInfo view_info;
++    VkImageCreateInfo image_info;
++    VkBindImageMemoryInfo bind;
++    VkResult vr;
++    HRESULT hr;
++
++    *image = VK_NULL_HANDLE;
++    if (view)
++        *view = VK_NULL_HANDLE;
++    memset(memory, 0, sizeof(*memory));
++
++    memset(&image_info, 0, sizeof(image_info));
++    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    image_info.imageType = VK_IMAGE_TYPE_2D;
++    image_info.format = format;
++    image_info.extent.width = width;
++    image_info.extent.height = height;
++    image_info.extent.depth = 1;
++    image_info.mipLevels = 1;
++    image_info.arrayLayers = 1;
++    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (hand_over)
++    {
++        /* Exactly transfer source + destination with a format list of the image's own format: no D3D12 resource is
++         * made like that, so FEX's frame generation layer knows this image by it. */
++        image_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++        memset(&format_list, 0, sizeof(format_list));
++        format_list.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
++        format_list.viewFormatCount = 1;
++        format_list.pViewFormats = &format;
++        image_info.pNext = &format_list;
++    }
++    else
++    {
++        image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    }
++
++    if ((vr = VK_CALL(vkCreateImage(device->vk_device, &image_info, NULL, image))) < 0)
++    {
++        *image = VK_NULL_HANDLE;
++        return hresult_from_vk_result(vr);
++    }
++
++    VK_CALL(vkGetImageMemoryRequirements(device->vk_device, *image, &requirements));
++    if (FAILED(hr = vkd3d_allocate_device_memory(device, requirements.size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++            requirements.memoryTypeBits, NULL, false, memory)))
++    {
++        memset(memory, 0, sizeof(*memory));
++        goto fail;
++    }
++
++    memset(&bind, 0, sizeof(bind));
++    bind.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
++    bind.image = *image;
++    bind.memory = memory->vk_memory;
++    if ((vr = VK_CALL(vkBindImageMemory2(device->vk_device, 1, &bind))) < 0)
++    {
++        hr = hresult_from_vk_result(vr);
++        goto fail;
++    }
++
++    if (view)
++    {
++        memset(&view_info, 0, sizeof(view_info));
++        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++        view_info.image = *image;
++        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++        view_info.format = format;
++        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        view_info.subresourceRange.levelCount = 1;
++        view_info.subresourceRange.layerCount = 1;
++        if ((vr = VK_CALL(vkCreateImageView(device->vk_device, &view_info, NULL, view))) < 0)
++        {
++            *view = VK_NULL_HANDLE;
++            hr = hresult_from_vk_result(vr);
++            goto fail;
++        }
++    }
++    return S_OK;
++
++fail:
++    vkd3d_fex_ui_destroy_image(device, *image, VK_NULL_HANDLE, memory);
++    *image = VK_NULL_HANDLE;
++    return hr;
++}
++
++void vkd3d_fex_ui_destroy_image(struct d3d12_device *device, VkImage image, VkImageView view,
++        struct vkd3d_device_memory_allocation *memory)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++
++    if (view)
++        VK_CALL(vkDestroyImageView(device->vk_device, view, NULL));
++    if (image)
++        VK_CALL(vkDestroyImage(device->vk_device, image, NULL));
++    if (memory->vk_memory)
++        vkd3d_free_device_memory(device, memory);
++    memset(memory, 0, sizeof(*memory));
++}
++
++VkImage vkd3d_fex_ui_save_image(struct d3d12_device *device, VkFormat format, uint32_t width, uint32_t height)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_fex_ui *ui = device->fex_ui;
++    VkImageCreateInfo image_info;
++    VkMemoryRequirements requirements;
++    VkBindImageMemoryInfo bind;
++    VkImage image;
++
++    pthread_mutex_lock(&ui->mutex);
++    if (ui->save_image && ui->save_format == format && ui->save_width == width && ui->save_height == height)
++    {
++        image = ui->save_image;
++        pthread_mutex_unlock(&ui->mutex);
++        return image;
++    }
++    /* Another size or format: the old one may still be in use by command lists in flight, so it is kept (the UI
++     * layer doesn't change size during play; a resize makes one more). */
++    ui->save_image = VK_NULL_HANDLE;
++    memset(&ui->save_memory, 0, sizeof(ui->save_memory));
++
++    memset(&image_info, 0, sizeof(image_info));
++    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    image_info.imageType = VK_IMAGE_TYPE_2D;
++    image_info.format = format;
++    image_info.extent.width = width;
++    image_info.extent.height = height;
++    image_info.extent.depth = 1;
++    image_info.mipLevels = 1;
++    image_info.arrayLayers = 1;
++    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
++    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++    image_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++            VK_IMAGE_USAGE_SAMPLED_BIT;
++    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++    image = VK_NULL_HANDLE;
++    if (VK_CALL(vkCreateImage(device->vk_device, &image_info, NULL, &image)) >= 0)
++    {
++        VK_CALL(vkGetImageMemoryRequirements(device->vk_device, image, &requirements));
++        if (FAILED(vkd3d_allocate_device_memory(device, requirements.size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++                requirements.memoryTypeBits, NULL, false, &ui->save_memory)))
++        {
++            memset(&ui->save_memory, 0, sizeof(ui->save_memory));
++            VK_CALL(vkDestroyImage(device->vk_device, image, NULL));
++            image = VK_NULL_HANDLE;
++        }
++        else
++        {
++            memset(&bind, 0, sizeof(bind));
++            bind.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
++            bind.image = image;
++            bind.memory = ui->save_memory.vk_memory;
++            if (VK_CALL(vkBindImageMemory2(device->vk_device, 1, &bind)) < 0)
++            {
++                vkd3d_fex_ui_destroy_image(device, image, VK_NULL_HANDLE, &ui->save_memory);
++                image = VK_NULL_HANDLE;
++            }
++        }
++    }
++    else
++    {
++        image = VK_NULL_HANDLE;
++    }
++
++    if (image)
++    {
++        ui->save_image = image;
++        ui->save_format = format;
++        ui->save_width = width;
++        ui->save_height = height;
++        INFO("FEX: UI layer save image %ux%u, format %u.\n", width, height, format);
++    }
++    pthread_mutex_unlock(&ui->mutex);
++    return image;
++}
++
++static const char *fex_ui_blend_factor_name(uint32_t factor)
++{
++    static const char *names[] =
++    {
++        "0", "1", "src", "1-src", "dst", "1-dst", "src.a", "1-src.a", "dst.a", "1-dst.a",
++        "const", "1-const", "const.a", "1-const.a", "src.a sat", "src1", "1-src1", "src1.a", "1-src1.a",
++    };
++    return factor < ARRAY_SIZE(names) ? names[factor] : "?";
++}
++
++size_t vkd3d_fex_ui_report(struct d3d12_device *device, char *text, size_t size, size_t len)
++{
++    struct vkd3d_fex_ui *ui = device->fex_ui;
++    uint32_t events[VKD3D_FEX_UI_EVENTS];
++    uint32_t blend, i;
++
++    if (!ui)
++        return len;
++    for (i = 0; i < VKD3D_FEX_UI_EVENTS; i++)
++        events[i] = vkd3d_atomic_uint32_exchange_explicit(&ui->events[i], 0, vkd3d_memory_order_relaxed);
++    blend = vkd3d_atomic_uint32_load_explicit(&ui->blend, vkd3d_memory_order_relaxed);
++
++    len = vkd3d_fex_report_append(text, size, len,
++            "  ui split (VKD3D fex35: each frame also handed to frame generation without the game's UI layer): presents"
++            " with it %u, as shown %u | made: copy before a composite that blends %u, composite drawn again with the UI"
++            " layer cleared %u | not made: no cleared full-size pass before the back buffer's %u, its first draw not"
++            " 3 vertices %u, no save image %u | composite blend ",
++            events[VKD3D_FEX_UI_PRESENT_SPLIT], events[VKD3D_FEX_UI_PRESENT_PLAIN],
++            events[VKD3D_FEX_UI_CAPTURE_COPY], events[VKD3D_FEX_UI_CAPTURE_REDRAW], events[VKD3D_FEX_UI_NO_UI],
++            events[VKD3D_FEX_UI_OTHER_DRAW], events[VKD3D_FEX_UI_NO_SAVE]);
++    if (!blend)
++        len = vkd3d_fex_report_append(text, size, len, "- (none seen)\n");
++    else if (!((blend - 1) & 1))
++        len = vkd3d_fex_report_append(text, size, len, "off\n");
++    else
++        len = vkd3d_fex_report_append(text, size, len, "on, color src*%s + dst*%s\n",
++                fex_ui_blend_factor_name(((blend - 1) >> 8) & 0xff), fex_ui_blend_factor_name(((blend - 1) >> 16) & 0xff));
++    return len;
++}
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index efda100..a92cbac 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -118,7 +118,7 @@ if enable_profiling
+   vkd3d_src += ['timestamp_profiler.c']
+ endif
+ 
+-vkd3d_src += ['fex_pass_meter.c', 'fex_timeline.c', 'fex_shader_copy.c', 'fex_draw_probe.c', 'fex_shader_swap.c']
++vkd3d_src += ['fex_pass_meter.c', 'fex_timeline.c', 'fex_shader_copy.c', 'fex_draw_probe.c', 'fex_shader_swap.c', 'fex_ui_split.c']
+ 
+ vkd3d_lib = static_library('vkd3d-proton', vkd3d_src, glsl_generator.process(vkd3d_shaders), vkd3d_build, vkd3d_version,
+   dependencies        : [ vkd3d_common_dep, vkd3d_shader_dep ] + vkd3d_extra_libs,
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 0041c3b..0c2a692 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -95,6 +95,7 @@ struct dxgi_vk_swap_chain_present_request
+     };
+     bool low_latency_update_requested;
+     bool modifies_hdr_metadata;
++    bool fex_ui_split; /* VKD3D fex35: this back buffer's frame without the UI layer was made for this Present() */
+     struct fex_frame_times fex; /* call_ns, start_ns and delay_ns are set in Present() */
+ };
+ 
+@@ -273,6 +274,13 @@ struct dxgi_vk_swap_chain
+         DXGI_VK_HDR_METADATA dxgi_hdr_metadata;
+         bool modifies_hdr_metadata;
+         uint64_t begin_frame_time_ns;
++
++        /* VKD3D fex35 (VKD3D_FEX_UI_SPLIT): each back buffer's frame without the UI layer, and the image every blit
++         * hands over to FEX's frame generation layer. */
++        struct vkd3d_fex_ui_frame fex_ui_frames[DXGI_MAX_SWAP_CHAIN_BUFFERS];
++        VkImage fex_ui_out;
++        struct vkd3d_device_memory_allocation fex_ui_out_memory;
++        uint32_t fex_ui_out_width, fex_ui_out_height;
+     } user;
+ 
+     struct
+@@ -882,6 +890,8 @@ static void dxgi_vk_swap_chain_cleanup_sync_objects(struct dxgi_vk_swap_chain *c
+     vkd3d_native_sync_handle_destroy(chain->present_request_done_event);
+ }
+ 
++static void dxgi_vk_swap_chain_fex_ui_destroy(struct dxgi_vk_swap_chain *chain);
++
+ static void dxgi_vk_swap_chain_cleanup_common(struct dxgi_vk_swap_chain *chain)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+@@ -901,6 +911,7 @@ static void dxgi_vk_swap_chain_cleanup_common(struct dxgi_vk_swap_chain *chain)
+ 
+     VK_CALL(vkDestroySwapchainKHR(chain->queue->device->vk_device, chain->present.vk_swapchain, NULL));
+ 
++    dxgi_vk_swap_chain_fex_ui_destroy(chain);
+     for (i = 0; i < ARRAY_SIZE(chain->user.backbuffers); i++)
+     {
+         if (chain->user.backbuffers[i])
+@@ -1100,6 +1111,66 @@ static HRESULT dxgi_vk_swap_chain_allocate_user_buffer(struct dxgi_vk_swap_chain
+             D3D12_RESOURCE_STATE_PRESENT, NULL, 0, NULL, NULL, ppResource);
+ }
+ 
++/* VKD3D fex35: the frame copies and the hand-over image go with the back buffers. */
++static void dxgi_vk_swap_chain_fex_ui_destroy(struct dxgi_vk_swap_chain *chain)
++{
++    struct d3d12_device *device = chain->queue->device;
++    unsigned int i;
++
++    for (i = 0; i < DXGI_MAX_SWAP_CHAIN_BUFFERS; i++)
++    {
++        struct vkd3d_fex_ui_frame *frame = &chain->user.fex_ui_frames[i];
++
++        if (chain->user.backbuffers[i] && chain->user.backbuffers[i]->fex_ui_frame == frame)
++            chain->user.backbuffers[i]->fex_ui_frame = NULL;
++        if (frame->vk_image)
++            vkd3d_fex_ui_destroy_image(device, frame->vk_image, frame->vk_view, &frame->memory);
++        memset(frame, 0, sizeof(*frame));
++    }
++    if (chain->user.fex_ui_out)
++        vkd3d_fex_ui_destroy_image(device, chain->user.fex_ui_out, VK_NULL_HANDLE, &chain->user.fex_ui_out_memory);
++    chain->user.fex_ui_out = VK_NULL_HANDLE;
++}
++
++static void dxgi_vk_swap_chain_fex_ui_create(struct dxgi_vk_swap_chain *chain)
++{
++    struct d3d12_device *device = chain->queue->device;
++    struct vkd3d_fex_ui_frame *frame;
++    struct d3d12_resource *resource;
++    unsigned int i;
++
++    if (!device->fex_ui || !chain->desc.BufferCount)
++        return;
++
++    resource = chain->user.backbuffers[0];
++    if (FAILED(vkd3d_fex_ui_create_image(device, chain->desc.Width, chain->desc.Height, resource->format->vk_format,
++            true, &chain->user.fex_ui_out, NULL, &chain->user.fex_ui_out_memory)))
++    {
++        WARN("FEX: no hand-over image, frames go to frame generation as shown.\n");
++        return;
++    }
++    chain->user.fex_ui_out_width = chain->desc.Width;
++    chain->user.fex_ui_out_height = chain->desc.Height;
++
++    for (i = 0; i < chain->desc.BufferCount; i++)
++    {
++        frame = &chain->user.fex_ui_frames[i];
++        resource = chain->user.backbuffers[i];
++        if (FAILED(vkd3d_fex_ui_create_image(device, chain->desc.Width, chain->desc.Height,
++                resource->format->vk_format, false, &frame->vk_image, &frame->vk_view, &frame->memory)))
++        {
++            WARN("FEX: no frame copy for back buffer %u, it goes to frame generation as shown.\n", i);
++            continue;
++        }
++        resource->fex_ui_frame = frame;
++    }
++
++    vkd3d_atomic_uint32_store_explicit(&device->fex_ui->width, chain->desc.Width, vkd3d_memory_order_relaxed);
++    vkd3d_atomic_uint32_store_explicit(&device->fex_ui->height, chain->desc.Height, vkd3d_memory_order_relaxed);
++    INFO("FEX: frames without the UI layer for %u back buffers of %ux%u.\n",
++            chain->desc.BufferCount, chain->desc.Width, chain->desc.Height);
++}
++
+ static HRESULT dxgi_vk_swap_chain_reallocate_user_buffers(struct dxgi_vk_swap_chain *chain)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+@@ -1112,6 +1183,9 @@ static HRESULT dxgi_vk_swap_chain_reallocate_user_buffers(struct dxgi_vk_swap_ch
+     if (chain->desc.BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+         return E_INVALIDARG;
+ 
++    /* VKD3D fex35: made again for the new back buffers below (the present queue is drained here). */
++    dxgi_vk_swap_chain_fex_ui_destroy(chain);
++
+     for (i = 0; i < DXGI_MAX_SWAP_CHAIN_BUFFERS; i++)
+     {
+         old_resources[i] = chain->user.backbuffers[i];
+@@ -1155,6 +1229,7 @@ static HRESULT dxgi_vk_swap_chain_reallocate_user_buffers(struct dxgi_vk_swap_ch
+         if (old_resources[i])
+             vkd3d_resource_decref((ID3D12Resource *)&old_resources[i]->ID3D12Resource_iface);
+ 
++    dxgi_vk_swap_chain_fex_ui_create(chain);
+     return S_OK;
+ 
+ err:
+@@ -1489,6 +1564,10 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     request->swap_interval = SyncInterval;
+     request->dxgi_format = chain->user.backbuffers[chain->user.index]->desc.Format;
+     request->user_index = chain->user.index;
++    /* VKD3D fex35: the frame copy counts if a command list made it since this back buffer was last presented. */
++    request->fex_ui_split = chain->user.backbuffers[chain->user.index]->fex_ui_frame &&
++            vkd3d_atomic_uint32_exchange_explicit(&chain->user.backbuffers[chain->user.index]->fex_ui_frame->captured,
++            0u, vkd3d_memory_order_acquire) != 0;
+     /* If we don't have wait thread, BufferCount needs to be tweaked to control latency.
+      * Some games that create BufferCount = 3 swapchains expect us to absorb a lot of latency or we start
+      * starving. If we have waiter thread, we'll block elsewhere. */
+@@ -2588,6 +2667,97 @@ static void dxgi_vk_swap_chain_present_signal_blit_semaphore(struct dxgi_vk_swap
+     }
+ }
+ 
++/* VKD3D fex35: the hand-over image gets this Present()'s frame without the UI layer, or the back buffer itself when
++ * none was made, and is left in GENERAL. The frame generation layer reads it in its own submit after this one, which
++ * waits on this blit's release semaphore. */
++static void dxgi_vk_swap_chain_fex_ui_hand_over(struct dxgi_vk_swap_chain *chain, VkCommandBuffer vk_cmd,
++        struct d3d12_resource *backbuffer)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
++    struct vkd3d_fex_ui_frame *frame = backbuffer->fex_ui_frame;
++    VkImageMemoryBarrier2 barriers[2];
++    VkImageLayout backbuffer_layout;
++    VkCopyImageInfo2 copy_info;
++    VkDependencyInfo dep_info;
++    VkImageCopy2 region;
++    bool split;
++    unsigned int i;
++
++    if (chain->user.fex_ui_out_width != backbuffer->desc.Width ||
++            chain->user.fex_ui_out_height != backbuffer->desc.Height)
++        return;
++
++    split = chain->request.fex_ui_split && frame && frame->vk_image;
++    backbuffer_layout = d3d12_resource_pick_layout(backbuffer, backbuffer->common_layout);
++
++    memset(barriers, 0, sizeof(barriers));
++    for (i = 0; i < ARRAY_SIZE(barriers); i++)
++    {
++        barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++        barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        barriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        barriers[i].subresourceRange.levelCount = 1;
++        barriers[i].subresourceRange.layerCount = 1;
++    }
++    /* The game's command lists wrote the frame copy (or the back buffer) in earlier submits. */
++    barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barriers[0].srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
++    barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++    barriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
++    barriers[0].image = split ? frame->vk_image : backbuffer->res.vk_image;
++    barriers[0].oldLayout = split ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : backbuffer_layout;
++    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    /* The layer's last read of the hand-over image was in an earlier submit too. */
++    barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++    barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    barriers[1].image = chain->user.fex_ui_out;
++    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++
++    memset(&dep_info, 0, sizeof(dep_info));
++    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep_info.imageMemoryBarrierCount = 2;
++    dep_info.pImageMemoryBarriers = barriers;
++    VK_CALL(vkCmdPipelineBarrier2(vk_cmd, &dep_info));
++
++    memset(&region, 0, sizeof(region));
++    region.sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2;
++    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    region.srcSubresource.layerCount = 1;
++    region.dstSubresource = region.srcSubresource;
++    region.extent.width = backbuffer->desc.Width;
++    region.extent.height = backbuffer->desc.Height;
++    region.extent.depth = 1;
++    memset(&copy_info, 0, sizeof(copy_info));
++    copy_info.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2;
++    copy_info.srcImage = barriers[0].image;
++    copy_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    copy_info.dstImage = chain->user.fex_ui_out;
++    copy_info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    copy_info.regionCount = 1;
++    copy_info.pRegions = &region;
++    VK_CALL(vkCmdCopyImage2(vk_cmd, &copy_info));
++
++    /* The frame copy stays in TRANSFER_SRC (its next copy starts from UNDEFINED); the back buffer goes back. */
++    barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++    barriers[0].srcAccessMask = 0;
++    barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barriers[0].dstAccessMask = 0;
++    barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    barriers[0].newLayout = split ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : backbuffer_layout;
++    barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++    barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barriers[1].dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT;
++    barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
++    VK_CALL(vkCmdPipelineBarrier2(vk_cmd, &dep_info));
++
++    vkd3d_fex_ui_event(chain->queue->device, split ? VKD3D_FEX_UI_PRESENT_SPLIT : VKD3D_FEX_UI_PRESENT_PLAIN);
++}
++
+ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *chain, VkCommandBuffer vk_cmd, uint32_t swapchain_index)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+@@ -2717,6 +2887,9 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
+ 
+     VK_CALL(vkCmdPipelineBarrier2(vk_cmd, &dep_info));
+ 
++    if (chain->user.fex_ui_out && !blank_present)
++        dxgi_vk_swap_chain_fex_ui_hand_over(chain, vk_cmd, resource);
++
+     if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_DEBUG_UTILS) &&
+             chain->queue->device->vk_info.EXT_debug_utils)
+     {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 2f11733..ba50b48 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1169,6 +1169,10 @@ struct d3d12_resource
+     /* VKD3D fex34 (command.c, VKD3D_FEX_CLEAR_MEMO): slot << 32 | bits of the depth value the memo remembers, 0 = no
+      * slot. Set once, atomically. */
+     UINT64 fex_memo;
++
++    /* VKD3D fex35 (fex_ui_split.c, VKD3D_FEX_UI_SPLIT): swapchain back buffers only, the copy of the frame without the
++     * game's UI layer, else NULL. */
++    struct vkd3d_fex_ui_frame *fex_ui_frame;
+ };
+ 
+ static inline bool d3d12_resource_is_buffer(const struct d3d12_resource *resource)
+@@ -3351,6 +3355,57 @@ enum vkd3d_fex_memo_event
+     VKD3D_FEX_MEMO_FULL,        /* an image found no slot left */
+     VKD3D_FEX_MEMO_EVENTS
+ };
++/* VKD3D fex35 (fex_ui_split.c, VKD3D_FEX_UI_SPLIT): FEX's frame generation layer gets each frame twice, as shown and
++ * without the game's UI layer, so it can make the frames in between from the scene alone and lay the real frame's UI
++ * on top. D2R draws its UI (map overlay, HUD, labels) into a back-buffer-sized RGBA16F image that starts with a clear,
++ * then mixes it into the back buffer with one 3-vertex draw. Before that draw, the back buffer goes into a copy of its
++ * own (vkd3d_fex_ui_frame); if the draw doesn't blend over the back buffer, it is drawn again into that copy with the
++ * UI layer cleared (the UI layer is saved before and put back after). Each swapchain blit then copies that frame, or
++ * the back buffer itself when no copy was made since the last Present(), into one image the layer finds by how it is
++ * made (vkd3d_fex_ui_out_image_info()). */
++struct vkd3d_fex_ui_frame
++{
++    VkImage vk_image;
++    VkImageView vk_view;
++    struct vkd3d_device_memory_allocation memory;
++    uint32_t captured; /* atomic: a copy was recorded since this back buffer's last Present() */
++};
++enum vkd3d_fex_ui_event
++{
++    VKD3D_FEX_UI_CAPTURE_COPY,   /* the composite blends over the back buffer: copy of the back buffer before it */
++    VKD3D_FEX_UI_CAPTURE_REDRAW, /* the composite drawn again with the UI layer cleared */
++    VKD3D_FEX_UI_NO_UI,          /* a back buffer pass with no cleared back-buffer-sized pass before it in the list */
++    VKD3D_FEX_UI_OTHER_DRAW,     /* the back buffer pass's first draw was not one 3-vertex draw */
++    VKD3D_FEX_UI_NO_SAVE,        /* no image to save the UI layer in */
++    VKD3D_FEX_UI_PRESENT_SPLIT,  /* blits that handed over the frame without the UI layer */
++    VKD3D_FEX_UI_PRESENT_PLAIN,  /* blits that handed over the frame as shown (no copy since the last Present()) */
++    VKD3D_FEX_UI_EVENTS
++};
++struct vkd3d_fex_ui
++{
++    pthread_mutex_t mutex;       /* the save image */
++    VkImage save_image;
++    struct vkd3d_device_memory_allocation save_memory;
++    VkFormat save_format;
++    uint32_t save_width, save_height;
++    uint32_t width, height;      /* atomics: the swapchain back buffers' size, 0 = none yet */
++    uint32_t events[VKD3D_FEX_UI_EVENTS];
++    uint32_t blend;              /* atomic: the last composite's blend, 1 + enable | src << 8 | dst << 16, 0 = none */
++};
++void vkd3d_fex_ui_init(struct d3d12_device *device);
++void vkd3d_fex_ui_cleanup(struct d3d12_device *device);
++void vkd3d_fex_ui_event(struct d3d12_device *device, enum vkd3d_fex_ui_event event);
++/* An image of the back buffer's format and size: the frame copy (render target + transfer) or the swapchain's
++ * hand-over image (transfer only, with a one-format list: how the layer tells it from the game's images). */
++HRESULT vkd3d_fex_ui_create_image(struct d3d12_device *device, uint32_t width, uint32_t height, VkFormat format,
++        bool hand_over, VkImage *image, VkImageView *view, struct vkd3d_device_memory_allocation *memory);
++void vkd3d_fex_ui_destroy_image(struct d3d12_device *device, VkImage image, VkImageView view,
++        struct vkd3d_device_memory_allocation *memory);
++/* The save image for a UI layer of this format and size, VK_NULL_HANDLE if it can't be made. */
++VkImage vkd3d_fex_ui_save_image(struct d3d12_device *device, VkFormat format, uint32_t width, uint32_t height);
++/* Appends the per-second line to the pass meter report. */
++size_t vkd3d_fex_ui_report(struct d3d12_device *device, char *text, size_t size, size_t len);
++
+ extern uint32_t vkd3d_fex_clear_memo_now;
+ static inline bool vkd3d_fex_clear_memo_on(void)
+ {
+@@ -3583,6 +3638,20 @@ struct d3d12_command_list
+         uint32_t pending[VKD3D_FEX_CLEAR_MEMO_LIST_SLOTS];
+         uint32_t pending_count;
+     } fex_memo;
++
++    /* VKD3D fex35: the last back-buffer-sized single-target pass that began with a clear in this list (the game's UI
++     * layer, as far as we can tell), and the back buffer whose pass just began (its first draw may be the composite). */
++    struct
++    {
++        VkImage ui_image;
++        VkImageLayout ui_layout;   /* its layout outside render passes */
++        VkImageSubresourceLayers ui_subresource;
++        VkFormat ui_format;
++        uint32_t ui_width, ui_height;
++        VkClearColorValue ui_clear;
++        bool ui_valid;
++        struct d3d12_resource *pending;
++    } fex_ui;
+ };
+ 
+ HRESULT d3d12_command_list_create(struct d3d12_device *device,
+@@ -5967,6 +6036,7 @@ struct d3d12_device
+ #endif
+     struct vkd3d_fex_pass_meter *fex_pass_meter;
+     struct vkd3d_fex_clear_memo *fex_clear_memo; /* VKD3D fex34, NULL = off */
++    struct vkd3d_fex_ui *fex_ui; /* VKD3D fex35, NULL = off */
+     bool fex_fold_clears;
+     bool fex_ds_store_none;
+     bool fex_skip_fresh_clears; /* VKD3D fex11: zero fills of never-used chunk pages skipped */
+-- 
+2.43.0
+

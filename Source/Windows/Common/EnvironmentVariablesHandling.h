@@ -139,6 +139,15 @@ namespace FEX::Windows {
 //                            game's own.
 //                            Build 110: 1 (fex33's run: clutter 0.66 ms per frame in town with FEX's version vs 1.14
 //                            with the game's own, 1.16 vs 1.19 outdoors; never slower).
+//   FEX_VKD3D_UI_SPLIT=1   VKD3D_FEX_UI_SPLIT=1 (the D2R default from build 122, VKD3D fex35; with the switch at 0 FEX
+//                            sets 0): each frame also without the game's UI layer, for the frame generation layer
+//                            (FEX_LSFG_UI). D2R draws its UI into a back-buffer-sized RGBA16F image that starts with a
+//                            clear and mixes it into the back buffer with one 3-vertex draw. Before that draw vkd3d
+//                            copies the back buffer into an image of its own; if the draw doesn't blend over the back
+//                            buffer, it is drawn into that copy too with the UI layer cleared (saved before, put back
+//                            after). The swapchain blit copies it (or the back buffer when none was made) into one
+//                            hand-over image the layer knows by its create info (transfer usage only, a one-format
+//                            list). The pass meter report gets an 'ui split' line.
 //   FEX_VKD3D_CLEAR_MEMO=1 VKD3D_FEX_CLEAR_MEMO=1 (the D2R default from build 110, VKD3D fex34; with the switch at 0 FEX
 //                            sets 0, as vkd3d remembers unless 0). D2R clears its second 4096 x 4096 shadow map in a
 //                            render pass of its own every frame, 0.55-0.69 ms of GPU time, though nothing draws into it
@@ -179,7 +188,7 @@ namespace FEX::Windows {
 //                        before the draw's waves may start
 //   FEX_TU_NOPREAMBLE=lit  that second binary always
 //
-// GameNative's frame generation layer, FEX's D2R build (build 113, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7-10). It
+// GameNative's frame generation layer, FEX's D2R build (build 113, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7-11). It
 // reads these from the Unix environment (__wine_set_unix_env) at its first present. From build 114 FEX sets them to 0 or 1
 // only in the game (where the switch has a value): build 113 set 0 in Steam, which has no D2R defaults, and the game
 // inherited it (the '# framegen:' note says what the variable was when the game started):
@@ -206,6 +215,15 @@ namespace FEX::Windows {
 //                          (LSFG_D2R_DEFER_NICE, -20 to 19). Build 116 (layer 9, nice -10): in fights the thread woke 1-6
 //                          ms late from its timed sleeps on cores the game's nice -10 job workers kept busy, and 9% of the
 //                          real frames went out 1 ms or more late. 0 or "off" = the nice the thread starts with.
+//   FEX_LSFG_UI=1          (the D2R default from build 122, layer 11) frame generation runs on VKD3D's frames without the
+//                          game's UI layer (FEX_VKD3D_UI_SPLIT), and every pixel where the real frame differs from its frame
+//                          without the UI layer is taken from the real frame. Build 121: a zone around the map overlay
+//                          smeared wherever trees moved under it (frame generation guesses motion from the whole picture,
+//                          and the overlay barely moves while the world does). The UI then moves at the game's frame rate.
+//                          0 = LSFG_D2R_UI=0 (frames as shown, as up to layer 10).
+//   FEX_LSFG_UI_TOL=0      (layer 11) a pixel counts as UI when the real frame differs from the frame without the UI layer
+//                          by more than this many 1/255 steps in any colour (LSFG_D2R_UI_TOL, at most 64; 0 = any
+//                          difference: both are 8-bit pictures of the same frame, equal where there is no UI).
 //   FEX_LSFG_GEN_GAP=50    (the D2R default from build 117, layer 10) a game frame that comes more than this many ms after
 //                          the one before (a freeze) gets no generated frame, only itself at the generated frame's slot: a
 //                          frame made between two pictures that far apart in time guesses a big jump (build 116: once a

@@ -408,6 +408,10 @@ namespace {
   // started: the line shows the difference to the last read), the present thread's wake-ups and CPUs, and gpu_* times.
   // Layer 10 (build 117) adds the present thread's nice and the frames without a generated frame because the game frame
   // took longer than gen_gap_ms (a total, shown as the difference).
+  // Layer 11 (build 122) adds frame generation on VKD3D's frames without the game's UI layer: frames that went that way or
+  // as shown (ui_plain_reason bits: 1 no hand-over image from VKD3D, 2 its size differs from the swapchain's, 4 its
+  // format isn't 8-bit, 8 the layer's debug_inputs), the share of pixels taken from the real frame (1 frame in 4 counted)
+  // and the GPU time of that step.
   struct FramegenState {
     fextl::string Path; // empty: not known yet
     char Last[4096];
@@ -521,6 +525,14 @@ namespace {
                                    Nice <= -100 ? fextl::string("-") : fextl::fmt::format("{:.0f}", Nice),
                                    Num("gen_gap_ms") > 0 ? fextl::fmt::format("{:.0f}", Num("gen_gap_ms")) : fextl::string("- (off)"), Delta,
                                    Now);
+    }
+    // Layer 11: frame generation on frames without the UI layer
+    if (!Get("ui").empty()) {
+      Timing += fextl::fmt::format("; frame generation without the UI layer {}: {} frames from VKD3D's copy, {} as shown (reason {}); "
+                                   "pixels from the real frame {:.2f}% (differing at all {:.2f}%, by 16/255 or more {:.2f}%; "
+                                   "more than {}/255 taken; {} frames counted), GPU {:.3f} ms per frame",
+                                   Get("ui"), Get("ui_frames"), Get("ui_plain"), Get("ui_plain_reason"), Num("ui_px_taken_pct"),
+                                   Num("ui_px_any_pct"), Num("ui_px_strong_pct"), Get("ui_tol"), Get("ui_px_frames"), Num("gpu_ui_ms"));
     }
 
     if (Get("layer").empty()) {
