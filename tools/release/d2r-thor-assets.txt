@@ -1,5 +1,5 @@
-fexcore-2610-d2rfix28s-thor-97/fexcore-2610-d2rfix28s-thor.wcp
-fexcore-2610-d2rfix28-thor-clean-97/fexcore-2610-d2rfix28-thor-clean.wcp
-vkd3d-proton-3.0b-arm64ec-fex27-29/vkd3d-proton-3.0b-arm64ec-fex27.wcp
-turnip-26.3.0-rc2-fex8-10/turnip-26.3.0-rc2-fex8.zip
-lsfg-d2r-6/liblsfg-vk-layer.so
+fexcore-2610-d2rfix28s-thor-127/fexcore-2610-d2rfix28s-thor.wcp
+fexcore-2610-d2rfix28-thor-clean-127/fexcore-2610-d2rfix28-thor-clean.wcp
+vkd3d-proton-3.0b-arm64ec-fex37-39/vkd3d-proton-3.0b-arm64ec-fex37.wcp
+turnip-26.3.0-rc2-fex17-21/turnip-26.3.0-rc2-fex17.zip
+lsfg-d2r-14/liblsfg-vk-layer.so
