@@ -86,6 +86,10 @@ namespace {
     // came back 1.3 s before the next. Leaving again within 3 s of coming back now doubles the hold up to 10 s (from 100 ms
     // again after 30 s without leaving). "off" = build 119 (1 s, up to 1.6 s).
     {"FEX_MAINCORE_ESCAPE_REPEAT", "3"},
+    // Build 121: in the build 120 run that outside work went on all session; the main thread stayed away 97% of play but
+    // came back each time its 10 s hold ended, into the next burst (a 32-88 ms wait every 10.4 s). While away it now comes
+    // back only once its core has had no burst of other work for 5 s (read every 20 ms from /proc/schedstat). "off" = 120.
+    {"FEX_MAINCORE_ESCAPE_QUIET", "5"},
     {"FEX_MAINCORE_ESCAPE_NICE", "-20"},
     // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
     // PriorityGuard.h). In the build 75 log the main thread waited for its core 7 ms per slow frame, nearly always inside
@@ -501,6 +505,7 @@ namespace {
     "FEX_MAINCORE_ESCAPE",
     "FEX_MAINCORE_ESCAPE_LIVE",
     "FEX_MAINCORE_ESCAPE_REPEAT",
+    "FEX_MAINCORE_ESCAPE_QUIET",
     "FEX_MAINCORE_ESCAPE_NICE",
     "FEX_MAINCORE_OTHERS",
     "FEX_HELPER_CORES",

@@ -74,6 +74,14 @@ namespace FEX::Windows {
 //                      overlay; builds 115-117 had no such period). The watcher moved the thread off after each one for
 //                      200 ms and it came back 1.3 s before the next, outside the 1 s that let the hold grow, so it was
 //                      caught every time. "off" or 0 = up to 1.6 s within 1 s, 10 s to start over (builds 117-119).
+//   FEX_MAINCORE_ESCAPE_QUIET=5  build 121 (D2R default 5, seconds): while the main thread is away, the watcher reads
+//                      its core's line of /proc/schedstat every 20 ms (all tasks' run time there; the app's own threads
+//                      are kept off that core, so it is other work) and brings the thread back only once that core has had
+//                      no burst (other work for half or more of 20 ms) for this long; each move then holds 100 ms. Build
+//                      120 run: the outside work went on all session, the thread was away 97% of play and each time its
+//                      10 s hold ended it came back into the next burst (32-88 ms waits every 10.4 s, 6 slow frames).
+//                      The 'main escape' line adds how many 20 ms checks found its core full and how long it stayed away
+//                      past its hold for that. "off" or 0, or /proc/schedstat unreadable = back after its hold (build 120).
 //   FEX_MAINCORE_ESCAPE_NICE=-20  its nice while away (D2R default -20, above the game's job workers at -10 there: on
 //                      those cores they are in the same CPU group, so nice counts); "off" leaves it at FEX_MAIN_NICE.
 //   FEX_MAINCORE_OTHERS=user  with "fast": every other thread of the app's Linux user stays off the main thread's core

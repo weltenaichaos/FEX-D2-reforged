@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -906,6 +907,10 @@ namespace {
   // thread off after each one, but for 200 ms only: it came back 1.3 s before the next one, outside the 1 s that let the
   // hold grow. Now a wait within N s (default 3) of coming back doubles the hold, up to 10 s, and the hold starts over
   // after 30 s without leaving; then the thread stays on the other big cores while such waits keep coming.
+  // Build 121, FEX_MAINCORE_ESCAPE_QUIET: in the build 120 run that outside work went on all session; the thread stayed
+  // away 97% of play, but each time its 10 s hold ended it came back into the next one (a 32-88 ms wait every 10.4 s).
+  // While away, the watcher now reads every 20 ms how long other work ran on its core (/proc/schedstat, the core's
+  // line), and the thread comes back only once that core has had no burst of it (half or more of 20 ms) for N s.
   constexpr int NiceUnchanged = 1000;
   struct EscapeState {
     std::mutex Lock; // held while the watcher, or the guard's 250 ms keeper, decides and sets the main thread's cores and nice
@@ -929,7 +934,39 @@ namespace {
     // FEX_MAINCORE_ESCAPE_REPEAT (build 120): leaving again within AgainMs of coming back doubles the hold up to HoldMaxMs;
     // the hold starts over after ResetMs without leaving. Builds 117-119: 1 s, 1.6 s, 10 s.
     uint32_t AgainMs {1000}, HoldMaxMs {1600}, ResetMs {10000};
+    // FEX_MAINCORE_ESCAPE_QUIET (build 121): back only after its core had no burst of other work for QuietMs (0 = off).
+    uint32_t QuietMs {};
+    // per second, read and reset by EscapeStatsLine: 20 ms windows with a burst on its core while away, their run time,
+    // and the time it stayed away past its hold because of them
+    std::atomic<uint32_t> BurstWindows {};
+    std::atomic<uint64_t> BurstNs {}, QuietWaitNs {};
+    std::atomic<bool> QuietOn {}; // set by the watcher: /proc/schedstat readable and QuietMs set
   };
+
+  // Run time of all tasks on one CPU so far (ns), from its line in /proc/schedstat ("cpuN yld_count 0 sched_count
+  // sched_goidle ttwu_count ttwu_local rq_cpu_time run_delay pcount"). The watcher thread's only.
+  bool ReadCpuRunNs(int Fd, int Cpu, uint64_t& RunNs) {
+    static char Buffer[32768];
+    const int64_t Len = Fd >= 0 ? Linux::Pread(Fd, Buffer + 1, sizeof(Buffer) - 2, 0) : -9;
+    if (Len <= 0) {
+      return false;
+    }
+    Buffer[0] = '\n';
+    Buffer[Len + 1] = 0;
+    char Name[16];
+    snprintf(Name, sizeof(Name), "\ncpu%d ", Cpu);
+    const char* Line = strstr(Buffer, Name);
+    if (!Line) {
+      return false;
+    }
+    char* P = const_cast<char*>(Line + strlen(Name));
+    uint64_t Fields[7] {};
+    for (auto& F : Fields) {
+      F = strtoull(P, &P, 10);
+    }
+    RunNs = Fields[6];
+    return true;
+  }
   EscapeState* Escape {};
 
   uint64_t Counter();
@@ -977,6 +1014,20 @@ namespace {
     uint64_t LastWait {}, PrevTick {};
     uint64_t LastT = Counter();
     uint64_t AwayUntil {}, ReturnedAt {}, LastEscapeAt {};
+    // Build 121: its core's other work while it is away (see FEX_MAINCORE_ESCAPE_QUIET).
+    const int CpuStatFd = E.QuietMs ? Linux::Open("/proc/schedstat") : -1;
+    uint64_t ProbeRun {};
+    const bool QuietOn = E.QuietMs && CpuStatFd >= 0 && ReadCpuRunNs(CpuStatFd, 0, ProbeRun);
+    E.QuietOn.store(QuietOn, std::memory_order_relaxed);
+    if (E.QuietMs && !QuietOn) {
+      StatsLogNote(fextl::fmt::format("cores: /proc/schedstat can't be read (error {}): the main thread comes back after its hold, as in "
+                                      "build 120",
+                                      CpuStatFd < 0 ? -CpuStatFd : 0));
+    }
+    const uint64_t QuietTicks = static_cast<uint64_t>(E.QuietMs) * Freq / 1000;
+    const uint64_t BurstWindowTicks = Freq / 50; // 20 ms
+    uint64_t LastBurstAt {}, CoreRunNs {}, CoreReadAt {};
+    int HomeCpu = -1;
     uint32_t HoldMs = HoldFirstMs;
     // The live view: CPU time and state at the last check, and since when it has been ready without a CPU (0: it isn't).
     int64_t LastCpu = -1;
@@ -1027,7 +1078,26 @@ namespace {
         const uint64_t Ns = TicksToNs(Now - LastT);
         E.AwayNs.fetch_add(Ns, std::memory_order_relaxed);
         E.TotalAwayNs.fetch_add(Ns, std::memory_order_relaxed);
-        if (!Home || Now >= AwayUntil) {
+        // Build 121: other work on its core while it is away, read every 20 ms.
+        if (QuietOn && HomeCpu >= 0 && Now - CoreReadAt >= BurstWindowTicks) {
+          uint64_t RunNs {};
+          if (ReadCpuRunNs(CpuStatFd, HomeCpu, RunNs)) {
+            const uint64_t WindowNs = TicksToNs(Now - CoreReadAt);
+            const uint64_t Busy = CoreReadAt && RunNs >= CoreRunNs ? RunNs - CoreRunNs : 0;
+            if (CoreReadAt && Busy * 2 >= WindowNs) {
+              LastBurstAt = Now;
+              E.BurstWindows.fetch_add(1, std::memory_order_relaxed);
+              E.BurstNs.fetch_add(Busy, std::memory_order_relaxed);
+            }
+            CoreRunNs = RunNs;
+            CoreReadAt = Now;
+          }
+        }
+        const bool Quiet = !QuietOn || Now - LastBurstAt >= QuietTicks;
+        if (Home && Now >= AwayUntil && !Quiet) {
+          E.QuietWaitNs.fetch_add(Ns, std::memory_order_relaxed);
+        }
+        if (!Home || (Now >= AwayUntil && Quiet)) {
           // Back home, or the keeper decides now (it widened the thread's cores for its own reasons, or its core is paused).
           std::scoped_lock Lock {E.Lock};
           if (E.Away.load(std::memory_order_relaxed)) {
@@ -1061,6 +1131,10 @@ namespace {
           } else if (!LastEscapeAt || Now - LastEscapeAt > ResetTicks) {
             HoldMs = HoldFirstMs;
           }
+          if (QuietOn) {
+            // It comes back once its core has been quiet for QuietMs, so a short hold is enough.
+            HoldMs = HoldFirstMs;
+          }
           std::scoped_lock Lock {E.Lock};
           if (E.Home.load(std::memory_order_relaxed) == Home && !E.Away.load(std::memory_order_relaxed)) {
             // The nice first: a thread moved while it waits is placed on its new core with the weight it has then.
@@ -1076,6 +1150,10 @@ namespace {
               StatsLogSetMainAwayFrom(Home);
               AwayUntil = Now + static_cast<uint64_t>(HoldMs) * Freq / 1000;
               LastEscapeAt = Now;
+              // The wait it leaves was other work on its core: quiet counts from now, the core read starts afresh.
+              LastBurstAt = Now;
+              CoreReadAt = 0;
+              HomeCpu = std::countr_zero(Home);
               E.Escapes.fetch_add(1, std::memory_order_relaxed);
               E.HoldMs.store(HoldMs, std::memory_order_relaxed);
               Max(E.TriggerMaxNs, Waited);
@@ -1137,13 +1215,16 @@ namespace {
     const uint64_t EndedNs = E.EndedNs.exchange(0, std::memory_order_relaxed);
     const uint64_t EndedMax = E.EndedMaxNs.exchange(0, std::memory_order_relaxed);
     const uint64_t MoveToRunMax = E.MoveToRunMaxNs.exchange(0, std::memory_order_relaxed);
+    const uint32_t BurstWindows = E.BurstWindows.exchange(0, std::memory_order_relaxed);
+    const uint64_t BurstNs = E.BurstNs.exchange(0, std::memory_order_relaxed);
+    const uint64_t QuietWait = E.QuietWaitNs.exchange(0, std::memory_order_relaxed);
     const bool AwayNow = E.Away.load(std::memory_order_relaxed) != 0;
     if (!Escapes && !AwayNs && !AwayNow && HomeWait < 20'000'000) {
       return {};
     }
     return fextl::fmt::format("  main escape: left its core {} times this second ({} in all), away {:.0f} ms{} (hold {} ms, {} of them "
                               "within {:g} s of coming back), came back {} times; waited for a CPU {:.1f} ms on its core, {:.1f} ms away; "
-                              "longest wait that sent it off {:.1f} ms ({}){}; {} checks\n",
+                              "longest wait that sent it off {:.1f} ms ({}){}{}; {} checks\n",
                               Escapes, E.TotalEscapes.load(std::memory_order_relaxed), static_cast<double>(AwayNs) / 1e6,
                               AwayNow ? " (away now)" : "", E.HoldMs.load(std::memory_order_relaxed), Again,
                               static_cast<double>(E.AgainMs) / 1000.0, Returns, static_cast<double>(HomeWait) / 1e6,
@@ -1155,6 +1236,11 @@ namespace {
                                                          static_cast<double>(EndedNs) / 1e6 / Ended, static_cast<double>(EndedMax) / 1e6,
                                                          static_cast<double>(MoveToRunMax) / 1e6) :
                                       fextl::string {},
+                              E.QuietOn.load(std::memory_order_relaxed) && (AwayNs || BurstWindows) ?
+                                fextl::fmt::format("; while away, other work filled its core in {} of the 20 ms checks ({:.1f} ms), "
+                                                   "it stayed away {:.0f} ms past its hold for that",
+                                                   BurstWindows, static_cast<double>(BurstNs) / 1e6, static_cast<double>(QuietWait) / 1e6) :
+                                fextl::string {},
                               Checks);
   }
 
@@ -2267,6 +2353,10 @@ void StartPriorityGuard(std::string_view AppName) {
   const char* RepeatSwitch = Switch("FEX_MAINCORE_ESCAPE_REPEAT");
   const uint32_t RepeatS =
     RepeatSwitch && RepeatSwitch[0] >= '0' && RepeatSwitch[0] <= '9' ? static_cast<uint32_t>(std::clamp(atoi(RepeatSwitch), 0, 30)) : 0;
+  // Build 121: seconds its core must be free of other work's bursts before it comes back; 0/off = build 120.
+  const char* QuietSwitch = Switch("FEX_MAINCORE_ESCAPE_QUIET");
+  const uint32_t QuietS =
+    QuietSwitch && QuietSwitch[0] >= '0' && QuietSwitch[0] <= '9' ? static_cast<uint32_t>(std::clamp(atoi(QuietSwitch), 0, 120)) : 0;
   const char* LiveSwitch = Switch("FEX_MAINCORE_ESCAPE_LIVE");
   const bool EscapeLive = LiveSwitch && (LiveSwitch[0] == '1' || (LiveSwitch[0] == 'o' && LiveSwitch[1] == 'n'));
   int EscapeNice = -20;
@@ -2355,6 +2445,15 @@ void StartPriorityGuard(std::string_view AppName) {
                                                                 RepeatS) :
                                              fextl::string("doubling up to 1.6 s while it has to leave again within 1 s of coming back "
                                                            "(FEX_MAINCORE_ESCAPE_REPEAT=off)");
+    if (EscapeMs) {
+      StatsLogNote(QuietS ? fextl::fmt::format("cores: build 121: while the main thread is away, its core's other work is read every 20 ms "
+                                               "(/proc/schedstat); it comes back only once that core has had no burst of it (half or "
+                                               "more of 20 ms) for {} s, and leaves with a 100 ms hold (FEX_MAINCORE_ESCAPE_QUIET=off: "
+                                               "back after its hold, as in build 120)",
+                                               QuietS) :
+                            fextl::string("cores: the main thread comes back after its hold, whatever runs on its core "
+                                          "(FEX_MAINCORE_ESCAPE_QUIET=off)"));
+    }
     StatsLogNote(
       EscapeMs && EscapeLive ?
         fextl::fmt::format("cores: main thread checked every 2 ms (build 118: while it waits, FEX_MAINCORE_ESCAPE_LIVE=1); once it has "
@@ -2444,6 +2543,7 @@ void StartPriorityGuard(std::string_view AppName) {
       Escape->HoldMaxMs = 10'000;
       Escape->ResetMs = 30'000;
     }
+    Escape->QuietMs = QuietS * 1000;
     StatsLogSetLineProvider(EscapeStatsLine);
     static fextl::unique_ptr<FEXCore::Threads::Thread> WatchThread;
     WatchThread = FEXCore::Threads::Thread::Create(EscapeThread, Escape, {.LowPriority = false, .Internal = true}, "FEXMainWatch");
