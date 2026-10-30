@@ -51,7 +51,8 @@ between them at any time; nothing else changes.
   - `FEX_DISKCACHE=1` (keeps translated code between sessions; important against stutter)
   - `VKD3D_CONFIG=no_upload_hvv,nodxr`
   - `MESA_SHADER_CACHE_MAX_SIZE=4096MB`
-  - Nothing else is needed. All D2R fixes in FEX, VKD3D, Turnip and the layer are on by default for `D2R.exe`.
+  - Nothing else is needed. All D2R fixes in FEX, VKD3D, Turnip and the layer are on by default for `D2R.exe`
+    ([switch list](d2r-switches.md) to turn one off).
   - Do **not** set `VKD3D_DISABLE_EXTENSIONS` (locks the game at 12 FPS).
   - Do **not** set `VKD3D_FEX_DRAW_PROBE` (a measuring test that ends by crashing the game).
 
@@ -103,3 +104,5 @@ away. A D2R patch changes the game code, so after a patch part of the cache is r
 
 Switch the container to `2610-d2rfix28s-thor` and play until the problem shows up. Send the session's
 `D:\fexstats-D2R.exe-b127-<time>-<pid>.txt`. If the clean version crashed, send `D:\fexcrash-D2R.exe-b127-...txt`.
+
+More answers: [FAQ](d2r-faq.md).

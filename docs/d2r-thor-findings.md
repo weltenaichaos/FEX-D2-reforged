@@ -29,7 +29,8 @@ build was tested on the device with a per-second stats log; the numbers below co
   D2R fixes. Two variants per build: `thor` (with the stats log) and `thor-clean` (no log, no measuring, a small crash
   note on an error exit). Both target armv8.4-a and tune for Cortex-X3.
 - **D2R defaults built in** (`Source/Windows/Common/Switches.cpp`): every fix is on for `D2R.exe` without environment
-  variables, and each has a `FEX_*` switch to turn it off. The log's `# switches:` line lists them.
+  variables, and each has a `FEX_*` switch to turn it off ([d2r-switches.md](d2r-switches.md)). The log's `# switches:`
+  line lists them.
 - **Stats log** (`thor` only): per-second CPU, scheduling and wait times per thread, JIT and disk cache work, frame times
   with a breakdown of every slow frame, memory and storage use, and the VKD3D, Turnip and frame generation layer reports.
 - **Hitch fixes, each found in a log first:**

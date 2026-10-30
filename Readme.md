@@ -36,7 +36,8 @@ Its release notes list every change and what is still open.
 
 ## Setup in short
 
-Step by step: **[docs/d2r-thor-setup.md](docs/d2r-thor-setup.md)**.
+Step by step: **[docs/d2r-thor-setup.md](docs/d2r-thor-setup.md)**. Common questions (other devices, storage, playing
+online, frame generation): **[docs/d2r-faq.md](docs/d2r-faq.md)**.
 
 | | |
 |---|---|
@@ -56,7 +57,8 @@ cache; back up `AppData\Local\fex-emu\DiskCache` once it is full.
 ## What we did
 
 Every build was played on the Thor with a per-second log of all threads, frames, CPU and GPU work. Each fix below came
-from a cause found in such a log, and each one can be switched off for comparison. The details and numbers are in
+from a cause found in such a log, and each one can be switched off for comparison
+(**[docs/d2r-switches.md](docs/d2r-switches.md)** lists every switch). The details and numbers are in
 **[docs/d2r-thor-findings.md](docs/d2r-thor-findings.md)**.
 
 ### FEX
@@ -106,10 +108,10 @@ and the game's UI taken from the real frame and moved along its own motion (no s
 
 ## Reporting problems
 
-**Please open an [issue here on GitHub](https://github.com/weltenaichaos/FEX-D2-reforged/issues)** and include:
+**Please open an [issue here on GitHub](https://github.com/weltenaichaos/FEX-D2-reforged/issues/new/choose)** and include:
 
 - your device, GameNative version and which release you use (for example TEST version 4),
-- what happened and when (loading, town, fights, after how long),
+- what happened and when (loading, town, fights, after how long), and any switch you changed,
 - a log: switch the container's FEX to `2610-d2rfix28s-thor`, play until the problem shows up, and attach
   `D:\fexstats-D2R.exe-b<N>-<time>-<pid>.txt` (zip it if it is large). If the clean version crashed, attach
   `D:\fexcrash-D2R.exe-...txt` instead.
@@ -124,7 +126,7 @@ and the game's UI taken from the real frame and moved along its own motion (no s
 | `tools/lsfg/d2r.patch` | Our frame generation layer patch |
 | `tools/release/` | Parts list and notes for the bundle release |
 | `.github/workflows/` | Builds of FEX (`build-fexcore-wcp.yml`), vkd3d-proton, Turnip, the layer, and the bundle release |
-| `docs/d2r-thor-setup.md`, `docs/d2r-thor-findings.md` | Setup guide and what we found |
+| `docs/d2r-thor-setup.md`, `docs/d2r-faq.md`, `docs/d2r-switches.md`, `docs/d2r-thor-findings.md` | Setup guide, FAQ, switch list, and what we found |
 
 ## Credits and licenses
 
