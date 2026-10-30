@@ -777,10 +777,12 @@ namespace {
     OthersProcess(*S, Pid, false);
   }
 
-  void KeepOthersOff(OthersKeeper& K, const Config& C, uint64_t Fallback, int ServerPid, uint32_t Round) {
+  void KeepOthersOff(OthersKeeper& K, const Config& C, uint64_t Fallback, int ServerPid, uint32_t Round, bool SelfShared) {
     OthersSweep S {
       .K = &K, .MainTid = C.MainLinuxTid, .Fast = C.FastMask, .Fallback = Fallback, .All = C.AllMask, .ServerPid = ServerPid, .Round = Round};
-    OthersProcess(S, K.SelfPid, true);
+    if (!SelfShared) {
+      OthersProcess(S, K.SelfPid, true);
+    }
     if (C.Others == OthersMode::User) {
       Linux::ForEachEntry("/proc", OthersEntry, &S);
       OthersHidden(S);
@@ -941,6 +943,24 @@ namespace {
     std::atomic<uint32_t> BurstWindows {};
     std::atomic<uint64_t> BurstNs {}, QuietWaitNs {};
     std::atomic<bool> QuietOn {}; // set by the watcher: /proc/schedstat readable and QuietMs set
+    std::atomic<bool> CoreReadOn {}; // set by the watcher: /proc/schedstat readable (its core's run time while away)
+    // FEX_MAINCORE_ESCAPE_STAY (build 123): once away it stays away (back only when the keeper decides: its core gone
+    // from the game's cores or paused).
+    bool StayWanted {};
+    // FEX_MAINCORE_AWAY_SHARE (build 123): while it is away, this process's threads and the wineserver's that are kept
+    // to the big cores without its core may use that core too. Under Lock: SharedCore is the core opened (0 = none).
+    bool ShareWanted {};
+    int SelfPid {};
+    std::atomic<int> ServerPid {}; // set by the guard each round
+    uint64_t SharedCore {};
+    std::atomic<bool> Sharing {}; // SharedCore set: the guard's keep-off sweeps leave this process and the wineserver alone
+    uint32_t ShareNotes {};       // under Lock
+    // per second, read and reset by EscapeStatsLine: threads given its core, failures, the longest sweep; and the threads
+    // that had it at the last sweep
+    std::atomic<uint32_t> ShareSets {}, ShareFailures {}, SharedSelf {}, SharedServer {};
+    std::atomic<uint64_t> ShareMaxNs {};
+    // per second: its core's run time while away (all tasks there) and the time those 20 ms reads covered
+    std::atomic<uint64_t> CoreAwayNs {}, CoreAwayWindowNs {};
   };
 
   // Run time of all tasks on one CPU so far (ns), from its line in /proc/schedstat ("cpuN yld_count 0 sched_count
@@ -971,6 +991,140 @@ namespace {
 
   uint64_t Counter();
   uint64_t CounterFrequency();
+
+  // Build 123, FEX_MAINCORE_AWAY_SHARE: one process's threads while the main thread is away from its core.
+  struct ShareSweep {
+    const EscapeState* E;
+    int Pid;
+    uint64_t Core; // the main thread's own core
+    uint64_t Big;  // the game's other big cores (where the main thread is now)
+    bool Open;     // true: give threads the core, false: take it away again
+    uint32_t Has;  // threads that have the core after the sweep (Open) or had it (!Open)
+    uint32_t Set;  // threads changed
+    uint32_t Failed;
+    int Error;
+  };
+
+  void ShareTask(const char* Name, void* Arg) {
+    auto* S = static_cast<ShareSweep*>(Arg);
+    const int Tid = atoi(Name);
+    if (Tid <= 0 || (S->Pid == S->E->SelfPid && Tid == S->E->Tid)) {
+      return;
+    }
+    // GetAffinity leaves out CPUs the kernel has paused; the status file has the mask as set (see OthersTask).
+    const uint64_t Usable = Linux::GetAffinity(Tid);
+    if (S->Open) {
+      if (Usable & S->Core) {
+        ++S->Has;
+        return;
+      }
+      // Only threads on the big cores: not the ones on the slowest cores alone (loader threads, FEX's helpers).
+      if (!(Usable & S->Big)) {
+        return;
+      }
+    }
+    char Path[96];
+    snprintf(Path, sizeof(Path), "/proc/%d/task/%d/status", S->Pid, Tid);
+    uint64_t Mask = Linux::ReadAllowedMask(Path);
+    if (!Mask) {
+      Mask = Usable;
+    }
+    if (!Mask) {
+      return;
+    }
+    uint64_t Want = Mask;
+    if (S->Open) {
+      if (Mask & S->Core) {
+        ++S->Has; // it has the core, paused at the moment
+        return;
+      }
+      Want = Mask | S->Core;
+    } else {
+      if (!(Mask & S->Core)) {
+        return;
+      }
+      ++S->Has;
+      Want = Mask & ~S->Core;
+      if (!Want) {
+        Want = S->Big;
+      }
+    }
+    if (!Want || Want == Mask) {
+      return;
+    }
+    const int Result = Linux::SetAffinity(Tid, Want);
+    if (Result == 0) {
+      ++S->Set;
+      if (S->Open) {
+        ++S->Has;
+      }
+    } else {
+      ++S->Failed;
+      S->Error = Result;
+    }
+  }
+
+  // Under E.Lock. Opens Core to this process's threads and the wineserver's (Open), or takes it away from all of them
+  // again before the main thread comes back. Returns the sweep's time in ns.
+  uint64_t ShareCore(EscapeState& E, uint64_t Core, uint64_t Big, bool Open, const char* Why) {
+    const uint64_t Start = Counter();
+    ShareSweep Self {.E = &E, .Pid = E.SelfPid, .Core = Core, .Big = Big, .Open = Open};
+    ShareSweep Server {.E = &E, .Pid = E.ServerPid.load(std::memory_order_relaxed), .Core = Core, .Big = Big, .Open = Open};
+    Linux::ForEachEntry("/proc/self/task", ShareTask, &Self);
+    if (Server.Pid > 0) {
+      const auto Path = fextl::fmt::format("/proc/{}/task", Server.Pid);
+      Linux::ForEachEntry(Path.c_str(), ShareTask, &Server);
+    }
+    const uint64_t Freq = CounterFrequency();
+    const uint64_t Ticks = Counter() - Start;
+    const uint64_t Ns = Ticks / Freq * 1'000'000'000 + Ticks % Freq * 1'000'000'000 / Freq;
+    E.ShareSets.fetch_add(Self.Set + Server.Set, std::memory_order_relaxed);
+    E.ShareFailures.fetch_add(Self.Failed + Server.Failed, std::memory_order_relaxed);
+    if (Ns > E.ShareMaxNs.load(std::memory_order_relaxed)) {
+      E.ShareMaxNs.store(Ns, std::memory_order_relaxed);
+    }
+    if (Open) {
+      E.SharedCore = Core;
+      E.Sharing.store(true, std::memory_order_release);
+      E.SharedSelf.store(Self.Has, std::memory_order_relaxed);
+      E.SharedServer.store(Server.Has, std::memory_order_relaxed);
+    } else {
+      E.SharedCore = 0;
+      E.Sharing.store(false, std::memory_order_release);
+      E.SharedSelf.store(0, std::memory_order_relaxed);
+      E.SharedServer.store(0, std::memory_order_relaxed);
+    }
+    // The first few opens and closes (Why says when), and any with failures.
+    if (Why && (E.ShareNotes < 6 || Self.Failed + Server.Failed)) {
+      ++E.ShareNotes;
+      const fextl::string Failed =
+        Self.Failed + Server.Failed ? fextl::fmt::format(", {} failed (error {})", Self.Failed + Server.Failed, -(Self.Failed ? Self.Error : Server.Error)) :
+                                      fextl::string {};
+      StatsLogNote(Open ? fextl::fmt::format("cores: main thread {}: its core {:#x} opened to {} of this process's threads and {} of the "
+                                             "wineserver's (pid {}), {} and {} have it now, {:.2f} ms{} (FEX_MAINCORE_AWAY_SHARE=0 keeps "
+                                             "them off)",
+                                             Why, Core, Self.Set, Server.Set, Server.Pid, Self.Has, Server.Has,
+                                             static_cast<double>(Ns) / 1e6, Failed) :
+                          fextl::fmt::format("cores: main thread {}: its core {:#x} taken from {} of this process's threads and {} of the "
+                                             "wineserver's first, {:.2f} ms{}",
+                                             Why, Core, Self.Set, Server.Set, static_cast<double>(Ns) / 1e6, Failed));
+    }
+    return Ns;
+  }
+
+  // Every 250 ms on the guard's thread, under E.Lock: while the main thread is away with its core shared, threads that
+  // started since (or that Wine or the game set back) get the core too; at home, nothing keeps it (the watcher takes it
+  // away before the thread comes back, this only catches what that missed).
+  void KeepCoreShared(EscapeState& E) {
+    if (!E.SharedCore) {
+      return;
+    }
+    if (const uint64_t Away = E.Away.load(std::memory_order_relaxed)) {
+      ShareCore(E, E.SharedCore, Away, true, nullptr);
+    } else {
+      ShareCore(E, E.SharedCore, E.AwayMask.load(std::memory_order_relaxed), false, "at home with its core still shared");
+    }
+  }
 
   void* EscapeThread(void* Arg) {
     auto& E = *static_cast<EscapeState*>(Arg);
@@ -1014,11 +1168,14 @@ namespace {
     uint64_t LastWait {}, PrevTick {};
     uint64_t LastT = Counter();
     uint64_t AwayUntil {}, ReturnedAt {}, LastEscapeAt {};
-    // Build 121: its core's other work while it is away (see FEX_MAINCORE_ESCAPE_QUIET).
-    const int CpuStatFd = E.QuietMs ? Linux::Open("/proc/schedstat") : -1;
+    // Build 121: its core's other work while it is away (see FEX_MAINCORE_ESCAPE_QUIET). Build 123: read for the
+    // 'main escape' line too while it stays away or shares its core.
+    const int CpuStatFd = E.QuietMs || E.StayWanted || E.ShareWanted ? Linux::Open("/proc/schedstat") : -1;
     uint64_t ProbeRun {};
-    const bool QuietOn = E.QuietMs && CpuStatFd >= 0 && ReadCpuRunNs(CpuStatFd, 0, ProbeRun);
+    const bool CoreReadOn = CpuStatFd >= 0 && ReadCpuRunNs(CpuStatFd, 0, ProbeRun);
+    const bool QuietOn = E.QuietMs && CoreReadOn;
     E.QuietOn.store(QuietOn, std::memory_order_relaxed);
+    E.CoreReadOn.store(CoreReadOn, std::memory_order_relaxed);
     if (E.QuietMs && !QuietOn) {
       StatsLogNote(fextl::fmt::format("cores: /proc/schedstat can't be read (error {}): the main thread comes back after its hold, as in "
                                       "build 120",
@@ -1078,12 +1235,17 @@ namespace {
         const uint64_t Ns = TicksToNs(Now - LastT);
         E.AwayNs.fetch_add(Ns, std::memory_order_relaxed);
         E.TotalAwayNs.fetch_add(Ns, std::memory_order_relaxed);
-        // Build 121: other work on its core while it is away, read every 20 ms.
-        if (QuietOn && HomeCpu >= 0 && Now - CoreReadAt >= BurstWindowTicks) {
+        // Build 121: other work on its core while it is away, read every 20 ms (with its core shared, build 123, the
+        // game's threads there count too).
+        if (CoreReadOn && HomeCpu >= 0 && Now - CoreReadAt >= BurstWindowTicks) {
           uint64_t RunNs {};
           if (ReadCpuRunNs(CpuStatFd, HomeCpu, RunNs)) {
             const uint64_t WindowNs = TicksToNs(Now - CoreReadAt);
             const uint64_t Busy = CoreReadAt && RunNs >= CoreRunNs ? RunNs - CoreRunNs : 0;
+            if (CoreReadAt) {
+              E.CoreAwayNs.fetch_add(Busy, std::memory_order_relaxed);
+              E.CoreAwayWindowNs.fetch_add(WindowNs, std::memory_order_relaxed);
+            }
             if (CoreReadAt && Busy * 2 >= WindowNs) {
               LastBurstAt = Now;
               E.BurstWindows.fetch_add(1, std::memory_order_relaxed);
@@ -1094,12 +1256,18 @@ namespace {
           }
         }
         const bool Quiet = !QuietOn || Now - LastBurstAt >= QuietTicks;
-        if (Home && Now >= AwayUntil && !Quiet) {
+        if (Home && Now >= AwayUntil && !Quiet && !E.StayWanted) {
           E.QuietWaitNs.fetch_add(Ns, std::memory_order_relaxed);
         }
-        if (!Home || (Now >= AwayUntil && Quiet)) {
+        // Build 123, FEX_MAINCORE_ESCAPE_STAY: it doesn't come back on its own (b121: back after 5 s quiet, into memory
+        // reclaim 2.5 s later); only the keeper can send it back.
+        if (!Home || (!E.StayWanted && Now >= AwayUntil && Quiet)) {
           // Back home, or the keeper decides now (it widened the thread's cores for its own reasons, or its core is paused).
           std::scoped_lock Lock {E.Lock};
+          if (E.SharedCore) {
+            // The game's threads off its core first (FEX_MAINCORE_AWAY_SHARE), then the thread back.
+            ShareCore(E, E.SharedCore, E.Away.load(std::memory_order_relaxed), false, Home ? "coming back" : "sent back by the keeper");
+          }
           if (E.Away.load(std::memory_order_relaxed)) {
             if (Home && E.Home.load(std::memory_order_relaxed) == Home) {
               Linux::SetAffinity(E.Tid, Home);
@@ -1166,11 +1334,18 @@ namespace {
               const uint64_t Total = E.TotalEscapes.fetch_add(1, std::memory_order_relaxed) + 1;
               if (Total <= 5 || Total % 100 == 0) {
                 StatsLogNote(fextl::fmt::format(
-                  "cores: main thread {}: on {:#x}{} for {} ms, #{} (FEX_MAINCORE_ESCAPE=off keeps it there)",
+                  "cores: main thread {}: on {:#x}{} {}, #{} (FEX_MAINCORE_ESCAPE=off keeps it there)",
                   Live ? fextl::fmt::format("ready to run on its core {:#x} without a CPU for {:.1f} ms so far", Home,
                                             static_cast<double>(Waited) / 1e6) :
                          fextl::fmt::format("waited {:.1f} ms for its core {:#x} within 8 ms", static_cast<double>(Waited) / 1e6, Home),
-                  AwayMask, E.AwayNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", E.AwayNice) : fextl::string {}, HoldMs, Total));
+                  AwayMask, E.AwayNice != NiceUnchanged ? fextl::fmt::format(" at nice {}", E.AwayNice) : fextl::string {},
+                  E.StayWanted ? fextl::string("from now on (FEX_MAINCORE_ESCAPE_STAY=0 lets it come back)") :
+                                 fextl::fmt::format("for {} ms", HoldMs),
+                  Total));
+              }
+              // Build 123: its core to the game's other threads while it is away.
+              if (E.ShareWanted) {
+                ShareCore(E, Home, AwayMask, true, "away");
               }
             } else {
               if (Before != NiceUnchanged && Before != -1000) {
@@ -1218,9 +1393,36 @@ namespace {
     const uint32_t BurstWindows = E.BurstWindows.exchange(0, std::memory_order_relaxed);
     const uint64_t BurstNs = E.BurstNs.exchange(0, std::memory_order_relaxed);
     const uint64_t QuietWait = E.QuietWaitNs.exchange(0, std::memory_order_relaxed);
+    const uint64_t CoreAway = E.CoreAwayNs.exchange(0, std::memory_order_relaxed);
+    const uint64_t CoreWindow = E.CoreAwayWindowNs.exchange(0, std::memory_order_relaxed);
+    const uint32_t ShareSets = E.ShareSets.exchange(0, std::memory_order_relaxed);
+    const uint32_t ShareFailures = E.ShareFailures.exchange(0, std::memory_order_relaxed);
+    const uint64_t ShareMax = E.ShareMaxNs.exchange(0, std::memory_order_relaxed);
     const bool AwayNow = E.Away.load(std::memory_order_relaxed) != 0;
     if (!Escapes && !AwayNs && !AwayNow && HomeWait < 20'000'000) {
       return {};
+    }
+    // Its core while away: with it shared (build 123) the game's threads run there too, so all of the core's run time
+    // shows; else only other work runs there.
+    fextl::string CoreText;
+    if (E.Sharing.load(std::memory_order_relaxed) || ShareSets || ShareFailures) {
+      CoreText = fextl::fmt::format("; its core shared with {} of this process's threads and {} of the wineserver's ({} given or taken "
+                                    "this second{}, sweep at most {:.2f} ms)",
+                                    E.SharedSelf.load(std::memory_order_relaxed), E.SharedServer.load(std::memory_order_relaxed), ShareSets,
+                                    ShareFailures ? fextl::fmt::format(", {} failed", ShareFailures) : fextl::string {},
+                                    static_cast<double>(ShareMax) / 1e6);
+    }
+    if (E.CoreReadOn.load(std::memory_order_relaxed) && (AwayNs || BurstWindows)) {
+      CoreText += fextl::fmt::format("; while away its core ran {:.0f} ms of {:.0f} ms read ({}), full (half or more of 20 ms) in {} "
+                                     "checks ({:.1f} ms)",
+                                     static_cast<double>(CoreAway) / 1e6, static_cast<double>(CoreWindow) / 1e6,
+                                     E.Sharing.load(std::memory_order_relaxed) ? "the game's threads and other work" : "other work",
+                                     BurstWindows, static_cast<double>(BurstNs) / 1e6);
+      if (E.StayWanted) {
+        CoreText += "; it stays away";
+      } else if (E.QuietOn.load(std::memory_order_relaxed)) {
+        CoreText += fextl::fmt::format(", it stayed away {:.0f} ms past its hold for that", static_cast<double>(QuietWait) / 1e6);
+      }
     }
     return fextl::fmt::format("  main escape: left its core {} times this second ({} in all), away {:.0f} ms{} (hold {} ms, {} of them "
                               "within {:g} s of coming back), came back {} times; waited for a CPU {:.1f} ms on its core, {:.1f} ms away; "
@@ -1236,12 +1438,7 @@ namespace {
                                                          static_cast<double>(EndedNs) / 1e6 / Ended, static_cast<double>(EndedMax) / 1e6,
                                                          static_cast<double>(MoveToRunMax) / 1e6) :
                                       fextl::string {},
-                              E.QuietOn.load(std::memory_order_relaxed) && (AwayNs || BurstWindows) ?
-                                fextl::fmt::format("; while away, other work filled its core in {} of the 20 ms checks ({:.1f} ms), "
-                                                   "it stayed away {:.0f} ms past its hold for that",
-                                                   BurstWindows, static_cast<double>(BurstNs) / 1e6, static_cast<double>(QuietWait) / 1e6) :
-                                fextl::string {},
-                              Checks);
+                              CoreText, Checks);
   }
 
   struct MainNiceKeeper {
@@ -2205,11 +2402,17 @@ namespace {
         }
       }
       const bool FastUsable = C->FastMask && GameMask && (GameMask & C->FastMask) == C->FastMask && GameMask != C->FastMask;
-      if (ServerPid && C->Cores == CoreMode::Fast && FastUsable) {
+      // Build 123: while the main thread is away and its core shared (FEX_MAINCORE_AWAY_SHARE), this process's threads
+      // and the wineserver's may run there; they are taken off again before it comes back.
+      const bool Shared = Escape && Escape->Sharing.load(std::memory_order_acquire);
+      if (Escape) {
+        Escape->ServerPid.store(ServerPid, std::memory_order_relaxed);
+      }
+      if (ServerPid && C->Cores == CoreMode::Fast && FastUsable && !Shared) {
         KeepServerOff(ServerPid, GameMask & ~C->FastMask, ServerCoreReports);
       }
       if (C->Others != OthersMode::Off && C->Cores == CoreMode::Fast && FastUsable) {
-        KeepOthersOff(Others, *C, GameMask & ~C->FastMask, ServerPid, Round);
+        KeepOthersOff(Others, *C, GameMask & ~C->FastMask, ServerPid, Round, Shared);
       }
       // What the main thread's Linux cores should be until the next round: the fast core, or with it the game's big cores
       // (never the slowest ones) while it waits too long for the fast one.
@@ -2319,6 +2522,9 @@ namespace {
           }
           KeepMainCore(Keeper, KeepFast, KeepWide);
           KeepMainNice(NiceKeeper);
+          if (Escape) {
+            KeepCoreShared(*Escape);
+          }
         }
         if (C->Loader != LoaderMode::Off) {
           LoaderTick(Finder, Threads);
@@ -2359,6 +2565,11 @@ void StartPriorityGuard(std::string_view AppName) {
     QuietSwitch && QuietSwitch[0] >= '0' && QuietSwitch[0] <= '9' ? static_cast<uint32_t>(std::clamp(atoi(QuietSwitch), 0, 120)) : 0;
   const char* LiveSwitch = Switch("FEX_MAINCORE_ESCAPE_LIVE");
   const bool EscapeLive = LiveSwitch && (LiveSwitch[0] == '1' || (LiveSwitch[0] == 'o' && LiveSwitch[1] == 'n'));
+  // Build 123: once away it stays away; while away its core is open to the game's other threads.
+  const char* StaySwitch = Switch("FEX_MAINCORE_ESCAPE_STAY");
+  const bool EscapeStay = StaySwitch && (StaySwitch[0] == '1' || (StaySwitch[0] == 'o' && StaySwitch[1] == 'n'));
+  const char* ShareSwitch = Switch("FEX_MAINCORE_AWAY_SHARE");
+  const bool AwayShare = ShareSwitch && (ShareSwitch[0] == '1' || (ShareSwitch[0] == 'o' && ShareSwitch[1] == 'n'));
   int EscapeNice = -20;
   if (const char* N = Switch("FEX_MAINCORE_ESCAPE_NICE"); N) {
     EscapeNice = N[0] == '-' || (N[0] >= '0' && N[0] <= '9') ? std::clamp(atoi(N), -20, 19) : NiceUnchanged;
@@ -2446,13 +2657,27 @@ void StartPriorityGuard(std::string_view AppName) {
                                              fextl::string("doubling up to 1.6 s while it has to leave again within 1 s of coming back "
                                                            "(FEX_MAINCORE_ESCAPE_REPEAT=off)");
     if (EscapeMs) {
-      StatsLogNote(QuietS ? fextl::fmt::format("cores: build 121: while the main thread is away, its core's other work is read every 20 ms "
+      StatsLogNote(EscapeStay ? fextl::string("cores: build 123: once the main thread has left its core it stays on the game's other big "
+                                              "cores for the rest of the run (in the build 121 run it came back once after 5 s without "
+                                              "outside work there and memory reclaim hit it 2.5 s later); FEX_MAINCORE_ESCAPE_STAY=0 lets "
+                                              "it come back as in build 121") :
+                                fextl::string("cores: the main thread comes back to its core by the rules below (FEX_MAINCORE_ESCAPE_STAY=0)"));
+      StatsLogNote(AwayShare ? fextl::string("cores: build 123: while the main thread is away, its core is open to this process's other "
+                                             "threads and the wineserver's that run on the big cores (set at the Linux level when it "
+                                             "leaves, kept every 250 ms, taken away again before it comes back); in the build 121 run "
+                                             "the game's job workers waited 328 ms a second for a CPU in a fight while that core was "
+                                             "82% idle. FEX_MAINCORE_AWAY_SHARE=0 keeps them off it") :
+                               fextl::string("cores: the main thread's core stays closed to the game's other threads while it is away "
+                                             "(FEX_MAINCORE_AWAY_SHARE=0)"));
+      if (!EscapeStay) {
+        StatsLogNote(QuietS ? fextl::fmt::format("cores: build 121: while the main thread is away, its core's other work is read every 20 ms "
                                                "(/proc/schedstat); it comes back only once that core has had no burst of it (half or "
                                                "more of 20 ms) for {} s, and leaves with a 100 ms hold (FEX_MAINCORE_ESCAPE_QUIET=off: "
                                                "back after its hold, as in build 120)",
                                                QuietS) :
                             fextl::string("cores: the main thread comes back after its hold, whatever runs on its core "
                                           "(FEX_MAINCORE_ESCAPE_QUIET=off)"));
+      }
     }
     StatsLogNote(
       EscapeMs && EscapeLive ?
@@ -2544,6 +2769,9 @@ void StartPriorityGuard(std::string_view AppName) {
       Escape->ResetMs = 30'000;
     }
     Escape->QuietMs = QuietS * 1000;
+    Escape->StayWanted = EscapeStay;
+    Escape->ShareWanted = AwayShare;
+    Escape->SelfPid = Linux::GetPid();
     StatsLogSetLineProvider(EscapeStatsLine);
     static fextl::unique_ptr<FEXCore::Threads::Thread> WatchThread;
     WatchThread = FEXCore::Threads::Thread::Create(EscapeThread, Escape, {.LowPriority = false, .Internal = true}, "FEXMainWatch");

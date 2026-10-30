@@ -90,6 +90,14 @@ namespace {
     // came back each time its 10 s hold ended, into the next burst (a 32-88 ms wait every 10.4 s). While away it now comes
     // back only once its core has had no burst of other work for 5 s (read every 20 ms from /proc/schedstat). "off" = 120.
     {"FEX_MAINCORE_ESCAPE_QUIET", "5"},
+    // Build 123: in the build 121 run the main thread left core 7 once at the start and stayed away, except once: after 5 s
+    // without outside work there it came back, and memory reclaim (kswapd) hit it 2.5 s later (a 46 ms frame). It now
+    // stays away for the rest of the run once it has left. "0" = build 121 (back after 5 s quiet).
+    {"FEX_MAINCORE_ESCAPE_STAY", "1"},
+    // Build 123: in the same run's heaviest fight the game's job workers waited 328 ms a second for a CPU on cores 3-6
+    // (now shared with the main thread) while core 7 was 82% idle. While the main thread is away, this process's threads
+    // and the wineserver's may use core 7 too; they lose it again before the main thread comes back. "0" keeps them off.
+    {"FEX_MAINCORE_AWAY_SHARE", "1"},
     {"FEX_MAINCORE_ESCAPE_NICE", "-20"},
     // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
     // PriorityGuard.h). In the build 75 log the main thread waited for its core 7 ms per slow frame, nearly always inside
@@ -516,6 +524,8 @@ namespace {
     "FEX_MAINCORE_ESCAPE_LIVE",
     "FEX_MAINCORE_ESCAPE_REPEAT",
     "FEX_MAINCORE_ESCAPE_QUIET",
+    "FEX_MAINCORE_ESCAPE_STAY",
+    "FEX_MAINCORE_AWAY_SHARE",
     "FEX_MAINCORE_ESCAPE_NICE",
     "FEX_MAINCORE_OTHERS",
     "FEX_HELPER_CORES",

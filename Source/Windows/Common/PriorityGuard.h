@@ -82,6 +82,21 @@ namespace FEX::Windows {
 //                      10 s hold ended it came back into the next burst (32-88 ms waits every 10.4 s, 6 slow frames).
 //                      The 'main escape' line adds how many 20 ms checks found its core full and how long it stayed away
 //                      past its hold for that. "off" or 0, or /proc/schedstat unreadable = back after its hold (build 120).
+//   FEX_MAINCORE_ESCAPE_STAY=1  build 123 (D2R default 1): once the main thread has left its core it stays on the game's
+//                      other big cores for the rest of the run (it still goes back when the keeper sends it: its core no
+//                      longer among the game's cores). Build 121 run: it left once at the start and stayed away except once,
+//                      when 5 s without outside work let it come back; memory reclaim (kswapd) hit it 2.5 s later (46 ms
+//                      frame). "0" or "off" = the hold and FEX_MAINCORE_ESCAPE_QUIET decide (build 121).
+//   FEX_MAINCORE_AWAY_SHARE=1  build 123 (D2R default 1): while the main thread is away, its core is open to this
+//                      process's other threads and the wineserver's that run on the big cores (not those on the slowest
+//                      cores alone: loader threads, FEX's helpers). Set at the Linux level by the watcher when the thread
+//                      leaves, kept every 250 ms (new threads, threads Wine or the game set back), and taken away from all
+//                      of them before the thread comes back; FEX_MAINCORE_OTHERS and the wineserver keep-off leave this
+//                      process and the wineserver alone meanwhile. Build 121 run: in the heaviest fight the job workers
+//                      waited 328 ms a second for a CPU on the four cores they then shared with the main thread, while its
+//                      core was 82% idle (a 42 ms frame). The 'main escape' line adds how many threads have the core and
+//                      the core's whole run time while away. With FEX_MAINCORE_ESCAPE_STAY=0 the quiet check then counts
+//                      the game's threads on that core too. "0" or "off" keeps them off it (build 121).
 //   FEX_MAINCORE_ESCAPE_NICE=-20  its nice while away (D2R default -20, above the game's job workers at -10 there: on
 //                      those cores they are in the same CPU group, so nice counts); "off" leaves it at FEX_MAIN_NICE.
 //   FEX_MAINCORE_OTHERS=user  with "fast": every other thread of the app's Linux user stays off the main thread's core
