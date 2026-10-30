@@ -179,7 +179,7 @@ namespace FEX::Windows {
 //                        before the draw's waves may start
 //   FEX_TU_NOPREAMBLE=lit  that second binary always
 //
-// GameNative's frame generation layer, FEX's D2R build (build 113, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7-9). It
+// GameNative's frame generation layer, FEX's D2R build (build 113, tools/lsfg/d2r.patch, release lsfg-d2r-N, layer 7-10). It
 // reads these from the Unix environment (__wine_set_unix_env) at its first present. From build 114 FEX sets them to 0 or 1
 // only in the game (where the switch has a value): build 113 set 0 in Steam, which has no D2R defaults, and the game
 // inherited it (the '# framegen:' note says what the variable was when the game started):
@@ -202,6 +202,15 @@ namespace FEX::Windows {
 //   FEX_LSFG_GPU_TIMES=1   (the D2R default from build 116, layer 9) GPU timestamps around the layer's copy and frame
 //                          generation (before only with LSFG_DEBUG): the framegen line shows their GPU time per frame.
 //                          0 = LSFG_D2R_GPU_TIMES=0.
+//   FEX_LSFG_PRESENT_NICE=-20 (the D2R default from build 117, layer 10) the layer's present thread runs at this nice
+//                          (LSFG_D2R_DEFER_NICE, -20 to 19). Build 116 (layer 9, nice -10): in fights the thread woke 1-6
+//                          ms late from its timed sleeps on cores the game's nice -10 job workers kept busy, and 9% of the
+//                          real frames went out 1 ms or more late. 0 or "off" = the nice the thread starts with.
+//   FEX_LSFG_GEN_GAP=50    (the D2R default from build 117, layer 10) a game frame that comes more than this many ms after
+//                          the one before (a freeze) gets no generated frame, only itself at the generated frame's slot: a
+//                          frame made between two pictures that far apart in time guesses a big jump (build 116: once a
+//                          chest's button label halfway across the screen). LSFG_D2R_GEN_GAP_MS (layer: at most 1000);
+//                          0 or "off" = every frame gets its generated frame.
 // The layer writes stats.txt next to its conf.toml every 500 ms; with the stats log a 'framegen' line shows it each second
 // (ARM64EC/Vkd3dReport.cpp).
 //

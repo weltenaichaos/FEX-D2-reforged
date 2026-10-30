@@ -1,5 +1,5 @@
 diff --git a/include/context.hpp b/include/context.hpp
-index ae382de..e6f9095 100644
+index ae382de..17d6f59 100644
 --- a/include/context.hpp
 +++ b/include/context.hpp
 @@ -20,6 +20,11 @@
@@ -86,7 +86,7 @@ index ae382de..e6f9095 100644
  
      void dumpFrameImages(const Hooks::DeviceInfo& info, uint32_t presentIdx);
      int dumpDoneFrames{0};          // presents already dumped (debug_dump)
-@@ -141,6 +194,103 @@ class LsContext {
+@@ -141,6 +194,109 @@ class LsContext {
          std::vector<Mini::CommandBuffer> postCopyBufs; // copy from out_n to swapchain image
          std::vector<Mini::Semaphore> postCopySemaphores; // signal when postCopyBuf is done
          std::vector<Mini::Semaphore> prevPostCopySemaphores; // signal for previous postCopyBuf
@@ -152,6 +152,7 @@ index ae382de..e6f9095 100644
 +        int64_t wokeLateMaxNs{0};
 +        uint64_t spinNs{0};         // time waited on the CPU before slots
 +        std::array<uint32_t, 16> cpus{}; // presents by the CPU they were called on
++        int presentNice{-100};      // layer 10: the thread's nice once it set it (-100: not yet)
 +    };
 +private:
 +    // D2R layer 8: a frame started at the game's blit submit (prepareEarly)
@@ -165,6 +166,7 @@ index ae382de..e6f9095 100644
 +        uint32_t genCount{0};
 +        int lastPresentedGen{-1};
 +        int64_t preparedNs{0};
++        bool gapSkipped{false};        // layer 10: no generated frame, the game frame took too long
 +    };
 +    EarlyFrame early;
 +    bool earlyOff{false};            // a mismatch turned it off for this swapchain
@@ -177,6 +179,10 @@ index ae382de..e6f9095 100644
 +    // last two windows (FEX reads it once a second, the windows are 500 ms)
 +    int64_t prevLateMaxNs{0}, prevGenLateMaxNs{0}, prevWokeLateMaxNs{0};
 +    std::array<uint32_t, 16> prevCpus{};
++    // layer 10: when the frame before started its copy, and whether this
++    // frame came too long after it for a generated frame
++    int64_t lastWorkStartNs{0};
++    bool gapSkip{false};
 +
 +    bool startFrameWork(const Hooks::DeviceInfo& info, VkQueue queue,
 +        const std::vector<VkSemaphore>& gameRenderSemaphores, uint32_t presentIdx,
@@ -240,7 +246,7 @@ index 2990194..22471f4 100644
      /// Call to the original vkQueueSubmit function.
      VkResult ovkQueueSubmit(
 diff --git a/src/context.cpp b/src/context.cpp
-index 2385454..143a003 100644
+index 2385454..edfc0b5 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
 @@ -47,6 +47,11 @@ bool LsContext::isStale() const {
@@ -255,7 +261,7 @@ index 2385454..143a003 100644
  
  namespace {
      // Every GPU wait is bounded so an incompatible sync path degrades to
-@@ -60,6 +65,12 @@ namespace {
+@@ -60,6 +65,16 @@ namespace {
          return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
      }
  
@@ -264,11 +270,15 @@ index 2385454..143a003 100644
 +    // generated: the stats file has the totals, FEX takes differences.
 +    std::atomic<uint64_t> g_lateTotals[4]{};
 +    std::atomic<uint64_t> g_presentTotals[2]{};
++    // Layer 10: frames shown without a generated frame before them because
++    // the game frame took longer than LSFG_D2R_GEN_GAP_MS (since the game
++    // started; FEX takes differences).
++    std::atomic<uint64_t> g_gapSkipTotal{0};
 +
      // Present-thread watchdog: the present hook publishes the stage it is
      // about to block in; a background thread reports any stage held for more
      // than 2 seconds. "idle" means the layer returned to the game — a freeze
-@@ -98,14 +109,15 @@ namespace {
+@@ -98,14 +113,15 @@ namespace {
          }).detach();
      }
  
@@ -290,7 +300,7 @@ index 2385454..143a003 100644
      }
  
      void imageBarrier(VkCommandBuffer cmd, VkImage img,
-@@ -245,6 +257,44 @@ namespace {
+@@ -245,6 +261,47 @@ namespace {
          double workMs, genSleepMs, genLateMs, genPresentMs, realPresentMs;
          uint64_t genSkips;
          std::string seq;
@@ -332,16 +342,19 @@ index 2385454..143a003 100644
 +        bool gpuTimesOn;
 +        uint64_t gpuSamples;      // frames with GPU times this window
 +        double gpuCopyMs, gpuFramegenMs, gpuFrameMs; // per such frame
++        // layer 10
++        int presentNice;          // the present thread's nice (-100: not known yet)
++        int64_t genGapMs;         // no generated frame after a game frame longer than this (0: off)
      };
  
      void writeStats(const std::filesystem::path& configFile, double fps, double baseFps,
-@@ -259,11 +309,389 @@ namespace {
+@@ -259,11 +316,414 @@ namespace {
              << "\ngen_present_ms=" << d.genPresentMs
              << "\nreal_present_ms=" << d.realPresentMs
              << "\ngen_skips=" << d.genSkips
 -            << "\nseq=" << d.seq << '\n';
 +            << "\nseq=" << d.seq
-+            << "\nlayer=d2r-9"
++            << "\nlayer=d2r-10"
 +            << "\ncall_ms=" << d.callMs
 +            << "\ndefer=" << (d.deferOn ? "on" : "off")
 +            << "\ndefer_frames=" << d.deferFrames
@@ -384,14 +397,20 @@ index 2385454..143a003 100644
 +            << "\ngpu_samples=" << d.gpuSamples
 +            << "\ngpu_copy_ms=" << d.gpuCopyMs
 +            << "\ngpu_framegen_ms=" << d.gpuFramegenMs
-+            << "\ngpu_frame_ms=" << d.gpuFrameMs << '\n';
++            << "\ngpu_frame_ms=" << d.gpuFrameMs
++            << "\npresent_nice=" << d.presentNice
++            << "\ngen_gap_ms=" << d.genGapMs
++            << "\ngen_gap_skips_total=" << g_gapSkipTotal.load(std::memory_order_relaxed) << '\n';
 +    }
 +
 +    // D2R: the real frame's present waits for its slot on a thread of the
 +    // layer instead of inside the game's vkQueuePresentKHR, where VKD3D holds
 +    // its only VkQueue (Adreno has one) and every submit of the game waited
 +    // ~17 ms a frame at 2x from 30. LSFG_D2R_DEFER=0 turns it off (FEX:
-+    // FEX_LSFG_DEFER=0); LSFG_D2R_DEFER_NICE sets the thread's nice (-10).
++    // FEX_LSFG_DEFER=0); LSFG_D2R_DEFER_NICE sets the thread's nice (-20 from
++    // layer 10, FEX: FEX_LSFG_PRESENT_NICE; -10 up to layer 9, when the
++    // thread woke 1-6 ms late in fights on cores the game's nice -10 job
++    // workers kept busy and real frames went out late).
 +    bool deferEnabled() {
 +        static const bool on = [] {
 +            const char* v = std::getenv("LSFG_D2R_DEFER");
@@ -428,7 +447,7 @@ index 2385454..143a003 100644
 +    int deferNice() {
 +        static const int nice = [] {
 +            const char* v = std::getenv("LSFG_D2R_DEFER_NICE");
-+            return v ? std::atoi(v) : -10;
++            return v ? std::clamp(std::atoi(v), -20, 19) : -20;
 +        }();
 +        return nice;
 +    }
@@ -456,6 +475,22 @@ index 2385454..143a003 100644
 +            return !(v && v[0] == '0');
 +        }();
 +        return on;
++    }
++
++    // Layer 10, LSFG_D2R_GEN_GAP_MS (FEX: FEX_LSFG_GEN_GAP): a game frame that
++    // took longer than this since the one before (a freeze: the build 116 log
++    // had 48-156 ms frames while Android's memory reclaim held the main
++    // thread's core) gets no generated frame before it, only itself, at the
++    // generated frame's slot: a frame made between two pictures that far
++    // apart guesses a big jump (a label shown halfway between). Default 50, at
++    // most 1000, 0 = off.
++    int64_t genGapNs() {
++        static const int64_t ns = [] {
++            const char* v = std::getenv("LSFG_D2R_GEN_GAP_MS");
++            const int64_t ms = v ? static_cast<int64_t>(std::atoll(v)) : 50;
++            return std::clamp<int64_t>(ms, 0, 1000) * 1'000'000;
++        }();
++        return ns;
 +    }
 +
 +    inline void cpuRelax() {
@@ -649,7 +684,10 @@ index 2385454..143a003 100644
 +        if (nice != 0 && setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), nice) != 0)
 +            std::cerr << "lsfg-vk: present thread: nice " << nice << " refused (errno "
 +                << errno << ")\n";
++        errno = 0;
++        const int niceNow = getpriority(PRIO_PROCESS, static_cast<id_t>(gettid()));
 +        std::unique_lock<std::mutex> lk(s.lock);
++        s.presentNice = errno == 0 ? niceNow : -100;
 +        for (;;) {
 +            s.cv.wait(lk, [&] { return s.jobNext < s.jobCount || s.stop; });
 +            if (s.jobNext >= s.jobCount)
@@ -726,7 +764,7 @@ index 2385454..143a003 100644
  LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          VkExtent2D extent, const std::vector<VkImage>& swapchainImages)
          : swapchain(swapchain), swapchainImages(swapchainImages),
-@@ -318,7 +746,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -318,7 +778,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
      // Android: single-device framegen on the game's own device and queue —
      // two ICDs interpret shared AHB memory differently and scramble it.
  
@@ -736,7 +774,7 @@ index 2385454..143a003 100644
  
      const VkImageUsageFlags sharedUsage = VK_IMAGE_USAGE_STORAGE_BIT
          | VK_IMAGE_USAGE_SAMPLED_BIT
-@@ -333,7 +763,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -333,7 +795,9 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          this->out_n.emplace_back(Mini::Image::createDeviceLocal(info.device, info.physicalDevice,
              extent, format, sharedUsage, VK_IMAGE_ASPECT_COLOR_BIT));
  
@@ -746,7 +784,7 @@ index 2385454..143a003 100644
  
      const auto shaderLoader = [](const std::string& name) {
          // debug override: override_<name>.spv next to conf.toml (brackets -> underscores)
-@@ -364,22 +796,24 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -364,22 +828,24 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          return spirv;
      };
      if (conf.performance)
@@ -773,22 +811,25 @@ index 2385454..143a003 100644
      if (conf.performance)
          ctxId = LSFG_3_1P::createContextFromImages(
              this->frame_0.handle(), this->frame_1.handle(),
-@@ -431,7 +865,13 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -431,7 +897,16 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
              throw LSFG::vulkan_error(VK_TIMEOUT, "Timed out initializing shared image layouts");
      }
  
 -    std::cerr << "lsfg-vk: single-device framegen context created (id=" << ctxId << ")\n";
 +    std::cerr << "lsfg-vk: single-device framegen context created (id=" << ctxId
-+        << ", D2R layer 9, real frame presented " << (deferEnabled() ? "from the layer's present thread" : "inline")
++        << ", D2R layer 10, real frame presented " << (deferEnabled() ? "from the layer's present thread" : "inline")
 +        << ", frames start " << (earlyEnabled() && deferEnabled() && genDrawnEnabled() && conf.multiplier == 2
 +            ? "at the game's blit submit" : "in the game's present")
 +        << ", presents waited on the CPU from " << presentEarlyNs() / 1000 << " us before their slot"
 +        << ", GPU times " << (gpuTimesEnabled() ? "on" : "off")
++        << ", present thread nice " << deferNice()
++        << ", no generated frame after a game frame longer than "
++        << (genGapNs() > 0 ? std::to_string(genGapNs() / 1'000'000) + " ms" : std::string("- (off)"))
 +        << ")\n";
  
  #else
      // Desktop Linux path: use OPAQUE_FD-based image sharing
-@@ -500,6 +940,10 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+@@ -500,6 +975,10 @@ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
          pass.postCopyBufs.resize(conf.multiplier - 1);
          pass.postCopySemaphores.resize(conf.multiplier - 1);
          pass.prevPostCopySemaphores.resize(conf.multiplier - 1);
@@ -799,7 +840,7 @@ index 2385454..143a003 100644
      }
  }
  
-@@ -524,7 +968,17 @@ void LsContext::paceBaseFrame(int fpsLimit) {
+@@ -524,7 +1003,17 @@ void LsContext::paceBaseFrame(int fpsLimit) {
          const int64_t stepNs = std::max<int64_t>(1,
              (targetNs + this->vsyncPeriodNs / 2) / this->vsyncPeriodNs) * this->vsyncPeriodNs;
          int64_t due = this->pacerNextDueNs;
@@ -818,7 +859,7 @@ index 2385454..143a003 100644
              due = this->vsyncPhaseNs
                  + ((entryNs - this->vsyncPhaseNs) / stepNs + 1) * stepNs;
          }
-@@ -731,64 +1185,81 @@ VkResult LsContext::presentPassthrough(VkQueue queue, const VkPresentInfoKHR* pP
+@@ -731,64 +1220,89 @@ VkResult LsContext::presentPassthrough(VkQueue queue, const VkPresentInfoKHR* pP
  #endif
  }
  
@@ -892,6 +933,14 @@ index 2385454..143a003 100644
 +        return false;
      }
      this->preCopyFence.reset();
++    {
++        // layer 10: a game frame that came too long after the one before
++        // gets no generated frame (see genGapNs)
++        const int64_t startNs = nowNs();
++        this->gapSkip = genGapNs() > 0 && this->lastWorkStartNs != 0
++            && startNs - this->lastWorkStartNs > genGapNs();
++        this->lastWorkStartNs = startNs;
++    }
 +    if (this->frameIdx == 0 && !this->dbgQueryPool && (Layer::lsfgDebug() || gpuTimesEnabled())) {
 +        auto createPool = reinterpret_cast<PFN_vkCreateQueryPool>(
 +            Layer::ovkGetDeviceProcAddr(info.device, "vkCreateQueryPool"));
@@ -941,7 +990,7 @@ index 2385454..143a003 100644
  
      // 1. copy swapchain image to frame_0/frame_1
      //    Use a simple semaphore (no fd export) to synchronize the copy.
-@@ -799,6 +1270,12 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -799,6 +1313,12 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      pass.preCopySemaphores.at(1) = Mini::Semaphore(info.device);
      pass.preCopyBuf = Mini::CommandBuffer(info.device, this->cmdPool);
      pass.preCopyBuf.begin();
@@ -954,7 +1003,7 @@ index 2385454..143a003 100644
      {
          VkCommandBuffer cmd = pass.preCopyBuf.handle();
          VkImage inputImg = this->frameIdx % 2 == 0
-@@ -822,6 +1299,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -822,6 +1342,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
      }
@@ -964,7 +1013,7 @@ index 2385454..143a003 100644
      pass.preCopyBuf.end();
  
      std::vector<VkSemaphore> gameRenderSemaphores2 = gameRenderSemaphores;
-@@ -839,6 +1319,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -839,6 +1362,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          { pass.preCopySemaphores.at(0).handle(),
            pass.preCopySemaphores.at(1).handle() },
          this->preCopyFence.handle());
@@ -972,7 +1021,7 @@ index 2385454..143a003 100644
      const int64_t workStartNs = nowNs();
  
      // 2. Tell framegen to generate intermediary frames. Graph-side fence
-@@ -846,6 +1327,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -846,6 +1370,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      std::vector<int> noOutSems;  // empty
      setStage("framegen submit");
      try {
@@ -980,7 +1029,7 @@ index 2385454..143a003 100644
          if (conf.performance)
              LSFG_3_1P::presentContext(*this->lsfgCtxId, -1, noOutSems);
          else
-@@ -871,6 +1353,278 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -871,6 +1396,282 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      if (conf.debugDump > 0 && this->dumpDoneFrames < conf.debugDump
              && !this->dumpFailed)
          this->dumpFrameImages(info, presentIdx);
@@ -1091,7 +1140,11 @@ index 2385454..143a003 100644
 +    e.gameSemaphore = gameSemaphore;
 +    e.frameIdx = this->frameIdx;
 +    auto& pass = this->passInfos.at(this->frameIdx % 8);
-+    if (framegen) {
++    if (framegen && this->gapSkip) {
++        // layer 10: only the real frame, at the generated frame's slot
++        e.gapSkipped = true;
++        g_gapSkipTotal.fetch_add(1, std::memory_order_relaxed);
++    } else if (framegen) {
 +        try {
 +            for (size_t i = 0; i < static_cast<size_t>(conf.multiplier - 1); i++) {
 +                pass.acquireSemaphores.at(i) = Mini::Semaphore(info.device);
@@ -1259,7 +1312,7 @@ index 2385454..143a003 100644
  
      // Late-frame guard interval: 1/multiplier of the measured base interval,
      // anchored on the paced real frame. Presents are not delayed to it — a
-@@ -880,9 +1634,43 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -880,9 +1681,48 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          baseIntervalNs = 1'000'000'000ull / static_cast<uint64_t>(conf.fpsLimit);
      const uint64_t outIntervalNs = baseIntervalNs / conf.multiplier;
  
@@ -1299,13 +1352,18 @@ index 2385454..143a003 100644
 +                throw LSFG::vulkan_error(t.res, "Failed to present swapchain image");
 +        }
 +    }
-+    const size_t genLoopCount = fromEarly ? 0 : static_cast<size_t>(conf.multiplier - 1);
++    // layer 10: no generated frame after a game frame that took too long; the
++    // real frame then goes out at the generated frame's slot
++    const bool gapSkipped = fromEarly ? this->early.gapSkipped : (started && this->gapSkip);
++    if (gapSkipped && !fromEarly)
++        g_gapSkipTotal.fetch_add(1, std::memory_order_relaxed);
++    const size_t genLoopCount = fromEarly || gapSkipped ? 0 : static_cast<size_t>(conf.multiplier - 1);
 +    for (size_t i = 0; i < genLoopCount; i++) {
 +        int64_t genDueNs = 0;
          // A generated frame far past its slot is dropped to hold cadence
          // (presenting it late would push everything after it off-pace).
          // Present as early as possible and let the FIFO queue space the frames
-@@ -898,6 +1686,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -898,6 +1738,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          if (outIntervalNs > 0) {
              const int64_t dueNs = this->pacerAnchorNs
                  + static_cast<int64_t>(i * outIntervalNs);
@@ -1313,7 +1371,7 @@ index 2385454..143a003 100644
              const int64_t nowGenNs = nowNs();
              if (nowGenNs > dueNs + static_cast<int64_t>(outIntervalNs) * 3 / 2) {
                  this->statsGenSkips++;
-@@ -934,48 +1723,38 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -934,48 +1775,38 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
  
          // copy output image to swapchain image (same device: plain
          // compute->transfer barriers order the read after framegen's write)
@@ -1391,7 +1449,7 @@ index 2385454..143a003 100644
  
          // present swapchain image
          // Never attach the game's pNext chain here: it can carry a
-@@ -1009,9 +1788,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1009,9 +1840,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      //    (the first one was consumed by that frame's own present). If every
      //    generated frame was skipped no semaphore is needed: the copy fence
      //    wait above already proved the game's rendering finished.
@@ -1400,12 +1458,12 @@ index 2385454..143a003 100644
 -            + static_cast<int64_t>((conf.multiplier - 1) * outIntervalNs));
 +    const bool paced = outIntervalNs > 0 && conf.fpsLimit > 0;
 +    const int64_t realDueNs = paced
-+        ? this->pacerAnchorNs + static_cast<int64_t>((conf.multiplier - 1) * outIntervalNs)
++        ? this->pacerAnchorNs + (gapSkipped ? 0 : static_cast<int64_t>((conf.multiplier - 1) * outIntervalNs))
 +        : 0;
      if (this->statsSeq.size() < 200) {
          this->statsSeq += 'A' + static_cast<char>(presentIdx % 26);
          this->statsSeq += '0' + static_cast<char>(gameRenderSemaphores.size() % 10);
-@@ -1020,24 +1800,71 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1020,24 +1852,71 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      if (lastPresentedGen >= 0)
          finalWaits.push_back(pass.prevPostCopySemaphores
              .at(static_cast<size_t>(lastPresentedGen)).handle());
@@ -1493,7 +1551,7 @@ index 2385454..143a003 100644
  
      // Publish measured fps + per-stage timing for the HUD and diagnosis.
      const int64_t statsNow = nowNs();
-@@ -1047,6 +1874,45 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1047,6 +1926,46 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          const double windowSec =
              static_cast<double>(statsNow - this->statsWindowStartNs) / 1e9;
          const double frames = static_cast<double>(this->statsRealPresents);
@@ -1519,6 +1577,7 @@ index 2385454..143a003 100644
 +            deferStats.wokeLateMaxNs = d.wokeLateMaxNs;
 +            deferStats.spinNs = d.spinNs;
 +            deferStats.cpus = d.cpus;
++            deferStats.presentNice = d.presentNice;
 +            d.frames = d.lateNs = d.presentNs = d.waitNs = d.acquireWaitNs = 0;
 +            d.genFrames = d.genWaitNs = d.genLateNs = d.genPresentNs = d.genTimeouts = 0;
 +            d.lateMaxNs = d.genLateMaxNs = d.wokeLateMaxNs = 0;
@@ -1539,7 +1598,7 @@ index 2385454..143a003 100644
          writeStats(conf.config_file,
              static_cast<double>(this->statsPresents) / windowSec,
              frames / windowSec,
-@@ -1058,8 +1924,78 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1058,8 +1977,80 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
                  .realPresentMs = static_cast<double>(this->statsRealPresentNs) / 1e6 / frames,
                  .genSkips      = this->statsGenSkips,
                  .seq           = this->statsSeq,
@@ -1584,6 +1643,8 @@ index 2385454..143a003 100644
 +                .gpuCopyMs     = this->dbgGpuCopyNs / gpuN / 1e6,
 +                .gpuFramegenMs = this->dbgGpuLsfgNs / gpuN / 1e6,
 +                .gpuFrameMs    = this->dbgGpuIntervalNs / gpuN / 1e6,
++                .presentNice   = deferStats.presentNice,
++                .genGapMs      = genGapNs() / 1'000'000,
              });
 +        this->prevLateMaxNs = deferStats.lateMaxNs;
 +        this->prevGenLateMaxNs = deferStats.genLateMaxNs;
@@ -1618,7 +1679,7 @@ index 2385454..143a003 100644
          this->statsPresents = 0;
          this->statsRealPresents = 0;
          this->statsWorkNs = 0;
-@@ -1068,6 +2004,13 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -1068,6 +2059,13 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          this->statsGenPresentNs = 0;
          this->statsRealPresentNs = 0;
          this->statsGenSkips = 0;

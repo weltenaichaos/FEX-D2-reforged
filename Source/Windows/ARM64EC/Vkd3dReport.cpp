@@ -406,10 +406,13 @@ namespace {
   // late after their slot). A 'framegen' line shows it once a second while it changes.
   // Layer 9 (build 116) adds the latest present after its slot, presents 1 ms / 4 ms or more late (totals since the game
   // started: the line shows the difference to the last read), the present thread's wake-ups and CPUs, and gpu_* times.
+  // Layer 10 (build 117) adds the present thread's nice and the frames without a generated frame because the game frame
+  // took longer than gen_gap_ms (a total, shown as the difference).
   struct FramegenState {
     fextl::string Path; // empty: not known yet
     char Last[4096];
     double PrevTotals[6] {}; // late_total, late_1ms_total, late_4ms_total, gen_late_total, gen_late_1ms_total, gen_late_4ms_total
+    double PrevGapSkips {};  // layer 10: gen_gap_skips_total
   };
   FramegenState Framegen {};
 
@@ -506,6 +509,18 @@ namespace {
         Get("present_early_us"), Num("late_max_ms"), Num("gen_late_max_ms"), Delta[1], Delta[2], Delta[0], Delta[4], Delta[5], Delta[3],
         Num("woke_late_ms"), Num("woke_late_max_ms"), Num("spin_ms"), Get("present_cpus").empty() ? std::string_view {"-"} : Get("present_cpus"),
         Get("gpu_times"), Num("gpu_copy_ms"), Num("gpu_framegen_ms"), Num("gpu_frame_ms"), Get("gpu_samples"));
+    }
+    // Layer 10: the present thread's nice, and frames shown without a generated frame after a long game frame
+    if (!Get("gen_gap_ms").empty()) {
+      const double Now = Num("gen_gap_skips_total");
+      const double Delta = Now >= Framegen.PrevGapSkips ? Now - Framegen.PrevGapSkips : Now;
+      Framegen.PrevGapSkips = Now;
+      const double Nice = Num("present_nice");
+      Timing += fextl::fmt::format("; present thread nice {}; no generated frame after a game frame over {} ms: {:.0f} since the last line "
+                                   "({:.0f} in all)",
+                                   Nice <= -100 ? fextl::string("-") : fextl::fmt::format("{:.0f}", Nice),
+                                   Num("gen_gap_ms") > 0 ? fextl::fmt::format("{:.0f}", Num("gen_gap_ms")) : fextl::string("- (off)"), Delta,
+                                   Now);
     }
 
     if (Get("layer").empty()) {

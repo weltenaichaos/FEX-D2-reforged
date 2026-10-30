@@ -42,6 +42,19 @@ namespace FEX::Windows {
 //                      kernel has its core paused (core control), it uses the game's other big cores and goes back
 //                      as soon as the core is in use again. D2R default 40; "off" or 0 keeps it on its core at all
 //                      times (paused or not, as up to build 92).
+//   FEX_MAINCORE_ESCAPE=N  with "fast" (build 117, D2R default 4): a watcher thread (FEXMainWatch, on the slowest cores)
+//                      reads the main thread's wait for a CPU every 4 ms; when it waited N ms or more within the last 8 ms
+//                      the thread moves to the game's other big cores (not its own) for 100 ms, doubling up to 1.6 s while
+//                      it has to leave again within 1 s of coming back (back to 100 ms after 10 s at home), then returns.
+//                      A 'main escape' line shows each second with activity. FEX_MAINCORE_WAIT's once-a-second widening is
+//                      off then (its "core paused" handling stays). Build 116 log: in play Android's memory reclaim
+//                      (kswapd) or a root process ran on the main thread's core 7 for up to a second; Android's CPU groups
+//                      put that work beside the app's whole group, so the main thread's nice -10 counted for nothing there
+//                      and it got about half the core: it waited 30-115 ms within single frames (48-156 ms frames). The
+//                      once-a-second widening reacted a second late and didn't help: allowed the other big cores too, the
+//                      kernel kept it on core 7 (98%), waiting 278 ms that second. 0 or "off" = no watcher.
+//   FEX_MAINCORE_ESCAPE_NICE=-20  its nice while away (D2R default -20, above the game's job workers at -10 there: on
+//                      those cores they are in the same CPU group, so nice counts); "off" leaves it at FEX_MAIN_NICE.
 //   FEX_MAINCORE_OTHERS=user  with "fast": every other thread of the app's Linux user stays off the main thread's core
 //                      too, checked every 2 seconds at the Linux level: Wine's other programs (steam.exe, winedevice.exe,
 //                      explorer.exe ...), the launcher's own process and this process's threads Wine doesn't list (the D2R

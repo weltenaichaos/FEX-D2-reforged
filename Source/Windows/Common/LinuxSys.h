@@ -61,6 +61,8 @@ bool ReadOwnMemory(uint64_t Address, void* Out, size_t Size);
 int GetNice(int Tid);
 // 0 or a negative errno.
 int SetNice(int Tid, int Nice);
+// Sleeps the calling thread (nanosleep, no Wine call in between); a signal may end it early.
+void SleepNs(uint64_t Ns);
 // CPUs a Linux thread may run on now (the first 64; the kernel leaves out paused CPUs), or 0 on failure.
 uint64_t GetAffinity(int Tid);
 // The CPUs a thread's own mask allows (the "Cpus_allowed" line of its /proc status file, e.g. "/proc/self/task/<tid>/status"),

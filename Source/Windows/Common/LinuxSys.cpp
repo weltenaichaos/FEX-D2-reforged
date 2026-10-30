@@ -26,6 +26,7 @@ namespace {
   constexpr int64_t NR_getuid = 174;
   constexpr int64_t NR_gettid = 178;
   constexpr int64_t NR_getrusage = 165;
+  constexpr int64_t NR_nanosleep = 101;
   constexpr int64_t RUSAGE_THREAD = 1;
   constexpr int64_t NR_fadvise64 = 223;
   constexpr int64_t NR_preadv2 = 286;
@@ -249,6 +250,14 @@ int GetNice(int Tid) {
   // The raw call returns 20 - nice (1..40) so that it is never negative.
   const int64_t Result = Syscall(NR_getpriority, PRIO_PROCESS, Tid);
   return Result < 0 ? -1000 : static_cast<int>(20 - Result);
+}
+
+void SleepNs(uint64_t Ns) {
+  struct {
+    int64_t Seconds;
+    int64_t Nanoseconds;
+  } Time {static_cast<int64_t>(Ns / 1'000'000'000), static_cast<int64_t>(Ns % 1'000'000'000)};
+  Syscall(NR_nanosleep, reinterpret_cast<intptr_t>(&Time), 0);
 }
 
 int SetNice(int Tid, int Nice) {

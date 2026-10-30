@@ -63,6 +63,16 @@ namespace {
     {"FEX_WORKER_NICE", "-10"},
     // Build 51: the main thread may leave its core while it waits 40 ms a second or more for it (see PriorityGuard.h).
     {"FEX_MAINCORE_WAIT", "40"},
+    // Build 117: in the build 116 run Android's memory reclaim (kswapd, a kernel thread) and once a root process ran on the
+    // main thread's core 7 in play; the main thread got about half the core (Android's CPU groups put system work beside
+    // the app's group, so its nice -10 doesn't count there), waited 30-115 ms within single frames and made 48-156 ms frames.
+    // FEX_MAINCORE_WAIT's widening (checked once a second) came too late and didn't help: allowed the other big cores too,
+    // the kernel kept it on core 7 (98%) waiting. A watcher now checks every 4 ms: when the main thread waited N ms or more
+    // for core 7 within the last 8 ms it moves to the game's other big cores (not core 7) at nice -20 for 100 ms (doubling up
+    // to 1.6 s while it keeps having to leave), then goes back. 0 or "off" turns it off (FEX_MAINCORE_WAIT then works as
+    // before).
+    {"FEX_MAINCORE_ESCAPE", "4"},
+    {"FEX_MAINCORE_ESCAPE_NICE", "-20"},
     // Build 76: every other thread of the app's Linux user off the main thread's core too, steam.exe's above all (see
     // PriorityGuard.h). In the build 75 log the main thread waited for its core 7 ms per slow frame, nearly always inside
     // SetEvent, and steam.exe's CPU use tracked those waits in four runs.
@@ -122,6 +132,16 @@ namespace {
     // the flow scale.
     {"FEX_LSFG_PRESENT_EARLY", "1000"},
     {"FEX_LSFG_GPU_TIMES", "1"},
+    // Build 117 (layer 10): in the build 116 run the real frames still went out 1 ms or more after their slot 9% of the
+    // time in fights: the layer's present thread (nice -10) woke 1-6 ms late from its timed sleeps on cores 3-6, which the
+    // game's job workers (also nice -10) kept busy. It now runs at nice -20 (LSFG_D2R_DEFER_NICE; "off" leaves the nice
+    // the thread starts with). The run also had 48-156 ms game frames (the main thread waiting for its core, see
+    // FEX_MAINCORE_ESCAPE); the generated frame after such a freeze is made between two pictures far apart in time and
+    // guesses a big jump (Jesse saw a chest's button label halfway across the screen once). A game frame that comes more
+    // than FEX_LSFG_GEN_GAP ms after the one before now gets no generated frame, only itself at the generated frame's slot
+    // (LSFG_D2R_GEN_GAP_MS, 0 = off).
+    {"FEX_LSFG_PRESENT_NICE", "-20"},
+    {"FEX_LSFG_GEN_GAP", "50"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -464,6 +484,8 @@ namespace {
     "FEX_STALLPROBE",
     "FEX_MAINCORE",
     "FEX_MAINCORE_WAIT",
+    "FEX_MAINCORE_ESCAPE",
+    "FEX_MAINCORE_ESCAPE_NICE",
     "FEX_MAINCORE_OTHERS",
     "FEX_HELPER_CORES",
     "FEX_SERVER_NICE",
@@ -490,6 +512,8 @@ namespace {
     "FEX_LSFG_EARLY",
     "FEX_LSFG_PRESENT_EARLY",
     "FEX_LSFG_GPU_TIMES",
+    "FEX_LSFG_PRESENT_NICE",
+    "FEX_LSFG_GEN_GAP",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",

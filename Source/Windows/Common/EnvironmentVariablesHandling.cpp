@@ -451,6 +451,12 @@ namespace {
        "it waits on the CPU from)",
        true},
       {"FEX_LSFG_GPU_TIMES", "LSFG_D2R_GPU_TIMES", "no GPU times of the layer's copy and frame generation", false},
+      {"FEX_LSFG_PRESENT_NICE", "LSFG_D2R_DEFER_NICE",
+       "the layer's present thread keeps the nice it starts with (the number: its nice, -20 to 19; layer 9 used -10)", true},
+      {"FEX_LSFG_GEN_GAP", "LSFG_D2R_GEN_GAP_MS",
+       "every game frame gets its generated frame, however long it took (the number: milliseconds since the frame before "
+       "after which a frame gets none)",
+       true},
     };
     for (const auto& S : Switches) {
       const char* Value = Switch(S.Name);
@@ -458,15 +464,23 @@ namespace {
         continue;
       }
       const bool Off = SwitchOff(Value);
-      // A number switch passes its digits (up to 6); anything else sets 0 or 1 as the other switches.
-      char Digits[8] {};
+      // A number switch passes its digits (up to 6, after a minus sign from build 117); anything else sets 0 or 1 as the
+      // other switches.
+      char Digits[9] {};
       size_t DigitCount = 0;
+      size_t SignCount = 0;
       if (S.Number && !Off) {
-        for (const char* c = Value; *c >= '0' && *c <= '9' && DigitCount < 6; ++c) {
-          Digits[DigitCount++] = *c;
+        const char* c = Value;
+        if (*c == '-' && c[1] >= '0' && c[1] <= '9') {
+          Digits[SignCount++] = *c++;
+        }
+        for (; *c >= '0' && *c <= '9' && DigitCount < 6; ++c) {
+          Digits[SignCount + DigitCount++] = *c;
         }
       }
-      const char* Set = Off ? "0" : (DigitCount ? Digits : "1");
+      // A number switch without a number ("off") is off too.
+      const bool NumberOff = S.Number && !Off && !DigitCount;
+      const char* Set = Off || NumberOff ? "0" : (DigitCount ? Digits : "1");
       const auto Before = StartUnixValue(S.Variable);
       if (!SetUnixEnv) {
         StatsLogNote(fextl::fmt::format("framegen: this Wine has no __wine_set_unix_env, {} can't be set (it is {})", S.Variable, Before));
@@ -474,8 +488,8 @@ namespace {
       }
       reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv)(S.Variable, Set);
       StatsLogNote(fextl::fmt::format("framegen: {}={} -> {}={} (it was {} when the game started{}){}{}", S.Name, Value, S.Variable, Set,
-                                      Before, Before == "-" ? "" : ", set by the program that started it", Off ? ": " : "",
-                                      Off ? S.What : ""));
+                                      Before, Before == "-" ? "" : ", set by the program that started it", Off || NumberOff ? ": " : "",
+                                      Off || NumberOff ? S.What : ""));
     }
   }
 
