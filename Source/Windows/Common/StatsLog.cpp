@@ -4207,4 +4207,36 @@ void StatsLogNote(std::string_view Line) {
     PendingNotes += Text;
   }
 }
+
+void StatsLogCrashNote(uint32_t Status, std::string_view AppName, std::string_view Text) {
+#ifndef FEX_DISABLE_STATSLOG
+  return;
+#endif
+  if (Status == 0) {
+    return;
+  }
+  const char* Dir = Switch("FEX_CRASH_NOTE");
+  if (!Dir || !Dir[0] || (Dir[0] == '0' && !Dir[1])) {
+    return;
+  }
+  fextl::string Folder = Dir;
+  while (!Folder.empty() && (Folder.back() == '\\' || Folder.back() == '/')) {
+    Folder.pop_back();
+  }
+  LARGE_INTEGER SystemTime {}, LocalTime {};
+  NtQuerySystemTime(&SystemTime);
+  RtlSystemTimeToLocalTime(&SystemTime, &LocalTime);
+  const uint64_t SecondOfDay = (static_cast<uint64_t>(LocalTime.QuadPart) / 10'000'000ULL) % 86400;
+  const auto Path = fextl::fmt::format("{}\\fexcrash-{}{}-{:02}{:02}{:02}-{}.txt", Folder, AppName, BuildNumberSuffix, SecondOfDay / 3600,
+                                       (SecondOfDay / 60) % 60, SecondOfDay % 60, GetCurrentProcessId());
+  FILE* File = fopen(Path.c_str(), "w");
+  if (!File) {
+    return;
+  }
+  const auto Head = fextl::fmt::format("# FEX crash note for {} (pid {}, build {}): the process ended with status {:X}\n", AppName,
+                                       GetCurrentProcessId(), BuildInfo, Status);
+  fwrite(Head.data(), 1, Head.size(), File);
+  fwrite(Text.data(), 1, Text.size(), File);
+  fclose(File);
+}
 } // namespace FEX::Windows

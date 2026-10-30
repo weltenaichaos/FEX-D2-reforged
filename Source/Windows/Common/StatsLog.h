@@ -31,6 +31,11 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName);
 // No-op unless FEX_STATSLOG is set.
 void StatsLogNote(std::string_view Line);
 
+// Build 127: the build without the stats log (thor-clean) writes Text to a small file (FEX_CRASH_NOTE's folder, D:\ for
+// D2R) when the process ends with a status other than 0, so a crash there leaves a record of the last exceptions. The
+// build with the log has them in its log already and writes nothing here.
+void StatsLogCrashNote(uint32_t Status, std::string_view AppName, std::string_view Text);
+
 // Classifies a disk cache hit for the preload probe: was the main executable's page holding GuestRIP already readable
 // at an earlier once-per-second scan (so a background preload could have loaded it), or not.
 void StatsLogDiskCacheHit(uint64_t GuestRIP);

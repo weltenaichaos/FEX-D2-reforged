@@ -515,15 +515,20 @@ void Write(NTSTATUS Status) {
     return;
   }
   const uint64_t Total = Count.load(std::memory_order_relaxed);
-  FEX::Windows::StatsLogNote(fextl::fmt::format("process exit: status {:X} by tid {}, {} exceptions passed on; the last ones, oldest "
-                                                "first:",
-                                                static_cast<uint32_t>(Status), GetCurrentThreadId(), Total));
+  const auto Head = fextl::fmt::format("process exit: status {:X} by tid {}, {} exceptions passed on; the last ones, oldest first:",
+                                       static_cast<uint32_t>(Status), GetCurrentThreadId(), Total);
+  FEX::Windows::StatsLogNote(Head);
+  // Build 127: the same lines for the crash note of the build without the stats log (written only for a status other than 0).
+  fextl::string Text = Head + "\n";
   constexpr const char* Names[] = {"guest code", "native code", "JIT, unexpected", "non-emulated thread"};
   for (uint64_t i = Total > RingSize ? Total - RingSize : 0; i < Total; ++i) {
     const auto& E = Ring[i % RingSize];
-    FEX::Windows::StatsLogNote(fextl::fmt::format("  exception #{}: code {:X} in {} tid {} pc {:X} rip {:X} fault {:X}", i, E.Code,
-                                                  Names[static_cast<uint8_t>(E.Where)], E.TID, E.HostPc, E.RIP, E.Fault));
+    const auto Line = fextl::fmt::format("  exception #{}: code {:X} in {} tid {} pc {:X} rip {:X} fault {:X}", i, E.Code,
+                                         Names[static_cast<uint8_t>(E.Where)], E.TID, E.HostPc, E.RIP, E.Fault);
+    FEX::Windows::StatsLogNote(Line);
+    Text += Line + "\n";
   }
+  FEX::Windows::StatsLogCrashNote(static_cast<uint32_t>(Status), AppConfigName, Text);
 }
 } // namespace CrashRecord
 

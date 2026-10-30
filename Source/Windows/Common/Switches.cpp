@@ -30,6 +30,9 @@ namespace {
     {"FEX_STATSLOG_PROFILE", "1"},
 #else
     {"FEX_VKD3D_LOG_OFF", "1"},
+    // Build 127: a small file D:\fexcrash-D2R.exe-b<N>-<time>-<pid>.txt only when the game ends with an error status (the
+    // last exceptions FEX passed on), nothing otherwise. "0" turns it off.
+    {"FEX_CRASH_NOTE", "D:\\"},
 #endif
     {"FEX_NATIVE_ZLIB", "1"},
     {"FEX_NATIVE_MD5", "1"},
@@ -157,7 +160,8 @@ namespace {
     // also times its copy and frame generation on the GPU (LSFG_D2R_GPU_TIMES, before only with LSFG_DEBUG), for the cost of
     // the flow scale.
     {"FEX_LSFG_PRESENT_EARLY", "1000"},
-    {"FEX_LSFG_GPU_TIMES", "1"},
+    // Build 127: measuring only (the 'framegen' line's GPU times), so off in the build without the stats log.
+    {"FEX_LSFG_GPU_TIMES", Measuring ? "1" : "0"},
     // Build 117 (layer 10): in the build 116 run the real frames still went out 1 ms or more after their slot 9% of the
     // time in fights: the layer's present thread (nice -10) woke 1-6 ms late from its timed sleeps on cores 3-6, which the
     // game's job workers (also nice -10) kept busy. It now runs at nice -20 (LSFG_D2R_DEFER_NICE; "off" leaves the nice
@@ -582,6 +586,7 @@ namespace {
     "FEX_KERNEL_FUTEX",
     "FEX_FRAME_THREADS",
     "FEX_FRAME_THREADS_OFFCORE",
+    "FEX_CRASH_NOTE",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",
