@@ -1,0 +1,217 @@
+From f73839df8f05cfdad818bc0fcafb10ba6e5aaa39 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 15:03:02 +0000
+Subject: [PATCH] FEX: UI split also for an indexed composite and with the
+ game's queries active
+
+In the build 122 run no frame was made without the UI layer: every back
+buffer pass's first draw (one 3-vertex or 3-index draw on the pass meter)
+was turned down as "not 3 vertices", a count that lumped together an
+indexed draw, active queries, predication, stream output and a missing
+pipeline.
+
+An indexed composite (3 indices, one instance) is now taken and drawn
+again with vkCmdDrawIndexed. The game's queries active inside the pass
+end before the pass is ended for the copy and start again in the pass
+begun after it, as when vkd3d ends and resumes a pass itself, so the
+extra draw is not counted. Each other reason has its own count on the
+'ui split' line, with the last draw turned down (indexed or not, count,
+instances).
+---
+ libs/vkd3d/command.c       | 58 ++++++++++++++++++++++++++------------
+ libs/vkd3d/fex_ui_split.c  | 21 ++++++++++----
+ libs/vkd3d/vkd3d_private.h | 10 ++++++-
+ 3 files changed, 64 insertions(+), 25 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 9186bdc..c57db99 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8226,8 +8226,8 @@ static void fex_ui_copy(struct d3d12_command_list *list, VkImage src, const VkIm
+  * (one 3-vertex draw), the back buffer goes into its frame copy first; if the draw doesn't blend over the back buffer,
+  * it is drawn into that copy too, with the UI layer cleared (saved before, put back after). The pass is ended for
+  * that and begun again with LOAD; bound state stays. */
+-static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list, uint32_t vertex_count,
+-        uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
++static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list, bool indexed, uint32_t vertex_count,
++        uint32_t instance_count, uint32_t first_vertex, int32_t vertex_offset, uint32_t first_instance)
+ {
+     const VkPipelineStageFlags2 shader_stages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+@@ -8248,15 +8248,24 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+     VkClearColorValue clear;
+     VkImageSubresourceRange range;
+     VkImage save = VK_NULL_HANDLE;
++    enum vkd3d_fex_ui_event other;
+     uint32_t width, height;
+-    bool redraw;
++    bool redraw, queries;
+ 
+     list->fex_ui.pending = NULL;
+-    if (vertex_count != 3 || instance_count != 1 || list->predication.fallback_enabled ||
+-            list->active_queries_count || list->xfb_buffer_count || !list->state ||
+-            list->rendering_info.info.colorAttachmentCount < 1)
+-    {
+-        vkd3d_fex_ui_event(device, VKD3D_FEX_UI_OTHER_DRAW);
++    /* fex36: in the build 122 run every back buffer pass's first draw (3 vertices or indices, one instance on the pass
++     * meter) was turned down; each reason counts on its own now, and indexed draws and active queries are taken. */
++    other = vertex_count != 3 ? VKD3D_FEX_UI_OTHER_COUNT :
++            instance_count != 1 ? VKD3D_FEX_UI_OTHER_INSTANCES :
++            list->predication.fallback_enabled ? VKD3D_FEX_UI_OTHER_PREDICATED :
++            list->xfb_buffer_count ? VKD3D_FEX_UI_OTHER_XFB :
++            !list->state || list->rendering_info.info.colorAttachmentCount < 1 ? VKD3D_FEX_UI_OTHER_STATE :
++            VKD3D_FEX_UI_EVENTS;
++    if (other != VKD3D_FEX_UI_EVENTS)
++    {
++        vkd3d_atomic_uint32_store_explicit(&device->fex_ui->other, 1u + (min(vertex_count, 0xfffeu) |
++                (min(instance_count, 0x7fffu) << 16) | (indexed ? 1u << 31 : 0u)), vkd3d_memory_order_relaxed);
++        vkd3d_fex_ui_event(device, other);
+         return;
+     }
+     blend = &list->state->graphics.blend_attachments[0];
+@@ -8288,6 +8297,11 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+     whole.layerCount = 1;
+     ui_layers = list->fex_ui.ui_subresource;
+ 
++    /* The game's queries inside this pass end with it and start again in the pass begun below, as when vkd3d itself
++     * ends and resumes a pass; the extra draw isn't counted. */
++    queries = list->active_queries_count != 0;
++    if (queries)
++        d3d12_command_list_handle_active_queries(list, true);
+     VK_CALL(vkCmdEndRendering(cmd));
+ 
+     fex_ui_barrier(&barriers[0], backbuffer->res.vk_image, &whole,
+@@ -8354,7 +8368,10 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+         rendering.colorAttachmentCount = 1;
+         rendering.pColorAttachments = &attachment;
+         VK_CALL(vkCmdBeginRendering(cmd, &rendering));
+-        VK_CALL(vkCmdDraw(cmd, vertex_count, instance_count, first_vertex, first_instance));
++        if (indexed)
++            VK_CALL(vkCmdDrawIndexed(cmd, vertex_count, instance_count, first_vertex, vertex_offset, first_instance));
++        else
++            VK_CALL(vkCmdDraw(cmd, vertex_count, instance_count, first_vertex, first_instance));
+         VK_CALL(vkCmdEndRendering(cmd));
+ 
+         fex_ui_barrier(&barriers[0], frame->vk_image, &whole,
+@@ -8395,9 +8412,16 @@ static void d3d12_command_list_fex_ui_composite(struct d3d12_command_list *list,
+     list->rendering_info.rtv[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+     VK_CALL(vkCmdBeginRendering(cmd, &list->rendering_info.info));
+     list->rendering_info.rtv[0].loadOp = load_op;
++    if (queries)
++    {
++        d3d12_command_list_handle_active_queries(list, false);
++        vkd3d_fex_ui_event(device, VKD3D_FEX_UI_CAPTURE_QUERIES);
++    }
+ 
+     vkd3d_atomic_uint32_store_explicit(&frame->captured, 1u, vkd3d_memory_order_release);
+     vkd3d_fex_ui_event(device, redraw ? VKD3D_FEX_UI_CAPTURE_REDRAW : VKD3D_FEX_UI_CAPTURE_COPY);
++    if (indexed)
++        vkd3d_fex_ui_event(device, VKD3D_FEX_UI_CAPTURE_INDEXED);
+ }
+ 
+ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list,
+@@ -8817,8 +8841,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
+ 
+     /* VKD3D fex35: the back buffer pass's first draw may be the game's composite of scene and UI layer. */
+     if (list->fex_ui.pending)
+-        d3d12_command_list_fex_ui_composite(list, vertex_count_per_instance, instance_count,
+-                start_vertex_location, start_instance_location);
++        d3d12_command_list_fex_ui_composite(list, false, vertex_count_per_instance, instance_count,
++                start_vertex_location, 0, start_instance_location);
+ 
+     if (!list->predication.fallback_enabled)
+     {
+@@ -8911,15 +8935,13 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
+ 
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
+ 
+-    /* VKD3D fex35: the game's composite is one non-indexed draw. */
+-    if (list->fex_ui.pending)
+-    {
+-        list->fex_ui.pending = NULL;
+-        vkd3d_fex_ui_event(list->device, VKD3D_FEX_UI_OTHER_DRAW);
+-    }
+-
+     d3d12_command_list_check_index_buffer_strip_cut_value(list);
+ 
++    /* VKD3D fex36: the game's composite may be an indexed draw too (index buffer bound above). */
++    if (list->fex_ui.pending)
++        d3d12_command_list_fex_ui_composite(list, true, index_count_per_instance, instance_count,
++                start_vertex_location, base_vertex_location, start_instance_location);
++
+     if (!list->predication.fallback_enabled)
+     {
+         VK_CALL(vkCmdDrawIndexed(list->cmd.vk_command_buffer, index_count_per_instance,
+diff --git a/libs/vkd3d/fex_ui_split.c b/libs/vkd3d/fex_ui_split.c
+index e4d74a3..b9282af 100644
+--- a/libs/vkd3d/fex_ui_split.c
++++ b/libs/vkd3d/fex_ui_split.c
+@@ -257,22 +257,31 @@ size_t vkd3d_fex_ui_report(struct d3d12_device *device, char *text, size_t size,
+ {
+     struct vkd3d_fex_ui *ui = device->fex_ui;
+     uint32_t events[VKD3D_FEX_UI_EVENTS];
+-    uint32_t blend, i;
++    uint32_t blend, other, i;
+ 
+     if (!ui)
+         return len;
+     for (i = 0; i < VKD3D_FEX_UI_EVENTS; i++)
+         events[i] = vkd3d_atomic_uint32_exchange_explicit(&ui->events[i], 0, vkd3d_memory_order_relaxed);
+     blend = vkd3d_atomic_uint32_load_explicit(&ui->blend, vkd3d_memory_order_relaxed);
++    other = vkd3d_atomic_uint32_load_explicit(&ui->other, vkd3d_memory_order_relaxed);
+ 
+     len = vkd3d_fex_report_append(text, size, len,
+-            "  ui split (VKD3D fex35: each frame also handed to frame generation without the game's UI layer): presents"
++            "  ui split (VKD3D fex36: each frame also handed to frame generation without the game's UI layer): presents"
+             " with it %u, as shown %u | made: copy before a composite that blends %u, composite drawn again with the UI"
+-            " layer cleared %u | not made: no cleared full-size pass before the back buffer's %u, its first draw not"
+-            " 3 vertices %u, no save image %u | composite blend ",
++            " layer cleared %u (indexed %u, with the game's queries paused %u) | not made: no cleared full-size pass"
++            " before the back buffer's %u, its first draw: not 3 vertices %u, instanced %u, predicated %u, stream"
++            " output %u, no pipeline or target %u, no save image %u",
+             events[VKD3D_FEX_UI_PRESENT_SPLIT], events[VKD3D_FEX_UI_PRESENT_PLAIN],
+-            events[VKD3D_FEX_UI_CAPTURE_COPY], events[VKD3D_FEX_UI_CAPTURE_REDRAW], events[VKD3D_FEX_UI_NO_UI],
+-            events[VKD3D_FEX_UI_OTHER_DRAW], events[VKD3D_FEX_UI_NO_SAVE]);
++            events[VKD3D_FEX_UI_CAPTURE_COPY], events[VKD3D_FEX_UI_CAPTURE_REDRAW], events[VKD3D_FEX_UI_CAPTURE_INDEXED],
++            events[VKD3D_FEX_UI_CAPTURE_QUERIES], events[VKD3D_FEX_UI_NO_UI], events[VKD3D_FEX_UI_OTHER_COUNT],
++            events[VKD3D_FEX_UI_OTHER_INSTANCES], events[VKD3D_FEX_UI_OTHER_PREDICATED], events[VKD3D_FEX_UI_OTHER_XFB],
++            events[VKD3D_FEX_UI_OTHER_STATE], events[VKD3D_FEX_UI_NO_SAVE]);
++    if (other)
++        len = vkd3d_fex_report_append(text, size, len, " (last one turned down: %s, %u %s, %u instances)",
++                ((other - 1) >> 31) ? "indexed" : "not indexed", (other - 1) & 0xffff,
++                ((other - 1) >> 31) ? "indices" : "vertices", ((other - 1) >> 16) & 0x7fff);
++    len = vkd3d_fex_report_append(text, size, len, " | composite blend ");
+     if (!blend)
+         len = vkd3d_fex_report_append(text, size, len, "- (none seen)\n");
+     else if (!((blend - 1) & 1))
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index ba50b48..9290174 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3375,7 +3375,13 @@ enum vkd3d_fex_ui_event
+     VKD3D_FEX_UI_CAPTURE_COPY,   /* the composite blends over the back buffer: copy of the back buffer before it */
+     VKD3D_FEX_UI_CAPTURE_REDRAW, /* the composite drawn again with the UI layer cleared */
+     VKD3D_FEX_UI_NO_UI,          /* a back buffer pass with no cleared back-buffer-sized pass before it in the list */
+-    VKD3D_FEX_UI_OTHER_DRAW,     /* the back buffer pass's first draw was not one 3-vertex draw */
++    VKD3D_FEX_UI_OTHER_COUNT,    /* the back buffer pass's first draw: not 3 vertices (indices) */
++    VKD3D_FEX_UI_OTHER_INSTANCES, /* ... more than one instance */
++    VKD3D_FEX_UI_OTHER_PREDICATED, /* ... predicated through vkd3d's fallback */
++    VKD3D_FEX_UI_OTHER_XFB,      /* ... with stream output */
++    VKD3D_FEX_UI_OTHER_STATE,    /* ... without a pipeline or color target */
++    VKD3D_FEX_UI_CAPTURE_INDEXED, /* fex36: captures whose composite was an indexed draw */
++    VKD3D_FEX_UI_CAPTURE_QUERIES, /* fex36: captures made with the game's queries active (paused around them) */
+     VKD3D_FEX_UI_NO_SAVE,        /* no image to save the UI layer in */
+     VKD3D_FEX_UI_PRESENT_SPLIT,  /* blits that handed over the frame without the UI layer */
+     VKD3D_FEX_UI_PRESENT_PLAIN,  /* blits that handed over the frame as shown (no copy since the last Present()) */
+@@ -3391,6 +3397,8 @@ struct vkd3d_fex_ui
+     uint32_t width, height;      /* atomics: the swapchain back buffers' size, 0 = none yet */
+     uint32_t events[VKD3D_FEX_UI_EVENTS];
+     uint32_t blend;              /* atomic: the last composite's blend, 1 + enable | src << 8 | dst << 16, 0 = none */
++    uint32_t other;              /* atomic: the last first draw not taken, 1 + count (16 bits) | instances << 16 (15 bits)
++                                  * | indexed << 31, 0 = none */
+ };
+ void vkd3d_fex_ui_init(struct d3d12_device *device);
+ void vkd3d_fex_ui_cleanup(struct d3d12_device *device);
+-- 
+2.43.0
+
