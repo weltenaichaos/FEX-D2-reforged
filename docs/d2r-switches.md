@@ -138,7 +138,7 @@ These only run in the **logging version** (`2610-d2rfix28s-thor`). The clean ver
 |---|---|---|
 | `FEX_STATSLOG` | `D:\` | The folder for the per-session log `fexstats-D2R.exe-b<N>-<time>-<pid>.txt`. `0` = no log. |
 | `FEX_STATSLOG_PROFILE` | `1` | Samples what the busiest threads run, and explains every slow frame. |
-| `FEX_STATSLOG_TIMELINE`, `FEX_SCHEDLOG`, `FEX_GPULOG`, `FEX_STALLPROBE` | on | Per-thread timeline, CPU wait times, GPU clock, lock and wineserver probes. `0` turns each off. |
+| `FEX_STATSLOG_TIMELINE`, `FEX_SCHEDLOG`, `FEX_GPULOG`, `FEX_STALLPROBE` | on | Per-thread timeline, CPU wait times, GPU clock, lock and wineserver probes. `0` turns each off. From build 133 a wait of 15 ms or more for Wine's memory lock gets a `# memory lock wait` line that lists every thread not asleep at 15 and 45 ms (Linux call, state, CPU), to find the thread holding the lock. |
 | `FEX_STATSLOG_APP`, `FEX_STATSLOG_SCAN` | unset | Log only the program named; a per-second scan of the game's code for the log. |
 | `FEX_LOADER_WATCH` | `1` | Counts the loader thread's calls. |
 | `FEX_VKD3D_PASSES`, `FEX_VKD3D_TIMELINE` | `1` | GPU time per render pass; each frame's way to the screen. |

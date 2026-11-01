@@ -306,6 +306,24 @@ namespace {
     uint64_t Ticks; // how long it took; for sleep, how much later than asked the thread woke up
     uint8_t Kind;
   };
+  // Memory lock waits (build 133): in the build 131 runs the main thread waited 44-109 ms for Wine's process-wide memory
+  // lock (virtual_mutex) a few times per run ('vq' in '# frame' stalls), and the log could not say which thread held it.
+  // While the probe's own VirtualQuery has waited LockSnapFirstMs, and again at LockSnapSecondMs, a watch thread writes
+  // down every thread of the process that is not asleep in a wait (Linux /proc/self/task/<tid>/syscall and stat): the
+  // holder is among them, in a memory call (mmap, munmap, mprotect, madvise) or running. The log thread prints them on a
+  // '# memory lock wait' line with what the sampled threads were doing during the wait.
+  constexpr double LockWaitMinMs = 15.0;
+  constexpr uint64_t LockSnapFirstMs = 15;
+  constexpr uint64_t LockSnapSecondMs = 45;
+  constexpr size_t LockSnapSlots = 16;
+  constexpr size_t LockSnapTextSize = 1536;
+  constexpr size_t MaxLockWaitLines = 300;
+  struct LockSnap {
+    std::atomic<uint32_t> Ready; // 0 free, 1 being written, 2 written
+    uint64_t Start;              // counter value when the probe's VirtualQuery began
+    uint32_t AtMs;               // how long it had waited then
+    char Text[LockSnapTextSize];
+  };
   // Written by the probe thread only.
   struct ProbeShared {
     ProbeEvent Ring[ProbeRingSize];
@@ -313,6 +331,9 @@ namespace {
     std::atomic<uint64_t> Max[ProbeKinds]; // longest since the log thread last took them
     std::atomic<uint64_t> MaxAt[ProbeKinds];
     std::atomic<uint64_t> Rounds;
+    std::atomic<uint64_t> VqStart; // counter value while the probe waits in VirtualQuery, 0 otherwise
+    std::atomic<int> ProbeTid;     // Linux tid of the probe thread
+    LockSnap Snaps[LockSnapSlots];  // written by the lock watch thread, taken by the log thread
   };
   ProbeShared* Probe {};
   std::atomic<void (*)()> LockProbe {};
@@ -2100,6 +2121,8 @@ namespace {
     // Stall probe events of 2ms or more from this and the previous second, for "# frame" lines.
     uint64_t ProbeRead;
     fextl::vector<ProbeEvent> ProbeEvents;
+    uint64_t LockWaitPrinted; // end of the last memory lock wait given a line
+    size_t LockWaitLines;
 
     // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
     struct MainTick {
@@ -2145,8 +2168,165 @@ namespace {
     return Result ? Result : 1;
   }
 
+  // Linux syscall names (arm64) for the lock watch's thread list.
+  const char* SyscallName(int64_t Nr) {
+    switch (Nr) {
+    case 17: return "getcwd";
+    case 22: return "epoll_pwait";
+    case 29: return "ioctl";
+    case 56: return "openat";
+    case 57: return "close";
+    case 61: return "getdents64";
+    case 62: return "lseek";
+    case 63: return "read";
+    case 64: return "write";
+    case 65: return "readv";
+    case 66: return "writev";
+    case 67: return "pread64";
+    case 68: return "pwrite64";
+    case 72: return "pselect6";
+    case 73: return "ppoll";
+    case 78: return "readlinkat";
+    case 79: return "newfstatat";
+    case 80: return "fstat";
+    case 82: return "fsync";
+    case 98: return "futex";
+    case 101: return "nanosleep";
+    case 113: return "clock_gettime";
+    case 115: return "clock_nanosleep";
+    case 124: return "sched_yield";
+    case 129: return "kill";
+    case 130: return "tkill";
+    case 131: return "tgkill";
+    case 134: return "rt_sigaction";
+    case 135: return "rt_sigprocmask";
+    case 139: return "rt_sigreturn";
+    case 172: return "getpid";
+    case 178: return "gettid";
+    case 203: return "connect";
+    case 206: return "sendto";
+    case 207: return "recvfrom";
+    case 211: return "sendmsg";
+    case 212: return "recvmsg";
+    case 214: return "brk";
+    case 215: return "munmap";
+    case 216: return "mremap";
+    case 220: return "clone";
+    case 222: return "mmap";
+    case 223: return "fadvise64";
+    case 226: return "mprotect";
+    case 227: return "msync";
+    case 232: return "mincore";
+    case 233: return "madvise";
+    case 260: return "wait4";
+    case 281: return "execveat";
+    case 285: return "copy_file_range";
+    case 435: return "clone3";
+    default: return nullptr;
+    }
+  }
+
+  struct LockSnapArgs {
+    fextl::string Text;
+    int Self;
+    uint32_t Waiting; // threads asleep in a wait (futex, poll, sleep), not listed
+    uint32_t Futex;   // ... of them in futex
+    uint32_t Listed;
+  };
+
+  void LockSnapTask(const char* Name, void* Arg) {
+    auto* A = static_cast<LockSnapArgs*>(Arg);
+    const int Tid = atoi(Name);
+    if (Tid <= 0 || Tid == A->Self) {
+      return;
+    }
+    char Path[64];
+    char Sys[256];
+    snprintf(Path, sizeof(Path), "/proc/self/task/%d/syscall", Tid);
+    if (Linux::ReadSmallFile(Path, Sys, sizeof(Sys)) <= 0) {
+      return;
+    }
+    Linux::TaskStat St {};
+    snprintf(Path, sizeof(Path), "/proc/self/task/%d/stat", Tid);
+    const bool HaveStat = Linux::ReadTaskStat(Path, St);
+    const char State = HaveStat ? St.State : '?';
+    fextl::string What;
+    if (!strncmp(Sys, "running", 7)) {
+      What = "running";
+    } else {
+      // "nr a0 a1 a2 a3 a4 a5 sp pc", or "-1 sp pc" when blocked outside a syscall (a page fault).
+      char* Cursor = Sys;
+      const int64_t Nr = strtoll(Cursor, &Cursor, 10);
+      uint64_t Args[3] {};
+      for (auto& V : Args) {
+        V = strtoull(Cursor, &Cursor, 16);
+      }
+      const bool Wait = Nr == 98 || Nr == 73 || Nr == 22 || Nr == 101 || Nr == 115 || Nr == 72 || Nr == 260;
+      if (Wait && State == 'S') {
+        ++A->Waiting;
+        A->Futex += Nr == 98 ? 1 : 0;
+        return;
+      }
+      const char* SysName = SyscallName(Nr);
+      if (Nr < 0) {
+        What = "fault/outside a syscall";
+      } else if (Nr == 215 || Nr == 226 || Nr == 233 || Nr == 222 || Nr == 216 || Nr == 232 || Nr == 227) {
+        // Memory calls: address and length.
+        What = fextl::fmt::format("{}(0x{:x}, {:.1f} MB)", SysName ? SysName : "?", Args[0], static_cast<double>(Args[1]) / (1024.0 * 1024.0));
+      } else if (SysName) {
+        What = SysName;
+      } else {
+        What = fextl::fmt::format("syscall {}", Nr);
+      }
+    }
+    if (A->Text.size() < LockSnapTextSize - 96) {
+      A->Text += fextl::fmt::format(" {} {} {} cpu{} {};", Tid, HaveStat ? St.Comm : "?", State, HaveStat ? St.Processor : -1, What);
+      ++A->Listed;
+    }
+  }
+
+  void* LockWatchThread(void*) {
+    auto* P = Probe;
+    const uint64_t Freq = GetCounterFrequency();
+    const uint64_t First = Freq * LockSnapFirstMs / 1000;
+    const uint64_t Second = Freq * LockSnapSecondMs / 1000;
+    uint64_t Last {};
+    int Stage {};
+    for (;;) {
+      Linux::SleepNs(5'000'000);
+      const uint64_t Start = P->VqStart.load(std::memory_order_acquire);
+      if (!Start) {
+        continue;
+      }
+      if (Start != Last) {
+        Last = Start;
+        Stage = 0;
+      }
+      const uint64_t Now = GetCounter();
+      const uint64_t Waited = Now > Start ? Now - Start : 0;
+      if (!((Stage == 0 && Waited >= First) || (Stage == 1 && Waited >= Second))) {
+        continue;
+      }
+      ++Stage;
+      LockSnapArgs A {.Self = P->ProbeTid.load(std::memory_order_relaxed)};
+      Linux::ForEachEntry("/proc/self/task", LockSnapTask, &A);
+      for (auto& S : P->Snaps) {
+        uint32_t Free = 0;
+        if (S.Ready.compare_exchange_strong(Free, 1, std::memory_order_acquire)) {
+          S.Start = Start;
+          S.AtMs = static_cast<uint32_t>(Waited * 1000 / Freq);
+          snprintf(S.Text, sizeof(S.Text), "%u not waiting:%s %u asleep in waits (%u in futex)", A.Listed, A.Text.c_str(), A.Waiting, A.Futex);
+          S.Ready.store(2, std::memory_order_release);
+          break;
+        }
+      }
+    }
+    return nullptr;
+  }
+
   void* ProbeThread(void*) {
     auto* P = Probe;
+    P->ProbeTid.store(Linux::GetTid(), std::memory_order_relaxed);
     const uint64_t Freq = GetCounterFrequency();
     const uint64_t SleepTicks = Freq * static_cast<uint64_t>(ProbeSleep100ns) / 10'000'000;
     const uint64_t KeepTicks = static_cast<uint64_t>(ProbeKeepMs * static_cast<double>(Freq) / 1000.0);
@@ -2179,8 +2359,10 @@ namespace {
       // VirtualQuery: Wine's process-wide memory lock (virtual_mutex), taken by every memory call and Wine fault.
       MEMORY_BASIC_INFORMATION Info {};
       T0 = GetCounter();
+      P->VqStart.store(T0, std::memory_order_release);
       NtQueryVirtualMemory(NtCurrentProcess(), Region ? Region : static_cast<void*>(&Info), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
       T1 = GetCounter();
+      P->VqStart.store(0, std::memory_order_release);
       Record(ProbeVQ, T1, T1 - T0);
 
       // First touch of a page: the kernel's per-process memory map lock, held for writing by every mprotect/mmap/munmap.
@@ -2987,6 +3169,66 @@ namespace {
     return Line + "\n";
   }
 
+  // '# memory lock wait' lines (build 133) for the probe's VirtualQuery waits of LockWaitMinMs or more that ended since the
+  // last ones: the watch thread's thread lists taken during the wait, then what the sampled threads were doing meanwhile.
+  LogState::Run CollectFrameRun(LogState* State, uint64_t Begin, uint64_t End);
+
+  fextl::string LockWaitLines(LogState* State, uint64_t Seconds) {
+    if (!Probe) {
+      return {};
+    }
+    const double MsPerTick = 1000.0 / static_cast<double>(State->CounterFreq);
+    const uint64_t MinTicks = static_cast<uint64_t>(LockWaitMinMs / MsPerTick);
+    fextl::string Out;
+    for (const auto& E : State->ProbeEvents) {
+      if (E.Kind != ProbeVQ || E.Ticks < MinTicks || E.End <= State->LockWaitPrinted) {
+        continue;
+      }
+      State->LockWaitPrinted = E.End;
+      const uint64_t Start = E.End - E.Ticks;
+      if (State->LockWaitLines >= MaxLockWaitLines) {
+        continue;
+      }
+      ++State->LockWaitLines;
+      Out += fextl::fmt::format("# memory lock wait t={} {:.0f}ms (Wine's memory lock, the stall probe's VirtualQuery)", FrameTime(State, Seconds, Start),
+                                static_cast<double>(E.Ticks) * MsPerTick);
+      for (auto& S : Probe->Snaps) {
+        if (S.Ready.load(std::memory_order_acquire) == 2 && S.Start == Start) {
+          Out += fextl::fmt::format(" | at {} ms: {}", S.AtMs, S.Text);
+          S.Ready.store(0, std::memory_order_release);
+        }
+      }
+      const LogState::Run R = CollectFrameRun(State, Start, E.End);
+      fextl::vector<std::pair<uint32_t, uint64_t>> Blocks, Natives;
+      SplitCounts(R.Counts, Blocks, Natives);
+      Out += fextl::fmt::format(" | sampled meanwhile: main samples={}", R.Samples);
+      AppendNatives(State, Natives, 2, Out);
+      fextl::vector<std::pair<uint32_t, const LogState::RunThread*>> Others;
+      for (const auto& [TID, T] : R.Others) {
+        if (T.Samples) {
+          Others.push_back({TID, &T});
+        }
+      }
+      std::sort(Others.begin(), Others.end(), [](const auto& a, const auto& b) { return a.second->Samples > b.second->Samples; });
+      for (size_t i = 0; i < std::min<size_t>(Others.size(), 8); ++i) {
+        const auto& T = *Others[i].second;
+        Out += fextl::fmt::format("; tid={} {} emu={}%", Others[i].first, QueryThreadName(Others[i].first), T.InSim * 100 / T.Samples);
+        fextl::vector<std::pair<uint32_t, uint64_t>> OtherBlocks, OtherNatives;
+        SplitCounts(T.Counts, OtherBlocks, OtherNatives);
+        AppendNatives(State, OtherNatives, 2, Out);
+      }
+      Out += "\n";
+    }
+    // Lists whose wait ended before the events kept (or under the minimum) are let go.
+    const uint64_t KeepFrom = State->PrevSecondStart ? State->PrevSecondStart : State->SecondStart;
+    for (auto& S : Probe->Snaps) {
+      if (S.Ready.load(std::memory_order_acquire) == 2 && S.Start < KeepFrom && Probe->VqStart.load(std::memory_order_relaxed) != S.Start) {
+        S.Ready.store(0, std::memory_order_release);
+      }
+    }
+    return Out;
+  }
+
   // A "# frame" line: what Main was sampled doing from frame start Begin to the next frame start End, from this and the
   // previous second's samples (an older start is noted as such).
   LogState::Run CollectFrameRun(LogState* State, uint64_t Begin, uint64_t End) {
@@ -3770,6 +4012,7 @@ namespace {
       Line += SchedLines(Seconds);
       Line += GpuLine();
       Line += ProbeLine(State, MsPerTick);
+      Line += LockWaitLines(State, Seconds);
       Line += FrameLines(State, Seconds);
       if (State->Profile) {
         Line += MainHitches(State, Seconds);
@@ -4114,8 +4357,12 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   if (State->Profile && !(StallProbe && StallProbe[0] == '0')) {
     Probe = new ProbeShared {};
     ProbeThreadObject = FEXCore::Threads::Thread::Create(ProbeThread, nullptr, {.LowPriority = false, .Internal = true}, "FEXStallProbe");
+    static fextl::unique_ptr<FEXCore::Threads::Thread> LockWatchObject;
+    LockWatchObject = FEXCore::Threads::Thread::Create(LockWatchThread, nullptr, {.LowPriority = false, .Internal = true}, "FEXLockWatch");
     const char* ProbeNote = "# stall probe: on, every 4ms: sleep (late wakeup), vq (Wine memory lock), fault (kernel memory map lock), "
-                            "fexlock (FEX memory/SMC lock), every 16ms server (wineserver round trip); FEX_STALLPROBE=0 turns it off\n";
+                            "fexlock (FEX memory/SMC lock), every 16ms server (wineserver round trip); FEX_STALLPROBE=0 turns it off. "
+                            "vq waits of 15 ms or more get a '# memory lock wait' line with every thread not asleep in a wait at 15 and "
+                            "45 ms (Linux syscall, state, CPU) and what the sampled threads did meanwhile (build 133)\n";
     fwrite(ProbeNote, 1, strlen(ProbeNote), File);
   }
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
