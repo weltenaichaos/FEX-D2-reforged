@@ -148,6 +148,8 @@ The **clean version** sets two switches of its own instead:
 |---|---|---|
 | `FEX_VKD3D_LOG_OFF` | `1` | VKD3D's own text output off. |
 | `FEX_CRASH_NOTE` | `D:\` | If the game ends with an error, a small file `fexcrash-D2R.exe-b<N>-<time>-<pid>.txt` with the last errors. Nothing otherwise. `0` = none. |
+| `FEX_START_WATCH` | `D:\` | Both versions, build 128: for every start a small file `fexstart-D2R.exe-b<N>-<time>-<pid>.txt` with the processes of the container (Steam, Wine) starting and ending in the first 2 minutes and the end of Steam's own logs, to find what ends a start that stays black. `0` = none. |
+| `FEX_START_WATCH_S` | `120` | How many seconds the start watch follows processes (5-3600). | |
 
 ## Tried and left off
 
