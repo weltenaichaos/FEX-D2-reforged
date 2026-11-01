@@ -19,6 +19,8 @@
 #include <winternl.h>
 #include <winbase.h>
 
+extern "C" NTSTATUS WINAPI RtlSystemTimeToLocalTime(const LARGE_INTEGER* SystemTime, LARGE_INTEGER* LocalTime);
+
 namespace FEX::Windows {
 namespace {
 #ifdef FEX_BUILD_NUMBER
