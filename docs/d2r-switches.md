@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 132, VKD3D fex38, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
+State: FEX build 132, VKD3D fex39, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -16,7 +16,7 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
   those, `0` means "nice 0", not off.
 - The logging version lists every switch with its value in the `# switches:` line near the top of the log. Built-in
   values are marked `(default)`.
-- VKD3D switches need our VKD3D (fex38), Turnip switches our Turnip (fex17), frame generation switches our layer. A
+- VKD3D switches need our VKD3D (fex39), Turnip switches our Turnip (fex17), frame generation switches our layer. A
   VKD3D switch does nothing when its matching `VKD3D_FEX_*` variable is already set.
 - If you changed any switch, say so when you report a problem.
 
@@ -100,7 +100,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_VKD3D_SHADER_SWAP` | `1` | Two of the game's shaders are swapped for faster versions that draw the same: the lighting table blur (30 ms to 2.2 ms per run) and the ground clutter shader (builds 108-110). `2` swaps only the blur. | `0` |
 | `FEX_VKD3D_CLEAR_MEMO` | `1` | The game's empty second shadow map isn't cleared again while it is still empty (build 110). | `0` |
 | `FEX_VKD3D_UI_SPLIT` | `1` | Each frame is also made without the game's UI, for frame generation (build 122). | `0` |
-| `VKD3D_FEX_START_HITCH_SKIP` | `1` | Set directly (no FEX switch). Frames that would have come late anyway (loading screens, area changes, hitches) no longer keep frame start pacing at 0 for 8.5 s, so the lag after loads drops back sooner (VKD3D fex38). | `0` |
+| `VKD3D_FEX_START_HITCH_SKIP` | `1` | Set directly (no FEX switch). Frames that would have come late anyway (loading screens, area changes, hitches) no longer keep frame start pacing at 0 for 8.5 s, and from fex39 neither do the frames around them or the first 10 s after a loading screen, so the lag after loads drops back sooner (VKD3D fex38-39). `1` = fex38 only. | `0` |
 
 ## Turnip (graphics driver)
 
