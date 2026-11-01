@@ -285,7 +285,10 @@ namespace {
     // 200-450 MB all session, so each few hundred MB the game added in play (new area GPU data) woke it. In a loading
     // screen FEX now takes memory until MemFree is this many MB and gives it back, so the reclaim runs in the load and
     // play starts with room (see ARM64EC/GameFiles.cpp). 0 = off.
-    {"FEX_MEM_HEADROOM_MB", "768"},
+    // Build 131: off by default. In the build 130 run it pushed Android's memory killer (lmkd) to close background apps
+    // at three loading screens (t=60, 198, 553: 2-9 ended a second), which restarted at once and kept all 8 cores near
+    // 100% busy for 15-25 s of play (2-3 cores of other apps), the run's worst stutter.
+    {"FEX_MEM_HEADROOM_MB", "0"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
