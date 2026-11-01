@@ -52,6 +52,7 @@ $end_info$
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/ThreadPlacer.h"
 #include "Windows/Common/PriorityGuard.h"
+#include "Windows/Common/StartWatch.h"
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/Switches.h"
 #include "CodeBuffer.h"
@@ -1063,6 +1064,8 @@ NTSTATUS ProcessInit() {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
   FEX::Windows::StartThreadPlacer(AppConfigName);
+  // Build 128: who ends a start that never gets going (StartWatch.h).
+  FEX::Windows::StartStartWatch(AppConfigName);
   LoaderWatch::Init(StatsLog);
   FEX::Windows::StartPriorityGuard(AppConfigName);
   FrameLatency::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);

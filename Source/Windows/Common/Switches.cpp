@@ -34,6 +34,10 @@ namespace {
     // last exceptions FEX passed on), nothing otherwise. "0" turns it off.
     {"FEX_CRASH_NOTE", "D:\\"},
 #endif
+    // Build 128: a small file D:\fexstart-D2R.exe-b<N>-<time>-<pid>.txt for every start (both builds): process starts and
+    // ends of this Linux user to the millisecond for 120 s and the end of Steam's logs, to find out what ends a start
+    // that shows a black screen and leaves neither D2R nor Steam running (see StartWatch.h). "0" turns it off.
+    {"FEX_START_WATCH", "D:\\"},
     {"FEX_NATIVE_ZLIB", "1"},
     {"FEX_NATIVE_MD5", "1"},
     {"FEX_UNPACK_CACHE", "1"},
@@ -600,6 +604,8 @@ namespace {
     "FEX_FRAME_THREADS",
     "FEX_FRAME_THREADS_OFFCORE",
     "FEX_CRASH_NOTE",
+    "FEX_START_WATCH",
+    "FEX_START_WATCH_S",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",
