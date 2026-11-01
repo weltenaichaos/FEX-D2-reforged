@@ -16,8 +16,11 @@ namespace FEX::Windows {
 //     the launcher) at the start, then every process start and end of that user to the millisecond for the first
 //     FEX_START_WATCH_S seconds (default 120), and a heartbeat each second, so the last lines of a failed start say
 //     who went away first and when this process stopped;
-//   - the end of Steam's own logs (C:\Program Files (x86)\Steam\logs: console_log, bootstrap_log, connection_log, ...):
-//     at the start, which holds the previous Steam session (a failed start's), and again after 60 s.
+//   - build 132: this app's entries in Android's log (logd lets an app read its own user's entries): warnings and errors
+//     of the launcher (GameNative) and crash lines, including those of a previous failed start, at the start and then
+//     every 250 ms; and the launcher's own app process: in the build 131 failed start every process of the container
+//     went away at once, which is what Android does when that process dies. (Build 129 copied Steam's logs instead; in
+//     GameNative's container they are stale.)
 // Every line is written at once (no buffering), so the file is complete up to the moment the process ended.
 // FEX_START_WATCH=<folder> sets the folder, 0 turns it off.
 void StartStartWatch(std::string_view AppName);

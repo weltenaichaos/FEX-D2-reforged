@@ -38,7 +38,6 @@ namespace {
   constexpr int64_t CLOCK_BOOTTIME = 7;
   constexpr uint64_t PollNs = 25'000'000;         // process list read every 25 ms
   constexpr uint64_t SteamTailBytes = 64 * 1024;  // the end of each Steam log
-  constexpr uint64_t SteamAgainS = 60;            // Steam's console log copied again after this long
 
   struct WatchState {
     FILE* File;
@@ -287,7 +286,7 @@ namespace {
     fextl::string* Text;
   };
 
-  void CopySteamLogs(const WatchState& S, bool ConsoleOnly) {
+  [[maybe_unused]] void CopySteamLogs(const WatchState& S, bool ConsoleOnly) {
     fextl::string Why;
     const fextl::string Dir = SteamLogsPath(Why);
     if (Dir.empty()) {
@@ -326,6 +325,134 @@ namespace {
     }
   }
 
+
+  // Android's log (logd), build 132. An app may read the log entries of its own Linux user: the launcher's (GameNative's)
+  // Java and native errors, a crash's "FATAL EXCEPTION" or "Fatal signal" lines, and the crash buffer. In the failed
+  // starts of 2026-11-01 every process of the container went away at once (none ended before the others in 25 ms
+  // checks), which is what Android does when the launcher's own app process dies: it ends everything in its group.
+  constexpr int64_t NR_kill = 129;
+  constexpr int64_t NR_socket = 198;
+  constexpr int64_t NR_connect = 203;
+  constexpr int64_t NR_setsockopt = 208;
+  constexpr int64_t NR_read = 63;
+  constexpr int64_t NR_write = 64;
+
+  struct LogCursor {
+    uint64_t Sec;
+    uint64_t Nsec;
+  };
+
+  int64_t LocalOffsetS() {
+    LARGE_INTEGER SystemTime {}, LocalTime {};
+    NtQuerySystemTime(&SystemTime);
+    RtlSystemTimeToLocalTime(&SystemTime, &LocalTime);
+    return (LocalTime.QuadPart - SystemTime.QuadPart) / 10'000'000LL;
+  }
+
+  // Runs one logd reader command ("dumpAndClose ...") and appends the entries at MinPrio or above (all of the crash
+  // buffer) newer than the cursor as text lines. Returns how many entries logd sent, or a negative errno.
+  int64_t ReadLogd(const fextl::string& Command, int MinPrio, LogCursor& Cursor, fextl::vector<fextl::string>& Lines, int64_t OffsetS) {
+    const int64_t Fd = Linux::Syscall(NR_socket, 1 /* AF_UNIX */, 5 /* SOCK_SEQPACKET */ | 0x80000 /* SOCK_CLOEXEC */, 0);
+    if (Fd < 0) {
+      return Fd;
+    }
+    struct {
+      uint16_t Family;
+      char Path[108];
+    } Addr {};
+    Addr.Family = 1;
+    strcpy(Addr.Path, "/dev/socket/logdr");
+    int64_t Result = Linux::Syscall(NR_connect, Fd, reinterpret_cast<intptr_t>(&Addr), 2 + strlen(Addr.Path) + 1);
+    if (Result < 0) {
+      Linux::Close(static_cast<int>(Fd));
+      return Result;
+    }
+    struct {
+      int64_t Sec;
+      int64_t Usec;
+    } Timeout {1, 0};
+    Linux::Syscall(NR_setsockopt, Fd, 1 /* SOL_SOCKET */, 20 /* SO_RCVTIMEO */, reinterpret_cast<intptr_t>(&Timeout), sizeof(Timeout));
+    Result = Linux::Syscall(NR_write, Fd, reinterpret_cast<intptr_t>(Command.data()), Command.size());
+    if (Result < 0) {
+      Linux::Close(static_cast<int>(Fd));
+      return Result;
+    }
+    alignas(8) unsigned char Buffer[8192 + 1];
+    int64_t Entries {};
+    for (int Guard = 0; Guard < 200000; ++Guard) {
+      const int64_t Len = Linux::Syscall(NR_read, Fd, reinterpret_cast<intptr_t>(Buffer), sizeof(Buffer) - 1);
+      if (Len <= 0) {
+        break;
+      }
+      if (Len < 28) {
+        continue;
+      }
+      ++Entries;
+      uint16_t PayloadLen, HdrSize;
+      int32_t Pid;
+      uint32_t Tid, Sec, Nsec, Lid;
+      memcpy(&PayloadLen, Buffer + 0, 2);
+      memcpy(&HdrSize, Buffer + 2, 2);
+      memcpy(&Pid, Buffer + 4, 4);
+      memcpy(&Tid, Buffer + 8, 4);
+      memcpy(&Sec, Buffer + 12, 4);
+      memcpy(&Nsec, Buffer + 16, 4);
+      memcpy(&Lid, Buffer + 20, 4);
+      if (HdrSize < 20 || HdrSize > Len) {
+        HdrSize = 20;
+      }
+      if (Sec < Cursor.Sec || (Sec == Cursor.Sec && Nsec <= Cursor.Nsec)) {
+        continue;
+      }
+      Cursor = {Sec, Nsec};
+      if (Lid == 2 || Lid == 5 || Lid == 6) { // events, stats, security: binary
+        continue;
+      }
+      const size_t End = std::min<size_t>(static_cast<size_t>(Len), static_cast<size_t>(HdrSize) + PayloadLen);
+      if (End <= HdrSize + 1u) {
+        continue;
+      }
+      Buffer[End] = 0;
+      const unsigned Prio = Buffer[HdrSize];
+      if (Lid != 4 && static_cast<int>(Prio) < MinPrio) {
+        continue;
+      }
+      const char* Tag = reinterpret_cast<const char*>(Buffer + HdrSize + 1);
+      const size_t TagLen = strnlen(Tag, End - HdrSize - 1);
+      const char* Msg = Tag + TagLen + 1;
+      fextl::string Text = reinterpret_cast<const char*>(Buffer + HdrSize + 1) + TagLen < reinterpret_cast<const char*>(Buffer + End) ?
+                             fextl::string(Msg, strnlen(Msg, reinterpret_cast<const char*>(Buffer + End) - Msg)) :
+                             fextl::string();
+      while (!Text.empty() && (Text.back() == '\n' || Text.back() == ' ')) {
+        Text.pop_back();
+      }
+      std::replace(Text.begin(), Text.end(), '\n', '|');
+      constexpr char Letters[] = "??VDIWEFS";
+      constexpr const char* Buffers[] = {"main", "radio", "events", "system", "crash", "stats", "security", "kernel"};
+      const int64_t Local = static_cast<int64_t>(Sec) + OffsetS;
+      Lines.push_back(fextl::fmt::format("{:02}:{:02}:{:02}.{:03} {} {}/{} {} {}: {}", (Local / 3600) % 24, (Local / 60) % 60, Local % 60,
+                                         Nsec / 1'000'000, Lid < 8 ? Buffers[Lid] : "?", Pid, Tid, Prio < 9 ? Letters[Prio] : '?',
+                                         fextl::string(Tag, TagLen), Text));
+    }
+    Linux::Close(static_cast<int>(Fd));
+    return Entries;
+  }
+
+  // The launcher's own app process: the pid in this process's Android group (/uid_N/pid_M in /proc/self/cgroup).
+  int LauncherPid() {
+    char Text[1024];
+    if (Linux::ReadSmallFile("/proc/self/cgroup", Text, sizeof(Text)) <= 0) {
+      return 0;
+    }
+    const char* P = strstr(Text, "/pid_");
+    return P ? atoi(P + 5) : 0;
+  }
+
+  bool ProcessExists(int Pid) {
+    // 0 or -EPERM: there; -ESRCH (3): gone. /proc hides the launcher's process from the game.
+    return Linux::Syscall(NR_kill, Pid, 0) != -3;
+  }
+
   void* WatchThread(void* Arg) {
     auto& S = *static_cast<WatchState*>(Arg);
     const uint64_t BeginMs = BootMs();
@@ -350,10 +477,30 @@ namespace {
     Put(S.File, fextl::fmt::format("{} {} other processes of this user (uid {}) running; {} processes in all\n", Stamp(S), Mine, S.Uid,
                                    Known.size()));
 
-    CopySteamLogs(S, false);
-    Put(S.File, fextl::fmt::format("{} watching process starts and ends every {} ms for {} s\n", Stamp(S), PollNs / 1'000'000, S.Seconds));
+    // Steam's own logs (build 129) were stale in GameNative's container (its steam.exe doesn't write them): left out.
+    // Android's log instead: what the launcher logged lately, including a previous start that failed.
+    const int64_t OffsetS = LocalOffsetS();
+    LogCursor Cursor {};
+    {
+      fextl::vector<fextl::string> Lines;
+      const int64_t Got = ReadLogd("dumpAndClose lids=0,3,4 tail=30000", 5 /* W */, Cursor, Lines, OffsetS);
+      constexpr size_t Keep = 1500;
+      Put(S.File, fextl::fmt::format("## android log (this app's entries, warnings and errors, local time): {} entries read{}, {} lines{}\n", Got < 0 ? 0 : Got,
+                                     Got < 0 ? fextl::fmt::format(" (logd error {})", Got) : fextl::string(), Lines.size(),
+                                     Lines.size() > Keep ? fextl::fmt::format(", the last {}", Keep) : fextl::string()));
+      for (size_t i = Lines.size() > Keep ? Lines.size() - Keep : 0; i < Lines.size(); ++i) {
+        Put(S.File, Lines[i] + "\n");
+      }
+      Put(S.File, "## end of android log\n");
+    }
+    const int Launcher = LauncherPid();
+    bool LauncherGone = false;
+    Put(S.File, fextl::fmt::format("{} launcher app process {} {}; watching process starts and ends every {} ms and new android log warnings "
+                                   "and errors every 250 ms for {} s\n",
+                                   Stamp(S), Launcher, Launcher ? (ProcessExists(Launcher) ? "running" : "not found") : "unknown",
+                                   PollNs / 1'000'000, S.Seconds));
 
-    bool CopiedAgain = false;
+    uint64_t NextLog = BeginMs + 250;
     uint64_t NextBeat = BeginMs + 1000;
     while (BootMs() - BeginMs < S.Seconds * 1000) {
       Linux::SleepNs(PollNs);
@@ -390,7 +537,19 @@ namespace {
       }
       Known = std::move(Next);
 
+      if (Launcher && !LauncherGone && !ProcessExists(Launcher)) {
+        LauncherGone = true;
+        Put(S.File, fextl::fmt::format("{} ended: the launcher's app process {}\n", Stamp(S), Launcher));
+      }
       const uint64_t Now = BootMs();
+      if (Now >= NextLog) {
+        NextLog = Now + 250;
+        fextl::vector<fextl::string> Lines;
+        ReadLogd(fextl::fmt::format("dumpAndClose lids=0,3,4 start={}.{:09}", Cursor.Sec, Cursor.Nsec), 5, Cursor, Lines, OffsetS);
+        for (const auto& L : Lines) {
+          Put(S.File, fextl::fmt::format("{} log: {}\n", Stamp(S), L));
+        }
+      }
       if (Now >= NextBeat) {
         size_t Count {};
         for (const auto& P : Known) {
@@ -399,16 +558,8 @@ namespace {
         Put(S.File, fextl::fmt::format("{} alive, {} processes of this user\n", Stamp(S), Count));
         NextBeat += 1000;
       }
-      if (!CopiedAgain && Now - BeginMs >= SteamAgainS * 1000) {
-        CopiedAgain = true;
-        Put(S.File, fextl::fmt::format("{} Steam's logs again after {} s:\n", Stamp(S), SteamAgainS));
-        CopySteamLogs(S, true);
-      }
     }
     Put(S.File, fextl::fmt::format("{} start watch done\n", Stamp(S)));
-    if (!CopiedAgain) {
-      CopySteamLogs(S, true);
-    }
     return nullptr;
   }
 } // namespace
@@ -445,11 +596,11 @@ void StartStartWatch(std::string_view AppName) {
   S->SelfStartMs = ReadParentAndStart(S->SelfPid, Parent, StartMs) ? StartMs : BootMs();
 
   Put(File, fextl::fmt::format("# FEX start watch for {} (Windows pid {}, Linux pid {}, build {}). Times are seconds since this process "
-                               "started (Linux). Lines: this process and its parent; every process of this Linux user at the start; the "
-                               "end of Steam's logs (the previous Steam session's is console_log.previous.txt); then every start and end "
-                               "of this user's processes, checked every {} ms, and 'alive' once a second, for {} s. A file whose last "
-                               "line is an 'alive' or 'ended' line belongs to a process that was ended from outside then "
-                               "(FEX_START_WATCH=0 turns this off)\n",
+                               "started (Linux). Lines: this process and its parent; every process of this Linux user at the start; this app's "
+                               "Android log entries (warnings and errors, a previous failed start's included); then every start and end of "
+                               "this user's processes and of the launcher's app process, checked every {} ms, new Android log warnings and "
+                               "errors every 250 ms ('log:'), and 'alive' once a second, for {} s. A file whose last line is an 'alive', "
+                               "'log' or 'ended' line belongs to a process that was ended from outside then (FEX_START_WATCH=0 turns this off)\n",
                                AppNameCopy, GetCurrentProcessId(), S->SelfPid, BuildInfo, PollNs / 1'000'000, Seconds));
   StatsLogNote(fextl::fmt::format("start watch: process starts and ends of this user and the end of Steam's logs go to {} (FEX_START_WATCH=0 "
                                   "turns it off)",
