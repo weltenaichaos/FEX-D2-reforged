@@ -272,6 +272,16 @@ namespace {
     // bursts, too short for Android to raise the clock, so a 3968 KB read took 20-21 ms (~200 MB/s, against ~950 MB/s in
     // loading screens), and an area entry had a 124 ms frame. The same reads come back in every session.
     {"FEX_GAME_FILES_LEARN", "256"},
+    // Build 129: in the b126 run of 2026-11-01 Android's memory reclaim (kswapd) threw part of the learned data out of the
+    // file cache in play (40.9 of 52.8 MB had to be read again at the next loading screen), and the main thread read
+    // 5.9 MB of it from storage in one frame (111 ms). The learned ranges are asked of storage every 500 ms in play too:
+    // what is still cached costs only the look-up, what was thrown out is read back in the background.
+    {"FEX_GAME_FILES_REFILL", "1"},
+    // Build 129: that reclaim runs when memory nothing holds (MemFree) reaches the kernel's watermark; in that run it was
+    // 200-450 MB all session, so each few hundred MB the game added in play (new area GPU data) woke it. In a loading
+    // screen FEX now takes memory until MemFree is this many MB and gives it back, so the reclaim runs in the load and
+    // play starts with room (see ARM64EC/GameFiles.cpp). 0 = off.
+    {"FEX_MEM_HEADROOM_MB", "768"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
@@ -531,6 +541,9 @@ namespace {
     "FEX_GAME_FILES_READ_WATCH",
     "FEX_GAME_FILES_AHEAD",
     "FEX_GAME_FILES_LEARN",
+    "FEX_GAME_FILES_REFILL",
+    "FEX_MEM_HEADROOM_MB",
+    "FEX_MEM_HEADROOM_GUARD_MB",
     "FEX_UNPACK_CACHE_SKIP_ADLER",
     "FEX_NATIVE_ADLER_NEON",
     "FEX_NATIVE_MD5_CACHE",

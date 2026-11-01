@@ -35,6 +35,8 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
 | `FEX_UNPACK_CACHE_FLUSH` | `1` | New cache data is written in 8 MB batches instead of piece by piece (build 91). | `0` |
 | `FEX_GAME_FILES_UNCACHED` | `1` | The game's own data files are kept out of Android's file cache. Before this, Android's memory killer closed other apps at every area load, and they restarted on all cores (builds 59-61). Needed by the next switch. | `0` |
 | `FEX_GAME_FILES_LEARN` | `256` | Game data the main thread waited for during play is remembered across sessions and read in at loading screens (budget in MB, build 89). | `0` |
+| `FEX_GAME_FILES_REFILL` | `1` | That learned data is checked every 500 ms in play too; what Android's memory reclaim threw out is read back in the background before the game needs it (build 129). | `0` |
+| `FEX_MEM_HEADROOM_MB` | `768` | In a loading screen FEX takes memory until this many MB are unused and gives it back, so Android's memory reclaim runs in the load instead of in play (build 129). `FEX_MEM_HEADROOM_GUARD_MB` (default `3072`) is the available memory it never goes below. | `0` |
 | `FEX_LOAD_LIGHT` | `64` | Frames that give the GPU very little work also count as a loading screen, so loading screens drawn at full speed are seen too (build 94). | `0` |
 
 ## FEX code and locks

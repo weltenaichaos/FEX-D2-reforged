@@ -15,6 +15,7 @@ $end_info$
 
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/Threads.h>
 
 #include <algorithm>
@@ -195,6 +196,34 @@ namespace {
   // Build 90: called once per FEXFileCache pass (SetPassHook).
   std::atomic<void (*)(bool, bool)> PassHook {};
   bool UnpackLearnWanted {}; // FEX_UNPACK_CACHE_LEARN asked for: the frame clock is needed
+
+  // Build 129, FEX_GAME_FILES_REFILL: in the b126 run of 2026-11-01 the learned data was all in the file cache at the
+  // loading screens (0.0 MB of 52.7 read from storage when asked), but Android's memory reclaim (kswapd, 897 MB/s at
+  // t=57 when the new area's GPU data grew 257 MB) threw part of it out in play: the main thread then read 5.9 MB of it
+  // from storage in one frame (111 ms), and the next loading screen had to read 40.9 of the 52.8 MB again. The kernel
+  // drops the oldest file pages first, and learned data read at a loading screen and not touched since is that. The
+  // learned ranges are now asked of storage every pass in play too: pages still there cost only the look-up (~0.5 ms
+  // for the whole list), pages thrown out are read back in the background.
+  bool RefillOn {};
+  // Build 129, FEX_MEM_HEADROOM_MB: the reclaim runs when memory nothing holds (MemFree) falls to the kernel's
+  // watermark; in that run it stayed at 200-450 MB all session (the file cache takes the rest), so every few hundred MB
+  // the game added in play woke it. While a loading screen runs, FEX takes memory until MemFree reaches the headroom and
+  // gives it back at once: the kernel reclaims then (in the load, where a slower frame doesn't show) and play starts
+  // with that much free. It stops when available memory (MemAvailable) would fall below FEX_MEM_HEADROOM_GUARD_MB (Android's
+  // memory killer closes other apps when it gets low, see build 58), after 1.5 s, or when play starts.
+  uint64_t HeadroomMB {};
+  uint64_t HeadroomGuardMB {3072};
+  struct HeadroomCounters {
+    // Per second.
+    std::atomic<uint64_t> Runs, TouchedMB, Ns, FreeBeforeMB, FreeAfterMB, Skipped;
+    std::atomic<uint32_t> LastStop; // 0 reached, 1 time, 2 available memory low, 3 play started, 4 allocation failed, 5 per-load cap
+  };
+  HeadroomCounters Headroom {};
+  uint64_t LoadTouchedMB {}; // this loading screen
+  struct RefillCounters {
+    std::atomic<uint64_t> Passes, StorageKB, Ns;
+  };
+  RefillCounters Refill {};
 
   struct HandleSlot {
     uint64_t Handle;
@@ -514,6 +543,7 @@ namespace {
   struct MemInfo {
     uint64_t CachedKB;
     uint64_t AvailableKB;
+    uint64_t FreeKB; // build 129: MemFree, memory nothing holds
   };
 
   MemInfo ReadMemInfo() {
@@ -523,7 +553,9 @@ namespace {
     }
     const char* Cached = strstr(Buffer, "\nCached:");
     const char* Available = strstr(Buffer, "\nMemAvailable:");
-    return {Cached ? strtoull(Cached + 8, nullptr, 10) : 0, Available ? strtoull(Available + 14, nullptr, 10) : 0};
+    const char* Free = strncmp(Buffer, "MemFree:", 8) == 0 ? Buffer : strstr(Buffer, "\nMemFree:");
+    const uint64_t FreeKB = !Free ? 0 : strtoull(Free + (Free == Buffer ? 8 : 9), nullptr, 10);
+    return {Cached ? strtoull(Cached + 8, nullptr, 10) : 0, Available ? strtoull(Available + 14, nullptr, 10) : 0, FreeKB};
   }
 
   // Whether a piece last read at Stamp is among the last Budget bytes read on a clock now at Now.
@@ -868,7 +900,7 @@ namespace {
 
   // Asks storage for every range in a file that is here (WILLNEED, the kernel's read-ahead size per call); pages already
   // in the file cache cost only the look-up.
-  void AskLearned() {
+  void AskLearned(bool InPlay = false) {
     FEX::Windows::Linux::ThreadUsage Before {}, After {};
     const bool Measure = FEX::Windows::Linux::GetThreadUsage(Before);
     const uint64_t Begin = GetCounter();
@@ -888,9 +920,14 @@ namespace {
       Bytes += R.Bytes;
     }
     const uint64_t Ns = (GetCounter() - Begin) * 1'000'000'000 / CounterFreq;
-    if (Measure && FEX::Windows::Linux::GetThreadUsage(After)) {
-      Learning.AskStorageKB.fetch_add((After.InBlocks - Before.InBlocks) / 2, std::memory_order_relaxed);
+    const uint64_t StorageKB = Measure && FEX::Windows::Linux::GetThreadUsage(After) ? (After.InBlocks - Before.InBlocks) / 2 : 0;
+    if (InPlay) {
+      Refill.Passes.fetch_add(1, std::memory_order_relaxed);
+      Refill.StorageKB.fetch_add(StorageKB, std::memory_order_relaxed);
+      Refill.Ns.fetch_add(Ns, std::memory_order_relaxed);
+      return;
     }
+    Learning.AskStorageKB.fetch_add(StorageKB, std::memory_order_relaxed);
     Learning.Asks.fetch_add(1, std::memory_order_relaxed);
     Learning.AskBytes.fetch_add(Bytes, std::memory_order_relaxed);
     Learning.AskCalls.fetch_add(Calls, std::memory_order_relaxed);
@@ -1077,15 +1114,80 @@ namespace {
     }
   }
 
+  // A loading screen now: no frame for PlayFrameMs, or GPU-light frames (build 94, LoadScreen.h).
+  bool GapNow() {
+    const uint64_t Marks = FrameCount();
+    const uint64_t Now = GetCounter();
+    const uint64_t Last = Marks ? FrameMark(Marks - 1) : 0;
+    return (Marks && Now > Last && Now - Last >= CounterFreq * PlayFrameMs / 1000) || LoadScreen::LightNow();
+  }
+
+  // Build 129 (see HeadroomMB): in a loading screen, takes memory until MemFree reaches the headroom, then gives it back.
+  void MakeHeadroom() {
+    const MemInfo Start = ReadMemInfo();
+    if (!Start.FreeKB || Start.FreeKB >= (HeadroomMB << 10)) {
+      return;
+    }
+    const uint64_t GuardKB = HeadroomGuardMB << 10;
+    if (Start.AvailableKB && Start.AvailableKB < GuardKB + (64 << 10)) {
+      Headroom.Skipped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (LoadTouchedMB >= 2 * HeadroomMB) {
+      Headroom.Skipped.fetch_add(1, std::memory_order_relaxed);
+      Headroom.LastStop.store(5, std::memory_order_relaxed);
+      return;
+    }
+    constexpr uint64_t Step = 32ull << 20;
+    const uint64_t Want = std::min(((HeadroomMB << 20) - (Start.FreeKB << 10) + Step - 1) & ~(Step - 1), HeadroomMB << 20);
+    const uint64_t Begin = GetCounter();
+    auto* Memory = static_cast<volatile uint8_t*>(FEXCore::Allocator::VirtualAlloc(Want));
+    uint32_t Stop = 0;
+    uint64_t Touched = 0;
+    if (!Memory) {
+      Stop = 4;
+    }
+    while (Memory && Touched < Want) {
+      for (uint64_t At = Touched, End = std::min(Touched + Step, Want); At < End; At += 4096) {
+        Memory[At] = 1;
+      }
+      Touched = std::min(Touched + Step, Want);
+      if (Touched >= Want) {
+        break;
+      }
+      const MemInfo Now = ReadMemInfo();
+      if (Now.AvailableKB && Now.AvailableKB < GuardKB) {
+        Stop = 2;
+        break;
+      }
+      if (GetCounter() - Begin >= CounterFreq * 3 / 2) {
+        Stop = 1;
+        break;
+      }
+      if (!GapNow()) {
+        Stop = 3;
+        break;
+      }
+    }
+    if (Memory) {
+      FEXCore::Allocator::VirtualFree(const_cast<uint8_t*>(Memory), Want);
+    }
+    const MemInfo After = ReadMemInfo();
+    LoadTouchedMB += Touched >> 20;
+    Headroom.Runs.fetch_add(1, std::memory_order_relaxed);
+    Headroom.TouchedMB.fetch_add(Touched >> 20, std::memory_order_relaxed);
+    Headroom.Ns.fetch_add((GetCounter() - Begin) * 1'000'000'000 / CounterFreq, std::memory_order_relaxed);
+    Headroom.FreeBeforeMB.store(Start.FreeKB >> 10, std::memory_order_relaxed);
+    Headroom.FreeAfterMB.store(After.FreeKB >> 10, std::memory_order_relaxed);
+    Headroom.LastStop.store(Stop, std::memory_order_relaxed);
+  }
+
   // Once per FEXFileCache pass: learns the candidates, counts the ranges read, asks storage for the list once the drops
   // keep pieces (the read watch found ReadFile; before that a pass drops the files whole) and when a loading screen
   // starts, saves the list.
   void LearnPass(bool& InLoad, bool& Asked, bool LowMemory, uint32_t& Matched) {
-    const uint64_t Marks = FrameCount();
-    const uint64_t Now = GetCounter();
-    const uint64_t Last = Marks ? FrameMark(Marks - 1) : 0;
     // Build 94: GPU-light frames are a loading screen too (LoadScreen.h).
-    const bool Gap = (Marks && Now > Last && Now - Last >= CounterFreq * PlayFrameMs / 1000) || LoadScreen::LightNow();
+    const bool Gap = GapNow();
     if (LearnBudget) {
       MatchNewFiles(Matched);
       TakeCandidates();
@@ -1096,6 +1198,8 @@ namespace {
       if (Keeping) {
         if ((!Asked || (Gap && !InLoad)) && !LowMemory && Learning.HereRanges.load(std::memory_order_relaxed)) {
           AskLearned();
+        } else if (Asked && RefillOn && !Gap && !LowMemory && Learning.HereRanges.load(std::memory_order_relaxed)) {
+          AskLearned(true); // build 129: in play, read back what the kernel threw out
         }
         Asked = true;
       }
@@ -1105,6 +1209,12 @@ namespace {
     // Build 90: the unpack cache's learned list (NativeUnpackCache.cpp) on the same passes.
     if (const auto Hook = PassHook.load(std::memory_order_acquire)) {
       Hook(Gap && !InLoad, LowMemory);
+    }
+    if (HeadroomMB && Gap) {
+      MakeHeadroom();
+    }
+    if (!Gap) {
+      LoadTouchedMB = 0;
     }
     InLoad = Gap;
   }
@@ -1204,7 +1314,7 @@ namespace {
       Stats.KeptMain.store(Kept[1], std::memory_order_relaxed);
       Stats.KeptAhead.store(Kept[2], std::memory_order_relaxed);
       Stats.KeptLearned.store(Kept[3], std::memory_order_relaxed);
-      if (LearnBudget || PassHook.load(std::memory_order_relaxed)) {
+      if (LearnBudget || HeadroomMB || PassHook.load(std::memory_order_relaxed)) {
         const uint64_t AvailableMB = Stats.AvailableMB.load(std::memory_order_relaxed);
         LearnPass(InLoad, Asked, AvailableMB && AvailableMB < GuardMB, Matched);
       }
@@ -1717,7 +1827,11 @@ namespace {
     const uint64_t AskCalls = Learning.AskCalls.exchange(0, std::memory_order_relaxed);
     const uint64_t Evicted = Learning.Evicted.exchange(0, std::memory_order_relaxed);
     const uint64_t SaveFailed = Learning.SaveFailed.exchange(0, std::memory_order_relaxed);
-    if (!NewRanges && !NewBytes && !Skipped && !Lost && !Asks && !Evicted && !SaveFailed) {
+    // Build 129: the refill's passes print only in seconds it read something back.
+    const uint64_t RefillPasses = Refill.Passes.exchange(0, std::memory_order_relaxed);
+    const uint64_t RefillKB = Refill.StorageKB.exchange(0, std::memory_order_relaxed);
+    const uint64_t RefillNs = Refill.Ns.exchange(0, std::memory_order_relaxed);
+    if (!NewRanges && !NewBytes && !Skipped && !Lost && !Asks && !Evicted && !SaveFailed && !RefillKB) {
       return {};
     }
     fextl::string Out = fextl::fmt::format(
@@ -1742,7 +1856,29 @@ namespace {
     if (SaveFailed) {
       Out += fextl::fmt::format(" | saving the list failed ({})", LearnFile);
     }
+    if (RefillKB) {
+      Out += fextl::fmt::format(" | refilled in play: {:.1f} MB read back from storage in {} passes, {:.1f} ms", static_cast<double>(RefillKB) / 1024.0,
+                                RefillPasses, static_cast<double>(RefillNs) / 1e6);
+    }
     return Out + "\n";
+  }
+
+  // Build 129: the headroom's line, in seconds it ran or was skipped.
+  fextl::string HeadroomLine() {
+    const uint64_t Runs = Headroom.Runs.exchange(0, std::memory_order_relaxed);
+    const uint64_t Skipped = Headroom.Skipped.exchange(0, std::memory_order_relaxed);
+    if (!Runs && !Skipped) {
+      return {};
+    }
+    constexpr const char* Stops[] = {"headroom reached", "1.5 s used", "available memory low", "play started", "allocation failed",
+                                     "this loading screen's cap"};
+    const uint32_t Stop = std::min<uint32_t>(Headroom.LastStop.load(std::memory_order_relaxed), 5);
+    return fextl::fmt::format("  memory headroom (loading screen): {} runs, took and gave back {} MB in {:.0f} ms, unused {} -> {} MB (target {} "
+                              "MB), last stop: {}{}\n",
+                              Runs, Headroom.TouchedMB.exchange(0, std::memory_order_relaxed),
+                              static_cast<double>(Headroom.Ns.exchange(0, std::memory_order_relaxed)) / 1e6,
+                              Headroom.FreeBeforeMB.load(std::memory_order_relaxed), Headroom.FreeAfterMB.load(std::memory_order_relaxed),
+                              HeadroomMB, Stops[Stop], Skipped ? fextl::fmt::format(", skipped {} times", Skipped) : fextl::string());
   }
 
   fextl::string StatsLine() {
@@ -1754,7 +1890,7 @@ namespace {
     const uint64_t GuardPasses = Stats.GuardPasses.exchange(0, std::memory_order_relaxed);
     const uint32_t Count = Stats.Files.load(std::memory_order_relaxed);
     if (!Passes) {
-      return ReadsLine() + LearnLine();
+      return ReadsLine() + LearnLine() + HeadroomLine();
     }
     const uint32_t Recent = Stats.KeptRecent.load(std::memory_order_relaxed);
     const uint32_t Main = Stats.KeptMain.load(std::memory_order_relaxed);
@@ -1773,7 +1909,7 @@ namespace {
                               "ms{}){}\n",
                               Count, Kept, static_cast<double>(ShrankKB) / 1024.0, Drops, Passes, static_cast<double>(LongestNs) / 1e6,
                               Failed ? fextl::fmt::format(", {} failed", Failed) : fextl::string(), GuardText) +
-           ReadsLine() + LearnLine();
+           ReadsLine() + LearnLine() + HeadroomLine();
   }
 
   uint64_t Number(const char* Name, uint64_t Default, uint64_t Min, uint64_t Max) {
@@ -1783,7 +1919,7 @@ namespace {
 } // namespace
 
 bool WantsFrameMarks() {
-  return LearnBudget > 0 || UnpackLearnWanted;
+  return LearnBudget > 0 || UnpackLearnWanted || HeadroomMB > 0;
 }
 
 bool Running() {
@@ -1836,6 +1972,10 @@ void Init(bool StatsLog) {
   if (LearnBudget) {
     LearnFile = Store::LearnedPath();
   }
+  // Build 129.
+  RefillOn = LearnBudget && Number("FEX_GAME_FILES_REFILL", 0, 0, 1) == 1;
+  HeadroomMB = Number("FEX_MEM_HEADROOM_MB", 0, 0, 4096);
+  HeadroomGuardMB = Number("FEX_MEM_HEADROOM_GUARD_MB", 3072, 512, 65536);
   // Build 90: the unpack cache's learned list tells play from loading screens by the frame clock too.
   const char* Unpack = FEX::Windows::Switch("FEX_UNPACK_CACHE");
   UnpackLearnWanted = Unpack && Unpack[0] == '1' && Number("FEX_UNPACK_CACHE_LEARN", 0, 0, 4096) > 0;
@@ -1854,6 +1994,20 @@ void Init(bool StatsLog) {
                                 "read), unless available memory is below {} MB",
                                 KeepRecent >> 20, KeepMain >> 20, GuardMB) :
              fextl::string(ReadWatchOn ? ", all of it (keep budget 0); the game's reads are followed" : ", all of it; reads not followed")));
+  if (RefillOn) {
+    FEX::Windows::StatsLogNote("game files: learned data refill: in play the learned ranges are asked of storage every pass too, so what "
+                               "Android's memory reclaim threw out is read back before the main thread needs it; pages still in the "
+                               "file cache cost only the look-up ('refilled in play' on the 'learned reads' line; build 129, "
+                               "FEX_GAME_FILES_REFILL=0 turns it off)");
+  }
+  if (HeadroomMB) {
+    FEX::Windows::StatsLogNote(fextl::fmt::format(
+      "memory headroom: in a loading screen FEX takes memory until unused memory (MemFree) is {} MB and gives it back at once, so the "
+      "kernel's reclaim runs there and play starts with that much free; stops when available memory would fall below {} MB, after "
+      "1.5 s, when play starts, or after {} MB in one loading screen ('memory headroom' line; build 129, FEX_MEM_HEADROOM_MB=0 turns "
+      "it off, FEX_MEM_HEADROOM_GUARD_MB sets the floor)",
+      HeadroomMB, HeadroomGuardMB, 2 * HeadroomMB));
+  }
   if (StatsLog) {
     FEX::Windows::StatsLogSetLineProvider(StatsLine);
   }
