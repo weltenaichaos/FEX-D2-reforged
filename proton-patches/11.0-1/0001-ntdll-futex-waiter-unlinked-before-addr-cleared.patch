@@ -1,0 +1,62 @@
+ntdll: Unlink a futex waiter before clearing its address.
+
+RtlWakeAddressSingle() and RtlWakeAddressAll() cleared entry->addr and only
+then unlinked the entry. The waiter in RtlWaitOnAddress() checks entry.addr
+without the queue's spin lock once it wakes (also on timeout); seeing NULL,
+it returns and its stack entry is reused while the waker's list_remove() is
+still reading and writing through it. The wait list of that bucket ends up
+corrupted, and every later SRW lock, condition variable or WaitOnAddress
+call hashed to it spins forever (D2R froze with the main thread in
+RtlWakeConditionVariable, workers in SleepConditionVariableSRW, all ~95% CPU).
+
+Same order as Valve's wine bleeding-edge and upstream Wine: read the tid,
+list_remove(), then WritePointerRelease(addr, NULL); the waiter reads the
+address with ReadPointerAcquire().
+---
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -910,7 +910,7 @@
+     ret = NtWaitForAlertByThreadId( NULL, timeout );
+ 
+     /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
+-    if (entry.addr)
++    if (ReadPointerAcquire( (void * volatile *)&entry.addr ))
+     {
+         spin_lock( &queue->lock );
+         if (entry.addr)
+@@ -933,6 +933,7 @@
+     struct futex_entry *entry, *next;
+     unsigned int count = 0;
+     HANDLE tids[256];
++    DWORD tid;
+ 
+     TRACE("%p\n", addr);
+ 
+@@ -947,14 +948,15 @@
+     {
+         if (entry->addr == addr)
+         {
+-            entry->addr = NULL;
++            tid = entry->tid;
+             list_remove( &entry->entry );
++            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
+             if (count == ARRAY_SIZE(tids))
+             {
+                 NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
+                 count = 0;
+             }
+-            tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
++            tids[count++] = (HANDLE)(ULONG_PTR)tid;
+         }
+     }
+ 
+@@ -994,8 +996,8 @@
+             /* Remove this entry from the queue, so that a simultaneous call to
+              * RtlWakeAddressSingle() will not also wake it—two simultaneous
+              * calls must wake at least two waiters if they exist. */
+-            entry->addr = NULL;
+             list_remove( &entry->entry );
++            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
+             break;
+         }
+     }
