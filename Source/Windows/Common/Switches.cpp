@@ -299,6 +299,10 @@ namespace {
     // loading screen with less unused memory than this, FEX's drops keep only readahead and learned game data, so FEX's
     // own ~600-850 MB of kept data makes the room instead of other apps (see ARM64EC/GameFiles.cpp). 0 = off.
     {"FEX_GAME_FILES_LOAD_FREE_MB", "1024"},
+    // Build 139: the same in play below this much unused memory. In the build 138 run the game streamed new areas while
+    // frames kept coming (t=46, t=189: 661 and 817 MB read in a second) with 147-185 MB unused, and Android closed 12 and
+    // 5 apps while FEX kept 750-870 MB of game data. 0 = off.
+    {"FEX_GAME_FILES_PLAY_FREE_MB", "384"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
@@ -560,6 +564,7 @@ namespace {
     "FEX_GAME_FILES_LEARN",
     "FEX_GAME_FILES_REFILL",
     "FEX_GAME_FILES_LOAD_FREE_MB",
+    "FEX_GAME_FILES_PLAY_FREE_MB",
     "FEX_MEM_HEADROOM_MB",
     "FEX_MEM_HEADROOM_GUARD_MB",
     "FEX_UNPACK_CACHE_SKIP_ADLER",

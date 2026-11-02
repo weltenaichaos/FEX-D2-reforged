@@ -82,6 +82,8 @@ namespace {
     // Build 138, per second: passes in a loading screen with little unused memory (LoadFreeMB), the lowest MemFree seen
     // at one, and how much the file cache shrank across them.
     std::atomic<uint64_t> RoomPasses, RoomLowestFreeMB, RoomShrankKB;
+    // Build 139: the same in play (PlayFreeMB).
+    std::atomic<uint64_t> PlayRoomPasses, PlayRoomLowestFreeMB, PlayRoomShrankKB;
   };
 
   struct File {
@@ -233,6 +235,13 @@ namespace {
   // read, the readahead and the learned pieces, runs every RoomIntervalMs, and the learned list isn't asked of storage there (refilled in play).
   uint64_t LoadFreeMB {1024};
   constexpr uint64_t RoomIntervalMs = 200;
+  // Build 139, FEX_GAME_FILES_PLAY_FREE_MB: the same in play, at its own (lower) mark and the usual pass time. In the
+  // build 138 run the game streamed a new area twice while frames kept coming (t=46: 661 MB read in a second and a 256 MB
+  // GPU heap made; t=189: 817 MB read) with 147-185 MB of unused memory; Android's memory killer closed 12 and 5 apps
+  // (a 60 ms frame, the main thread waited 64 ms for a CPU). FEX kept 750-870 MB of game data then, while the main thread
+  // read 11 MB of game data in all 250 s of play: in play below this mark only the last 32 MB read, the readahead and the
+  // learned pieces stay (the learned list is still asked for and refilled as before).
+  uint64_t PlayFreeMB {384};
   struct RefillCounters {
     std::atomic<uint64_t> Passes, StorageKB, Ns;
   };
@@ -1310,7 +1319,7 @@ namespace {
       }
       uint64_t Calls = 0, Failed = 0;
       uint32_t Kept[4] {};
-      bool Room = false;
+      bool Room = false, PlayRoom = false;
       if (FileCount) {
         const MemInfo Before = ReadMemInfo();
         const bool Keeping = Armed.load(std::memory_order_acquire) && (KeepRecent || KeepMain);
@@ -1318,13 +1327,19 @@ namespace {
         if (Guard) {
           Stats.GuardPasses.fetch_add(1, std::memory_order_relaxed);
         }
-        // Build 138: a loading screen with little unused memory.
-        Room = Keeping && !Guard && LoadFreeMB && Before.FreeKB && Before.FreeKB < (LoadFreeMB << 10) && GapNow();
+        // Build 138: a loading screen with little unused memory; build 139: play with less still.
+        if (Keeping && !Guard && Before.FreeKB && (LoadFreeMB || PlayFreeMB)) {
+          const bool Gap = GapNow();
+          const uint64_t Mark = Gap ? LoadFreeMB : PlayFreeMB;
+          Room = Mark && Before.FreeKB < (Mark << 10);
+          PlayRoom = Room && !Gap;
+        }
         if (Room) {
-          Stats.RoomPasses.fetch_add(1, std::memory_order_relaxed);
+          (PlayRoom ? Stats.PlayRoomPasses : Stats.RoomPasses).fetch_add(1, std::memory_order_relaxed);
+          auto& LowestFree = PlayRoom ? Stats.PlayRoomLowestFreeMB : Stats.RoomLowestFreeMB;
           const uint64_t FreeMB = Before.FreeKB >> 10;
-          uint64_t Lowest = Stats.RoomLowestFreeMB.load(std::memory_order_relaxed);
-          while ((!Lowest || FreeMB < Lowest) && !Stats.RoomLowestFreeMB.compare_exchange_weak(Lowest, FreeMB, std::memory_order_relaxed)) {}
+          uint64_t Lowest = LowestFree.load(std::memory_order_relaxed);
+          while ((!Lowest || FreeMB < Lowest) && !LowestFree.compare_exchange_weak(Lowest, FreeMB, std::memory_order_relaxed)) {}
         }
         Stats.AvailableMB.store(Before.AvailableKB >> 10, std::memory_order_relaxed);
         const uint64_t AllNow = AllClock.load(std::memory_order_relaxed);
@@ -1355,7 +1370,7 @@ namespace {
         if (Before.CachedKB && After && After < Before.CachedKB) {
           Stats.ShrankKB.fetch_add(Before.CachedKB - After, std::memory_order_relaxed);
           if (Room) {
-            Stats.RoomShrankKB.fetch_add(Before.CachedKB - After, std::memory_order_relaxed);
+            (PlayRoom ? Stats.PlayRoomShrankKB : Stats.RoomShrankKB).fetch_add(Before.CachedKB - After, std::memory_order_relaxed);
           }
         }
       }
@@ -1366,7 +1381,7 @@ namespace {
       Stats.KeptLearned.store(Kept[3], std::memory_order_relaxed);
       if (LearnBudget || HeadroomMB || PassHook.load(std::memory_order_relaxed)) {
         const uint64_t AvailableMB = Stats.AvailableMB.load(std::memory_order_relaxed);
-        LearnPass(InLoad, Asked, AvailableMB && AvailableMB < GuardMB, Room, Matched);
+        LearnPass(InLoad, Asked, AvailableMB && AvailableMB < GuardMB, Room && !PlayRoom, Matched);
       }
       Stats.Drops.fetch_add(Calls - Failed, std::memory_order_relaxed);
       Stats.Failed.fetch_add(Failed, std::memory_order_relaxed);
@@ -1374,7 +1389,7 @@ namespace {
       const uint64_t Ns = (GetCounter() - Begin) * 1'000'000'000 / CounterFreq;
       uint64_t Longest = Stats.LongestNs.load(std::memory_order_relaxed);
       while (Ns > Longest && !Stats.LongestNs.compare_exchange_weak(Longest, Ns, std::memory_order_relaxed)) {}
-      SleepMs(Room ? std::min(IntervalMs, RoomIntervalMs) : IntervalMs);
+      SleepMs(Room && !PlayRoom ? std::min(IntervalMs, RoomIntervalMs) : IntervalMs);
     }
     return nullptr;
   }
@@ -1991,6 +2006,9 @@ namespace {
     const uint64_t RoomPasses = Stats.RoomPasses.exchange(0, std::memory_order_relaxed);
     const uint64_t RoomLowestMB = Stats.RoomLowestFreeMB.exchange(0, std::memory_order_relaxed);
     const uint64_t RoomShrankKB = Stats.RoomShrankKB.exchange(0, std::memory_order_relaxed);
+    const uint64_t PlayRoomPasses = Stats.PlayRoomPasses.exchange(0, std::memory_order_relaxed);
+    const uint64_t PlayRoomLowestMB = Stats.PlayRoomLowestFreeMB.exchange(0, std::memory_order_relaxed);
+    const uint64_t PlayRoomShrankKB = Stats.PlayRoomShrankKB.exchange(0, std::memory_order_relaxed);
     const uint32_t Count = Stats.Files.load(std::memory_order_relaxed);
     if (!Passes) {
       return ReadsLine() + LearnLine() + HeadroomLine();
@@ -2013,10 +2031,15 @@ namespace {
                                       "the last 32 MB read, readahead and learned pieces, file cache {:.0f} MB smaller by them",
                                       RoomPasses, LoadFreeMB, RoomLowestMB, static_cast<double>(RoomShrankKB) / 1024.0) :
                    fextl::string();
+    const fextl::string PlayRoomText =
+      PlayRoomPasses ? fextl::fmt::format(", play room: {} passes in play with unused memory below {} MB (lowest {} MB) kept only the "
+                                          "last 32 MB read, readahead and learned pieces, file cache {:.0f} MB smaller by them",
+                                          PlayRoomPasses, PlayFreeMB, PlayRoomLowestMB, static_cast<double>(PlayRoomShrankKB) / 1024.0) :
+                       fextl::string();
     return fextl::fmt::format("  game files: {} files{}, file cache {:.0f} MB smaller after the drops ({} drops in {} passes, longest {:.1f} "
-                              "ms{}){}{}\n",
+                              "ms{}){}{}{}\n",
                               Count, Kept, static_cast<double>(ShrankKB) / 1024.0, Drops, Passes, static_cast<double>(LongestNs) / 1e6,
-                              Failed ? fextl::fmt::format(", {} failed", Failed) : fextl::string(), GuardText, RoomText) +
+                              Failed ? fextl::fmt::format(", {} failed", Failed) : fextl::string(), GuardText, RoomText, PlayRoomText) +
            ReadsLine() + LearnLine() + HeadroomLine();
   }
 
@@ -2027,7 +2050,7 @@ namespace {
 } // namespace
 
 bool WantsFrameMarks() {
-  return LearnBudget > 0 || UnpackLearnWanted || HeadroomMB > 0 || (KeepMB > 0 && LoadFreeMB > 0);
+  return LearnBudget > 0 || UnpackLearnWanted || HeadroomMB > 0 || (KeepMB > 0 && (LoadFreeMB > 0 || PlayFreeMB > 0));
 }
 
 bool Running() {
@@ -2086,6 +2109,8 @@ void Init(bool StatsLog) {
   HeadroomGuardMB = Number("FEX_MEM_HEADROOM_GUARD_MB", 3072, 512, 65536);
   // Build 138.
   LoadFreeMB = KeepMB ? Number("FEX_GAME_FILES_LOAD_FREE_MB", 1024, 0, 16384) : 0;
+  // Build 139.
+  PlayFreeMB = KeepMB ? Number("FEX_GAME_FILES_PLAY_FREE_MB", 384, 0, 16384) : 0;
   // Build 90: the unpack cache's learned list tells play from loading screens by the frame clock too.
   const char* Unpack = FEX::Windows::Switch("FEX_UNPACK_CACHE");
   UnpackLearnWanted = Unpack && Unpack[0] == '1' && Number("FEX_UNPACK_CACHE_LEARN", 0, 0, 4096) > 0;
@@ -2117,6 +2142,14 @@ void Init(bool StatsLog) {
       "makes room before Android has to reclaim other apps' memory (build 137 run: first area load with 330 MB unused, 9 apps closed and "
       "restarting for 28 s; 'load room' on the 'game files' line; FEX_GAME_FILES_LOAD_FREE_MB=0 turns it off)",
       LoadFreeMB, RoomIntervalMs));
+  }
+  if (PlayFreeMB) {
+    FEX::Windows::StatsLogNote(fextl::fmt::format(
+      "game files: play room (build 139): in play with less than {} MB of unused memory (MemFree), the drops keep only the last 32 MB "
+      "read, readahead and learned pieces, so when the game streams a new area while frames keep coming FEX's own kept game data makes "
+      "room first (build 138 run: 147-185 MB unused at t=46 and t=189, Android closed 12 and 5 apps; 'play room' on the 'game files' "
+      "line; FEX_GAME_FILES_PLAY_FREE_MB=0 turns it off)",
+      PlayFreeMB));
   }
   if (HeadroomMB) {
     FEX::Windows::StatsLogNote(fextl::fmt::format(
