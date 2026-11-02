@@ -31,4 +31,6 @@ namespace FEX::Windows {
 void StartStartWatch(std::string_view AppName);
 // A line for the start watch file now (time-stamped), from any thread; nothing when the start watch is off.
 void StartWatchNote(std::string_view Text);
+// Whether the start watch file is open (build 140: lets callers skip work for a note nobody writes).
+bool StartWatchActive();
 } // namespace FEX::Windows

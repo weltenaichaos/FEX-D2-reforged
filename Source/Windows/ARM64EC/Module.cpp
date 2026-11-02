@@ -506,9 +506,92 @@ Entry Ring[RingSize];
 std::atomic<uint64_t> Count;
 std::atomic<bool> Written;
 
-void Note(Kind Where, uint32_t Code, uint64_t HostPc, uint64_t Fault, uint64_t RIP) {
+// Build 140: where an address is: its memory region (base, size, allocation base, state, protection, type) and the file
+// mapped there, if any.
+fextl::string DescribeAddress(uint64_t Address) {
+  MEMORY_BASIC_INFORMATION Info {};
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr) !=
+      STATUS_SUCCESS) {
+    return "(no region)";
+  }
+  auto Text = fextl::fmt::format("(region {:X}+{:X} alloc {:X} state {:X} protect {:X} type {:X}", reinterpret_cast<uint64_t>(Info.BaseAddress),
+                                 Info.RegionSize, reinterpret_cast<uint64_t>(Info.AllocationBase), Info.State, Info.Protect, Info.Type);
+  struct {
+    UNICODE_STRING Name;
+    WCHAR Buffer[300];
+  } Name {};
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryMappedFilenameInformation,
+                           &Name, sizeof(Name), nullptr) == STATUS_SUCCESS &&
+      Name.Name.Buffer) {
+    const size_t Chars = Name.Name.Length / sizeof(WCHAR);
+    size_t Start = 0;
+    for (size_t i = 0; i < Chars; ++i) {
+      if (Name.Name.Buffer[i] == L'\\') {
+        Start = i + 1;
+      }
+    }
+    Text += " file ";
+    for (size_t i = Start; i < Chars; ++i) {
+      const WCHAR C = Name.Name.Buffer[i];
+      Text += C < 128 ? static_cast<char>(C) : '?';
+    }
+  }
+  return Text + ")";
+}
+
+// Build 140: the failed D2R starts end with Wine's "Unhandled exception code c0000005" in the main thread ~1.6 s in,
+// at an address outside the game's exe, right after the protection maps a fresh copy of ntdll.dll. Exceptions passed
+// on outside the main exe (the game's own code raises hundreds on purpose; those are skipped) go to the start watch
+// file at once, with where the code and the faulting address are, the code bytes and the top of the guest stack.
+std::atomic<uint32_t> Watched;
+constexpr uint32_t MaxWatched = 400;
+
+void WatchNote(Kind Where, uint32_t Code, uint64_t HostPc, uint64_t Fault, uint64_t RIP, uint64_t Sp, uint32_t Access) {
+  if (!FEX::Windows::StartWatchActive()) {
+    return;
+  }
+  const uint64_t Pc = Where == Kind::Guest ? RIP : HostPc;
+  if (Where == Kind::Guest && Pc - MainExeBase < MainExeSize) {
+    return;
+  }
+  const uint32_t N = Watched.fetch_add(1, std::memory_order_relaxed);
+  if (N >= MaxWatched) {
+    return;
+  }
+  constexpr const char* Names[] = {"guest code", "native code", "JIT, unexpected", "non-emulated thread"};
+  auto Text = fextl::fmt::format("exception #{} passed on: code {:X} in {} tid {} at {:X} {}", N, Code, Names[static_cast<uint8_t>(Where)],
+                                 GetCurrentThreadId(), Pc, DescribeAddress(Pc));
+  if (Code == EXCEPTION_ACCESS_VIOLATION) {
+    Text += fextl::fmt::format(" | {} {:X} {}", Access == 0 ? "read" : Access == 1 ? "write" : Access == 8 ? "execute" : "access", Fault,
+                               DescribeAddress(Fault));
+  }
+  if (Where == Kind::Guest) {
+    uint8_t Bytes[16] {};
+    if (FEX::Windows::Linux::ReadOwnMemory(Pc, Bytes, sizeof(Bytes))) {
+      Text += " | code";
+      for (uint8_t B : Bytes) {
+        Text += fextl::fmt::format(" {:02X}", B);
+      }
+    }
+    uint64_t Stack[4] {};
+    if (Sp && FEX::Windows::Linux::ReadOwnMemory(Sp, Stack, sizeof(Stack))) {
+      Text += fextl::fmt::format(" | rsp {:X}: {:X} {} {:X} {:X} {:X}", Sp, Stack[0], DescribeAddress(Stack[0]), Stack[1], Stack[2], Stack[3]);
+    }
+  }
+  if (N + 1 == MaxWatched) {
+    Text += fextl::fmt::format(" (the last one noted, {} at most)", MaxWatched);
+  }
+  FEX::Windows::StartWatchNote(Text);
+}
+
+void Note(Kind Where, uint32_t Code, uint64_t HostPc, uint64_t Fault, uint64_t RIP, uint64_t Sp = 0, uint32_t Access = ~0U) {
   const uint64_t Index = Count.fetch_add(1, std::memory_order_relaxed);
   Ring[Index % RingSize] = {.Code = Code, .TID = GetCurrentThreadId(), .HostPc = HostPc, .Fault = Fault, .RIP = RIP, .Where = Where};
+  WatchNote(Where, Code, HostPc, Fault, RIP, Sp, Access);
+}
+
+uint32_t AccessKind(const EXCEPTION_RECORD& Rec) {
+  return Rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && Rec.NumberParameters >= 2 ? static_cast<uint32_t>(Rec.ExceptionInformation[0]) : ~0U;
 }
 
 uint64_t FaultAddress(const EXCEPTION_RECORD& Rec) {
@@ -744,7 +827,8 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
 
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
-  CrashRecord::Note(CrashRecord::Kind::Guest, GuestRec.ExceptionCode, Context.Pc, CrashRecord::FaultAddress(GuestRec), GuestContext.Pc);
+  CrashRecord::Note(CrashRecord::Kind::Guest, GuestRec.ExceptionCode, Context.Pc, CrashRecord::FaultAddress(GuestRec), GuestContext.Pc,
+                    GuestContext.Sp, CrashRecord::AccessKind(GuestRec));
   if (GuestContext.Pc - MainExeBase < MainExeSize) {
     auto* Frontend = GetFrontendThreadData(Thread);
     __atomic_store_n(&Frontend->GameExceptions, Frontend->GameExceptions + 1, __ATOMIC_RELAXED);
@@ -1223,7 +1307,8 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 
   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
     LogMan::Msg::DFmt("Passing through exception");
-    CrashRecord::Note(CrashRecord::Kind::Native, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0);
+    CrashRecord::Note(CrashRecord::Kind::Native, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0, 0,
+                      CrashRecord::AccessKind(*Exception));
     return false;
   }
 
@@ -1251,7 +1336,8 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     return true;
   } else {
     LogMan::Msg::EFmt("Unexpected exception in JIT code on guest stack");
-    CrashRecord::Note(CrashRecord::Kind::JITUnexpected, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0);
+    CrashRecord::Note(CrashRecord::Kind::JITUnexpected, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0, 0,
+                      CrashRecord::AccessKind(*Exception));
     return false;
   }
 }

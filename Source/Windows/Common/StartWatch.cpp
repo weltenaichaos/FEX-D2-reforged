@@ -729,6 +729,10 @@ void StartWatchNote(std::string_view Text) {
   }
 }
 
+bool StartWatchActive() {
+  return Active != nullptr;
+}
+
 void StartStartWatch(std::string_view AppName) {
   const char* Dir = Switch("FEX_START_WATCH");
   if (!Dir || !Dir[0] || (Dir[0] == '0' && !Dir[1])) {
