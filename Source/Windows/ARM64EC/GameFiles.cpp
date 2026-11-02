@@ -8,6 +8,7 @@ $end_info$
 
 #include "GameFiles.h"
 #include "LoadScreen.h"
+#include "PipeWatch.h"
 #include "FrameLatency.h"
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/StatsLog.h"
@@ -1461,13 +1462,15 @@ namespace {
   }
 
   void NoteRead(HANDLE File, uint64_t Offset, bool HaveOffset, uint64_t Bytes, bool Queued, uint64_t Ticks, uint64_t Start,
-                ReadUsage* Usage = nullptr) {
+                ReadUsage* Usage = nullptr, const void* Buffer = nullptr) {
     if (!Bytes) {
       return;
     }
     const int Index = WatchOf(File, Start);
     if (Index < 0) {
       const bool MainOther = reinterpret_cast<uint64_t>(NtCurrentTeb()) == MainTeb;
+      // Build 146: pipes (Steam's) are counted by the pipe watch (logging build).
+      PipeWatch::NoteRead(File, Buffer, Bytes, Queued, Ticks, MainOther);
       bool Name = false;
       {
         std::scoped_lock Guard {ReadLock};
@@ -2215,7 +2218,7 @@ extern "C" BOOL FEXNativeReadFile(HANDLE File, void* Buffer, DWORD Bytes, DWORD*
   const bool Queued = !Result && Error == ErrorIoPending;
   if (Result || Queued) {
     const uint64_t Got = Queued ? Bytes : Read ? *Read : Overlapped ? Overlapped->InternalHigh : Bytes;
-    NoteRead(File, Offset, Overlapped != nullptr, Got, Queued, End - Start, Start, Usage.Have ? &Usage : nullptr);
+    NoteRead(File, Offset, Overlapped != nullptr, Got, Queued, End - Start, Start, Usage.Have ? &Usage : nullptr, Buffer);
   }
   if (AskCalls) {
     NoteAhead(Bytes, AskCalls, Asked - Start, End - Asked);

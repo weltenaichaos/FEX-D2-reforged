@@ -2151,7 +2151,7 @@ namespace {
   };
 
   // Up to sixteen, see StatsLogSetLineProvider.
-  constexpr size_t MaxLineProviders = 16;
+  constexpr size_t MaxLineProviders = 24;
   std::atomic<fextl::string (*)()> LineProviders[MaxLineProviders] {};
   // Called with every sample of the main thread, see StatsLogSetMainSampleHook.
   std::atomic<uint8_t (*)(uint64_t)> MainSampleHook {};

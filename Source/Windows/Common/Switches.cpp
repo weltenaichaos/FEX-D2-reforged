@@ -203,6 +203,9 @@ namespace {
     // ended up pointing into reused stack. FEX runs ntdll's RtlWaitOnAddress/RtlWakeAddress* with the fixed code
     // (WineWaitFix.h); 2 = the same with Wine's spin lock, 0 = Wine's own code.
     {"FEX_WINE_WAIT_FIX", "1"},
+    // Build 146 (measurement, logging build only): the main thread's pipe reads and writes, the process at the other end
+    // and its threads' CPU time (ARM64EC/PipeWatch.h). Build 143: the main thread waited ~0.84 ms a frame on Steam.
+    {"FEX_PIPE_WATCH", Measuring ? "1" : "0"},
     // Build 126: the longest hitch of the build 125 run (161 ms at 3:50) was VKD3D's queue thread, which hands every frame's
     // GPU work to the driver: at nice 0 it waited 163 ms for a CPU on the main thread's core (open to the game's threads
     // while the main thread is away) while the kernel reclaimed memory there. VKD3D's frame threads (vkd3d_queue,
@@ -627,6 +630,7 @@ namespace {
     "FEX_LSFG_UI_MOTION",
     "FEX_KERNEL_FUTEX",
     "FEX_WINE_WAIT_FIX",
+    "FEX_PIPE_WATCH",
     "FEX_FRAME_THREADS",
     "FEX_FRAME_THREADS_OFFCORE",
     "FEX_INPUT_THREADS",

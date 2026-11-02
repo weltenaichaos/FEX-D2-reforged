@@ -48,7 +48,7 @@ void StatsLogWatchImage(uint64_t Base);
 void StatsLogSetMainAwayFrom(uint64_t CoreMask);
 
 // Adds the lines Provider returns (each indented and ending in a newline, or nothing) to every per-second block.
-// Provider runs on the log thread. Up to sixteen providers, in the order they were set.
+// Provider runs on the log thread. Up to 24 providers, in the order they were set.
 void StatsLogSetLineProvider(fextl::string (*Provider)());
 // The number of the last second the log sampled (1 for the first; the next one is being sampled now), 0 before the log
 // runs or without it. A line provider runs right after its second was sampled, with this number.

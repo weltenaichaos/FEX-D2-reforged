@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 144, VKD3D fex41, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
+State: FEX build 146, VKD3D fex41, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -147,6 +147,7 @@ These only run in the **logging version** (`2610-d2rfix28s-thor`). The clean ver
 | `FEX_STATSLOG_TIMELINE`, `FEX_SCHEDLOG`, `FEX_GPULOG`, `FEX_STALLPROBE` | on | Per-thread timeline, CPU wait times, GPU clock, lock and wineserver probes. `0` turns each off. From build 133 a wait of 15 ms or more for Wine's memory lock gets a `# memory lock wait` line that lists every thread not asleep at 15 and 45 ms (Linux call, state, CPU), to find the thread holding the lock. |
 | `FEX_STATSLOG_APP`, `FEX_STATSLOG_SCAN` | unset | Log only the program named; a per-second scan of the game's code for the log. |
 | `FEX_LOADER_WATCH` | `1` | Counts the loader thread's calls. |
+| `FEX_PIPE_WATCH` | `1` | Build 146: the main thread's pipe reads and writes (Steam's round trip every frame), with each message's size and first 8 bytes; the Windows process that made the pipe, from the list of Windows processes; and that process's threads' time on a CPU and waiting for one (`pipe watch` and `pipe peer` lines). |
 | `FEX_VKD3D_PASSES`, `FEX_VKD3D_TIMELINE` | `1` | GPU time per render pass; each frame's way to the screen. |
 | `FEX_TU_COUNTERS`, `FEX_TU_SAMPLE_DRAWS` | `1`, `100` | GPU counters for passes with 100 draws or more. |
 | `FEX_LSFG_GPU_TIMES` | `1` | GPU time of frame generation. |

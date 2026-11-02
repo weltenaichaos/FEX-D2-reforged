@@ -11,6 +11,7 @@ add_library(arm64ecfex SHARED
   NativeRedirect.cpp
   NativeUnpackCache.cpp
   NativeZlib.c
+  PipeWatch.cpp
   Rumble.cpp
   Vkd3dReport.cpp
   WineWaitFix.cpp

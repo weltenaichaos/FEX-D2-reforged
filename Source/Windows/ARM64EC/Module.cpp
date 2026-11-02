@@ -58,6 +58,7 @@ $end_info$
 #include "CodeBuffer.h"
 #include "FrameLatency.h"
 #include "Rumble.h"
+#include "PipeWatch.h"
 #include "WineWaitFix.h"
 #include "LoaderWatch.h"
 #include "GameFiles.h"
@@ -1195,6 +1196,8 @@ NTSTATUS ProcessInit() {
   FEX::Windows::StartPriorityGuard(AppConfigName);
   FrameLatency::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
   Rumble::Init(StatsLog);
+  // Build 146: the main thread's pipe traffic (Steam), logging build only.
+  PipeWatch::Init(StatsLog);
   GameFiles::Init(StatsLog);
   // Build 94: loading screens that still draw frames, for the code buffer renewal and the learned lists.
   LoadScreen::Init(StatsLog, CodeBufferPolicy::WantsFrameMarks() || GameFiles::WantsFrameMarks());

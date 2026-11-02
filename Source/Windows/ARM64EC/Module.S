@@ -110,6 +110,27 @@ read_watch_hit:
   add x9, x9, #:lo12:NativeReadFileTarget
 read_watch_done:
 
+  // Build 146: the same for WriteFile (FEXWriteWatch[0..2], all 0 until PipeWatch.cpp finds kernelbase's; only with the
+  // stats log on): FEX's wrapper (NativeWriteFileTarget, see PipeWatch.h) notes pipe writes and calls the entry the game
+  // called, stored in FEXWriteWatch[3]. Only x16 and x17, as above.
+  adrp x16, FEXWriteWatch
+  add x16, x16, #:lo12:FEXWriteWatch
+  ldr x17, [x16]
+  cbz x17, write_watch_done
+  cmp x17, x9
+  b.eq write_watch_hit
+  ldr x17, [x16, #8]
+  cmp x17, x9
+  b.eq write_watch_hit
+  ldr x17, [x16, #16]
+  cmp x17, x9
+  b.ne write_watch_done
+write_watch_hit:
+  str x9, [x16, #24]
+  adrp x9, NativeWriteFileTarget
+  add x9, x9, #:lo12:NativeWriteFileTarget
+write_watch_done:
+
   // A call from one of the game's loader threads (its TEB in FEXLoaderWatch[1..4], see LoaderWatch.h) into CreateEventW,
   // CloseHandle, WaitForMultipleObjects or WaitForSingleObject runs FEX's counting wrapper instead, which calls the one it
   // was going to. Only x16 and x17, as above; [0] stays 0 until a loader thread is found.
@@ -424,3 +445,5 @@ NATIVE_REDIRECT NativeLoaderWaitOne, #FEXNativeLoaderWaitForSingle, "mov x2, x30
   // The game files' ReadFile wrapper (GameFiles.cpp), entered from ExitFunctionEC above, also with lr and sp after its four
   // register arguments: the fifth (the OVERLAPPED) is on the x64 caller's stack.
 NATIVE_REDIRECT NativeReadFile, #FEXNativeReadFile, "mov x4, x30; mov x5, sp"
+  // The pipe watch's WriteFile wrapper (PipeWatch.cpp), the same way.
+NATIVE_REDIRECT NativeWriteFile, #FEXNativeWriteFile, "mov x4, x30; mov x5, sp"
