@@ -205,6 +205,11 @@ namespace {
     // thread's core while it is open to others. "off" leaves their nice; FEX_FRAME_THREADS_OFFCORE=0 lets them on it.
     {"FEX_FRAME_THREADS", "-10"},
     {"FEX_FRAME_THREADS_OFFCORE", "1"},
+    // Build 137: in the build 133 run the main thread sat 14 ms in XInputGetState in a 48 ms frame: the game's controller
+    // reads take a controller's lock that Wine's controller thread (wine_xinput_hid_update) holds while it reads the next
+    // report, and at nice 0 that thread waited for a CPU behind the main thread and the job workers. It is kept at this
+    // nice or better (it runs a few ms a second). "off" leaves it.
+    {"FEX_INPUT_THREADS", "-10"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -606,6 +611,7 @@ namespace {
     "FEX_KERNEL_FUTEX",
     "FEX_FRAME_THREADS",
     "FEX_FRAME_THREADS_OFFCORE",
+    "FEX_INPUT_THREADS",
     "FEX_CRASH_NOTE",
     "FEX_START_WATCH",
     "FEX_START_WATCH_S",

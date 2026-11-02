@@ -1002,9 +1002,18 @@ namespace {
   constexpr size_t MaxFrameThreads = 16;
   constexpr const char* FrameThreadNames[] = {"vkd3d_queue",     "vkd3d_fence",     "vkd3d-fex-prese", "vkd3d-fex-start",
                                               "vkd3d-fex-done",  "vkd3d-swapchain", "lsfg-present"};
+  // Build 137, FEX_INPUT_THREADS: Wine's controller thread (xinput's wine_xinput_hid_update). The game's XInputGetState
+  // takes a controller's lock, which that thread holds while it reads the controller's next report (ReadFile, a wineserver
+  // call). At nice 0 on the game's cores, behind the main thread and the job workers, it waited for a CPU with the lock
+  // held: in the build 133 run the main thread sat 14 ms in XInputGetState in a 48 ms frame at t=194.8. It runs a few ms a
+  // second. Kept at FEX_INPUT_THREADS's nice or better the same way as the frame threads (not kept off any core).
+  constexpr const char* InputThreadNames[] = {"wine_xinput_hid"};
   struct FrameThreadKeeper {
     int Nice;     // NiceUnchanged = left alone
     bool OffCore; // kept off the main thread's core while it is open to others
+    const char* const* Want; // the Linux names it keeps
+    size_t WantCount;
+    const char* Label;       // "frame threads" or "input threads" in the log
     // Written by the guard (under the escape lock when there is one), read by the share sweeps.
     std::atomic<uint32_t> Count;
     std::atomic<int> Tids[MaxFrameThreads];
@@ -1018,6 +1027,7 @@ namespace {
     std::atomic<int> CoreError;
   };
   FrameThreadKeeper* FrameThreads {};
+  FrameThreadKeeper* InputThreads {};
 
   // A frame thread to keep off the main thread's core (any thread, under the escape lock).
   bool KeptOffSharedCore(int Tid) {
@@ -1035,6 +1045,8 @@ namespace {
   }
 
   struct FrameScan {
+    const char* const* Want;
+    size_t WantCount;
     int Tids[MaxFrameThreads];
     char Names[MaxFrameThreads][16];
     uint32_t Count;
@@ -1056,8 +1068,8 @@ namespace {
     if (Comm[Len - 1] == '\n') {
       Comm[--Len] = 0;
     }
-    for (const char* Want : FrameThreadNames) {
-      if (strcmp(Comm, Want) == 0) {
+    for (size_t w = 0; w < S->WantCount; ++w) {
+      if (strcmp(Comm, S->Want[w]) == 0) {
         S->Tids[S->Count] = Tid;
         snprintf(S->Names[S->Count], sizeof(S->Names[0]), "%s", Comm);
         ++S->Count;
@@ -1085,6 +1097,8 @@ namespace {
   // Every 2 s on the guard's thread: finds the frame threads by name; notes the list when it changed.
   void FindFrameThreads(FrameThreadKeeper& K, EscapeState* E) {
     FrameScan S {};
+    S.Want = K.Want;
+    S.WantCount = K.WantCount;
     Linux::ForEachEntry("/proc/self/task", FrameScanTask, &S);
     const uint32_t Old = K.Count.load(std::memory_order_relaxed);
     bool Same = Old == S.Count;
@@ -1115,7 +1129,7 @@ namespace {
     ++K.Lists;
     if (K.Notes < 12) {
       ++K.Notes;
-      StatsLogNote(fextl::fmt::format("frame threads: {} found (list #{}):{}{}", S.Count, K.Lists, S.Count ? Text : fextl::string(" none"),
+      StatsLogNote(fextl::fmt::format("{}: {} found (list #{}):{}{}", K.Label, S.Count, K.Lists, S.Count ? Text : fextl::string(" none"),
                                       K.OffCore ? "; kept off the main thread's core while it is open to the game's threads" : ""));
     }
   }
@@ -2630,6 +2644,16 @@ namespace {
       if (C->Loader != LoaderMode::Off) {
         LoaderRound(Finder, Threads, Round);
       }
+      if (InputThreads) {
+        FindFrameThreads(*InputThreads, Escape);
+        if (Round % 30 == 0) {
+          const auto& K = *InputThreads;
+          StatsLogNote(fextl::fmt::format("input threads: s={} {} kept, nice set {} times{}", Round * 2, K.Count.load(std::memory_order_relaxed),
+                                          K.NiceSets,
+                                          K.NiceFailures ? fextl::fmt::format(" ({} failed, errno {})", K.NiceFailures, -K.NiceError) :
+                                                           fextl::string {}));
+        }
+      }
       if (FrameThreads) {
         FindFrameThreads(*FrameThreads, Escape);
         // Once a minute: what keeping them took.
@@ -2704,6 +2728,9 @@ namespace {
         }
         if (FrameThreads) {
           KeepFrameThreads(*FrameThreads);
+        }
+        if (InputThreads) {
+          KeepFrameThreads(*InputThreads);
         }
       }
     }
@@ -2799,6 +2826,11 @@ void StartPriorityGuard(std::string_view AppName) {
     FrameNice = std::clamp(atoi(F), -20, 19);
   }
   const char* FrameCoreSwitch = Switch("FEX_FRAME_THREADS_OFFCORE");
+  // Build 137: Wine's controller thread.
+  int InputNice = NiceUnchanged;
+  if (const char* F = Switch("FEX_INPUT_THREADS"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
+    InputNice = std::clamp(atoi(F), -20, 19);
+  }
   const bool FrameOffCore = FrameCoreSwitch && (FrameCoreSwitch[0] == '1' || (FrameCoreSwitch[0] == 'o' && FrameCoreSwitch[1] == 'n'));
 
   StatsLogNote(C->Prio == PrioMode::Keep ? fextl::fmt::format("prio: off, Windows thread priorities pass through to Linux nice "
@@ -2908,6 +2940,13 @@ void StartPriorityGuard(std::string_view AppName) {
                                     FrameOffCore ? "kept off the main thread's core while it is open to the game's threads (build 123)" : "") :
                  fextl::string("frame threads: left alone (FEX_FRAME_THREADS=-10 keeps VKD3D's frame threads at nice -10, "
                                "FEX_FRAME_THREADS_OFFCORE=1 keeps them off the main thread's core while it is open)"));
+  StatsLogNote(InputNice != NiceUnchanged ?
+                 fextl::fmt::format("input threads: build 137: Wine's controller thread (wine_xinput_hid_update) kept at nice {} or better, "
+                                    "found by name every 2 s and checked every 250 ms; it holds a controller's lock while it reads the "
+                                    "next report, and the game's XInputGetState waits for that lock (build 133 run: main thread 14 ms "
+                                    "in XInputGetState in a 48 ms frame). FEX_INPUT_THREADS=off leaves its nice",
+                                    InputNice) :
+                 fextl::string("input threads: left alone (FEX_INPUT_THREADS=-10 keeps Wine's controller thread at nice -10)"));
 
   const fextl::string Exe = fextl::fmt::format("main exe {:X}-{:X}", C->ExeBase, C->ExeEnd);
   StatsLogNote(C->Loader == LoaderMode::Little ?
@@ -2934,7 +2973,8 @@ void StartPriorityGuard(std::string_view AppName) {
   }
 
   if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && !C->MainNiceOn &&
-      C->Loader == LoaderMode::Off && WorkerNiceMode == WorkerMode::Off && FrameNice == NiceUnchanged && !FrameOffCore) {
+      C->Loader == LoaderMode::Off && WorkerNiceMode == WorkerMode::Off && FrameNice == NiceUnchanged && !FrameOffCore &&
+      InputNice == NiceUnchanged) {
     delete C;
     return;
   }
@@ -2942,6 +2982,17 @@ void StartPriorityGuard(std::string_view AppName) {
     FrameThreads = new FrameThreadKeeper {};
     FrameThreads->Nice = FrameNice;
     FrameThreads->OffCore = FrameOffCore;
+    FrameThreads->Want = FrameThreadNames;
+    FrameThreads->WantCount = std::size(FrameThreadNames);
+    FrameThreads->Label = "frame threads";
+  }
+  if (InputNice != NiceUnchanged) {
+    InputThreads = new FrameThreadKeeper {};
+    InputThreads->Nice = InputNice;
+    InputThreads->OffCore = false;
+    InputThreads->Want = InputThreadNames;
+    InputThreads->WantCount = std::size(InputThreadNames);
+    InputThreads->Label = "input threads";
   }
   if (WorkerNiceMode != WorkerMode::Off) {
     Workers = new WorkerKeeper {};

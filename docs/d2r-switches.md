@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 132, VKD3D fex40, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
+State: FEX build 137, VKD3D fex40, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -76,6 +76,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_WORKER_NICE` | `-10` | The game's job worker threads' priority (builds 87-88). | `off` |
 | `FEX_FRAME_THREADS` | `-10` | VKD3D's frame threads and the frame generation layer's present thread run at this priority or better (build 126). | `off` |
 | `FEX_FRAME_THREADS_OFFCORE` | `1` | Those threads stay off the main thread's core while it is shared (build 126). | `0` |
+| `FEX_INPUT_THREADS` | `-10` | Wine's controller thread runs at this priority or better, so the game's controller reads don't wait for it while it holds the controller's lock (build 137). | `off` |
 
 ## Other game fixes
 
