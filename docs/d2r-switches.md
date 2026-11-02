@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 147, VKD3D fex41, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
+State: FEX build 148, VKD3D fex41, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -38,7 +38,9 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
 | `FEX_GAME_FILES_REFILL` | `1` | That learned data is checked every 500 ms in play too; what Android's memory reclaim threw out is read back in the background before the game needs it (build 130). | `0` |
 | `FEX_MEM_HEADROOM_MB` | `0` | In a loading screen FEX takes memory until this many MB are unused and gives it back, so Android's memory reclaim runs in the load instead of in play (build 130; off from build 131: it made Android close background apps, which restarted on all cores). `FEX_MEM_HEADROOM_GUARD_MB` (default `3072`) is the available memory it never goes below. | `0` |
 | `FEX_GAME_FILES_LOAD_FREE_MB` | `1024` | In a loading screen with less unused memory (MemFree) than this, FEX lets go of its kept game data every 200 ms (all but the last 32 MB read, readahead and learned pieces: ~600 MB), so an area load doesn't make Android close other apps (build 138; in the build 137 run 9 apps were closed at the first area load and restarted for 28 s). | `0` |
-| `FEX_GAME_FILES_PLAY_FREE_MB` | `384` | The same in play with less unused memory than this (every 500 ms), so a new area the game streams in while frames keep coming takes FEX's kept data first instead of making Android close other apps (build 139; in the build 138 run 12 and 5 apps were closed at t=46 and t=189). | `0` |
+| `FEX_GAME_FILES_PLAY_FREE_MB` | `1024` | The same in play with less unused memory than this (every 500 ms), so a new area the game streams in while frames keep coming takes FEX's kept data first instead of making Android close other apps (build 139; in the build 138 run 12 and 5 apps were closed at t=46 and t=189). Build 148 raised it from 384: in the build 147 run unused memory sat at 384-512 MB in most of play, where FEX kept 80-250 MB more game data. | `0` |
+| `FEX_GAME_FILES_BURST_MB` | `32` | In the play room, a pass also starts once the game has read this many MB since the last one (at least 100 ms after it began), so a new area's data leaves the file cache as it comes instead of waiting up to 500 ms (build 148; in the build 147 run the game read 191 MB in a second at t=282 and Android closed 12 apps). | `0` |
+| `FEX_GAME_FILES_NICE` | `-10` | FEXFileCache (the thread that drops the game data) runs at this priority, so its drops come on time when all cores are busy (build 148; in the build 147 run it waited 457 ms for a CPU at t=283). | `off` |
 | `FEX_GAME_FILES_ROOM_AHEAD_READ` | `1` | In the load and play rooms, a piece marked readahead that was read since counts by that read, so the rooms keep only the last 32 MB read as meant (build 147; in the build 146 run the first area load kept 171-385 MB as readahead and Android closed 18 apps). | `0` |
 | `FEX_GAME_FILES_LEARN_RANGES` | `1` | A 1 MB piece kept only because it holds learned data keeps only its learned ranges, not the whole piece (build 147; build 146 kept ~195 MB of pieces for 54 MB of learned ranges). | `0` |
 | `FEX_LOAD_LIGHT` | `64` | Frames that give the GPU very little work also count as a loading screen, so loading screens drawn at full speed are seen too (build 94). | `0` |

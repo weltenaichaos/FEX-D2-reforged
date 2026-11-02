@@ -316,7 +316,16 @@ namespace {
     // Build 139: the same in play below this much unused memory. In the build 138 run the game streamed new areas while
     // frames kept coming (t=46, t=189: 661 and 817 MB read in a second) with 147-185 MB unused, and Android closed 12 and
     // 5 apps while FEX kept 750-870 MB of game data. 0 = off.
-    {"FEX_GAME_FILES_PLAY_FREE_MB", "384"},
+    // Build 148: 384 -> 1024. In the build 147 run unused memory sat at 384-512 MB in most of play, where FEX kept 80-250 MB
+    // more game data than in the room, and Android closed 13 and 12 apps when the game streamed new areas (t=48, t=283).
+    {"FEX_GAME_FILES_PLAY_FREE_MB", "1024"},
+    // Build 148: in the play room a pass also starts once the game has read this many MB since the last one (at least
+    // 100 ms after it began). In the build 147 run the game read 191 MB in a second at t=282 and the reads stayed in the
+    // file cache up to 500 ms until the next pass. 0 = off (passes every 500 ms only).
+    {"FEX_GAME_FILES_BURST_MB", "32"},
+    // Build 148: FEXFileCache's nice. In the build 147 run it waited 457 ms for a CPU at t=283 while all cores were busy,
+    // and its one pass that second took 189 ms, when Android closed 12 apps. It runs 1-18 ms a pass. "off" leaves it.
+    {"FEX_GAME_FILES_NICE", "-10"},
     // Build 147: in the build 146 run the first area load's room passes kept 171-385 MB as readahead, mostly pieces read
     // 32-128 MB before (a read had ended in the piece before them), and Android's memory killer closed 18 apps at t=36-37,
     // which restarted every second for 30 s on all 8 cores. A piece read since its readahead mark now counts by that read
@@ -589,6 +598,8 @@ namespace {
     "FEX_GAME_FILES_PLAY_FREE_MB",
     "FEX_GAME_FILES_ROOM_AHEAD_READ",
     "FEX_GAME_FILES_LEARN_RANGES",
+    "FEX_GAME_FILES_BURST_MB",
+    "FEX_GAME_FILES_NICE",
     "FEX_MEM_HEADROOM_MB",
     "FEX_MEM_HEADROOM_GUARD_MB",
     "FEX_UNPACK_CACHE_SKIP_ADLER",

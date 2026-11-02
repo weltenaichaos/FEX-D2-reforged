@@ -40,6 +40,9 @@ extern void* X64ReturnInstr; // Module.cpp
 // NativeRedirect.cpp: [0] = frame starts counted so far (0 until the frame clock is found), then a ring of 1024
 // CNTVCT_EL0 times.
 extern uint64_t FEXFrameMarks[];
+// Build 148: the read burst event (as in StatsLog.cpp).
+NTSTATUS WINAPI NtCreateEvent(HANDLE* Handle, ACCESS_MASK Access, const OBJECT_ATTRIBUTES* Attr, int Type, BOOLEAN State);
+NTSTATUS WINAPI NtSetEvent(HANDLE Handle, LONG* PreviousState);
 }
 
 namespace GameFiles {
@@ -90,6 +93,8 @@ namespace {
     // since (FEX_GAME_FILES_ROOM_AHEAD_READ).
     std::atomic<uint64_t> LearnedRangeKB;
     std::atomic<uint32_t> RoomAheadReadMost;
+    // Build 148, per second: play room passes that a read burst started (FEX_GAME_FILES_BURST_MB).
+    std::atomic<uint64_t> BurstPasses;
   };
 
   struct File {
@@ -265,6 +270,21 @@ namespace {
   // those pieces whole: ~195 MB of pieces for 54 MB of learned ranges in the build 146 run (253 ranges, 64 KB blocks). A
   // piece kept only because it is learned now keeps only its learned ranges; the rest goes like any other piece.
   bool LearnRangesOn {};
+  // Build 148, FEX_GAME_FILES_BURST_MB: in the play room a pass also starts once the game has read this much since the
+  // last one, at least BurstGapMs after it began. In the build 147 run the game read 191 and 122 MB a second at t=282-283
+  // while it streamed a new area in play, and those reads sat in the file cache up to 500 ms until the next pass: unused
+  // memory fell to 120 MB and Android closed 12 apps, which then restarted for 18 s on 2-3 cores. The event is set by the
+  // read watch (a few microseconds with esync), so calm play keeps its 500 ms passes.
+  uint64_t BurstBytes {};
+  constexpr uint64_t BurstGapMs = 100;
+  HANDLE BurstEvent {};
+  std::atomic<bool> PlayRoomNow {}, BurstSet {};
+  std::atomic<uint64_t> PassAllClock {};
+  // Build 148, FEX_GAME_FILES_NICE: FEXFileCache's nice. In the build 147 run at t=283 it waited 457 ms for a CPU (all
+  // cores busy with the game's streaming and the kernel's reclaim) and its one pass that second took 189 ms, just when
+  // the drops were needed. A pass takes 1-18 ms, 2 a second in calm play.
+  int CacheNice {};
+  bool CacheNiceSet {};
   struct RefillCounters {
     std::atomic<uint64_t> Passes, StorageKB, Ns;
   };
@@ -1316,6 +1336,13 @@ namespace {
   }
 
   void* FileCacheThread(void*) {
+    if (CacheNiceSet) {
+      const int Result = FEX::Windows::Linux::SetNice(FEX::Windows::Linux::GetTid(), CacheNice);
+      FEX::Windows::StatsLogNote(fextl::fmt::format(
+        "game files: FEXFileCache runs at nice {}{} so its drops come on time when the cores are full (build 148; in the build 147 "
+        "run it waited 457 ms for a CPU at t=283 while Android closed 12 apps; FEX_GAME_FILES_NICE=off leaves it at nice 0)",
+        CacheNice, Result ? fextl::fmt::format(" - failed (error {})", -Result) : fextl::string()));
+    }
     fextl::string Why;
     const fextl::string Folder = GameFolder(Why);
     if (!Folder.empty() && Folder.size() < PathSize) {
@@ -1353,16 +1380,21 @@ namespace {
     uint32_t Matched = WatchedCount.load(std::memory_order_acquire); // StartLearning matched the files watched so far
 
     uint32_t ArmTries {};
+    uint64_t LastScan {};
     for (uint64_t Pass = 0;; ++Pass) {
       const uint64_t Begin = GetCounter();
+      // Build 148: reads from here on count toward the next burst.
+      PassAllClock.store(AllClock.load(std::memory_order_relaxed), std::memory_order_relaxed);
+      BurstSet.store(false, std::memory_order_relaxed);
       if (ReadWatchOn && !Armed.load(std::memory_order_relaxed) && WatchedCount.load(std::memory_order_relaxed) && ArmTries < 240) {
         if (!Arm() && ++ArmTries == 240) {
           FEX::Windows::StatsLogNote("game files: no ReadFile found in kernelbase or kernel32 after 2 minutes; the game's files are dropped "
                                      "whole");
         }
       }
-      // Every 2 s, look for big files the game has open that aren't in the list.
-      if (Pass % 4 == 0) {
+      // Every 2 s, look for big files the game has open that aren't in the list (by time: read bursts add passes).
+      if (Pass == 0 || Begin - LastScan >= 2 * CounterFreq) {
+        LastScan = Begin;
         ScanArgs Args {};
         FEX::Windows::Linux::ForEachEntry("/proc/self/fd", ScanEntry, &Args);
       }
@@ -1471,7 +1503,21 @@ namespace {
       const uint64_t Ns = (GetCounter() - Begin) * 1'000'000'000 / CounterFreq;
       uint64_t Longest = Stats.LongestNs.load(std::memory_order_relaxed);
       while (Ns > Longest && !Stats.LongestNs.compare_exchange_weak(Longest, Ns, std::memory_order_relaxed)) {}
-      SleepMs(Room && !PlayRoom ? std::min(IntervalMs, RoomIntervalMs) : IntervalMs);
+      PlayRoomNow.store(PlayRoom && BurstBytes, std::memory_order_relaxed);
+      const uint64_t WaitMs = Room && !PlayRoom ? std::min(IntervalMs, RoomIntervalMs) : IntervalMs;
+      if (BurstEvent) {
+        LARGE_INTEGER Timeout {.QuadPart = -static_cast<int64_t>(WaitMs * 10'000)};
+        if (NtWaitForSingleObject(BurstEvent, FALSE, &Timeout) == STATUS_SUCCESS) {
+          // A read burst (build 148): the next pass, at least BurstGapMs after this one began.
+          const uint64_t SinceMs = (GetCounter() - Begin) * 1000 / CounterFreq;
+          if (SinceMs < BurstGapMs) {
+            SleepMs(BurstGapMs - SinceMs);
+          }
+          Stats.BurstPasses.fetch_add(1, std::memory_order_relaxed);
+        }
+      } else {
+        SleepMs(WaitMs);
+      }
     }
     return nullptr;
   }
@@ -1632,6 +1678,14 @@ namespace {
       }
       if (Last + 1 < W.Pieces) {
         AheadStamps[W.FirstPiece + Last + 1].store(AllEnd, std::memory_order_relaxed);
+      }
+      // Build 148: a read burst in the play room starts the next pass now.
+      if (BurstBytes && PlayRoomNow.load(std::memory_order_relaxed)) {
+        const uint64_t PassAll = PassAllClock.load(std::memory_order_relaxed);
+        if (AllEnd > PassAll && AllEnd - PassAll >= BurstBytes && !BurstSet.load(std::memory_order_relaxed) &&
+            !BurstSet.exchange(true, std::memory_order_relaxed)) {
+          NtSetEvent(BurstEvent, nullptr);
+        }
       }
     } else {
       AllKept = false;
@@ -2093,6 +2147,7 @@ namespace {
     const uint64_t PlayRoomPasses = Stats.PlayRoomPasses.exchange(0, std::memory_order_relaxed);
     const uint64_t PlayRoomLowestMB = Stats.PlayRoomLowestFreeMB.exchange(0, std::memory_order_relaxed);
     const uint64_t PlayRoomShrankKB = Stats.PlayRoomShrankKB.exchange(0, std::memory_order_relaxed);
+    const uint64_t BurstPasses = Stats.BurstPasses.exchange(0, std::memory_order_relaxed);
     const uint32_t Count = Stats.Files.load(std::memory_order_relaxed);
     if (!Passes) {
       return ReadsLine() + LearnLine() + HeadroomLine();
@@ -2124,9 +2179,12 @@ namespace {
                                       RoomPasses, LoadFreeMB, RoomLowestMB, AheadReadText, static_cast<double>(RoomShrankKB) / 1024.0) :
                    fextl::string();
     const fextl::string PlayRoomText =
-      PlayRoomPasses ? fextl::fmt::format(", play room: {} passes in play with unused memory below {} MB (lowest {} MB) kept only the "
+      PlayRoomPasses ? fextl::fmt::format(", play room: {} passes{} in play with unused memory below {} MB (lowest {} MB) kept only the "
                                           "last 32 MB read, readahead and learned pieces{}, file cache {:.0f} MB smaller by them",
-                                          PlayRoomPasses, PlayFreeMB, PlayRoomLowestMB, RoomPasses ? fextl::string() : AheadReadText,
+                                          PlayRoomPasses,
+                                          BurstPasses ? fextl::fmt::format(" ({} started by {} MB of reads)", BurstPasses, BurstBytes >> 20) :
+                                                        fextl::string(),
+                                          PlayFreeMB, PlayRoomLowestMB, RoomPasses ? fextl::string() : AheadReadText,
                                           static_cast<double>(PlayRoomShrankKB) / 1024.0) :
                        fextl::string();
     return fextl::fmt::format("  game files: {} files{}, file cache {:.0f} MB smaller after the drops ({} drops in {} passes, longest {:.1f} "
@@ -2203,10 +2261,23 @@ void Init(bool StatsLog) {
   // Build 138.
   LoadFreeMB = KeepMB ? Number("FEX_GAME_FILES_LOAD_FREE_MB", 1024, 0, 16384) : 0;
   // Build 139.
-  PlayFreeMB = KeepMB ? Number("FEX_GAME_FILES_PLAY_FREE_MB", 384, 0, 16384) : 0;
+  PlayFreeMB = KeepMB ? Number("FEX_GAME_FILES_PLAY_FREE_MB", 1024, 0, 16384) : 0;
   // Build 147.
   RoomAheadRead = (LoadFreeMB || PlayFreeMB) && Number("FEX_GAME_FILES_ROOM_AHEAD_READ", 0, 0, 1) == 1;
   LearnRangesOn = LearnBudget && Number("FEX_GAME_FILES_LEARN_RANGES", 0, 0, 1) == 1;
+  // Build 148.
+  BurstBytes = PlayFreeMB && ReadWatchOn ? Number("FEX_GAME_FILES_BURST_MB", 0, 0, 4096) << 20 : 0;
+  if (BurstBytes) {
+    OBJECT_ATTRIBUTES Attr {.Length = sizeof(Attr)};
+    if (NtCreateEvent(&BurstEvent, EVENT_ALL_ACCESS, &Attr, 1 /* SynchronizationEvent */, FALSE) != STATUS_SUCCESS) {
+      BurstEvent = nullptr;
+      BurstBytes = 0;
+    }
+  }
+  if (const char* F = FEX::Windows::Switch("FEX_GAME_FILES_NICE"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
+    CacheNice = std::clamp(atoi(F), -20, 19);
+    CacheNiceSet = true;
+  }
   // Build 90: the unpack cache's learned list tells play from loading screens by the frame clock too.
   const char* Unpack = FEX::Windows::Switch("FEX_UNPACK_CACHE");
   UnpackLearnWanted = Unpack && Unpack[0] == '1' && Number("FEX_UNPACK_CACHE_LEARN", 0, 0, 4096) > 0;
@@ -2244,8 +2315,17 @@ void Init(bool StatsLog) {
       "game files: play room (build 139): in play with less than {} MB of unused memory (MemFree), the drops keep only the last 32 MB "
       "read, readahead and learned pieces, so when the game streams a new area while frames keep coming FEX's own kept game data makes "
       "room first (build 138 run: 147-185 MB unused at t=46 and t=189, Android closed 12 and 5 apps; 'play room' on the 'game files' "
-      "line; FEX_GAME_FILES_PLAY_FREE_MB=0 turns it off)",
+      "line; FEX_GAME_FILES_PLAY_FREE_MB=0 turns it off; build 148 raised the mark from 384 MB: in the build 147 run unused memory sat at "
+      "384-512 MB in most of play, where FEX kept 80-250 MB more game data than in the room)",
       PlayFreeMB));
+  }
+  if (BurstBytes) {
+    FEX::Windows::StatsLogNote(fextl::fmt::format(
+      "game files: read bursts (build 148): in the play room a pass also starts once the game has read {} MB since the last one, at "
+      "least {} ms after it began, so the data of a new area streamed in play leaves the file cache as it comes (build 147 run: "
+      "191 MB read in a second at t=282, unused memory down to 120 MB, Android closed 12 apps; '(N started by {} MB of reads)' on "
+      "the 'play room' part of the 'game files' line; FEX_GAME_FILES_BURST_MB=0 turns it off)",
+      BurstBytes >> 20, BurstGapMs, BurstBytes >> 20));
   }
   if (RoomAheadRead) {
     FEX::Windows::StatsLogNote(
