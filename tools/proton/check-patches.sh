@@ -10,6 +10,7 @@ LIB=$1/lib/wine
 PATCHES=$2
 NT=$LIB/aarch64-windows/ntdll.dll
 NT32=$LIB/i386-windows/ntdll.dll
+NTSO=$LIB/aarch64-unix/ntdll.so
 fail=0
 
 ok()  { echo "OK   $1: $2"; }
@@ -65,6 +66,23 @@ check_0004() {
     if [ "$v" = 3 ]; then ok 0004 "${f#$LIB/} __wine_d2r_wait_lists = 3"; else bad 0004 "${f#$LIB/} __wine_d2r_wait_lists = '$v', not 3"; fi
     if utf16_in "$f" WINE_D2R_WAKE_FAST; then ok 0004 "${f#$LIB/} reads WINE_D2R_WAKE_FAST"; else bad 0004 "${f#$LIB/} lacks WINE_D2R_WAKE_FAST"; fi
   done
+}
+
+ascii_in() { grep -qaF "$2" "$1" 2>/dev/null; }
+
+# 0005: unix ntdll keeps pipe/device/socket I/O out of the memory lock; off switch is there
+check_0005() {
+  if ascii_in "$NTSO" WINE_D2R_VM_IO; then ok 0005 "${NTSO#$LIB/} reads WINE_D2R_VM_IO"; else bad 0005 "${NTSO#$LIB/} lacks WINE_D2R_VM_IO"; fi
+}
+
+# 0006: memory lock holder notes in PE ntdll's __wine_d2r_vm_lock, filled by the unix side
+check_0006() {
+  local f
+  for f in "$NT" "$NT32"; do
+    if exports "$f" __wine_d2r_vm_lock; then ok 0006 "${f#$LIB/} exports __wine_d2r_vm_lock"; else bad 0006 "${f#$LIB/} lacks __wine_d2r_vm_lock"; fi
+  done
+  if ascii_in "$NTSO" __wine_d2r_vm_lock; then ok 0006 "${NTSO#$LIB/} looks up __wine_d2r_vm_lock"; else bad 0006 "${NTSO#$LIB/} never looks up __wine_d2r_vm_lock"; fi
+  if ascii_in "$NTSO" WINE_D2R_VM_NOTES; then ok 0006 "${NTSO#$LIB/} reads WINE_D2R_VM_NOTES"; else bad 0006 "${NTSO#$LIB/} lacks WINE_D2R_VM_NOTES"; fi
 }
 
 for p in "$PATCHES"/*.patch; do

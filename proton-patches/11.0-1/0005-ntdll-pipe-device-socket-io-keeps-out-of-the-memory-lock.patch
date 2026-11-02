@@ -1,0 +1,215 @@
+ntdll: Pipe, device and socket I/O keeps out of the memory lock.
+
+virtual_locked_server_call() holds virtual_mutex, the lock of every memory call in the
+process (NtAllocate/Protect/Free/QueryVirtualMemory, write watch and guard page faults),
+for the whole wineserver round trip of every read or ioctl that returns data: ReadFile
+on pipes, DeviceIoControl, socket ioctls and their async completions. The EFAULT
+fallbacks of virtual_locked_read/pread/recvmsg also do their storage or socket I/O
+under it.
+
+In D2R (b147, 120 Hz run) the main thread reads the Steam client's pipe twice a frame.
+At t=63, 145 and 236 one of these reads took 55.5, 55.9 and 54.7 ms while FEX's probe
+waited 54.8, 53.0 and 54.3 ms for virtual_mutex, with the wineserver answering FEX's
+round trip probe within 0.2-2 ms: the pipe read waited for the memory lock, and each
+time the frame took ~70 ms.
+
+The server round trip now runs without virtual_mutex. The caller's buffer is touched
+first (as NtReadFile does for file reads, so write watches and guard pages are handled
+by the fault handler), the reply goes into a private buffer (stack up to 1 KB, heap up
+to 4 MB) and is copied out after the call. A buffer that can't be written takes the
+old locked way and fails there as before. The read fallbacks take the lock only to make
+the buffer writable and to update the write watches after the I/O, not during it.
+
+WINE_D2R_VM_IO=0 keeps the I/O under the lock as stock Wine does (read once per
+process at start).
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 6e16977..afd45ed 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -294,6 +294,7 @@ static const BYTE VIRTUAL_Win32Flags[16] =
+ 
+ static struct wine_rb_tree views_tree;
+ static pthread_mutex_t virtual_mutex;
++static BOOL d2r_vm_io_locked;  /* WINE_D2R_VM_IO=0: I/O under virtual_mutex as stock Wine */
+ 
+ static const UINT page_shift = 12;
+ static const UINT_PTR page_mask = 0xfff;
+@@ -3888,7 +3889,7 @@ void virtual_init(void)
+ {
+     const struct preload_info **preload_info = dlsym( RTLD_DEFAULT, "wine_main_preload_info" );
+     struct r_debug **r_debug = dlsym( RTLD_DEFAULT, "wine_r_debug" );
+-    const char *preload;
++    const char *preload, *env;
+     size_t size;
+     int i;
+     pthread_mutexattr_t attr;
+@@ -3915,6 +3916,12 @@ void virtual_init(void)
+ 
+     kernel_writewatch_init();
+ 
++    if ((env = getenv( "WINE_D2R_VM_IO" )) && env[0] == '0')
++    {
++        ERR( "d2r: I/O stays under the memory lock as in stock Wine (WINE_D2R_VM_IO=0).\n" );
++        d2r_vm_io_locked = TRUE;
++    }
++
+     if (preload_info && *preload_info)
+         for (i = 0; (*preload_info)[i].size; i++)
+             mmap_add_reserved_area( (*preload_info)[i].addr, (*preload_info)[i].size );
+@@ -5022,6 +5029,51 @@ static NTSTATUS check_write_access( void *base, size_t size, BOOL *has_write_wat
+ }
+ 
+ 
++/* d2r (fex-d2-reforged): pipe, device and socket server calls and the EFAULT
++ * fallbacks of reads keep their I/O out of virtual_mutex, so a slow server round
++ * trip or storage read holds up only the calling thread, not every memory call
++ * of the process (d2r_vm_io_locked = WINE_D2R_VM_IO=0 keeps stock behavior). */
++#define D2R_BOUNCE_STACK 1024
++#define D2R_BOUNCE_MAX   (4 * 1024 * 1024)
++
++/* copy a reply into the caller's buffer; write watch faults are handled on the way */
++static BOOL d2r_copy_to_user( void *dst, const void *src, size_t size )
++{
++    if (!size) return TRUE;
++    __TRY
++    {
++        memcpy( dst, src, size );
++    }
++    __EXCEPT
++    {
++        return FALSE;
++    }
++    __ENDTRY
++    return TRUE;
++}
++
++/* virtual_mutex held only to make the buffer writable for the I/O that follows */
++static BOOL d2r_prepare_write( void *addr, size_t size, BOOL *has_write_watch )
++{
++    sigset_t sigset;
++    BOOL ret;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    ret = !check_write_access( addr, size, has_write_watch );
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    return ret;
++}
++
++static void d2r_finish_write( void *addr, size_t size, size_t accessed )
++{
++    sigset_t sigset;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    update_write_watches( addr, size, accessed );
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++}
++
++
+ /***********************************************************************
+  *           virtual_locked_server_call
+  */
+@@ -5036,6 +5088,27 @@ unsigned int virtual_locked_server_call( void *req_ptr )
+ 
+     if (!size) return wine_server_call( req_ptr );
+ 
++    /* The reply lands in a private buffer during the round trip and is copied out
++     * after it, without virtual_mutex. Touching the buffer first takes care of
++     * write watches and keeps a buffer that can't be written from reaching the
++     * server (that case goes the locked way below and fails there as before). */
++    if (!d2r_vm_io_locked && size <= D2R_BOUNCE_MAX && virtual_check_buffer_for_write( addr, size ))
++    {
++        char stack_buf[D2R_BOUNCE_STACK];
++        char *bounce = size <= sizeof(stack_buf) ? stack_buf : malloc( size );
++
++        if (bounce)
++        {
++            req->reply_data = bounce;
++            ret = wine_server_call( req );
++            req->reply_data = addr;
++            if (!d2r_copy_to_user( addr, bounce, wine_server_reply_size( req ) ))
++                ret = STATUS_ACCESS_VIOLATION;
++            if (bounce != stack_buf) free( bounce );
++            return ret;
++        }
++    }
++
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+     if (!(ret = check_write_access( addr, size, &has_write_watch )))
+     {
+@@ -5060,6 +5133,26 @@ ssize_t virtual_locked_read( int fd, void *addr, size_t size )
+     ssize_t ret = read( fd, addr, size );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
++    if (!d2r_vm_io_locked)
++    {
++        if (!d2r_prepare_write( addr, size, &has_write_watch ))
++        {
++            errno = EFAULT;
++            return -1;
++        }
++        ret = read( fd, addr, size );
++        if (ret != -1 || errno != EFAULT)
++        {
++            err = errno;
++            if (has_write_watch) d2r_finish_write( addr, size, max( 0, ret ));
++            errno = err;
++            return ret;
++        }
++        /* protections changed meanwhile, do it the locked way */
++        if (has_write_watch) d2r_finish_write( addr, size, 0 );
++        has_write_watch = FALSE;
++    }
++
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+     if (!check_write_access( addr, size, &has_write_watch ))
+     {
+@@ -5085,6 +5178,25 @@ ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset )
+     ssize_t ret = pread( fd, addr, size, offset );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
++    if (!d2r_vm_io_locked)
++    {
++        if (!d2r_prepare_write( addr, size, &has_write_watch ))
++        {
++            errno = EFAULT;
++            return -1;
++        }
++        ret = pread( fd, addr, size, offset );
++        if (ret != -1 || errno != EFAULT)
++        {
++            err = errno;
++            if (has_write_watch) d2r_finish_write( addr, size, max( 0, ret ));
++            errno = err;
++            return ret;
++        }
++        if (has_write_watch) d2r_finish_write( addr, size, 0 );
++        has_write_watch = FALSE;
++    }
++
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+     if (!check_write_access( addr, size, &has_write_watch ))
+     {
+@@ -5111,6 +5223,22 @@ ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
+     ssize_t ret = recvmsg( fd, hdr, flags );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
++    if (!d2r_vm_io_locked)
++    {
++        for (i = 0; i < hdr->msg_iovlen; i++)
++            if (!d2r_prepare_write( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, &has_write_watch ))
++                break;
++        if (i == hdr->msg_iovlen)
++        {
++            ret = recvmsg( fd, hdr, flags );
++            err = errno;
++        }
++        if (has_write_watch)
++            while (i--) d2r_finish_write( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, 0 );
++        errno = err;
++        return ret;
++    }
++
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+     for (i = 0; i < hdr->msg_iovlen; i++)
+         if (check_write_access( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, &has_write_watch ))

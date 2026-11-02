@@ -1,0 +1,186 @@
+ntdll: The memory lock notes who holds it, where and for how long.
+
+FEX's lock watch sees threads wait for virtual_mutex for 15-110 ms but can't tell who
+holds it (b131-b147). Every outermost hold now notes the holder's Windows thread id,
+the line in dlls/ntdll/unix/virtual.c where it was taken and when (CLOCK_MONOTONIC);
+holds of 4 ms or more go to a 16 slot ring, and the total number of holds is counted.
+
+The notes live in PE ntdll's export __wine_d2r_vm_lock (512 bytes, layout struct
+d2r_vm_lock_info in unix/unix_private.h, version 1), found by load_ntdll_functions(),
+so FEX can read them from its own threads while others wait. Writers are the lock
+holder only; a reader takes tid, line and since_ns and checks tid again.
+
+The hooks wrap server_enter/leave_uninterrupted_section and mutex_lock/unlock inside
+unix/virtual.c (all of them lock virtual_mutex there), so no call site changes. Cost:
+two vDSO clock reads per outermost hold.
+
+WINE_D2R_VM_NOTES=0 leaves the notes off (read once per process at start).
+---
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index f5f9780..59a28b8 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1756,6 +1756,7 @@
+ @ extern -private -arch=arm64ec __wine_unix_call_dispatcher_arm64ec
+ @ extern -private __wine_unixlib_handle
+ @ extern -private __wine_d2r_wait_lists
++@ extern -private __wine_d2r_vm_lock
+ @ stdcall __wine_get_unix_env(ptr ptr long)
+ @ stdcall __wine_set_unix_env(ptr ptr)
+ @ stdcall wine_nt_to_unix_file_name(ptr ptr ptr long) compat_wine_nt_to_unix_file_name
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index af7375f..c607e4f 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -851,6 +851,10 @@ static struct futex_queue futex_queues[1024];
+  * waiters (3), so FEX keeps its own copy out (it does so for 2 and up). */
+ const ULONG __wine_d2r_wait_lists = 3;
+ 
++/* Written by the unix side (patch 0006): who holds the unix side's memory lock
++ * (struct d2r_vm_lock_info in unix/unix_private.h), read by FEX's lock watch. */
++DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_vm_lock[64];
++
+ /* WINE_D2R_WAIT_LOCK=0 (read in loader_init): spin until free, as stock Wine does */
+ BOOL d2r_wait_lock_spin = FALSE;
+ 
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 4deeac7..8ef845a 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2014,6 +2014,10 @@ static void load_ntdll_functions( HMODULE module )
+         *p__wine_unix_call_dispatcher_arm64ec = __wine_unix_call_dispatcher;
+     }
+     else *p__wine_unix_call_dispatcher = __wine_unix_call_dispatcher;
++    /* d2r: memory lock holder notes for FEX (patch 0006), off with WINE_D2R_VM_NOTES=0 */
++    if (!(getenv( "WINE_D2R_VM_NOTES" ) && getenv( "WINE_D2R_VM_NOTES" )[0] == '0') &&
++        (d2r_vm_lock = (void *)find_named_export( module, exports, "__wine_d2r_vm_lock" )))
++        d2r_vm_lock->version = 1;
+ #undef GET_FUNC
+ }
+ 
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 2f649ca..d077c7b 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -98,6 +98,31 @@ static inline BOOL is_arm64ec(void)
+             main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64);
+ }
+ 
++/* d2r (fex-d2-reforged, patch 0006): who holds the memory lock (virtual_mutex), kept in
++ * PE ntdll's export __wine_d2r_vm_lock for FEX's lock watch. Version 1 layout:
++ * a reader takes tid, line and since_ns and checks tid again for a stable copy. */
++struct d2r_vm_hold
++{
++    ULONG   line;     /* line in dlls/ntdll/unix/virtual.c where the lock was taken */
++    ULONG   tid;      /* Windows thread id of the holder */
++    ULONG   held_us;  /* how long it was held */
++    ULONG   pad;
++    ULONG64 end_ns;   /* CLOCK_MONOTONIC when it was let go */
++};
++
++struct d2r_vm_lock_info
++{
++    ULONG   version;      /* 1 once the unix side writes here */
++    ULONG   tid;          /* Windows thread id of the holder now, 0 when free */
++    ULONG   line;         /* where the holder now took it */
++    ULONG   long_holds;   /* holds of 4 ms or more so far; the next goes to holds[long_holds % 16] */
++    ULONG64 since_ns;     /* CLOCK_MONOTONIC when the holder now took it */
++    ULONG64 holds_total;  /* all holds so far */
++    struct d2r_vm_hold holds[16];
++};
++
++extern struct d2r_vm_lock_info *d2r_vm_lock;
++
+ /* thread private data, stored in NtCurrentTeb()->GdiTebBatch */
+ struct ntdll_thread_data
+ {
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index afd45ed..53a1e73 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -296,6 +296,85 @@ static struct wine_rb_tree views_tree;
+ static pthread_mutex_t virtual_mutex;
+ static BOOL d2r_vm_io_locked;  /* WINE_D2R_VM_IO=0: I/O under virtual_mutex as stock Wine */
+ 
++/* d2r (patch 0006): every outermost hold of virtual_mutex notes its holder, the line
++ * here where it was taken and when; holds of 4 ms or more go to a small ring. All of
++ * it lives in PE ntdll's __wine_d2r_vm_lock (struct d2r_vm_lock_info), read by FEX. */
++struct d2r_vm_lock_info *d2r_vm_lock;
++static unsigned int d2r_vm_depth;  /* the holder's recursion depth, guarded by virtual_mutex */
++
++#define D2R_VM_LONG_NS (4 * 1000000)
++C_ASSERT( sizeof(struct d2r_vm_lock_info) <= 512 );  /* fits __wine_d2r_vm_lock */
++
++static inline ULONG64 d2r_vm_now(void)
++{
++    struct timespec ts;
++
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return ts.tv_sec * (ULONG64)1000000000 + ts.tv_nsec;
++}
++
++static void d2r_vm_taken( int line )
++{
++    struct d2r_vm_lock_info *info = d2r_vm_lock;
++
++    if (d2r_vm_depth++ || !info) return;
++    info->since_ns = d2r_vm_now();
++    info->line = line;
++    info->holds_total++;
++    WriteRelease( (LONG *)&info->tid, HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ));
++}
++
++static void d2r_vm_released(void)
++{
++    struct d2r_vm_lock_info *info = d2r_vm_lock;
++    ULONG64 now, held;
++    struct d2r_vm_hold *hold;
++
++    if (!d2r_vm_depth || --d2r_vm_depth || !info || !info->tid) return;
++    now = d2r_vm_now();
++    held = now - info->since_ns;
++    if (held >= D2R_VM_LONG_NS)
++    {
++        hold = &info->holds[info->long_holds % ARRAY_SIZE(info->holds)];
++        hold->line = info->line;
++        hold->tid = info->tid;
++        hold->held_us = min( held / 1000, 0xffffffff );
++        hold->end_ns = now;
++        WriteRelease( (LONG *)&info->long_holds, info->long_holds + 1 );
++    }
++    WriteRelease( (LONG *)&info->tid, 0 );
++}
++
++/* every lock of virtual_mutex in this file goes through these */
++static inline void d2r_enter_section( pthread_mutex_t *mutex, sigset_t *sigset, int line )
++{
++    (server_enter_uninterrupted_section)( mutex, sigset );
++    if (mutex == &virtual_mutex) d2r_vm_taken( line );
++}
++
++static inline void d2r_leave_section( pthread_mutex_t *mutex, sigset_t *sigset )
++{
++    if (mutex == &virtual_mutex) d2r_vm_released();
++    (server_leave_uninterrupted_section)( mutex, sigset );
++}
++
++static inline void d2r_mutex_lock( pthread_mutex_t *mutex, int line )
++{
++    (mutex_lock)( mutex );
++    if (mutex == &virtual_mutex) d2r_vm_taken( line );
++}
++
++static inline void d2r_mutex_unlock( pthread_mutex_t *mutex )
++{
++    if (mutex == &virtual_mutex) d2r_vm_released();
++    (mutex_unlock)( mutex );
++}
++
++#define server_enter_uninterrupted_section( mutex, sigset ) d2r_enter_section( mutex, sigset, __LINE__ )
++#define server_leave_uninterrupted_section( mutex, sigset ) d2r_leave_section( mutex, sigset )
++#define mutex_lock( mutex ) d2r_mutex_lock( mutex, __LINE__ )
++#define mutex_unlock( mutex ) d2r_mutex_unlock( mutex )
++
+ static const UINT page_shift = 12;
+ static const UINT_PTR page_mask = 0xfff;
+ static const UINT_PTR granularity_mask = 0xffff;

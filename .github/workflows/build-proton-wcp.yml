@@ -38,7 +38,7 @@ env:
   PROTON_REPO: GameNative/proton-wine
   PROTON_REF: f7c016668db739f563e3d4781c27ed085843d63a
   PROTON_VERSION: 11.0-1
-  D2R_TAG: d2r3
+  D2R_TAG: d2r4
   CCACHE_DIR: /home/runner/.ccache
   CCACHE_COMPILERCHECK: content
   CCACHE_MAXSIZE: 3G
@@ -76,6 +76,8 @@ jobs:
             git apply --verbose "$p"
           done
           git diff --stat
+          # where virtual.c takes the memory lock, to read patch 0006's line numbers
+          bash fex-src/tools/proton/vm-lock-lines.sh dlls/ntdll/unix/virtual.c > "$RUNNER_TEMP/vm-lock-lines.txt"
           # keep the patch folder out of the source tree (configure/autogen don't need it)
           mv fex-src "$RUNNER_TEMP/fex-src"
 
@@ -210,6 +212,7 @@ jobs:
             echo "fex-d2-reforged ${GITHUB_SHA}, ${BUILD_KIND}"
             echo "binary checks:"; cat $RUNNER_TEMP/checks.txt
           } > share/wine/d2r-proton.txt
+          cp $RUNNER_TEMP/vm-lock-lines.txt share/wine/d2r-vm-lock-lines.txt
           cat share/wine/d2r-proton.txt
           cat > profile.json <<EOF
           {
@@ -262,6 +265,8 @@ jobs:
             echo "- WINE_D2R_WAIT_LOCK=0: wait list locks spin as in stock Wine (0002)"
             echo "- WINE_D2R_XINPUT=0: xinput reads and rumble as in stock Wine (0003)"
             echo "- WINE_D2R_WAKE_FAST=0: every wake takes the wait list lock as in stock Wine (0004)"
+            echo "- WINE_D2R_VM_IO=0: pipe, device and socket I/O under the memory lock as in stock Wine (0005)"
+            echo "- WINE_D2R_VM_NOTES=0: the memory lock keeps no holder notes (0006)"
             echo
             echo "Binary checks of this build:"
             echo '```'
