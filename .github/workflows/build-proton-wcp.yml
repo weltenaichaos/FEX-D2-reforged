@@ -17,9 +17,10 @@
 # share/wine/d2r-proton.txt.
 #
 # The package keeps versionName 11.0-1-arm64ec (GameNative's identifier regex needs the
-# plain "11.0-1-arm64ec" form) and uses versionCode 100 + run number, so it installs next
-# to the stock one (proton-11.0-1-arm64ec-1) as proton-11.0-1-arm64ec-<code>; no delete
-# step, and every build gets a new entry.
+# plain "11.0-1-arm64ec" form) and uses versionCode 100 + run number, so every build is a
+# new entry proton-11.0-1-arm64ec-<code>. GameNative keeps one install per version name
+# (seen on the Thor, 2026-11-02), so an import replaces the 11.0-1 installed before and the
+# container has to be pointed at the new entry.
 name: Build Proton ARM64EC WCP
 
 on:
@@ -37,7 +38,7 @@ env:
   PROTON_REPO: GameNative/proton-wine
   PROTON_REF: f7c016668db739f563e3d4781c27ed085843d63a
   PROTON_VERSION: 11.0-1
-  D2R_TAG: d2r2
+  D2R_TAG: d2r3
   CCACHE_DIR: /home/runner/.ccache
   CCACHE_COMPILERCHECK: content
   CCACHE_MAXSIZE: 3G
@@ -246,9 +247,11 @@ jobs:
             echo "(${PROTON_REPO} proton_11.0 @ ${PROTON_REF}, built like their SDK 28 package)"
             echo "with this repo's proton-patches/${PROTON_VERSION} on top. Patch set **${PATCH_HASH}**, ${BUILD_KIND}."
             echo
-            echo "Shows up in GameNative as **proton-${PROTON_VERSION}-arm64ec-${VERSION_CODE}**, next to the stock"
-            echo "proton-${PROTON_VERSION}-arm64ec-1 and earlier builds (nothing to delete). Pick it in the"
-            echo "container's Proton version setting; switch back to compare."
+            echo "Shows up in GameNative as **proton-${PROTON_VERSION}-arm64ec-${VERSION_CODE}**. GameNative keeps one"
+            echo "Proton per version name, so importing it replaces the Proton 11.0-1 installed before (stock or an"
+            echo "earlier build of ours). After the import, pick the new entry in the container's Proton setting,"
+            echo "otherwise the container still names the replaced one and the start fails (\"No base prefix\")."
+            echo "Back to stock: download Proton 11.0-1 again in GameNative (that replaces this one)."
             echo
             echo "Patches (first line of each; full text in proton-patches/${PROTON_VERSION}):"
             for p in $RUNNER_TEMP/fex-src/proton-patches/${PROTON_VERSION}/*.patch; do
@@ -257,6 +260,7 @@ jobs:
             echo
             echo "Off switches (container environment variables):"
             echo "- WINE_D2R_WAIT_LOCK=0: wait list locks spin as in stock Wine (0002)"
+            echo "- WINE_D2R_XINPUT=0: xinput reads and rumble as in stock Wine (0003)"
             echo
             echo "Binary checks of this build:"
             echo '```'
