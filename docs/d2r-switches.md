@@ -85,7 +85,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 
 | Switch | Default | What it does | Off |
 |---|---|---|---|
-| `FEX_RUMBLE` | `async` | The game's controller rumble calls return at once, and a FEX thread passes them on. They used to block the game's render threads (build 53). | `keep` (Wine's way); `off` = no rumble at all |
+| `FEX_RUMBLE` | `async` | The game's controller rumble calls return at once, and a FEX thread passes them on. They used to block the game's render threads (build 53). Left to Proton when its xinput exports `__wine_d2r_xinput` (our Proton d2r3+, build 145). | `keep` (Wine's way); `off` = no rumble at all |
 
 ## VKD3D (DirectX 12)
 
