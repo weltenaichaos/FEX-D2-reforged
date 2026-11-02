@@ -58,6 +58,7 @@ $end_info$
 #include "CodeBuffer.h"
 #include "FrameLatency.h"
 #include "Rumble.h"
+#include "WineWaitFix.h"
 #include "LoaderWatch.h"
 #include "GameFiles.h"
 #include "LoadScreen.h"
@@ -1078,6 +1079,9 @@ NTSTATUS ProcessInit() {
     const char* KernelFutexSwitch = FEX::Windows::Switch("FEX_KERNEL_FUTEX");
     FEXCore::Utils::WritePriorityMutex::KernelFutex = KernelFutexSwitch && KernelFutexSwitch[0] == '1';
   }
+  // Build 141: ntdll's wait lists (every SRW lock, condition variable and WaitOnAddress) run with upstream Wine's race fix
+  // (WineWaitFix.h). Here, while this is the process's only thread and nothing waits yet.
+  WineWaitFix::Init();
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
@@ -1174,6 +1178,7 @@ NTSTATUS ProcessInit() {
   } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
+  WineWaitFix::StartStats(StatsLog);
   FEX::Windows::StartThreadPlacer(AppConfigName);
   // Build 128: who ends a start that never gets going (StartWatch.h).
   FEX::Windows::StartStartWatch(AppConfigName);

@@ -197,6 +197,12 @@ namespace {
     // spun on that spin lock for ~120 ms, which kept the stuck thread off a CPU longer still. FEX's code lock and memory
     // lock now sleep and wake in the Linux kernel (futex), whose wait lists can't be held by a thread that isn't running.
     {"FEX_KERNEL_FUTEX", "1"},
+    // Build 141: the build 118 and 139 freezes (no frames, main thread stuck in RtlWakeConditionVariable at 95% CPU, job
+    // workers spinning in SleepConditionVariableSRW) were a race in Proton 11.0's ntdll wait lists that upstream Wine has
+    // fixed: a waker marked a waiter woken before unlinking it, a waiter coming back on its own left at once, and the list
+    // ended up pointing into reused stack. FEX runs ntdll's RtlWaitOnAddress/RtlWakeAddress* with the fixed code
+    // (WineWaitFix.h); 2 = the same with Wine's spin lock, 0 = Wine's own code.
+    {"FEX_WINE_WAIT_FIX", "1"},
     // Build 126: the longest hitch of the build 125 run (161 ms at 3:50) was VKD3D's queue thread, which hands every frame's
     // GPU work to the driver: at nice 0 it waited 163 ms for a CPU on the main thread's core (open to the game's threads
     // while the main thread is away) while the kernel reclaimed memory there. VKD3D's frame threads (vkd3d_queue,
@@ -620,6 +626,7 @@ namespace {
     "FEX_LSFG_UI_TOL",
     "FEX_LSFG_UI_MOTION",
     "FEX_KERNEL_FUTEX",
+    "FEX_WINE_WAIT_FIX",
     "FEX_FRAME_THREADS",
     "FEX_FRAME_THREADS_OFFCORE",
     "FEX_INPUT_THREADS",
