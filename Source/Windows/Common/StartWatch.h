@@ -23,6 +23,9 @@ namespace FEX::Windows {
 //     GameNative's container they are stale.)
 //   - build 134: every log entry of the last 10 minutes (info level too) at the start and every entry in the first 30 s,
 //     and the wineserver checked every 2 ms (in the build 133 failed start no warning or error came first).
+//   - build 136: written through Linux directly (not Wine), so lines keep coming when a Wine lock or the wineserver
+//     hangs; '## threads' blocks list every thread's state, kernel wait and system call once at 1 s and whenever the
+//     process used under 100 ms CPU in a second during the first 30 s (a hang instead of an end).
 // Every line is written at once (no buffering), so the file is complete up to the moment the process ended.
 // FEX_START_WATCH=<folder> sets the folder, 0 turns it off.
 void StartStartWatch(std::string_view AppName);

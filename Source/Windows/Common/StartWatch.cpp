@@ -41,6 +41,7 @@ namespace {
 
   struct WatchState {
     FILE* File;
+    int Fd = -1; // build 136: the same file opened by Linux, written without Wine (see Put)
     uint32_t Uid;
     int SelfPid;
     uint64_t SelfStartMs; // this process's start, ms since boot
@@ -63,10 +64,20 @@ namespace {
     return static_cast<uint64_t>(Ts.Sec) * 1000 + static_cast<uint64_t>(Ts.Nsec) / 1'000'000;
   }
 
-  void Put(FILE* File, const fextl::string& Text) {
+  constexpr int64_t NR_openat = 56;
+  constexpr int64_t NR_write_ = 64;
+
+  void Put(const WatchState& S, const fextl::string& Text) {
+    // Build 136: written straight to Linux when the file could be opened there, so lines keep coming even when a Wine
+    // thread holds a lock or the wineserver doesn't answer (a hang looks the same as an ended process otherwise).
+    if (S.Fd >= 0) {
+      if (Linux::Syscall(NR_write_, S.Fd, reinterpret_cast<intptr_t>(Text.data()), Text.size()) >= 0) {
+        return;
+      }
+    }
     // FEX's CRT fwrite goes straight to WriteFile (its fflush is a stub that ends the process), so each line is in the
     // file once this returns.
-    fwrite(Text.data(), 1, Text.size(), File);
+    fwrite(Text.data(), 1, Text.size(), S.File);
   }
 
   int ParsePid(const char* Name) {
@@ -209,10 +220,10 @@ namespace {
                               static_cast<double>(Since) / 1000.0, ReadCmdline(Pid));
   }
 
-  // Steam's logs folder as a Linux path, from Wine (C:\Program Files (x86)\Steam\logs); empty when Wine can't say.
-  fextl::string SteamLogsPath(fextl::string& Why) {
+  // A Windows path of an existing file or folder as a Linux path, from Wine; empty with the reason in Why when Wine can't say.
+  fextl::string UnixPathOf(const wchar_t* DosPath, fextl::string& Why) {
     UNICODE_STRING NtName {};
-    if (!RtlDosPathNameToNtPathName_U(L"C:\\Program Files (x86)\\Steam\\logs", &NtName, nullptr, nullptr)) {
+    if (!RtlDosPathNameToNtPathName_U(DosPath, &NtName, nullptr, nullptr)) {
       Why = "RtlDosPathNameToNtPathName_U failed";
       return {};
     }
@@ -247,6 +258,11 @@ namespace {
     return Result;
   }
 
+  // Steam's logs folder as a Linux path (C:\Program Files (x86)\Steam\logs); empty when Wine can't say.
+  fextl::string SteamLogsPath(fextl::string& Why) {
+    return UnixPathOf(L"C:\\Program Files (x86)\\Steam\\logs", Why);
+  }
+
   void CopyTail(const WatchState& S, const fextl::string& Dir, const char* Name) {
     const fextl::string Path = Dir + "/" + Name;
     Linux::FileInfo Info {};
@@ -255,7 +271,7 @@ namespace {
     }
     const int Fd = Linux::OpenRead(Path.c_str(), false);
     if (Fd < 0) {
-      Put(S.File, fextl::fmt::format("## steam log {}: can't open ({})\n", Name, Fd));
+      Put(S, fextl::fmt::format("## steam log {}: can't open ({})\n", Name, Fd));
       return;
     }
     const uint64_t From = Info.Size > SteamTailBytes ? Info.Size - SteamTailBytes : 0;
@@ -265,7 +281,7 @@ namespace {
     Linux::Close(Fd);
     Data.resize(Got > 0 ? static_cast<size_t>(Got) : 0);
     std::replace(Data.begin(), Data.end(), '\0', ' ');
-    Put(S.File, fextl::fmt::format("## steam log {} ({} bytes, {}):\n", Name, Info.Size,
+    Put(S, fextl::fmt::format("## steam log {} ({} bytes, {}):\n", Name, Info.Size,
                                    From ? fextl::fmt::format("its last {} KB", SteamTailBytes / 1024) : fextl::string("all of it")));
     if (From) {
       // Start at a whole line.
@@ -277,8 +293,8 @@ namespace {
     if (!Data.empty() && Data.back() != '\n') {
       Data += '\n';
     }
-    Put(S.File, Data);
-    Put(S.File, fextl::fmt::format("## end of steam log {}\n", Name));
+    Put(S, Data);
+    Put(S, fextl::fmt::format("## end of steam log {}\n", Name));
   }
 
   struct DirListArgs {
@@ -290,7 +306,7 @@ namespace {
     fextl::string Why;
     const fextl::string Dir = SteamLogsPath(Why);
     if (Dir.empty()) {
-      Put(S.File, fextl::fmt::format("## steam logs: C:\\Program Files (x86)\\Steam\\logs not found: {}\n", Why));
+      Put(S, fextl::fmt::format("## steam logs: C:\\Program Files (x86)\\Steam\\logs not found: {}\n", Why));
       return;
     }
     if (!ConsoleOnly) {
@@ -308,7 +324,7 @@ namespace {
           }
         },
         &A);
-      Put(S.File, fextl::fmt::format("## steam logs folder {}: {}\n", Dir, Listed ? (Text.empty() ? fextl::string(" empty") : Text) :
+      Put(S, fextl::fmt::format("## steam logs folder {}: {}\n", Dir, Listed ? (Text.empty() ? fextl::string(" empty") : Text) :
                                                                                      fextl::string(" can't be read")));
     }
     constexpr const char* All[] = {"console_log.previous.txt", "console_log.txt",          "bootstrap_log.txt", "connection_log.previous.txt",
@@ -453,6 +469,80 @@ namespace {
     return Linux::Syscall(NR_kill, Pid, 0) != -3;
   }
 
+  // Build 136: CPU time this whole process has used, in ms.
+  uint64_t ProcessCpuMs() {
+    struct {
+      int64_t Sec;
+      int64_t Nsec;
+    } Ts {};
+    Linux::Syscall(NR_clock_gettime, 2 /* CLOCK_PROCESS_CPUTIME_ID */, reinterpret_cast<intptr_t>(&Ts));
+    return static_cast<uint64_t>(Ts.Sec) * 1000 + static_cast<uint64_t>(Ts.Nsec) / 1'000'000;
+  }
+
+  // One line of a task's state: name, state, CPU time, the kernel function it sleeps in and its system call (number and
+  // first arguments; the futex address shows which threads wait for the same lock).
+  fextl::string TaskLine(const char* Base) {
+    char Path[96];
+    char Text[256];
+    fextl::string Line;
+    snprintf(Path, sizeof(Path), "%s/stat", Base);
+    Linux::TaskStat T {};
+    if (Linux::ReadTaskStat(Path, T)) {
+      Line = fextl::fmt::format("{} state {} cpu {} ms core {}", T.Comm, T.State, (T.UserTicks + T.SystemTicks) * 10, T.Processor);
+    } else {
+      return "gone";
+    }
+    snprintf(Path, sizeof(Path), "%s/wchan", Base);
+    if (Linux::ReadSmallFile(Path, Text, sizeof(Text)) > 0) {
+      Line += fextl::fmt::format(" in {}", Text);
+    }
+    snprintf(Path, sizeof(Path), "%s/syscall", Base);
+    if (Linux::ReadSmallFile(Path, Text, sizeof(Text)) > 0) {
+      // "nr a0 a1 a2 a3 a4 a5 sp pc": keep the number and the first three arguments.
+      char* End = Text;
+      for (int Fields = 0; *End && Fields < 4; ++End) {
+        if (*End == ' ' && ++Fields == 4) {
+          break;
+        }
+      }
+      *End = 0;
+      for (char* C = Text; *C; ++C) {
+        if (*C == '\n') {
+          *C = 0;
+          break;
+        }
+      }
+      Line += fextl::fmt::format(" | syscall {}", Text);
+    }
+    return Line;
+  }
+
+  // Every thread of this process (and the wineserver): who waits where when the game makes no progress.
+  void DumpThreads(const WatchState& S, int Server, const char* Why) {
+    fextl::vector<int> Tids;
+    Linux::ForEachEntry(
+      "/proc/self/task",
+      [](const char* Name, void* Arg) {
+        if (const int Tid = ParsePid(Name)) {
+          static_cast<fextl::vector<int>*>(Arg)->push_back(Tid);
+        }
+      },
+      &Tids);
+    std::sort(Tids.begin(), Tids.end());
+    Put(S, fextl::fmt::format("{} ## threads ({}): {} threads\n", Stamp(S), Why, Tids.size()));
+    for (int Tid : Tids) {
+      char Base[48];
+      snprintf(Base, sizeof(Base), "/proc/self/task/%d", Tid);
+      Put(S, fextl::fmt::format("  tid {}: {}\n", Tid, TaskLine(Base)));
+    }
+    if (Server) {
+      char Base[48];
+      snprintf(Base, sizeof(Base), "/proc/%d", Server);
+      Put(S, fextl::fmt::format("  wineserver {}: {}\n", Server, TaskLine(Base)));
+    }
+    Put(S, "  ## end of threads\n");
+  }
+
   void* WatchThread(void* Arg) {
     auto& S = *static_cast<WatchState*>(Arg);
     const uint64_t BeginMs = BootMs();
@@ -465,16 +555,16 @@ namespace {
     int Parent {};
     uint64_t Unused {};
     ReadParentAndStart(S.SelfPid, Parent, Unused);
-    Put(S.File, fextl::fmt::format("{} this process: {} | parent: {}/{} | {}\n", Stamp(S), ReadCmdline(S.SelfPid), ReadComm(Parent), Parent,
+    Put(S, fextl::fmt::format("{} this process: {} | parent: {}/{} | {}\n", Stamp(S), ReadCmdline(S.SelfPid), ReadComm(Parent), Parent,
                                    ReadCmdline(Parent)));
     size_t Mine {};
     for (const auto& P : Known) {
       if (P.Mine && P.Pid != S.SelfPid) {
-        Put(S.File, fextl::fmt::format("{} running: {}\n", Stamp(S), ProcLine(S, P.Pid, P)));
+        Put(S, fextl::fmt::format("{} running: {}\n", Stamp(S), ProcLine(S, P.Pid, P)));
         ++Mine;
       }
     }
-    Put(S.File, fextl::fmt::format("{} {} other processes of this user (uid {}) running; {} processes in all\n", Stamp(S), Mine, S.Uid,
+    Put(S, fextl::fmt::format("{} {} other processes of this user (uid {}) running; {} processes in all\n", Stamp(S), Mine, S.Uid,
                                    Known.size()));
 
     // Steam's own logs (build 129) were stale in GameNative's container (its steam.exe doesn't write them): left out.
@@ -485,13 +575,13 @@ namespace {
       fextl::vector<fextl::string> Lines;
       const int64_t Got = ReadLogd("dumpAndClose lids=0,3,4 tail=30000", 5 /* W */, Cursor, Lines, OffsetS);
       constexpr size_t Keep = 1500;
-      Put(S.File, fextl::fmt::format("## android log (this app's entries, warnings and errors, local time): {} entries read{}, {} lines{}\n", Got < 0 ? 0 : Got,
+      Put(S, fextl::fmt::format("## android log (this app's entries, warnings and errors, local time): {} entries read{}, {} lines{}\n", Got < 0 ? 0 : Got,
                                      Got < 0 ? fextl::fmt::format(" (logd error {})", Got) : fextl::string(), Lines.size(),
                                      Lines.size() > Keep ? fextl::fmt::format(", the last {}", Keep) : fextl::string()));
       for (size_t i = Lines.size() > Keep ? Lines.size() - Keep : 0; i < Lines.size(); ++i) {
-        Put(S.File, Lines[i] + "\n");
+        Put(S, Lines[i] + "\n");
       }
-      Put(S.File, "## end of android log\n");
+      Put(S, "## end of android log\n");
     }
     {
       // Build 134: every entry (info and debug too) of the last 10 minutes. GameNative's own messages about the container
@@ -504,13 +594,13 @@ namespace {
       fextl::vector<fextl::string> Lines;
       const int64_t Got = ReadLogd(fextl::fmt::format("dumpAndClose lids=0,3,4 start={}.000000000", NowS - 600), 0, Recent, Lines, OffsetS);
       constexpr size_t Keep = 6000;
-      Put(S.File, fextl::fmt::format("## android log, all entries of the last 10 minutes (local time): {} entries read{}, {} lines{}\n",
+      Put(S, fextl::fmt::format("## android log, all entries of the last 10 minutes (local time): {} entries read{}, {} lines{}\n",
                                      Got < 0 ? 0 : Got, Got < 0 ? fextl::fmt::format(" (logd error {})", Got) : fextl::string(), Lines.size(),
                                      Lines.size() > Keep ? fextl::fmt::format(", the last {}", Keep) : fextl::string()));
       for (size_t i = Lines.size() > Keep ? Lines.size() - Keep : 0; i < Lines.size(); ++i) {
-        Put(S.File, Lines[i] + "\n");
+        Put(S, Lines[i] + "\n");
       }
-      Put(S.File, "## end of android log, all entries\n");
+      Put(S, "## end of android log, all entries\n");
       if (Recent.Sec > Cursor.Sec || (Recent.Sec == Cursor.Sec && Recent.Nsec > Cursor.Nsec)) {
         Cursor = Recent;
       }
@@ -527,11 +617,14 @@ namespace {
     char ServerState = '?';
     const int Launcher = LauncherPid();
     bool LauncherGone = false;
-    Put(S.File, fextl::fmt::format("{} launcher app process {} {}; watching process starts and ends every {} ms and new android log warnings "
+    Put(S, fextl::fmt::format("{} launcher app process {} {}; watching process starts and ends every {} ms and new android log warnings "
                                    "and errors every 250 ms (every entry every 100 ms in the first 30 s), the wineserver every 2 ms, for {} s\n",
                                    Stamp(S), Launcher, Launcher ? (ProcessExists(Launcher) ? "running" : "not found") : "unknown",
                                    PollNs / 1'000'000, S.Seconds));
 
+    uint64_t LastCpuMs = ProcessCpuMs();
+    int Dumps {};
+    bool EarlyDumped = false;
     uint64_t NextLog = BeginMs + 250;
     uint64_t NextBeat = BeginMs + 1000;
     while (BootMs() - BeginMs < S.Seconds * 1000) {
@@ -545,7 +638,7 @@ namespace {
             ServerState = T.State;
           } else if (!ProcessExists(Server)) {
             ServerGone = true;
-            Put(S.File, fextl::fmt::format("{} ended: the wineserver {} (last seen in state {})\n", Stamp(S), Server, ServerState));
+            Put(S, fextl::fmt::format("{} ended: the wineserver {} (last seen in state {})\n", Stamp(S), Server, ServerState));
           }
         }
       }
@@ -557,7 +650,7 @@ namespace {
         while (k < Known.size() && Known[k].Pid < Pid) {
           if (Known[k].Mine) {
             const int64_t Lived = static_cast<int64_t>(BootMs()) - static_cast<int64_t>(Known[k].StartMs);
-            Put(S.File, fextl::fmt::format("{} ended: {}/{} after {:.2f} s\n", Stamp(S), Known[k].Name, Known[k].Pid,
+            Put(S, fextl::fmt::format("{} ended: {}/{} after {:.2f} s\n", Stamp(S), Known[k].Name, Known[k].Pid,
                                            static_cast<double>(Lived) / 1000.0));
           }
           ++k;
@@ -568,7 +661,7 @@ namespace {
         } else {
           Proc P = Describe(S, Pid);
           if (P.Mine) {
-            Put(S.File, fextl::fmt::format("{} started: {}\n", Stamp(S), ProcLine(S, Pid, P)));
+            Put(S, fextl::fmt::format("{} started: {}\n", Stamp(S), ProcLine(S, Pid, P)));
           }
           Next.push_back(std::move(P));
         }
@@ -576,7 +669,7 @@ namespace {
       for (; k < Known.size(); ++k) {
         if (Known[k].Mine) {
           const int64_t Lived = static_cast<int64_t>(BootMs()) - static_cast<int64_t>(Known[k].StartMs);
-          Put(S.File, fextl::fmt::format("{} ended: {}/{} after {:.2f} s\n", Stamp(S), Known[k].Name, Known[k].Pid,
+          Put(S, fextl::fmt::format("{} ended: {}/{} after {:.2f} s\n", Stamp(S), Known[k].Name, Known[k].Pid,
                                          static_cast<double>(Lived) / 1000.0));
         }
       }
@@ -584,7 +677,7 @@ namespace {
 
       if (Launcher && !LauncherGone && !ProcessExists(Launcher)) {
         LauncherGone = true;
-        Put(S.File, fextl::fmt::format("{} ended: the launcher's app process {}\n", Stamp(S), Launcher));
+        Put(S, fextl::fmt::format("{} ended: the launcher's app process {}\n", Stamp(S), Launcher));
       }
       const uint64_t Now = BootMs();
       if (Now >= NextLog) {
@@ -594,7 +687,7 @@ namespace {
         fextl::vector<fextl::string> Lines;
         ReadLogd(fextl::fmt::format("dumpAndClose lids=0,3,4 start={}.{:09}", Cursor.Sec, Cursor.Nsec), Early ? 0 : 5, Cursor, Lines, OffsetS);
         for (const auto& L : Lines) {
-          Put(S.File, fextl::fmt::format("{} log: {}\n", Stamp(S), L));
+          Put(S, fextl::fmt::format("{} log: {}\n", Stamp(S), L));
         }
       }
       if (Now >= NextBeat) {
@@ -602,11 +695,26 @@ namespace {
         for (const auto& P : Known) {
           Count += P.Mine;
         }
-        Put(S.File, fextl::fmt::format("{} alive, {} processes of this user\n", Stamp(S), Count));
+        const uint64_t Cpu = ProcessCpuMs();
+        Put(S, fextl::fmt::format("{} alive, {} processes of this user, this process used {} ms CPU in the last second\n", Stamp(S), Count,
+                                  Cpu - LastCpuMs));
         NextBeat += 1000;
+        // Build 136: in the first 30 s a starting D2R keeps a core busy; next to no CPU for a second means it waits on
+        // something (a lock, the wineserver): write down every thread's state (up to 6 times; also once at 1 s, just before
+        // the failed starts stopped).
+        const uint64_t Since = Now - BeginMs;
+        if (Dumps < 6 && Since < 30'000 && Cpu - LastCpuMs < 100) {
+          ++Dumps;
+          DumpThreads(S, Server, "this process used little CPU in the last second");
+        }
+        LastCpuMs = Cpu;
+      }
+      if (!EarlyDumped && Now >= S.SelfStartMs + 1000) {
+        EarlyDumped = true;
+        DumpThreads(S, Server, "1 s after this process started, for comparison");
       }
     }
-    Put(S.File, fextl::fmt::format("{} start watch done\n", Stamp(S)));
+    Put(S, fextl::fmt::format("{} start watch done\n", Stamp(S)));
     return nullptr;
   }
 } // namespace
@@ -617,7 +725,7 @@ namespace {
 
 void StartWatchNote(std::string_view Text) {
   if (auto* S = Active) {
-    Put(S->File, fextl::fmt::format("{} {}\n", Stamp(*S), Text));
+    Put(*S, fextl::fmt::format("{} {}\n", Stamp(*S), Text));
   }
 }
 
@@ -648,17 +756,36 @@ void StartStartWatch(std::string_view AppName) {
 
   // Lives for the rest of the process.
   auto* S = new WatchState {.File = File, .Uid = Linux::GetUid(), .SelfPid = Linux::GetPid(), .Seconds = Seconds};
+  // Build 136: the same file opened by Linux (appending), so writing it needs no Wine.
+  fextl::string FdWhy;
+  {
+    fextl::vector<wchar_t> Wide(Path.begin(), Path.end());
+    Wide.push_back(0);
+    const fextl::string UnixPath = UnixPathOf(Wide.data(), FdWhy);
+    if (!UnixPath.empty()) {
+      const int64_t Fd = Linux::Syscall(NR_openat, -100 /* AT_FDCWD */, reinterpret_cast<intptr_t>(UnixPath.c_str()),
+                                        0x1 /* O_WRONLY */ | 0x400 /* O_APPEND */ | 0x80000 /* O_CLOEXEC */);
+      if (Fd >= 0) {
+        S->Fd = static_cast<int>(Fd);
+      } else {
+        FdWhy = fextl::fmt::format("open {} failed ({})", UnixPath, Fd);
+      }
+    }
+  }
   int Parent {};
   uint64_t StartMs {};
   S->SelfStartMs = ReadParentAndStart(S->SelfPid, Parent, StartMs) ? StartMs : BootMs();
 
-  Put(File, fextl::fmt::format("# FEX start watch for {} (Windows pid {}, Linux pid {}, build {}). Times are seconds since this process "
+  Put(*S, fextl::fmt::format("# FEX start watch for {} (Windows pid {}, Linux pid {}, build {}). Times are seconds since this process "
                                "started (Linux). Lines: this process and its parent; every process of this Linux user at the start; this app's "
                                "Android log entries (warnings and errors, a previous failed start's included); then every start and end of "
                                "this user's processes and of the launcher's app process, checked every {} ms, new Android log warnings and "
                                "errors every 250 ms ('log:'), and 'alive' once a second, for {} s. A file whose last line is an 'alive', "
                                "'log' or 'ended' line belongs to a process that was ended from outside then (FEX_START_WATCH=0 turns this off)\n",
                                AppNameCopy, GetCurrentProcessId(), S->SelfPid, BuildInfo, PollNs / 1'000'000, Seconds));
+  Put(*S, S->Fd >= 0 ? fextl::string("# written through Linux (no Wine), so lines keep coming while Wine hangs; '## threads' blocks = every "
+                                     "thread's state when the process used little CPU for a second\n") :
+                       fextl::fmt::format("# written through Wine ({}); lines stop when Wine hangs\n", FdWhy));
   StatsLogNote(fextl::fmt::format("start watch: process starts and ends of this user and the end of Steam's logs go to {} (FEX_START_WATCH=0 "
                                   "turns it off)",
                                   Path));
