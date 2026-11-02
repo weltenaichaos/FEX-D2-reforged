@@ -1079,7 +1079,7 @@ NTSTATUS ProcessInit() {
     const char* KernelFutexSwitch = FEX::Windows::Switch("FEX_KERNEL_FUTEX");
     FEXCore::Utils::WritePriorityMutex::KernelFutex = KernelFutexSwitch && KernelFutexSwitch[0] == '1';
   }
-  // Build 141: ntdll's wait lists (every SRW lock, condition variable and WaitOnAddress) run with upstream Wine's race fix
+  // Build 142: ntdll's wait lists (every SRW lock, condition variable and WaitOnAddress) run with upstream Wine's race fix
   // (WineWaitFix.h). Here, while this is the process's only thread and nothing waits yet.
   WineWaitFix::Init();
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());

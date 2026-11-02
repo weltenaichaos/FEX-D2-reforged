@@ -197,7 +197,7 @@ namespace {
     // spun on that spin lock for ~120 ms, which kept the stuck thread off a CPU longer still. FEX's code lock and memory
     // lock now sleep and wake in the Linux kernel (futex), whose wait lists can't be held by a thread that isn't running.
     {"FEX_KERNEL_FUTEX", "1"},
-    // Build 141: the build 118 and 139 freezes (no frames, main thread stuck in RtlWakeConditionVariable at 95% CPU, job
+    // Build 142: the build 118 and 139 freezes (no frames, main thread stuck in RtlWakeConditionVariable at 95% CPU, job
     // workers spinning in SleepConditionVariableSRW) were a race in Proton 11.0's ntdll wait lists that upstream Wine has
     // fixed: a waker marked a waiter woken before unlinking it, a waiter coming back on its own left at once, and the list
     // ended up pointing into reused stack. FEX runs ntdll's RtlWaitOnAddress/RtlWakeAddress* with the fixed code

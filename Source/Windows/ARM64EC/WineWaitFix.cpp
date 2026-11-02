@@ -463,9 +463,7 @@ namespace {
     uint32_t Uses;  // uses of Wine's lists inside it
   };
 
-  // Acquire loads and release stores (LDAR, LDAPR, LDAPUR, STLR, STLUR, any size) in a function. Stock Proton 11.0's three
-  // functions have none (their list lock uses exclusive or LSE atomics, other encodings); upstream Wine's fix reads and
-  // clears the woken mark with them, so a Proton that has the fix (our own build) is left alone.
+  // Acquire loads and release stores (LDAR, LDAPR, LDAPUR, STLR, STLUR, any size) in a function.
   uint32_t OrderedAccesses(const Target& T) {
     uint32_t Count = 0;
     const auto* C = reinterpret_cast<const uint32_t*>(T.Begin);
@@ -477,6 +475,24 @@ namespace {
       }
     }
     return Count;
+  }
+
+  // The woken mark being cleared in a wake function: str xzr, [Xn, #0x10] (futex_entry.addr). Stock 11.0-1 clears it
+  // with a plain store before the unlink (the bug); with upstream's fix it comes after the unlink as WritePointerRelease,
+  // which Wine's headers build as a DMB and a plain store (checked on both: stock 0 fenced / 1 plain in each wake
+  // function, our Proton d2r1 1 fenced / 0 plain).
+  void MarkClears(const Target& T, uint32_t& Fenced, uint32_t& Plain) {
+    Fenced = Plain = 0;
+    const auto* C = reinterpret_cast<const uint32_t*>(T.Begin);
+    for (uint64_t i = 1; i < T.Length / 4; ++i) {
+      if ((C[i] & 0xfffffc1f) == 0xf900081f) {
+        if ((C[i - 1] & 0xfffff0ff) == 0xd50330bf) {
+          ++Fenced;
+        } else {
+          ++Plain;
+        }
+      }
+    }
   }
 
   // FNV-1a over the three functions' code, for the note: names the exact ntdll build the checks ran on.
@@ -575,10 +591,18 @@ namespace {
       }
     }
     CodeHash = Hash;
-    if (Ordered) {
-      return fextl::fmt::format("Proton's wait code already has upstream Wine's fix ({} acquire/release accesses in the three functions): "
-                                "not stock 11.0-1, left alone",
-                                Ordered);
+    // Only Proton's buggy order is replaced: both wake functions clear the mark with a plain store, none with a fence or a
+    // release store. A Proton with the fix (our own build) is left alone.
+    uint32_t Fenced[2], Plain[2];
+    MarkClears(Targets[1], Fenced[0], Plain[0]);
+    MarkClears(Targets[2], Fenced[1], Plain[1]);
+    if (Ordered || Fenced[0] || Fenced[1]) {
+      return fextl::fmt::format("Proton's wait code already has upstream Wine's fix (woken mark cleared after a fence {}/{}, acquire/release "
+                                "accesses {}): not stock 11.0-1, left alone",
+                                Fenced[0], Fenced[1], Ordered);
+    }
+    if (!Plain[0] || !Plain[1]) {
+      return fextl::fmt::format("Wine's wake code doesn't clear the woken mark as 11.0 does ({}/{} found), left alone", Plain[0], Plain[1]);
     }
 
     // Wine's list array: an address all three functions form in full (each computes &futex_queues[(addr >> 4) % 256] from
@@ -696,7 +720,7 @@ void StartStats(bool StatsLog) {
     return;
   }
   FEX::Windows::StatsLogNote(fextl::fmt::format(
-    "wine waits (build 141): {}. Proton 11.0's code marks a woken waiter before unlinking it, and a waiter that comes back on its own "
+    "wine waits (build 142): {}. Proton 11.0's code marks a woken waiter before unlinking it, and a waiter that comes back on its own "
     "can leave while the waker still uses its list entry; the list then never ends and every thread on it spins: the freezes of the "
     "build 118 and 139 runs (main in RtlWakeConditionVariable, workers in SleepConditionVariableSRW, no frames){}",
     Outcome, CodeHash ? fextl::fmt::format(" | ntdll wait code {:016x}", CodeHash) : fextl::string {}));

@@ -3,7 +3,7 @@
 
 #include <FEXCore/fextl/string.h>
 
-// Build 141: Wine's wait lists, fixed (FEX_WINE_WAIT_FIX).
+// Build 142: Wine's wait lists, fixed (FEX_WINE_WAIT_FIX).
 //
 // Every SRW lock, condition variable and WaitOnAddress in a Wine process waits and wakes through ntdll's
 // RtlWaitOnAddress, RtlWakeAddressSingle and RtlWakeAddressAll. They keep each waiting thread in one of 256 lists, as a
@@ -26,10 +26,11 @@
 //   FEX_WINE_WAIT_FIX=0  Wine's own code (as up to build 140)
 //
 // Before patching it checks that ntdll's code matches what it replaces: the native code of the three functions is
-// found through the ARM64EC redirection table, Wine's list array through the code of RtlWakeAddressSingle (the one
+// found through the ARM64EC redirection table, Wine's list array through their code (the one
 // address all three functions use whose 256 lists all look empty), and no code anywhere else in ntdll may use that
-// array (so no copy of the functions was inlined elsewhere), and the functions must not already have the fix (its
-// acquire/release accesses; our own Proton build carries it, then FEX stays out). Any mismatch leaves Wine's code alone
+// array (so no copy of the functions was inlined elsewhere), and both wake functions must clear the woken mark the
+// buggy way (a plain store; with the fix a fence comes right before it, as in our own Proton build, and then FEX stays
+// out). All of this was tried on stock 11.0-1's and our d2r1 Proton's ntdll.dll. Any mismatch leaves Wine's code alone
 // and says why in the '# wine waits' note, which also names a hash of the three functions' code. With the stats log on,
 // a 'wine waits' line counts each second's waits and wakes.
 namespace WineWaitFix {
