@@ -1,0 +1,229 @@
+ntdll: Wait list locks park a thread instead of spinning.
+
+RtlWaitOnAddress() and RtlWakeAddress*() guard each of the 256 wait lists with a spin
+lock that spins forever. Wine's SRW locks, condition variables and critical sections all
+go through these lists. When the holder is preempted on a busy core, the spinners (often
+at a better nice value) keep it off the CPU: D2R's 144 ms hitch in the layer 13 run was
+exactly that (FEX 125 analysis).
+
+After 64 spins a thread now parks: it takes a slot in the list's parked table, marks the
+lock as contended (2) and sleeps in NtWaitForAlertByThreadId (a futex in the unix side,
+no wineserver) with a 1 ms safety timeout. The unlock clears the lock and alerts the
+parked threads only when it was marked contended, so the fast path is unchanged. 1024
+lists instead of 256 (as FEX 142's copy), fewer unrelated threads share a lock.
+
+WINE_D2R_WAIT_LOCK=0 makes the lock spin as before (read once at process start).
+The export __wine_d2r_wait_lists = 2 tells FEX that these lists have both the unlink
+order fix (0001) and this lock, so FEX keeps its own copy of the functions out.
+---
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index 217b1f7..eaf7b70 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -4669,6 +4669,11 @@ void loader_init( CONTEXT *context, void **entry )
+             ERR( "Enabling heap top down hack.\n" );
+             heap_top_down_hack = TRUE;
+         }
++        if (get_env( L"WINE_D2R_WAIT_LOCK", env_str, sizeof(env_str)) && env_str[0] == L'0')
++        {
++            ERR( "d2r: wait list locks spin as in stock Wine (WINE_D2R_WAIT_LOCK=0).\n" );
++            d2r_wait_lock_spin = TRUE;
++        }
+ 
+         peb->ProcessHeap        = RtlCreateHeap( heap_flags, NULL, 0, 0, NULL, NULL );
+ 
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 32b1d5e..f5f9780 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1755,6 +1755,7 @@
+ @ extern -private __wine_unix_call_dispatcher
+ @ extern -private -arch=arm64ec __wine_unix_call_dispatcher_arm64ec
+ @ extern -private __wine_unixlib_handle
++@ extern -private __wine_d2r_wait_lists
+ @ stdcall __wine_get_unix_env(ptr ptr long)
+ @ stdcall __wine_set_unix_env(ptr ptr)
+ @ stdcall wine_nt_to_unix_file_name(ptr ptr ptr long) compat_wine_nt_to_unix_file_name
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index c4f9cc5..2222d42 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -54,6 +54,7 @@ static const UINT_PTR page_size = 0x1000;
+ extern BOOL delay_heap_free;
+ extern BOOL heap_zero_hack;
+ extern BOOL heap_top_down_hack;
++extern BOOL d2r_wait_lock_spin;
+ 
+ /* exceptions */
+ extern NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *context );
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index d30f533..40e87af 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -830,13 +830,27 @@ struct futex_entry
+     DWORD tid;
+ };
+ 
++/* A list's lock is held for a few instructions only. A thread that still finds it
++ * held after a short spin parks until the holder lets go, so a holder that was
++ * preempted on a busy core gets that core back instead of losing it to spinners. */
++#define FUTEX_LOCK_SPINS  64
++#define FUTEX_LOCK_PARKED 16
++
+ struct futex_queue
+ {
+     struct list queue;
+-    LONG lock;
++    LONG lock;  /* 0 free, 1 held, 2 held and threads may be parked on it */
++    LONG parked[FUTEX_LOCK_PARKED];  /* ids of the threads parked on the lock */
+ };
+ 
+-static struct futex_queue futex_queues[256];
++static struct futex_queue futex_queues[1024];
++
++/* Exported for FEX (fex-d2-reforged): these wait lists have upstream Wine's unlink order
++ * (1) and a lock that parks instead of spinning (2), so FEX keeps its own copy out. */
++const ULONG __wine_d2r_wait_lists = 2;
++
++/* WINE_D2R_WAIT_LOCK=0 (read in loader_init): spin until free, as stock Wine does */
++BOOL d2r_wait_lock_spin = FALSE;
+ 
+ static struct futex_queue *get_futex_queue( const void *addr )
+ {
+@@ -845,15 +859,59 @@ static struct futex_queue *get_futex_queue( const void *addr )
+     return &futex_queues[(val >> 4) % ARRAY_SIZE(futex_queues)];
+ }
+ 
+-static void spin_lock( LONG *lock )
++static void queue_park( struct futex_queue *queue )
+ {
+-    while (InterlockedCompareExchange( lock, -1, 0 ))
++    LONG tid = GetCurrentThreadId();
++    LARGE_INTEGER timeout;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(queue->parked); i++)
++        if (!InterlockedCompareExchange( &queue->parked[i], tid, 0 )) break;
++
++    if (i == ARRAY_SIZE(queue->parked))
++    {
++        /* every slot taken: give the core away instead */
++        NtYieldExecution();
++        return;
++    }
++
++    /* The unlock sets 0 before it reads the slots, and we read the lock after taking
++     * a slot, so either we see it free or the unlock sees us. The timeout only
++     * guards against a missed alert. */
++    if (InterlockedCompareExchange( &queue->lock, 2, 2 ) == 2)
++    {
++        timeout.QuadPart = -10000; /* 1 ms */
++        NtWaitForAlertByThreadId( queue, &timeout );
++    }
++    InterlockedExchange( &queue->parked[i], 0 );
++}
++
++static void queue_lock( struct futex_queue *queue )
++{
++    unsigned int spins;
++
++    for (spins = 0; spins < FUTEX_LOCK_SPINS || d2r_wait_lock_spin; spins++)
++    {
++        if (!InterlockedCompareExchange( &queue->lock, 1, 0 )) return;
+         YieldProcessor();
++    }
++
++    /* mark the lock as having sleepers; taking it this way is fine too, the
++     * unlock then just looks for parked threads */
++    while (InterlockedExchange( &queue->lock, 2 ))
++        queue_park( queue );
+ }
+ 
+-static void spin_unlock( LONG *lock )
++static void queue_unlock( struct futex_queue *queue )
+ {
+-    InterlockedExchange( lock, 0 );
++    unsigned int i;
++    LONG tid;
++
++    if (InterlockedExchange( &queue->lock, 0 ) != 2) return;
++
++    for (i = 0; i < ARRAY_SIZE(queue->parked); i++)
++        if ((tid = InterlockedCompareExchange( &queue->parked[i], 0, 0 )))
++            NtAlertThreadByThreadId( (HANDLE)(DWORD_PTR)tid );
+ }
+ 
+ static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size )
+@@ -891,13 +949,13 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     entry.addr = addr;
+     entry.tid = GetCurrentThreadId();
+ 
+-    spin_lock( &queue->lock );
++    queue_lock( queue );
+ 
+     /* Do the comparison inside of the spinlock, to reduce spurious wakeups. */
+ 
+     if (!compare_addr( addr, cmp, size ))
+     {
+-        spin_unlock( &queue->lock );
++        queue_unlock( queue );
+         return STATUS_SUCCESS;
+     }
+ 
+@@ -905,17 +963,17 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+         list_init( &queue->queue );
+     list_add_tail( &queue->queue, &entry.entry );
+ 
+-    spin_unlock( &queue->lock );
++    queue_unlock( queue );
+ 
+     ret = NtWaitForAlertByThreadId( NULL, timeout );
+ 
+     /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
+     if (ReadPointerAcquire( (void * volatile *)&entry.addr ))
+     {
+-        spin_lock( &queue->lock );
++        queue_lock( queue );
+         if (entry.addr)
+             list_remove( &entry.entry );
+-        spin_unlock( &queue->lock );
++        queue_unlock( queue );
+     }
+ 
+     TRACE("returning %#lx\n", ret);
+@@ -939,7 +997,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+ 
+     if (!addr) return;
+ 
+-    spin_lock( &queue->lock );
++    queue_lock( queue );
+ 
+     if (!queue->queue.next)
+         list_init(&queue->queue);
+@@ -962,7 +1020,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+ 
+     /* Try not to make a system call while holding a spinlock (even if that can be responsible for spurious wake
+      * up scenario). */
+-    spin_unlock( &queue->lock );
++    queue_unlock( queue );
+     if (count)
+         NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
+ }
+@@ -980,7 +1038,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+ 
+     if (!addr) return;
+ 
+-    spin_lock( &queue->lock );
++    queue_lock( queue );
+ 
+     if (!queue->queue.next)
+         list_init(&queue->queue);
+@@ -1002,7 +1060,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+         }
+     }
+ 
+-    spin_unlock( &queue->lock );
++    queue_unlock( queue );
+ 
+     if (tid) NtAlertThreadByThreadId( (HANDLE)(DWORD_PTR)tid );
+ }

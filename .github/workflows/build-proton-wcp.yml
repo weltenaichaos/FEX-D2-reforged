@@ -7,6 +7,15 @@
 # llvm-mingw 20250920, their termuxfs and prefixPack), with proton-patches/11.0-1/*.patch
 # from this repo on top, in name order.
 #
+# Fast rebuilds without stale code: compiles go through ccache, which keys every object
+# on the preprocessed source, the compiler and its flags (content, not timestamps); the
+# source tree is checked out fresh every run and no build tree is restored. A patch to
+# one file recompiles that file only (~10 min builds instead of ~37). workflow_dispatch
+# with full=true (the default there) builds without ccache. Every build then proves each
+# patch is in the built binaries (tools/proton/check-patches.sh, a patch without a check
+# fails the build) and carries the patch set's hash in its name, profile and
+# share/wine/d2r-proton.txt.
+#
 # The package keeps versionName 11.0-1-arm64ec (GameNative's identifier regex needs the
 # plain "11.0-1-arm64ec" form) and uses versionCode 100 + run number, so it installs next
 # to the stock one (proton-11.0-1-arm64ec-1) as proton-11.0-1-arm64ec-<code>; no delete
@@ -18,12 +27,20 @@ on:
     branches: [ main, d2r/clean, 'claude/**' ]
     paths: [ .github/workflows/build-proton-wcp.yml, proton-patches/** ]
   workflow_dispatch:
+    inputs:
+      full:
+        description: Full build without ccache (for batch releases)
+        type: boolean
+        default: true
 
 env:
   PROTON_REPO: GameNative/proton-wine
   PROTON_REF: f7c016668db739f563e3d4781c27ed085843d63a
   PROTON_VERSION: 11.0-1
-  D2R_TAG: d2r1
+  D2R_TAG: d2r2
+  CCACHE_DIR: /home/runner/.ccache
+  CCACHE_COMPILERCHECK: content
+  CCACHE_MAXSIZE: 3G
 
 jobs:
   build:
@@ -34,7 +51,7 @@ jobs:
     steps:
       - name: Free up disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h
 
       - name: Checkout proton-wine
@@ -47,7 +64,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: fex-src
-          sparse-checkout: proton-patches
+          sparse-checkout: |
+            proton-patches
+            tools/proton
 
       - name: Apply our patches
         run: |
@@ -62,15 +81,19 @@ jobs:
       - name: Version
         run: |
           CODE=$((100 + GITHUB_RUN_NUMBER))
+          PATCH_HASH=$(cat $RUNNER_TEMP/fex-src/proton-patches/${PROTON_VERSION}/*.patch | sha256sum | cut -c1-8)
+          if [ "${{ github.event_name }}" = workflow_dispatch ] && [ "${{ inputs.full }}" = true ]; then USE_CCACHE=0; else USE_CCACHE=1; fi
           echo "VERSION_CODE=$CODE" >> $GITHUB_ENV
-          echo "Proton ${PROTON_VERSION} ${D2R_TAG}, versionCode $CODE"
+          echo "PATCH_HASH=$PATCH_HASH" >> $GITHUB_ENV
+          echo "USE_CCACHE=$USE_CCACHE" >> $GITHUB_ENV
+          echo "Proton ${PROTON_VERSION} ${D2R_TAG}, versionCode $CODE, patch set $PATCH_HASH, ccache $USE_CCACHE"
 
       - name: Set up build environment
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y build-essential git wget curl unzip flex bison gettext \
-            autoconf automake libtool pkg-config mingw-w64 gcc-multilib g++-multilib \
+            autoconf automake libtool pkg-config mingw-w64 gcc-multilib g++-multilib ccache \
             libfreetype6-dev libfreetype6-dev:i386 libpng-dev libpng-dev:i386 \
             zlib1g-dev zlib1g-dev:i386
 
@@ -115,16 +138,31 @@ jobs:
       - name: Autogen
         run: bash build-scripts/build-step0-autogen.sh
 
-      - name: Cache wine-tools
-        id: cache-wine-tools
+      - name: Build wine-tools
+        run: bash build-scripts/build-step0.sh
+
+      - name: Restore ccache
+        if: env.USE_CCACHE == '1'
         uses: actions/cache@v4
         with:
-          path: wine-tools
-          key: proton-wine-tools-${{ env.PROTON_REF }}
+          path: /home/runner/.ccache
+          key: proton-ccache-${{ env.PROTON_REF }}-ndk27d-llvmmingw20250920-${{ github.run_id }}
+          restore-keys: proton-ccache-${{ env.PROTON_REF }}-ndk27d-llvmmingw20250920-
 
-      - name: Build wine-tools
-        if: steps.cache-wine-tools.outputs.cache-hit != 'true'
-        run: bash build-scripts/build-step0.sh
+      - name: Route compilers through ccache
+        if: env.USE_CCACHE == '1'
+        run: |
+          # PE side: configure calls plain "clang" from llvm-mingw; a ccache symlink named clang
+          # ahead of it in PATH (ccache then runs the next clang in PATH). Unix side: the NDK clang.
+          mkdir -p $HOME/ccache-wrap
+          ln -sf "$(command -v ccache)" $HOME/ccache-wrap/clang
+          S=build-scripts/build-step-arm64ec.sh
+          sed -i 's|^export PATH=\$LLVM_MINGW_TOOLCHAIN:\$PATH$|export PATH=$HOME/ccache-wrap:$LLVM_MINGW_TOOLCHAIN:$PATH|' $S
+          sed -i 's|^export CC=\$TOOLCHAIN/\$TARGET-clang$|export CC="ccache $TOOLCHAIN/$TARGET-clang"|' $S
+          sed -i 's|^export CXX=\$TOOLCHAIN/\$TARGET-clang++$|export CXX="ccache $TOOLCHAIN/$TARGET-clang++"|' $S
+          grep -n 'ccache' $S
+          [ "$(grep -c ccache $S)" = 3 ] || { echo "::error::build script changed, ccache not routed"; exit 1; }
+          ccache -z
 
       - name: Build sysvshm library
         run: bash build-scripts/build-step-arm64ec.sh --build-sysvshm
@@ -138,29 +176,46 @@ jobs:
           fi
 
       - name: Build
-        run: bash build-scripts/build-step-arm64ec.sh --build
+        run: |
+          bash build-scripts/build-step-arm64ec.sh --build
+          if [ "$USE_CCACHE" = 1 ]; then
+            ccache -s | tee $RUNNER_TEMP/ccache-stats.txt
+            HITS=$(ccache --print-stats | awk -F'\t' '$1=="direct_cache_hit"||$1=="preprocessed_cache_hit"{h+=$2} $1=="cache_miss"{m+=$2} END{if(h+m) printf "%d", 100*h/(h+m); else print 0}')
+            echo "BUILD_KIND=cached build, ${HITS}% of compiles from ccache" >> $GITHUB_ENV
+          else
+            echo "BUILD_KIND=full build without ccache" >> $GITHUB_ENV
+          fi
 
       - name: Install
         run: bash build-scripts/build-step-arm64ec.sh --install
 
-      - name: Check the fix is in ntdll.dll
+      - name: Check every patch is in the built binaries
         run: |
-          # the patched wake functions write addr with a release store after list_remove;
-          # just make sure the PE ntdll was rebuilt from our tree
-          ls -la $HOME/compiled-files-aarch64/lib/wine/*-windows/ntdll.dll
-          grep -c "WritePointerRelease( (void \* volatile \*)&entry->addr, NULL )" dlls/ntdll/sync.c
+          OBJDUMP=$HOME/toolchains/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64/bin/llvm-objdump
+          [ -x "$OBJDUMP" ] || OBJDUMP=$(command -v llvm-objdump-18 || command -v llvm-objdump)
+          echo "objdump: $OBJDUMP"
+          OBJDUMP=$OBJDUMP bash $RUNNER_TEMP/fex-src/tools/proton/check-patches.sh $HOME/compiled-files-aarch64 \
+            $RUNNER_TEMP/fex-src/proton-patches/${PROTON_VERSION} | tee $RUNNER_TEMP/checks.txt
 
       - name: Package wcp
         run: |
           wget -q https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-11.txz -O $GITHUB_WORKSPACE/prefixPack.txz
           cd $HOME/compiled-files-aarch64
           cp $GITHUB_WORKSPACE/prefixPack.txz .
+          {
+            echo "Proton ${PROTON_VERSION} arm64ec ${D2R_TAG} build ${GITHUB_RUN_NUMBER} (versionCode ${VERSION_CODE})"
+            echo "source ${PROTON_REPO} @ ${PROTON_REF}"
+            echo "patch set ${PATCH_HASH}: $(cd $RUNNER_TEMP/fex-src/proton-patches/${PROTON_VERSION} && ls *.patch | tr '\n' ' ')"
+            echo "fex-d2-reforged ${GITHUB_SHA}, ${BUILD_KIND}"
+            echo "binary checks:"; cat $RUNNER_TEMP/checks.txt
+          } > share/wine/d2r-proton.txt
+          cat share/wine/d2r-proton.txt
           cat > profile.json <<EOF
           {
             "type": "Proton",
             "versionName": "${PROTON_VERSION}-arm64ec",
             "versionCode": ${VERSION_CODE},
-            "description": "Proton ${PROTON_VERSION} arm64ec ${D2R_TAG} (build ${GITHUB_RUN_NUMBER}): GameNative 11.0-1 + fex-d2-reforged proton-patches",
+            "description": "Proton ${PROTON_VERSION} arm64ec ${D2R_TAG} (build ${GITHUB_RUN_NUMBER}, patch set ${PATCH_HASH}): GameNative 11.0-1 + fex-d2-reforged proton-patches",
             "files": [],
             "wine": {
               "binPath": "bin",
@@ -171,7 +226,8 @@ jobs:
           EOF
           cat profile.json
           OUT=proton-${PROTON_VERSION}-arm64ec-${D2R_TAG}-${GITHUB_RUN_NUMBER}.wcp
-          tar cJf $GITHUB_WORKSPACE/$OUT bin lib share prefixPack.txz profile.json
+          # same .xz format as GameNative's packages, multi-threaded
+          tar -I 'xz -T0 -6' -cf $GITHUB_WORKSPACE/$OUT bin lib share prefixPack.txz profile.json
           echo "WCP=$OUT" >> $GITHUB_ENV
           ls -la $GITHUB_WORKSPACE/$OUT
           sha256sum $GITHUB_WORKSPACE/$OUT
@@ -183,25 +239,37 @@ jobs:
           path: ${{ env.WCP }}
           retention-days: 30
 
+      - name: Release notes
+        run: |
+          {
+            echo "Our own Proton for D2R on the AYN Thor: GameNative's Proton ${PROTON_VERSION} ARM64EC"
+            echo "(${PROTON_REPO} proton_11.0 @ ${PROTON_REF}, built like their SDK 28 package)"
+            echo "with this repo's proton-patches/${PROTON_VERSION} on top. Patch set **${PATCH_HASH}**, ${BUILD_KIND}."
+            echo
+            echo "Shows up in GameNative as **proton-${PROTON_VERSION}-arm64ec-${VERSION_CODE}**, next to the stock"
+            echo "proton-${PROTON_VERSION}-arm64ec-1 and earlier builds (nothing to delete). Pick it in the"
+            echo "container's Proton version setting; switch back to compare."
+            echo
+            echo "Patches (first line of each; full text in proton-patches/${PROTON_VERSION}):"
+            for p in $RUNNER_TEMP/fex-src/proton-patches/${PROTON_VERSION}/*.patch; do
+              echo "- $(basename $p .patch | cut -c1-4): $(head -1 $p)"
+            done
+            echo
+            echo "Off switches (container environment variables):"
+            echo "- WINE_D2R_WAIT_LOCK=0: wait list locks spin as in stock Wine (0002)"
+            echo
+            echo "Binary checks of this build:"
+            echo '```'
+            cat $RUNNER_TEMP/checks.txt
+            echo '```'
+          } > $RUNNER_TEMP/notes.md
+          cat $RUNNER_TEMP/notes.md
+
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: proton-${{ env.PROTON_VERSION }}-arm64ec-${{ env.D2R_TAG }}-${{ github.run_number }}
-          name: Proton ${{ env.PROTON_VERSION }} ARM64EC ${{ env.D2R_TAG }} (build ${{ github.run_number }})
+          name: Proton ${{ env.PROTON_VERSION }} ARM64EC ${{ env.D2R_TAG }} (build ${{ github.run_number }}, patch set ${{ env.PATCH_HASH }})
           files: ${{ env.WCP }}
           prerelease: true
-          body: |
-            Our own Proton for D2R on the AYN Thor: GameNative's Proton 11.0-1 ARM64EC
-            (proton-wine proton_11.0 @ ${{ env.PROTON_REF }}, built like their SDK 28 package)
-            with this repo's proton-patches/${{ env.PROTON_VERSION }} on top.
-
-            Shows up in GameNative as proton-11.0-1-arm64ec-${{ env.VERSION_CODE }}, next to the
-            stock proton-11.0-1-arm64ec-1 (no need to delete anything). Pick it in the container's
-            Wine/Proton version setting; switch back to -1 to compare.
-
-            d2r1 patches:
-            - 0001 ntdll: a woken WaitOnAddress waiter is taken off the wait list before its
-              address is cleared (fix from Valve's wine bleeding-edge / upstream Wine). Before, a
-              waiter could return and reuse its stack entry while the waker was still unlinking it,
-              corrupting the wait list: every SRW lock, condition variable and WaitOnAddress on that
-              list then spun forever (D2R's freezes with main thread in RtlWakeConditionVariable).
+          body_path: ${{ runner.temp }}/notes.md
