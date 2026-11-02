@@ -545,6 +545,7 @@ fextl::string DescribeAddress(uint64_t Address) {
 // on outside the main exe (the game's own code raises hundreds on purpose; those are skipped) go to the start watch
 // file at once, with where the code and the faulting address are, the code bytes and the top of the guest stack.
 std::atomic<uint32_t> Watched;
+std::atomic<uint64_t> SkippedBreaks;
 constexpr uint32_t MaxWatched = 400;
 
 void WatchNote(Kind Where, uint32_t Code, uint64_t HostPc, uint64_t Fault, uint64_t RIP, uint64_t Sp, uint32_t Access) {
@@ -555,13 +556,21 @@ void WatchNote(Kind Where, uint32_t Code, uint64_t HostPc, uint64_t Fault, uint6
   if (Where == Kind::Guest && Pc - MainExeBase < MainExeSize) {
     return;
   }
+  // Build 146: D2R_loader.dll's own code runs on int3 breakpoints (hundreds a second at start-up, each also seen once more
+  // as native code); in build 140 they used up the 400 lines before the crash point. Breakpoints and single steps are
+  // only counted.
+  if (Code == EXCEPTION_BREAKPOINT || Code == EXCEPTION_SINGLE_STEP) {
+    SkippedBreaks.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   const uint32_t N = Watched.fetch_add(1, std::memory_order_relaxed);
   if (N >= MaxWatched) {
     return;
   }
   constexpr const char* Names[] = {"guest code", "native code", "JIT, unexpected", "non-emulated thread"};
-  auto Text = fextl::fmt::format("exception #{} passed on: code {:X} in {} tid {} at {:X} {}", N, Code, Names[static_cast<uint8_t>(Where)],
-                                 GetCurrentThreadId(), Pc, DescribeAddress(Pc));
+  auto Text = fextl::fmt::format("exception #{} passed on ({} breakpoints/single steps so far, not listed): code {:X} in {} tid {} at {:X} {}", N,
+                                 SkippedBreaks.load(std::memory_order_relaxed), Code, Names[static_cast<uint8_t>(Where)], GetCurrentThreadId(), Pc,
+                                 DescribeAddress(Pc));
   if (Code == EXCEPTION_ACCESS_VIOLATION) {
     Text += fextl::fmt::format(" | {} {:X} {}", Access == 0 ? "read" : Access == 1 ? "write" : Access == 8 ? "execute" : "access", Fault,
                                DescribeAddress(Fault));
