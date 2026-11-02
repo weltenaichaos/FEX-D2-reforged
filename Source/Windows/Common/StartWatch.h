@@ -26,4 +26,6 @@ namespace FEX::Windows {
 // Every line is written at once (no buffering), so the file is complete up to the moment the process ended.
 // FEX_START_WATCH=<folder> sets the folder, 0 turns it off.
 void StartStartWatch(std::string_view AppName);
+// A line for the start watch file now (time-stamped), from any thread; nothing when the start watch is off.
+void StartWatchNote(std::string_view Text);
 } // namespace FEX::Windows

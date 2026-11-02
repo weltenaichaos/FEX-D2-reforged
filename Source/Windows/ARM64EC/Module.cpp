@@ -106,6 +106,8 @@ uint64_t WineNtContinueSyscallId;
 uint64_t WineNtAllocateVirtualMemorySyscallId;
 uint64_t WineNtProtectVirtualMemorySyscallId;
 uint64_t WineNtRaiseExceptionSyscallId;
+// Build 134: the game's own NtTerminateProcess system calls are noted before they run (see ECSyscallHandler).
+uint64_t WineNtTerminateProcessSyscallId = ~0ULL;
 
 NTSTATUS NtContinueNative(ARM64_NT_CONTEXT* NativeContext, BOOLEAN Alert);
 NTSTATUS NtAllocateVirtualMemoryNative(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG, ULONG);
@@ -365,7 +367,8 @@ void ParseWineSyscallNumbers(HMODULE NtDll) {
     } else if (strcmp(it->Name, "NtProtectVirtualMemory") == 0) {
       WineNtProtectVirtualMemorySyscallId = CurSyscallId;
     } else if (strcmp(it->Name, "NtRaiseException") == 0) {
-      WineNtRaiseExceptionSyscallId = CurSyscallId;
+      WineNtRaiseExceptionSyscallId = CurSyscallId;    } else if (strcmp(it->Name, "NtTerminateProcess") == 0) {
+      WineNtTerminateProcessSyscallId = CurSyscallId;
     }
   }
 }
@@ -431,6 +434,7 @@ bool InitSyscalls() {
     WineNtAllocateVirtualMemorySyscallId = GetNTSyscallNo(NtDll, "NtAllocateVirtualMemory");
     WineNtProtectVirtualMemorySyscallId = GetNTSyscallNo(NtDll, "NtProtectVirtualMemory");
     WineNtRaiseExceptionSyscallId = GetNTSyscallNo(NtDll, "NtRaiseException");
+    WineNtTerminateProcessSyscallId = GetNTSyscallNo(NtDll, "NtTerminateProcess");
 
     // Fail if the syscall number we found is beyond the bounds
     // of our static table. This is almost certainly not going
@@ -849,6 +853,29 @@ public:
 
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
     ProcessPendingCrossProcessEmulatorWork();
+
+    // Build 134: the failed D2R starts (black screen, D2R and then Steam gone ~1.5 s in) left no exit record: the process
+    // ended without going through RtlExitUserProcess, whose NtTerminateProcess(0) is where Wine tells FEX (ProcessTerm).
+    // The game's protection code issues system calls itself; one that ends this process is written down here first,
+    // with where it came from, before Wine runs it.
+    if (WineNtTerminateProcessSyscallId != ~0ULL &&
+        static_cast<uint32_t>(Frame->State.gregs[FEXCore::X86State::REG_RAX]) == WineNtTerminateProcessSyscallId) {
+      const uint64_t Handle = Frame->State.gregs[FEXCore::X86State::REG_R10];
+      const uint64_t Status = Frame->State.gregs[FEXCore::X86State::REG_RDX];
+      const uint64_t Rsp = Frame->State.gregs[FEXCore::X86State::REG_RSP];
+      uint64_t Return[4] {};
+      FEX::Windows::Linux::ReadOwnMemory(Rsp, Return, sizeof(Return));
+      const bool Self = Handle == ~0ULL || Handle == 0;
+      const auto Text = fextl::fmt::format("game system call NtTerminateProcess(handle {:X}{}, status {:X}) at rip {:X}, stack {:X} {:X} {:X} {:X} "
+                                           "(tid {})",
+                                           Handle, Self ? (Handle ? " = this process" : " = the other threads") : "", static_cast<uint32_t>(Status),
+                                           Frame->State.rip, Return[0], Return[1], Return[2], Return[3], GetCurrentThreadId());
+      FEX::Windows::StatsLogNote(Text);
+      FEX::Windows::StartWatchNote(Text);
+      if (Handle == ~0ULL) {
+        CrashRecord::Write(static_cast<NTSTATUS>(Status));
+      }
+    }
 
     // Manually raise an exeption with the current JIT state packed into a native context, ntdll handles this and
     // reenters the JIT (see dlls/ntdll/signal_arm64ec.c in wine).

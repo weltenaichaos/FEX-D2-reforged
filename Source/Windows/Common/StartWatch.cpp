@@ -611,6 +611,16 @@ namespace {
   }
 } // namespace
 
+namespace {
+  WatchState* Active;
+}
+
+void StartWatchNote(std::string_view Text) {
+  if (auto* S = Active) {
+    Put(S->File, fextl::fmt::format("{} {}\n", Stamp(*S), Text));
+  }
+}
+
 void StartStartWatch(std::string_view AppName) {
   const char* Dir = Switch("FEX_START_WATCH");
   if (!Dir || !Dir[0] || (Dir[0] == '0' && !Dir[1])) {
@@ -653,6 +663,7 @@ void StartStartWatch(std::string_view AppName) {
                                   "turns it off)",
                                   Path));
 
+  Active = S;
   static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
   Thread = FEXCore::Threads::Thread::Create(WatchThread, S, {.LowPriority = false, .Internal = true}, "FEXStartWatch");
 }
