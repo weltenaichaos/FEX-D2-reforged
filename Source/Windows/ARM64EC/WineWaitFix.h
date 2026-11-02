@@ -33,8 +33,8 @@
 // d2r1). On a Proton with the fix FEX still swaps in for its sleeping list lock while Proton's lock still spins (build
 // 143); our Proton d2r2 and later export __wine_d2r_wait_lists = 2 (both fixes), and then FEX stays out (build 144).
 // All of this was tried on stock 11.0-1's and our d2r1 Proton's ntdll.dll (tools/wine/check-wait-fix.py). Any
-// mismatch leaves Wine's code alone and says why in the '# wine waits' note, which also names a hash of the three functions' code. With the stats log on,
-// a 'wine waits' line counts each second's waits and wakes.
+// mismatch leaves Wine's code alone and says why in the '# wine waits' note, which also names a hash of the three
+// functions' code. With the stats log on, a 'wine waits' line counts each second's waits and wakes.
 namespace WineWaitFix {
 // Call on the process's first thread in process init, right after the switches are read, before any other thread or
 // wait exists. Does nothing outside Wine or with the switch off.
