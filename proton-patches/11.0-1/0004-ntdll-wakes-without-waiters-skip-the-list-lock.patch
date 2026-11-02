@@ -1,0 +1,158 @@
+ntdll: Wakes on a wait list without waiters skip the list lock.
+
+RtlWakeAddressSingle() and RtlWakeAddressAll() take the wait list lock on every call,
+even when nobody waits. D2R makes about 172,000 wake calls per second in busy scenes
+(FEX lock watch, b143), and about 98% of them find no waiter on the list. Each one still
+took and released the lock (two atomic operations on a cache line shared with real
+waiters and wakers), and with patch 0002 a busy lock can park the caller.
+
+Each list now counts its waiters: a waiter adds itself under the lock before it compares
+the value, and leaves the count when it is unlinked (by a waker or by itself after a
+timeout, both under the lock). A wake first does a full barrier and reads the count; at 0
+it returns without the lock. The caller changed the value before the wake (often with a
+plain store), so with a full barrier on both sides either the waiter sees the new value
+and does not sleep, or the wake sees the count and takes the lock as before. A waiter
+that is counted but not queued yet holds the lock, so the wake's walk finds it queued.
+Lists are 64-byte aligned so the count of one list shares no cache line with another
+list's lock.
+
+A host stress test (pairs passing a turn with plain stores, 8 million handoffs) loses no
+wake; the same test without the wake's barrier loses wakes, so the barrier is needed.
+
+WINE_D2R_WAKE_FAST=0 makes every wake take the lock again (read once at process start).
+__wine_d2r_wait_lists is now 3; FEX keeps its own copy out for 2 and up.
+---
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index eaf7b70..313882a 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -4674,6 +4674,11 @@ void loader_init( CONTEXT *context, void **entry )
+             ERR( "d2r: wait list locks spin as in stock Wine (WINE_D2R_WAIT_LOCK=0).\n" );
+             d2r_wait_lock_spin = TRUE;
+         }
++        if (get_env( L"WINE_D2R_WAKE_FAST", env_str, sizeof(env_str)) && env_str[0] == L'0')
++        {
++            ERR( "d2r: every wake takes the wait list lock as in stock Wine (WINE_D2R_WAKE_FAST=0).\n" );
++            d2r_wake_slow = TRUE;
++        }
+ 
+         peb->ProcessHeap        = RtlCreateHeap( heap_flags, NULL, 0, 0, NULL, NULL );
+ 
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index 2222d42..8600619 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -55,6 +55,7 @@ extern BOOL delay_heap_free;
+ extern BOOL heap_zero_hack;
+ extern BOOL heap_top_down_hack;
+ extern BOOL d2r_wait_lock_spin;
++extern BOOL d2r_wake_slow;
+ 
+ /* exceptions */
+ extern NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *context );
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index 40e87af..af7375f 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -836,22 +836,39 @@ struct futex_entry
+ #define FUTEX_LOCK_SPINS  64
+ #define FUTEX_LOCK_PARKED 16
+ 
+-struct futex_queue
++struct DECLSPEC_ALIGN(64) futex_queue
+ {
+     struct list queue;
+     LONG lock;  /* 0 free, 1 held, 2 held and threads may be parked on it */
++    LONG waiters;  /* threads queued or about to queue; a wake that finds 0 needs no lock */
+     LONG parked[FUTEX_LOCK_PARKED];  /* ids of the threads parked on the lock */
+ };
+ 
+ static struct futex_queue futex_queues[1024];
+ 
+ /* Exported for FEX (fex-d2-reforged): these wait lists have upstream Wine's unlink order
+- * (1) and a lock that parks instead of spinning (2), so FEX keeps its own copy out. */
+-const ULONG __wine_d2r_wait_lists = 2;
++ * (1), a lock that parks instead of spinning (2) and wakes that skip lists without
++ * waiters (3), so FEX keeps its own copy out (it does so for 2 and up). */
++const ULONG __wine_d2r_wait_lists = 3;
+ 
+ /* WINE_D2R_WAIT_LOCK=0 (read in loader_init): spin until free, as stock Wine does */
+ BOOL d2r_wait_lock_spin = FALSE;
+ 
++/* WINE_D2R_WAKE_FAST=0 (read in loader_init): every wake takes the list lock, as stock Wine does */
++BOOL d2r_wake_slow = FALSE;
++
++/* A wake that finds no waiter on its list returns without the list lock. The caller has
++ * just changed the value at the address (possibly with a plain store); a waiter counts
++ * itself in before it compares the value. With a full barrier on both sides, either the
++ * waiter sees the new value or the waker sees the count; a waiter counted in but not yet
++ * queued holds the list lock, so the waker's walk finds it queued. */
++static inline BOOL queue_has_waiters( struct futex_queue *queue )
++{
++    if (d2r_wake_slow) return TRUE;
++    MemoryBarrier();
++    return ReadNoFence( &queue->waiters ) != 0;
++}
++
+ static struct futex_queue *get_futex_queue( const void *addr )
+ {
+     ULONG_PTR val = (ULONG_PTR)addr;
+@@ -951,10 +968,15 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+ 
+     queue_lock( queue );
+ 
++    /* count in before the comparison, see queue_has_waiters() */
++    InterlockedIncrement( &queue->waiters );
++    MemoryBarrier();
++
+     /* Do the comparison inside of the spinlock, to reduce spurious wakeups. */
+ 
+     if (!compare_addr( addr, cmp, size ))
+     {
++        InterlockedDecrement( &queue->waiters );
+         queue_unlock( queue );
+         return STATUS_SUCCESS;
+     }
+@@ -972,7 +994,10 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     {
+         queue_lock( queue );
+         if (entry.addr)
++        {
+             list_remove( &entry.entry );
++            InterlockedDecrement( &queue->waiters );
++        }
+         queue_unlock( queue );
+     }
+ 
+@@ -996,6 +1021,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+     TRACE("%p\n", addr);
+ 
+     if (!addr) return;
++    if (!queue_has_waiters( queue )) return;
+ 
+     queue_lock( queue );
+ 
+@@ -1008,6 +1034,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+         {
+             tid = entry->tid;
+             list_remove( &entry->entry );
++            InterlockedDecrement( &queue->waiters );
+             WritePointerRelease( (void * volatile *)&entry->addr, NULL );
+             if (count == ARRAY_SIZE(tids))
+             {
+@@ -1037,6 +1064,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+     TRACE("%p\n", addr);
+ 
+     if (!addr) return;
++    if (!queue_has_waiters( queue )) return;
+ 
+     queue_lock( queue );
+ 
+@@ -1055,6 +1083,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+              * RtlWakeAddressSingle() will not also wake it—two simultaneous
+              * calls must wake at least two waiters if they exist. */
+             list_remove( &entry->entry );
++            InterlockedDecrement( &queue->waiters );
+             WritePointerRelease( (void * volatile *)&entry->addr, NULL );
+             break;
+         }

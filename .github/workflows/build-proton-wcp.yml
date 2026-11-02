@@ -261,6 +261,7 @@ jobs:
             echo "Off switches (container environment variables):"
             echo "- WINE_D2R_WAIT_LOCK=0: wait list locks spin as in stock Wine (0002)"
             echo "- WINE_D2R_XINPUT=0: xinput reads and rumble as in stock Wine (0003)"
+            echo "- WINE_D2R_WAKE_FAST=0: every wake takes the wait list lock as in stock Wine (0004)"
             echo
             echo "Binary checks of this build:"
             echo '```'

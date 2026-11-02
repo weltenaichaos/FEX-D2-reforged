@@ -23,6 +23,9 @@ release_clears() {
 
 exports() { $OBJDUMP -p "$1" 2>/dev/null | grep -qw "$2"; }
 
+# value of a 32-bit data export
+export_u32() { python3 -I "$(dirname "$0")/pe-export-u32.py" "$1" "$2" 2>/dev/null; }
+
 utf16_in() { python3 -I -c 'import sys; sys.exit(0 if open(sys.argv[1],"rb").read().count(sys.argv[2].encode("utf-16-le")) else 1)' "$1" "$2"; }
 
 # 0001: wake functions clear a waiter's address with a release store after unlinking it
@@ -52,6 +55,16 @@ check_0003() {
   done
   f=$LIB/aarch64-windows/xinput9_1_0.dll
   if exports "$f" __wine_d2r_xinput; then ok 0003 "${f#$LIB/} exports __wine_d2r_xinput"; else bad 0003 "${f#$LIB/} lacks __wine_d2r_xinput"; fi
+}
+
+# 0004: wakes skip lists without waiters; the export says 3 and the off switch is there
+check_0004() {
+  local f v
+  for f in "$NT" "$NT32"; do
+    v=$(export_u32 "$f" __wine_d2r_wait_lists)
+    if [ "$v" = 3 ]; then ok 0004 "${f#$LIB/} __wine_d2r_wait_lists = 3"; else bad 0004 "${f#$LIB/} __wine_d2r_wait_lists = '$v', not 3"; fi
+    if utf16_in "$f" WINE_D2R_WAKE_FAST; then ok 0004 "${f#$LIB/} reads WINE_D2R_WAKE_FAST"; else bad 0004 "${f#$LIB/} lacks WINE_D2R_WAKE_FAST"; fi
+  done
 }
 
 for p in "$PATCHES"/*.patch; do
