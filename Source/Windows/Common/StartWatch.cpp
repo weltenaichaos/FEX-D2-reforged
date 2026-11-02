@@ -493,17 +493,62 @@ namespace {
       }
       Put(S.File, "## end of android log\n");
     }
+    {
+      // Build 134: every entry (info and debug too) of the last 10 minutes. GameNative's own messages about the container
+      // (Wine's programs ending, its X server) and Wine's own output are at info level, and in the build 133 failed start
+      // no warning or error came before the container went away.
+      LARGE_INTEGER SystemTime {};
+      NtQuerySystemTime(&SystemTime);
+      const int64_t NowS = SystemTime.QuadPart / 10'000'000LL - 11'644'473'600LL;
+      LogCursor Recent {static_cast<uint64_t>(NowS - 600), 0};
+      fextl::vector<fextl::string> Lines;
+      const int64_t Got = ReadLogd(fextl::fmt::format("dumpAndClose lids=0,3,4 start={}.000000000", NowS - 600), 0, Recent, Lines, OffsetS);
+      constexpr size_t Keep = 6000;
+      Put(S.File, fextl::fmt::format("## android log, all entries of the last 10 minutes (local time): {} entries read{}, {} lines{}\n",
+                                     Got < 0 ? 0 : Got, Got < 0 ? fextl::fmt::format(" (logd error {})", Got) : fextl::string(), Lines.size(),
+                                     Lines.size() > Keep ? fextl::fmt::format(", the last {}", Keep) : fextl::string()));
+      for (size_t i = Lines.size() > Keep ? Lines.size() - Keep : 0; i < Lines.size(); ++i) {
+        Put(S.File, Lines[i] + "\n");
+      }
+      Put(S.File, "## end of android log, all entries\n");
+      if (Recent.Sec > Cursor.Sec || (Recent.Sec == Cursor.Sec && Recent.Nsec > Cursor.Nsec)) {
+        Cursor = Recent;
+      }
+    }
+    // The wineserver: when it ends, every Wine program ends within milliseconds, which is what the failed starts look
+    // like. Checked every 2 ms so its end is seen before this process goes.
+    int Server {};
+    for (const auto& P : Known) {
+      if (P.Mine && P.Name == "wineserver") {
+        Server = P.Pid;
+      }
+    }
+    bool ServerGone = false;
+    char ServerState = '?';
     const int Launcher = LauncherPid();
     bool LauncherGone = false;
     Put(S.File, fextl::fmt::format("{} launcher app process {} {}; watching process starts and ends every {} ms and new android log warnings "
-                                   "and errors every 250 ms for {} s\n",
+                                   "and errors every 250 ms (every entry every 100 ms in the first 30 s), the wineserver every 2 ms, for {} s\n",
                                    Stamp(S), Launcher, Launcher ? (ProcessExists(Launcher) ? "running" : "not found") : "unknown",
                                    PollNs / 1'000'000, S.Seconds));
 
     uint64_t NextLog = BeginMs + 250;
     uint64_t NextBeat = BeginMs + 1000;
     while (BootMs() - BeginMs < S.Seconds * 1000) {
-      Linux::SleepNs(PollNs);
+      for (uint64_t Slept = 0; Slept < PollNs; Slept += 2'000'000) {
+        Linux::SleepNs(2'000'000);
+        if (Server && !ServerGone) {
+          char Path[48];
+          snprintf(Path, sizeof(Path), "/proc/%d/stat", Server);
+          Linux::TaskStat T {};
+          if (Linux::ReadTaskStat(Path, T)) {
+            ServerState = T.State;
+          } else if (!ProcessExists(Server)) {
+            ServerGone = true;
+            Put(S.File, fextl::fmt::format("{} ended: the wineserver {} (last seen in state {})\n", Stamp(S), Server, ServerState));
+          }
+        }
+      }
       const auto Pids = ListPids();
       fextl::vector<Proc> Next;
       Next.reserve(Pids.size());
@@ -543,9 +588,11 @@ namespace {
       }
       const uint64_t Now = BootMs();
       if (Now >= NextLog) {
-        NextLog = Now + 250;
+        // Every entry for the first 30 s (the failed starts ended at 1-2 s), then warnings and errors.
+        const bool Early = Now - BeginMs < 30'000;
+        NextLog = Now + (Early ? 100 : 250);
         fextl::vector<fextl::string> Lines;
-        ReadLogd(fextl::fmt::format("dumpAndClose lids=0,3,4 start={}.{:09}", Cursor.Sec, Cursor.Nsec), 5, Cursor, Lines, OffsetS);
+        ReadLogd(fextl::fmt::format("dumpAndClose lids=0,3,4 start={}.{:09}", Cursor.Sec, Cursor.Nsec), Early ? 0 : 5, Cursor, Lines, OffsetS);
         for (const auto& L : Lines) {
           Put(S.File, fextl::fmt::format("{} log: {}\n", Stamp(S), L));
         }

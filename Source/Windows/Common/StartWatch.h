@@ -21,6 +21,8 @@ namespace FEX::Windows {
 //     every 250 ms; and the launcher's own app process: in the build 131 failed start every process of the container
 //     went away at once, which is what Android does when that process dies. (Build 129 copied Steam's logs instead; in
 //     GameNative's container they are stale.)
+//   - build 134: every log entry of the last 10 minutes (info level too) at the start and every entry in the first 30 s,
+//     and the wineserver checked every 2 ms (in the build 133 failed start no warning or error came first).
 // Every line is written at once (no buffering), so the file is complete up to the moment the process ended.
 // FEX_START_WATCH=<folder> sets the folder, 0 turns it off.
 void StartStartWatch(std::string_view AppName);
