@@ -495,6 +495,20 @@ namespace {
     }
   }
 
+  // YIELD instructions in a function: Wine's list lock spins with YieldProcessor in all three (stock and d2r1 alike).
+  uint32_t Yields(const Target& T) {
+    uint32_t Count = 0;
+    const auto* C = reinterpret_cast<const uint32_t*>(T.Begin);
+    for (uint64_t i = 0; i < T.Length / 4; ++i) {
+      Count += C[i] == 0xd503203f;
+    }
+    return Count;
+  }
+
+  // Set when Proton's own code already wakes in the fixed order (our Proton d2r1): FEX then swaps in only for its
+  // sleeping list lock.
+  bool ProtonOrderFixed {};
+
   // FNV-1a over the three functions' code, for the note: names the exact ntdll build the checks ran on.
   uint64_t CodeHash {};
 
@@ -591,18 +605,27 @@ namespace {
       }
     }
     CodeHash = Hash;
-    // Only Proton's buggy order is replaced: both wake functions clear the mark with a plain store, none with a fence or a
-    // release store. A Proton with the fix (our own build) is left alone.
+    // Both wake functions must clear the woken mark in one known way: a plain store before the unlink (stock 11.0-1, the
+    // bug) or a fenced store after it (upstream's fix, our Proton d2r1). On a Proton with the fix FEX still swaps in, for
+    // its sleeping list lock, as long as Proton's lock still spins (a YIELD in all three functions); once our Proton has
+    // its own sleeping lock FEX stays out (build 143).
     uint32_t Fenced[2], Plain[2];
     MarkClears(Targets[1], Fenced[0], Plain[0]);
     MarkClears(Targets[2], Fenced[1], Plain[1]);
-    if (Ordered || Fenced[0] || Fenced[1]) {
-      return fextl::fmt::format("Proton's wait code already has upstream Wine's fix (woken mark cleared after a fence {}/{}, acquire/release "
-                                "accesses {}): not stock 11.0-1, left alone",
-                                Fenced[0], Fenced[1], Ordered);
+    const bool Stock = Plain[0] && Plain[1] && !Fenced[0] && !Fenced[1] && !Ordered;
+    const bool OrderFixed = (Fenced[0] && Fenced[1] && !Plain[0] && !Plain[1]) || (Ordered && !Plain[0] && !Plain[1]);
+    if (!Stock && !OrderFixed) {
+      return fextl::fmt::format("Wine's wake code doesn't clear the woken mark in a known way (plain {}/{}, after a fence {}/{}, "
+                                "acquire/release accesses {}), left alone",
+                                Plain[0], Plain[1], Fenced[0], Fenced[1], Ordered);
     }
-    if (!Plain[0] || !Plain[1]) {
-      return fextl::fmt::format("Wine's wake code doesn't clear the woken mark as 11.0 does ({}/{} found), left alone", Plain[0], Plain[1]);
+    ProtonOrderFixed = OrderFixed;
+    if (OrderFixed) {
+      const uint32_t Spins[3] = {Yields(Targets[0]), Yields(Targets[1]), Yields(Targets[2])};
+      if (!Spins[0] || !Spins[1] || !Spins[2]) {
+        return fextl::fmt::format("Proton's wait code has both fixes already (wake order fixed, list lock without a spin {}/{}/{}), left alone",
+                                  Spins[0], Spins[1], Spins[2]);
+      }
     }
 
     // Wine's list array: an address all three functions form in full (each computes &futex_queues[(addr >> 4) % 256] from
@@ -694,9 +717,12 @@ namespace {
       return Failed;
     }
     return fextl::fmt::format("in use: ntdll's RtlWaitOnAddress (+{:x}), RtlWakeAddressAll (+{:x}) and RtlWakeAddressSingle (+{:x}) run "
-                              "FEX's copy with upstream Wine's fix (a waker unlinks an entry before marking it woken), {} lists, list "
+                              "FEX's copy with upstream Wine's fix (a waker unlinks an entry before marking it woken; {}), {} lists, list "
                               "lock {}; Wine's lists at ntdll+{:x} were empty and used only there ({}/{}/{} uses)",
-                              Targets[0].Code - NtDllBase, Targets[1].Code - NtDllBase, Targets[2].Code - NtDllBase, QueueCount,
+                              Targets[0].Code - NtDllBase, Targets[1].Code - NtDllBase, Targets[2].Code - NtDllBase,
+                              ProtonOrderFixed ? "this Proton has that fix too, FEX swaps in for its sleeping list lock" :
+                                                 "this Proton is stock 11.0-1 without it",
+                              QueueCount,
                               Active == Mode::Spin ? "spins like Wine's (FEX_WINE_WAIT_FIX=2)" : "sleeps in the kernel after a short spin",
                               Lists - NtDllBase, Targets[0].Uses, Targets[1].Uses, Targets[2].Uses);
   }
@@ -720,7 +746,7 @@ void StartStats(bool StatsLog) {
     return;
   }
   FEX::Windows::StatsLogNote(fextl::fmt::format(
-    "wine waits (build 142): {}. Proton 11.0's code marks a woken waiter before unlinking it, and a waiter that comes back on its own "
+    "wine waits (build 143): {}. Proton 11.0's code marks a woken waiter before unlinking it, and a waiter that comes back on its own "
     "can leave while the waker still uses its list entry; the list then never ends and every thread on it spins: the freezes of the "
     "build 118 and 139 runs (main in RtlWakeConditionVariable, workers in SleepConditionVariableSRW, no frames){}",
     Outcome, CodeHash ? fextl::fmt::format(" | ntdll wait code {:016x}", CodeHash) : fextl::string {}));

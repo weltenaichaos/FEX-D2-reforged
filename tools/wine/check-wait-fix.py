@@ -2,7 +2,7 @@
 # Tries FEX_WINE_WAIT_FIX's ntdll checks (Source/Windows/ARM64EC/WineWaitFix.cpp) on an ntdll.dll file, the way FEX
 # sees it in an ARM64EC process: python3 check-wait-fix.py <aarch64-windows/ntdll.dll> --ec --rfe
 # Prints the three functions' native code, the woken-mark clears, the code hash, Wine's lists and the verdict.
-# Stock Proton 11.0-1: hash 25abfe54721af2aa, 'in use'. Our Proton d2r1: 'already has the fix, left alone'.
+# Stock Proton 11.0-1: hash 25abfe54721af2aa, 'in use'. Our Proton d2r1: order already fixed, still 'in use' (sleeping lock).
 import struct, sys
 f = open(sys.argv[1], 'rb').read()
 pe = struct.unpack_from('<I', f, 0x3c)[0]
@@ -162,11 +162,18 @@ def marks(b, l):
             else: plain += 1
     return fenced, plain
 for t in T: print(f"  {t[0]} mark clears (fenced, plain): {marks(t[1], t[2])}")
+def yields(b, l):
+    return sum(1 for a in range(b, b + l, 4) if u32(a) == 0xd503203f)
 fa, pa = marks(T[1][1], T[1][2]); fs, ps = marks(T[2][1], T[2][2])
-if fa or fs or sum(ordered(b, l) for _, b, l, _ in T):
-    print("RESULT: already has the fix, left alone"); sys.exit(0)
-if not pa or not ps:
-    print("RESULT: mark not cleared as 11.0 does, left alone"); sys.exit(0)
+od = sum(ordered(b, l) for _, b, l, _ in T)
+stock = pa and ps and not fa and not fs and not od
+fixed = (fa and fs and not pa and not ps) or (od and not pa and not ps)
+if not stock and not fixed:
+    print("RESULT: mark not cleared in a known way, left alone"); sys.exit(0)
+spins = [yields(t[1], t[2]) for t in T]
+print("  Proton:", "stock 11.0-1 order" if stock else "order already fixed", "| list lock spins (yield):", spins)
+if fixed and not all(spins):
+    print("RESULT: both fixes already in Proton, left alone"); sys.exit(0)
 h = 0xcbf29ce484222325
 for nm, b, l, _ in T:
     for x in img[b:b+l]: h = ((h ^ x) * 0x100000001b3) & 0xffffffffffffffff
