@@ -85,6 +85,11 @@ namespace {
     std::atomic<uint64_t> RoomPasses, RoomLowestFreeMB, RoomShrankKB;
     // Build 139: the same in play (PlayFreeMB).
     std::atomic<uint64_t> PlayRoomPasses, PlayRoomLowestFreeMB, PlayRoomShrankKB;
+    // Build 147, at the last pass: KB of the learned-only pieces left in the cache by their learned ranges
+    // (FEX_GAME_FILES_LEARN_RANGES). Per second: the most pieces a room pass dropped that were readahead once but read
+    // since (FEX_GAME_FILES_ROOM_AHEAD_READ).
+    std::atomic<uint64_t> LearnedRangeKB;
+    std::atomic<uint32_t> RoomAheadReadMost;
   };
 
   struct File {
@@ -193,6 +198,12 @@ namespace {
   uint32_t Session {1};
   LearnedRange Ranges[MaxLearned]; // FEXFileCache only
   size_t RangeCount {};
+  struct KeptRange {
+    int32_t Watch;
+    uint64_t Offset, End;
+  };
+  KeptRange SortedRanges[MaxLearned]; // build 147, FEXFileCache only: the ranges here by file and offset, made at each pass
+  size_t SortedCount {};
   bool LearnDirty {};
   uint64_t LastSave {};
   std::atomic<uint8_t> LearnedPieces[MaxPieces];
@@ -243,6 +254,17 @@ namespace {
   // read 11 MB of game data in all 250 s of play: in play below this mark only the last 32 MB read, the readahead and the
   // learned pieces stay (the learned list is still asked for and refilled as before).
   uint64_t PlayFreeMB {384};
+  // Build 147, FEX_GAME_FILES_ROOM_AHEAD_READ: the rooms (builds 138-139) were meant to keep only the last 32 MB read
+  // (and readahead and learned pieces), but a piece read 32-128 MB ago stayed when a read had ended in the piece before
+  // it (marked readahead then, and read since): in the build 146 run's first area load the room passes kept 171-385 MB as
+  // readahead, against 79-145 MB in play, and Android's memory killer closed 18 apps at t=36-37 (unused memory 162 MB,
+  // memory pressure 7%), which then restarted every second for 30 s on all 8 cores. In a room pass a piece read since its
+  // readahead mark counts by that read.
+  bool RoomAheadRead {};
+  // Build 147, FEX_GAME_FILES_LEARN_RANGES: a learned range marks its whole 1 MB piece as learned, and the drops kept
+  // those pieces whole: ~195 MB of pieces for 54 MB of learned ranges in the build 146 run (253 ranges, 64 KB blocks). A
+  // piece kept only because it is learned now keeps only its learned ranges; the rest goes like any other piece.
+  bool LearnRangesOn {};
   struct RefillCounters {
     std::atomic<uint64_t> Passes, StorageKB, Ns;
   };
@@ -663,17 +685,43 @@ namespace {
   // 32 MB of reads (a 1 MB piece the load reads in parts, so its rest isn't read from storage again), the readahead piece
   // after a read (the load is about to read it) and learned pieces (read back in play otherwise).
   constexpr uint64_t RoomRecentBytes = 32ull << 20;
-  int RoomKeepReason(uint32_t Piece, uint64_t AllNow) {
-    if (Within(AllStamps[Piece].load(std::memory_order_relaxed), AllNow, RoomRecentBytes)) {
+  int RoomKeepReason(uint32_t Piece, uint64_t AllNow, uint32_t& AheadRead) {
+    const uint64_t All = AllStamps[Piece].load(std::memory_order_relaxed);
+    if (Within(All, AllNow, RoomRecentBytes)) {
       return 0;
     }
-    if (Within(AheadStamps[Piece].load(std::memory_order_relaxed), AllNow, KeepRecent)) {
-      return 2;
+    if (const uint64_t Ahead = AheadStamps[Piece].load(std::memory_order_relaxed); Within(Ahead, AllNow, KeepRecent)) {
+      // Build 147: read since it was marked readahead: that read decides.
+      if (!RoomAheadRead || All <= Ahead) {
+        return 2;
+      }
+      ++AheadRead;
     }
     if (LearnBudget && (LearnedPieces[Piece].load(std::memory_order_relaxed) & PieceLearned)) {
       return 3;
     }
     return -1;
+  }
+
+  // Build 147: the learned ranges of the files here, by file and offset, for the drops (FEXFileCache only).
+  void SortRanges() {
+    SortedCount = 0;
+    for (size_t i = 0; i < RangeCount; ++i) {
+      const auto& R = Ranges[i];
+      if (R.Watch >= 0 && R.Bytes) {
+        SortedRanges[SortedCount++] = {R.Watch, R.Offset, R.Offset + R.Bytes};
+      }
+    }
+    std::sort(SortedRanges, SortedRanges + SortedCount, [](const KeptRange& A, const KeptRange& B) {
+      return A.Watch != B.Watch ? A.Watch < B.Watch : A.Offset < B.Offset;
+    });
+  }
+
+  // The first sorted range of watched file Watch, or where it would be.
+  size_t FirstRangeOf(int32_t Watch) {
+    return static_cast<size_t>(std::lower_bound(SortedRanges, SortedRanges + SortedCount, Watch,
+                                                [](const KeptRange& A, int32_t W) { return A.Watch < W; }) -
+                               SortedRanges);
   }
 
   // One drop call; counts it.
@@ -1345,27 +1393,60 @@ namespace {
         Stats.AvailableMB.store(Before.AvailableKB >> 10, std::memory_order_relaxed);
         const uint64_t AllNow = AllClock.load(std::memory_order_relaxed);
         const uint64_t MainNow = MainClock.load(std::memory_order_relaxed);
+        const bool ByRanges = LearnRangesOn && LearnBudget && Keeping && !Guard;
+        if (ByRanges) {
+          SortRanges();
+        }
+        uint32_t AheadRead = 0;
+        uint64_t RangeBytes = 0;
         for (size_t i = 0; i < FileCount; ++i) {
           const int Fd = Files[i].Fd;
           if (!Keeping || Guard || Files[i].Watch < 0) {
             Drop(Fd, 0, 0, Calls, Failed);
             continue;
           }
-          // Drop the stretches between the pieces kept, then the rest to the end (all of it when none is kept).
+          // Drop the stretches between what is kept, then the rest to the end (all of it when nothing is kept). Byte
+          // offsets: from build 147 a learned-only piece keeps only its learned ranges.
           const auto& W = Watched[Files[i].Watch];
+          size_t Range = ByRanges ? FirstRangeOf(Files[i].Watch) : SortedCount;
           uint64_t From = 0;
           for (uint32_t p = 0; p < W.Pieces; ++p) {
-            const int Reason = Room ? RoomKeepReason(W.FirstPiece + p, AllNow) : KeepReason(W.FirstPiece + p, AllNow, MainNow);
+            const int Reason = Room ? RoomKeepReason(W.FirstPiece + p, AllNow, AheadRead) : KeepReason(W.FirstPiece + p, AllNow, MainNow);
             if (Reason < 0) {
               continue;
             }
             ++Kept[Reason];
-            if (p > From) {
-              Drop(Fd, From << PieceShift, (p - From) << PieceShift, Calls, Failed);
+            const uint64_t Start = static_cast<uint64_t>(p) << PieceShift;
+            const uint64_t End = Start + (uint64_t {1} << PieceShift);
+            if (Reason == 3 && ByRanges) {
+              while (Range < SortedCount && SortedRanges[Range].Watch == Files[i].Watch && SortedRanges[Range].End <= Start) {
+                ++Range;
+              }
+              for (size_t r = Range; r < SortedCount && SortedRanges[r].Watch == Files[i].Watch && SortedRanges[r].Offset < End; ++r) {
+                const uint64_t KeepFrom = std::max(SortedRanges[r].Offset, Start) & ~uint64_t {4095};
+                const uint64_t KeepTo = (std::min(SortedRanges[r].End, End) + 4095) & ~uint64_t {4095};
+                if (KeepTo <= From) {
+                  continue;
+                }
+                if (KeepFrom > From) {
+                  Drop(Fd, From, KeepFrom - From, Calls, Failed);
+                }
+                RangeBytes += KeepTo - std::max(KeepFrom, From);
+                From = KeepTo;
+              }
+              continue;
             }
-            From = p + 1;
+            if (Start > From) {
+              Drop(Fd, From, Start - From, Calls, Failed);
+            }
+            From = std::max(From, End);
           }
-          Drop(Fd, From << PieceShift, 0, Calls, Failed);
+          Drop(Fd, From, 0, Calls, Failed);
+        }
+        Stats.LearnedRangeKB.store(RangeBytes >> 10, std::memory_order_relaxed);
+        if (Room) {
+          uint32_t Most = Stats.RoomAheadReadMost.load(std::memory_order_relaxed);
+          while (AheadRead > Most && !Stats.RoomAheadReadMost.compare_exchange_weak(Most, AheadRead, std::memory_order_relaxed)) {}
         }
         const uint64_t After = ReadMemInfo().CachedKB;
         if (Before.CachedKB && After && After < Before.CachedKB) {
@@ -2020,24 +2101,33 @@ namespace {
     const uint32_t Main = Stats.KeptMain.load(std::memory_order_relaxed);
     const uint32_t Ahead = Stats.KeptAhead.load(std::memory_order_relaxed);
     const uint32_t LearnedKept = Stats.KeptLearned.load(std::memory_order_relaxed);
+    const uint64_t LearnedRangeKB = Stats.LearnedRangeKB.load(std::memory_order_relaxed);
+    const uint32_t AheadReadMost = Stats.RoomAheadReadMost.exchange(0, std::memory_order_relaxed);
     const fextl::string Kept =
       Armed.load(std::memory_order_relaxed) && KeepMB ?
         fextl::fmt::format(", kept {} MB of {} (read lately {}, by the main thread {}, readahead {}){}", Recent + Main + Ahead, KeepMB, Recent,
-                           Main, Ahead, LearnBudget ? fextl::fmt::format(" + learned {} MB", LearnedKept) : fextl::string()) :
+                           Main, Ahead,
+                           !LearnBudget  ? fextl::string() :
+                           LearnRangesOn ? fextl::fmt::format(" + learned {} MB pieces, of them only the learned ranges kept: {:.1f} MB",
+                                                              LearnedKept, static_cast<double>(LearnedRangeKB) / 1024.0) :
+                                           fextl::fmt::format(" + learned {} MB", LearnedKept)) :
         fextl::string();
+    const fextl::string AheadReadText =
+      AheadReadMost ? fextl::fmt::format(" (readahead read since then not kept: up to {} MB at a pass)", AheadReadMost) : fextl::string();
     const fextl::string GuardText =
       GuardPasses ? fextl::fmt::format(", memory guard: available {} MB below {}, all dropped in {} passes",
                                        Stats.AvailableMB.load(std::memory_order_relaxed), GuardMB, GuardPasses) :
                     fextl::string();
     const fextl::string RoomText =
       RoomPasses ? fextl::fmt::format(", load room: {} passes in a loading screen with unused memory below {} MB (lowest {} MB) kept only "
-                                      "the last 32 MB read, readahead and learned pieces, file cache {:.0f} MB smaller by them",
-                                      RoomPasses, LoadFreeMB, RoomLowestMB, static_cast<double>(RoomShrankKB) / 1024.0) :
+                                      "the last 32 MB read, readahead and learned pieces{}, file cache {:.0f} MB smaller by them",
+                                      RoomPasses, LoadFreeMB, RoomLowestMB, AheadReadText, static_cast<double>(RoomShrankKB) / 1024.0) :
                    fextl::string();
     const fextl::string PlayRoomText =
       PlayRoomPasses ? fextl::fmt::format(", play room: {} passes in play with unused memory below {} MB (lowest {} MB) kept only the "
-                                          "last 32 MB read, readahead and learned pieces, file cache {:.0f} MB smaller by them",
-                                          PlayRoomPasses, PlayFreeMB, PlayRoomLowestMB, static_cast<double>(PlayRoomShrankKB) / 1024.0) :
+                                          "last 32 MB read, readahead and learned pieces{}, file cache {:.0f} MB smaller by them",
+                                          PlayRoomPasses, PlayFreeMB, PlayRoomLowestMB, RoomPasses ? fextl::string() : AheadReadText,
+                                          static_cast<double>(PlayRoomShrankKB) / 1024.0) :
                        fextl::string();
     return fextl::fmt::format("  game files: {} files{}, file cache {:.0f} MB smaller after the drops ({} drops in {} passes, longest {:.1f} "
                               "ms{}){}{}{}\n",
@@ -2114,6 +2204,9 @@ void Init(bool StatsLog) {
   LoadFreeMB = KeepMB ? Number("FEX_GAME_FILES_LOAD_FREE_MB", 1024, 0, 16384) : 0;
   // Build 139.
   PlayFreeMB = KeepMB ? Number("FEX_GAME_FILES_PLAY_FREE_MB", 384, 0, 16384) : 0;
+  // Build 147.
+  RoomAheadRead = (LoadFreeMB || PlayFreeMB) && Number("FEX_GAME_FILES_ROOM_AHEAD_READ", 0, 0, 1) == 1;
+  LearnRangesOn = LearnBudget && Number("FEX_GAME_FILES_LEARN_RANGES", 0, 0, 1) == 1;
   // Build 90: the unpack cache's learned list tells play from loading screens by the frame clock too.
   const char* Unpack = FEX::Windows::Switch("FEX_UNPACK_CACHE");
   UnpackLearnWanted = Unpack && Unpack[0] == '1' && Number("FEX_UNPACK_CACHE_LEARN", 0, 0, 4096) > 0;
@@ -2153,6 +2246,19 @@ void Init(bool StatsLog) {
       "room first (build 138 run: 147-185 MB unused at t=46 and t=189, Android closed 12 and 5 apps; 'play room' on the 'game files' "
       "line; FEX_GAME_FILES_PLAY_FREE_MB=0 turns it off)",
       PlayFreeMB));
+  }
+  if (RoomAheadRead) {
+    FEX::Windows::StatsLogNote(
+      "game files: rooms read by their reads (build 147): in the load and play rooms a piece marked readahead that was read since "
+      "counts by that read, so only the last 32 MB read stay as meant (build 146 run: the first area load's room passes kept 171-385 MB "
+      "as readahead, mostly pieces read 32-128 MB before, and Android closed 18 apps at t=36-37; 'readahead read since then not kept' "
+      "on the 'game files' line; FEX_GAME_FILES_ROOM_AHEAD_READ=0 keeps them as in build 146)");
+  }
+  if (LearnRangesOn) {
+    FEX::Windows::StatsLogNote(
+      "game files: learned ranges (build 147): a piece kept only because it is learned keeps only its learned ranges (64 KB blocks), "
+      "the rest of its 1 MB is dropped like other pieces (build 146 run: ~195 MB of learned pieces kept whole for 54 MB of learned "
+      "ranges; 'only the learned ranges kept' on the 'game files' line; FEX_GAME_FILES_LEARN_RANGES=0 keeps whole pieces as before)");
   }
   if (HeadroomMB) {
     FEX::Windows::StatsLogNote(fextl::fmt::format(

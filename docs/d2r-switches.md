@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 146, VKD3D fex41, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
+State: FEX build 147, VKD3D fex41, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -39,6 +39,8 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
 | `FEX_MEM_HEADROOM_MB` | `0` | In a loading screen FEX takes memory until this many MB are unused and gives it back, so Android's memory reclaim runs in the load instead of in play (build 130; off from build 131: it made Android close background apps, which restarted on all cores). `FEX_MEM_HEADROOM_GUARD_MB` (default `3072`) is the available memory it never goes below. | `0` |
 | `FEX_GAME_FILES_LOAD_FREE_MB` | `1024` | In a loading screen with less unused memory (MemFree) than this, FEX lets go of its kept game data every 200 ms (all but the last 32 MB read, readahead and learned pieces: ~600 MB), so an area load doesn't make Android close other apps (build 138; in the build 137 run 9 apps were closed at the first area load and restarted for 28 s). | `0` |
 | `FEX_GAME_FILES_PLAY_FREE_MB` | `384` | The same in play with less unused memory than this (every 500 ms), so a new area the game streams in while frames keep coming takes FEX's kept data first instead of making Android close other apps (build 139; in the build 138 run 12 and 5 apps were closed at t=46 and t=189). | `0` |
+| `FEX_GAME_FILES_ROOM_AHEAD_READ` | `1` | In the load and play rooms, a piece marked readahead that was read since counts by that read, so the rooms keep only the last 32 MB read as meant (build 147; in the build 146 run the first area load kept 171-385 MB as readahead and Android closed 18 apps). | `0` |
+| `FEX_GAME_FILES_LEARN_RANGES` | `1` | A 1 MB piece kept only because it holds learned data keeps only its learned ranges, not the whole piece (build 147; build 146 kept ~195 MB of pieces for 54 MB of learned ranges). | `0` |
 | `FEX_LOAD_LIGHT` | `64` | Frames that give the GPU very little work also count as a loading screen, so loading screens drawn at full speed are seen too (build 94). | `0` |
 
 ## FEX code and locks
@@ -80,6 +82,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_FRAME_THREADS` | `-10` | VKD3D's frame threads and the frame generation layer's present thread run at this priority or better (build 126). | `off` |
 | `FEX_FRAME_THREADS_OFFCORE` | `1` | Those threads stay off the main thread's core while it is shared (build 126). | `0` |
 | `FEX_INPUT_THREADS` | `-10` | Wine's controller thread runs at this priority or better, so the game's controller reads don't wait for it while it holds the controller's lock (build 137). | `off` |
+| `FEX_STEAM_THREADS` | `-10` | steam.exe's thread that answers the game's Steam calls every frame runs at this priority or better, so the game doesn't wait on Steam while the cores are crowded (build 147; in the build 146 run it waited up to 340 ms a second for a CPU). | `off` |
 
 ## Other game fixes
 

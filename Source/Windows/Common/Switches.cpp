@@ -219,6 +219,11 @@ namespace {
     // report, and at nice 0 that thread waited for a CPU behind the main thread and the job workers. It is kept at this
     // nice or better (it runs a few ms a second). "off" leaves it.
     {"FEX_INPUT_THREADS", "-10"},
+    // Build 147: steam.exe's thread that answers the game's Steam calls (IPC:CSteamEngin). The game asks Steam the same two
+    // questions every frame and waits for the answer (build 146 pipe watch); in the build 146 run that thread (nice 0)
+    // waited up to 340 ms a second for a CPU while other apps restarted on all cores, and the main thread waited up to
+    // 194 ms a second on Steam. It is kept at this nice or better (it runs ~20-30 ms a second). "off" leaves it.
+    {"FEX_STEAM_THREADS", "-10"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -312,6 +317,14 @@ namespace {
     // frames kept coming (t=46, t=189: 661 and 817 MB read in a second) with 147-185 MB unused, and Android closed 12 and
     // 5 apps while FEX kept 750-870 MB of game data. 0 = off.
     {"FEX_GAME_FILES_PLAY_FREE_MB", "384"},
+    // Build 147: in the build 146 run the first area load's room passes kept 171-385 MB as readahead, mostly pieces read
+    // 32-128 MB before (a read had ended in the piece before them), and Android's memory killer closed 18 apps at t=36-37,
+    // which restarted every second for 30 s on all 8 cores. A piece read since its readahead mark now counts by that read
+    // in the rooms, so they keep only the last 32 MB read as meant. 0 = as build 146.
+    {"FEX_GAME_FILES_ROOM_AHEAD_READ", "1"},
+    // Build 147: learned pieces (1 MB) were kept whole: ~195 MB for 54 MB of learned ranges in the build 146 run. A piece
+    // kept only because it is learned now keeps only its learned ranges. 0 = whole pieces as before.
+    {"FEX_GAME_FILES_LEARN_RANGES", "1"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
@@ -574,6 +587,8 @@ namespace {
     "FEX_GAME_FILES_REFILL",
     "FEX_GAME_FILES_LOAD_FREE_MB",
     "FEX_GAME_FILES_PLAY_FREE_MB",
+    "FEX_GAME_FILES_ROOM_AHEAD_READ",
+    "FEX_GAME_FILES_LEARN_RANGES",
     "FEX_MEM_HEADROOM_MB",
     "FEX_MEM_HEADROOM_GUARD_MB",
     "FEX_UNPACK_CACHE_SKIP_ADLER",
@@ -634,6 +649,7 @@ namespace {
     "FEX_FRAME_THREADS",
     "FEX_FRAME_THREADS_OFFCORE",
     "FEX_INPUT_THREADS",
+    "FEX_STEAM_THREADS",
     "FEX_CRASH_NOTE",
     "FEX_START_WATCH",
     "FEX_START_WATCH_S",

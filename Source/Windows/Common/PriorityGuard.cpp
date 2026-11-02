@@ -1008,12 +1008,24 @@ namespace {
   // held: in the build 133 run the main thread sat 14 ms in XInputGetState in a 48 ms frame at t=194.8. It runs a few ms a
   // second. Kept at FEX_INPUT_THREADS's nice or better the same way as the frame threads (not kept off any core).
   constexpr const char* InputThreadNames[] = {"wine_xinput_hid"};
+  // Build 147, FEX_STEAM_THREADS: steam.exe's thread that answers the game's Steam calls (Steam's "IPC:CSteamEngine",
+  // cut to 15 characters). The game asks Steam the same two questions every frame over a pipe and waits for the answer
+  // (build 146 pipe watch: ~1 ms a frame in calm play). In the build 146 run, while other apps restarted on all 8 cores
+  // after the first area load, that thread (nice 0) waited up to 340 ms a second for a CPU, the main thread waited up to
+  // 194 ms a second on Steam, and one reply took 68.6 ms. It runs ~20-30 ms a second. Kept at FEX_STEAM_THREADS's nice
+  // or better like the input threads, found by name among steam.exe's threads (another Linux process of this app).
+  constexpr const char* SteamThreadNames[] = {"IPC:CSteamEngin"};
+  constexpr const char* SteamProcessName = "steam.exe";
   struct FrameThreadKeeper {
     int Nice;     // NiceUnchanged = left alone
     bool OffCore; // kept off the main thread's core while it is open to others
     const char* const* Want; // the Linux names it keeps
     size_t WantCount;
     const char* Label;       // "frame threads" or "input threads" in the log
+    // Build 147: the Linux process (by name, Linux::FindProcess) whose threads it keeps; nullptr = this one. Guard thread only:
+    // its pid, 0 while not found.
+    const char* Process;
+    int Pid;
     // Written by the guard (under the escape lock when there is one), read by the share sweeps.
     std::atomic<uint32_t> Count;
     std::atomic<int> Tids[MaxFrameThreads];
@@ -1028,6 +1040,7 @@ namespace {
   };
   FrameThreadKeeper* FrameThreads {};
   FrameThreadKeeper* InputThreads {};
+  FrameThreadKeeper* SteamThreads {};
 
   // A frame thread to keep off the main thread's core (any thread, under the escape lock).
   bool KeptOffSharedCore(int Tid) {
@@ -1047,6 +1060,7 @@ namespace {
   struct FrameScan {
     const char* const* Want;
     size_t WantCount;
+    char Dir[40]; // the task folder: /proc/self/task, or /proc/<pid>/task for another process (build 147)
     int Tids[MaxFrameThreads];
     char Names[MaxFrameThreads][16];
     uint32_t Count;
@@ -1059,7 +1073,7 @@ namespace {
       return;
     }
     char Path[64];
-    snprintf(Path, sizeof(Path), "/proc/self/task/%d/comm", Tid);
+    snprintf(Path, sizeof(Path), "%s/%d/comm", S->Dir, Tid);
     char Comm[32];
     int64_t Len = Linux::ReadSmallFile(Path, Comm, sizeof(Comm));
     if (Len <= 0) {
@@ -1099,7 +1113,27 @@ namespace {
     FrameScan S {};
     S.Want = K.Want;
     S.WantCount = K.WantCount;
-    Linux::ForEachEntry("/proc/self/task", FrameScanTask, &S);
+    if (!K.Process) {
+      snprintf(S.Dir, sizeof(S.Dir), "/proc/self/task");
+      Linux::ForEachEntry(S.Dir, FrameScanTask, &S);
+    } else {
+      // Build 147: another of this app's processes, looked up again once it's gone (or until it's there).
+      if (K.Pid > 0) {
+        char Path[40];
+        char Comm[32];
+        snprintf(Path, sizeof(Path), "/proc/%d/comm", K.Pid);
+        if (Linux::ReadSmallFile(Path, Comm, sizeof(Comm)) <= 0) {
+          K.Pid = 0;
+        }
+      }
+      if (K.Pid <= 0) {
+        K.Pid = Linux::FindProcess(K.Process);
+      }
+      if (K.Pid > 0) {
+        snprintf(S.Dir, sizeof(S.Dir), "/proc/%d/task", K.Pid);
+        Linux::ForEachEntry(S.Dir, FrameScanTask, &S);
+      }
+    }
     const uint32_t Old = K.Count.load(std::memory_order_relaxed);
     bool Same = Old == S.Count;
     for (uint32_t i = 0; i < S.Count && Same; ++i) {
@@ -1129,7 +1163,11 @@ namespace {
     ++K.Lists;
     if (K.Notes < 12) {
       ++K.Notes;
-      StatsLogNote(fextl::fmt::format("{}: {} found (list #{}):{}{}", K.Label, S.Count, K.Lists, S.Count ? Text : fextl::string(" none"),
+      StatsLogNote(fextl::fmt::format("{}: {} found (list #{}){}:{}{}", K.Label, S.Count, K.Lists,
+                                      K.Process ? (K.Pid > 0 ? fextl::fmt::format(" in {} (Linux pid {})", K.Process, K.Pid) :
+                                                               fextl::fmt::format(" ({} not running)", K.Process)) :
+                                                  fextl::string {},
+                                      S.Count ? Text : fextl::string(" none"),
                                       K.OffCore ? "; kept off the main thread's core while it is open to the game's threads" : ""));
     }
   }
@@ -2654,6 +2692,16 @@ namespace {
                                                            fextl::string {}));
         }
       }
+      if (SteamThreads) {
+        FindFrameThreads(*SteamThreads, Escape);
+        if (Round % 30 == 0) {
+          const auto& K = *SteamThreads;
+          StatsLogNote(fextl::fmt::format("steam threads: s={} {} kept, nice set {} times{}", Round * 2, K.Count.load(std::memory_order_relaxed),
+                                          K.NiceSets,
+                                          K.NiceFailures ? fextl::fmt::format(" ({} failed, errno {})", K.NiceFailures, -K.NiceError) :
+                                                           fextl::string {}));
+        }
+      }
       if (FrameThreads) {
         FindFrameThreads(*FrameThreads, Escape);
         // Once a minute: what keeping them took.
@@ -2731,6 +2779,9 @@ namespace {
         }
         if (InputThreads) {
           KeepFrameThreads(*InputThreads);
+        }
+        if (SteamThreads) {
+          KeepFrameThreads(*SteamThreads);
         }
       }
     }
@@ -2830,6 +2881,11 @@ void StartPriorityGuard(std::string_view AppName) {
   int InputNice = NiceUnchanged;
   if (const char* F = Switch("FEX_INPUT_THREADS"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
     InputNice = std::clamp(atoi(F), -20, 19);
+  }
+  // Build 147: steam.exe's thread that answers the game's Steam calls.
+  int SteamNice = NiceUnchanged;
+  if (const char* F = Switch("FEX_STEAM_THREADS"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
+    SteamNice = std::clamp(atoi(F), -20, 19);
   }
   const bool FrameOffCore = FrameCoreSwitch && (FrameCoreSwitch[0] == '1' || (FrameCoreSwitch[0] == 'o' && FrameCoreSwitch[1] == 'n'));
 
@@ -2947,6 +3003,14 @@ void StartPriorityGuard(std::string_view AppName) {
                                     "in XInputGetState in a 48 ms frame). FEX_INPUT_THREADS=off leaves its nice",
                                     InputNice) :
                  fextl::string("input threads: left alone (FEX_INPUT_THREADS=-10 keeps Wine's controller thread at nice -10)"));
+  StatsLogNote(SteamNice != NiceUnchanged ?
+                 fextl::fmt::format("steam threads: build 147: steam.exe's thread that answers the game's Steam calls (IPC:CSteamEngin) "
+                                    "kept at nice {} or better, found by name every 2 s and checked every 250 ms; the game waits for "
+                                    "its answer every frame (build 146 run: at nice 0 it waited up to 340 ms a second for a CPU while "
+                                    "other apps restarted on all cores, the main thread waited up to 194 ms a second on Steam). "
+                                    "FEX_STEAM_THREADS=off leaves its nice",
+                                    SteamNice) :
+                 fextl::string("steam threads: left alone (FEX_STEAM_THREADS=-10 keeps steam.exe's answering thread at nice -10)"));
 
   const fextl::string Exe = fextl::fmt::format("main exe {:X}-{:X}", C->ExeBase, C->ExeEnd);
   StatsLogNote(C->Loader == LoaderMode::Little ?
@@ -2974,7 +3038,7 @@ void StartPriorityGuard(std::string_view AppName) {
 
   if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && !C->MainNiceOn &&
       C->Loader == LoaderMode::Off && WorkerNiceMode == WorkerMode::Off && FrameNice == NiceUnchanged && !FrameOffCore &&
-      InputNice == NiceUnchanged) {
+      InputNice == NiceUnchanged && SteamNice == NiceUnchanged) {
     delete C;
     return;
   }
@@ -2993,6 +3057,15 @@ void StartPriorityGuard(std::string_view AppName) {
     InputThreads->Want = InputThreadNames;
     InputThreads->WantCount = std::size(InputThreadNames);
     InputThreads->Label = "input threads";
+  }
+  if (SteamNice != NiceUnchanged) {
+    SteamThreads = new FrameThreadKeeper {};
+    SteamThreads->Nice = SteamNice;
+    SteamThreads->OffCore = false;
+    SteamThreads->Want = SteamThreadNames;
+    SteamThreads->WantCount = std::size(SteamThreadNames);
+    SteamThreads->Label = "steam threads";
+    SteamThreads->Process = SteamProcessName;
   }
   if (WorkerNiceMode != WorkerMode::Off) {
     Workers = new WorkerKeeper {};

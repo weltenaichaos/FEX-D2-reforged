@@ -914,6 +914,58 @@ namespace {
 
   char SystemBuffer[16384];
 
+  // Build 147: the kernel's reclaim marks and settings, once at the start. kswapd wakes when a zone's free memory falls
+  // below its low mark and reclaims until the high mark; in the build 146 run Android's memory killer closed 18 apps
+  // after kswapd's work at the first area load (unused memory 162 MB, memory pressure 7%).
+  fextl::string ReclaimSettings() {
+    fextl::string Out = "system: memory reclaim (build 147): ";
+    fextl::vector<char> Zone(65536);
+    const int64_t Len = Linux::ReadSmallFile("/proc/zoneinfo", Zone.data(), Zone.size());
+    if (Len > 0) {
+      // Sum "min", "low" and "high" (pages) over the zones; the per-CPU "high:" lines have a colon and don't match.
+      uint64_t Marks[3] {}, Zones {};
+      const char* Names[3] = {"min", "low", "high"};
+      const char* P = Zone.data();
+      const char* End = Zone.data() + std::min<int64_t>(Len, Zone.size() - 1);
+      while (P < End) {
+        const char* Eol = static_cast<const char*>(memchr(P, '\n', End - P));
+        if (!Eol) {
+          Eol = End;
+        }
+        const char* T = P;
+        while (T < Eol && *T == ' ') {
+          ++T;
+        }
+        if (Eol - T > 5 && strncmp(T, "Node ", 5) == 0) {
+          ++Zones;
+        }
+        for (size_t i = 0; i < 3; ++i) {
+          const size_t N = strlen(Names[i]);
+          if (static_cast<size_t>(Eol - T) > N + 1 && strncmp(T, Names[i], N) == 0 && T[N] == ' ') {
+            Marks[i] += strtoull(T + N, nullptr, 10);
+          }
+        }
+        P = Eol + 1;
+      }
+      Out += fextl::fmt::format("zone marks ({} zones) min {} / low {} / high {} MB", Zones, Marks[0] * 4 / 1024, Marks[1] * 4 / 1024,
+                                Marks[2] * 4 / 1024);
+    } else {
+      Out += "zone marks not readable";
+    }
+    const char* Settings[] = {"swappiness", "watermark_scale_factor", "watermark_boost_factor", "min_free_kbytes", "extra_free_kbytes"};
+    for (const char* Name : Settings) {
+      char Path[64];
+      char Value[32];
+      snprintf(Path, sizeof(Path), "/proc/sys/vm/%s", Name);
+      int64_t N = Linux::ReadSmallFile(Path, Value, sizeof(Value));
+      while (N > 0 && (Value[N - 1] == '\n' || Value[N - 1] == ' ')) {
+        --N;
+      }
+      Out += N > 0 ? fextl::fmt::format(", {} {}", Name, std::string_view(Value, N)) : fextl::fmt::format(", {} not readable", Name);
+    }
+    return Out;
+  }
+
   // The number after Key ("Key value" or "Key=value" form) in Text, at a line start (Key begins with '\n') or anywhere.
   bool SystemField(const char* Text, const char* Key, uint64_t& Out) {
     const char* P = strstr(Text, Key);
@@ -1215,6 +1267,7 @@ namespace {
                                     "GPU memory per process from kgsl (checked once the game uses the GPU)",
                                     Mem ? fextl::fmt::format("{}", TotalKB / 1024) : fextl::string("?"), SwapKB / 1024, AppNote,
                                     Vm ? "readable" : "not readable", Psi ? "readable" : "not readable"));
+    StatsLogNote(ReclaimSettings());
     uint32_t OwnUid = ~0u;
     if (const size_t At = Group.find("/uid_"); At != fextl::string::npos) {
       OwnUid = static_cast<uint32_t>(strtoull(Group.c_str() + At + 5, nullptr, 10));
