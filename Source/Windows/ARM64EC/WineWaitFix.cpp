@@ -562,6 +562,13 @@ namespace {
     if (!NtDll || !GetProcAddress(NtDll, "wine_get_version")) {
       return "not under Wine, left alone";
     }
+    // Our own Proton says what it has through a data export (d2r2 and later): 2 = the wake order fix and a list lock that
+    // parks instead of spinning, so nothing is left for FEX's copy, also when WINE_D2R_WAIT_LOCK=0 turns Proton's lock
+    // back to spinning (that is Proton's own A/B). Without the export (stock, d2r1) the code checks below decide.
+    if (const auto* Marker = reinterpret_cast<const ULONG*>(GetProcAddress(NtDll, "__wine_d2r_wait_lists")); Marker && *Marker >= 2) {
+      return fextl::fmt::format("our Proton has both fixes (__wine_d2r_wait_lists={}: wake order and a parking list lock), left alone",
+                                *Marker);
+    }
     const auto* Nt = RtlImageNtHeader(NtDll);
     if (!Nt) {
       return "ntdll has no PE header, left alone";
@@ -746,7 +753,7 @@ void StartStats(bool StatsLog) {
     return;
   }
   FEX::Windows::StatsLogNote(fextl::fmt::format(
-    "wine waits (build 143): {}. Proton 11.0's code marks a woken waiter before unlinking it, and a waiter that comes back on its own "
+    "wine waits (build 144): {}. Proton 11.0's code marks a woken waiter before unlinking it, and a waiter that comes back on its own "
     "can leave while the waker still uses its list entry; the list then never ends and every thread on it spins: the freezes of the "
     "build 118 and 139 runs (main in RtlWakeConditionVariable, workers in SleepConditionVariableSRW, no frames){}",
     Outcome, CodeHash ? fextl::fmt::format(" | ntdll wait code {:016x}", CodeHash) : fextl::string {}));

@@ -3,6 +3,7 @@
 # sees it in an ARM64EC process: python3 check-wait-fix.py <aarch64-windows/ntdll.dll> --ec --rfe
 # Prints the three functions' native code, the woken-mark clears, the code hash, Wine's lists and the verdict.
 # Stock Proton 11.0-1: hash 25abfe54721af2aa, 'in use'. Our Proton d2r1: order already fixed, still 'in use' (sleeping lock).
+# Our Proton d2r2+: export __wine_d2r_wait_lists = 2, 'left alone'.
 import struct, sys
 f = open(sys.argv[1], 'rb').read()
 pe = struct.unpack_from('<I', f, 0x3c)[0]
@@ -143,6 +144,11 @@ def ordered(b, l):
         I = u32(a)
         if (I & 0x3ffffc00) in (0x08dffc00, 0x089ffc00, 0x38bfc000) or (I & 0x3f200c00) == 0x19000000: c += 1
     return c
+if '__wine_d2r_wait_lists' in exports:
+    mv = u32(exports['__wine_d2r_wait_lists'])
+    print(f"__wine_d2r_wait_lists export {exports['__wine_d2r_wait_lists']:#x} = {mv}")
+    if mv >= 2:
+        print("RESULT: our Proton has both fixes, left alone"); sys.exit(0)
 for nm in ('wine_get_version', 'NtWaitForAlertByThreadId', 'NtAlertThreadByThreadId'):
     print(nm, 'export', hex(exports.get(nm, 0)))
 T = []

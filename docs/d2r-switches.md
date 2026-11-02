@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 143, VKD3D fex41, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
+State: FEX build 144, VKD3D fex41, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -52,7 +52,7 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
 | `FEX_JIT_REUSE` | `1` | The same for freshly translated code. The game's protection rewrites its code every minute or two (build 95). | `0` |
 | `FEX_SMC_HOTPAGE` | `16` | A memory page that its own code writes to this often within 100 ms stops being write-protected; its code checks itself instead. This fixed the protection's regular freezes (build 54). | `0` |
 | `FEX_KERNEL_FUTEX` | `1` | FEX's internal locks wait in the Linux kernel instead of Wine's wait lists. Fixed a 144 ms freeze (build 125). | `0` |
-| `FEX_WINE_WAIT_FIX` | `1` | Wine's wait lists (every lock and condition variable in the process) run with upstream Wine's fix for a race that froze the game for good (build 118 and 139 runs). FEX checks ntdll's code first and leaves it alone if it doesn't match. On our own Proton (which has the order fix) FEX still swaps in for its sleeping list lock, until our Proton has its own. `2` = the same fix with Wine's spin lock (build 142/143). | `0` |
+| `FEX_WINE_WAIT_FIX` | `1` | Wine's wait lists (every lock and condition variable in the process) run with upstream Wine's fix for a race that froze the game for good (build 118 and 139 runs). FEX checks ntdll's code first and leaves it alone if it doesn't match. On our Proton d2r1 (order fix only) FEX still swaps in for its sleeping list lock; from d2r2 on (both fixes, export `__wine_d2r_wait_lists` = 2) FEX stays out. `2` = the same fix with Wine's spin lock (build 142-144). | `0` |
 
 ## CPU cores and priorities
 
