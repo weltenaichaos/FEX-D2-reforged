@@ -343,6 +343,27 @@ namespace {
   std::atomic<VmLockInfo*> VmLock {};
   constexpr size_t MaxVmHoldLines = 900;
 
+  // Wineserver request counts (build 154): our Proton d2r6 and later count every wine_server_call of this process in PE
+  // ntdll's export __wine_d2r_server_calls: per request number how many and the time from send to reply (a select's
+  // includes its wait), and what its anonymous event reuse did. Layout version 1 = struct d2r_server_calls of
+  // proton-patches/11.0-1 (d2r6). Request names come from share/wine/d2r-server-requests.txt ("number name" per row).
+  struct ServerCallsInfo {
+    uint32_t Version;    // 1 once Wine counts (0: WINE_D2R_CALL_COUNTS=0)
+    uint32_t NbRequests; // request types in this build
+    uint64_t EvKept;        // anonymous events kept at their close for reuse
+    uint64_t EvReused;      // event creations served from kept events
+    uint64_t EvShared;      // closes not kept: the event was shared (duplicated, used for I/O)
+    uint64_t EvOtherThread; // ... closed by another thread than the one that made it
+    uint64_t EvTooOld;      // ... lived too long
+    uint64_t EvPoolFull;    // ... no room left
+    uint64_t Pad;
+    uint64_t Count[512];
+    uint64_t TimeNs[512];
+  };
+  static_assert(sizeof(ServerCallsInfo) == 8256);
+  std::atomic<ServerCallsInfo*> ServerCalls {};
+  constexpr size_t ServerCallsShown = 10;
+
   // The holder as Wine noted it: State 0 = no notes, 1 = free, 2 = held, 3 = it changed while being read.
   struct VmHolder {
     uint32_t State;
@@ -2354,6 +2375,11 @@ namespace {
     size_t VmHoldLines;
     uint64_t VmTakesPrev; // Wine's memory lock take count at the last probe line (build 153)
     bool VmTakesHave;
+    // Wine's request counts at the last 'server calls' line (build 154).
+    uint64_t ServerPrevCount[512];
+    uint64_t ServerPrevTime[512];
+    uint64_t ServerPrevEv[6];
+    bool ServerHave;
 
     // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
     struct MainTick {
@@ -3478,8 +3504,9 @@ namespace {
   bool VmLockLinesRead {};
   fextl::string VmLockLinesNote;
 
-  void ReadVmLockLines() {
-    VmLockLinesRead = true;
+  // Where our Proton's share/wine folder is: next to the lib/wine/aarch64-unix/ntdll.so this process mapped. Empty, with
+  // Why set, when it can't be found.
+  fextl::string WineShareDir(fextl::string& Why) {
     fextl::string Ntdll;
     const int Fd = Linux::Open("/proc/self/maps");
     if (Fd >= 0) {
@@ -3510,10 +3537,21 @@ namespace {
     }
     constexpr std::string_view Lib = "lib/wine/aarch64-unix/ntdll.so";
     if (Ntdll.size() <= Lib.size() || Ntdll.compare(Ntdll.size() - Lib.size(), Lib.size(), Lib) != 0) {
-      VmLockLinesNote = fextl::fmt::format("line table not found (ntdll.so {})", Ntdll.empty() ? "not in /proc/self/maps" : Ntdll);
+      Why = fextl::fmt::format("ntdll.so {}", Ntdll.empty() ? "not in /proc/self/maps" : Ntdll);
+      return {};
+    }
+    return Ntdll.substr(0, Ntdll.size() - Lib.size()) + "share/wine/";
+  }
+
+  void ReadVmLockLines() {
+    VmLockLinesRead = true;
+    fextl::string Why;
+    const fextl::string Share = WineShareDir(Why);
+    if (Share.empty()) {
+      VmLockLinesNote = fextl::fmt::format("line table not found ({})", Why);
       return;
     }
-    const fextl::string Path = Ntdll.substr(0, Ntdll.size() - Lib.size()) + "share/wine/d2r-vm-lock-lines.txt";
+    const fextl::string Path = Share + "d2r-vm-lock-lines.txt";
     static char Buffer[16384];
     const int64_t Len = Linux::ReadSmallFile(Path.c_str(), Buffer, sizeof(Buffer));
     if (Len <= 0) {
@@ -3567,6 +3605,147 @@ namespace {
     case 3: return "Wine's notes: holder changed while read; ";
     default: return {};
     }
+  }
+
+  // Request names for the 'server calls' line, from our Proton's share/wine/d2r-server-requests.txt. Read once.
+  fextl::vector<fextl::string> ServerRequestNames;
+  bool ServerRequestNamesRead {};
+  fextl::string ServerRequestNamesNote;
+
+  void ReadServerRequestNames() {
+    ServerRequestNamesRead = true;
+    fextl::string Why;
+    const fextl::string Share = WineShareDir(Why);
+    if (Share.empty()) {
+      ServerRequestNamesNote = fextl::fmt::format("request names not found ({})", Why);
+      return;
+    }
+    const fextl::string Path = Share + "d2r-server-requests.txt";
+    static char Buffer[32768];
+    const int64_t Len = Linux::ReadSmallFile(Path.c_str(), Buffer, sizeof(Buffer));
+    if (Len <= 0) {
+      ServerRequestNamesNote = fextl::fmt::format("request names {} can't be read ({})", Path, Len);
+      return;
+    }
+    const char* Cursor = Buffer;
+    const char* End = Buffer + Len;
+    size_t Names {};
+    while (Cursor < End) {
+      char* After {};
+      const unsigned long Number = strtoul(Cursor, &After, 10);
+      const bool HaveNumber = After != Cursor;
+      const char* NameBegin = After;
+      while (NameBegin < End && *NameBegin == ' ') {
+        ++NameBegin;
+      }
+      const char* NameEnd = NameBegin;
+      while (NameEnd < End && *NameEnd != '\n' && *NameEnd != '\r' && *NameEnd != ' ') {
+        ++NameEnd;
+      }
+      if (HaveNumber && Number < 512 && NameEnd > NameBegin) {
+        if (ServerRequestNames.size() <= Number) {
+          ServerRequestNames.resize(Number + 1);
+        }
+        ServerRequestNames[Number] = fextl::string(NameBegin, NameEnd);
+        ++Names;
+      }
+      Cursor = NameEnd;
+      while (Cursor < End && *Cursor != '\n') {
+        ++Cursor;
+      }
+      if (Cursor < End) {
+        ++Cursor;
+      }
+    }
+    ServerRequestNamesNote = fextl::fmt::format("{} request names from {}", Names, Path);
+  }
+
+  fextl::string ServerRequestName(uint32_t Number) {
+    if (Number < ServerRequestNames.size() && !ServerRequestNames[Number].empty()) {
+      return ServerRequestNames[Number];
+    }
+    return fextl::fmt::format("req{}", Number);
+  }
+
+  // 'server calls' (build 154): this process's wineserver requests in the last second from Wine's counts, the busiest
+  // types with how long each took on average (send to reply; a select's includes its wait), and Wine's anonymous event
+  // reuse. A first line notes where the names came from.
+  fextl::string ServerCallsLine(LogState* State) {
+    auto* Info = ServerCalls.load(std::memory_order_relaxed);
+    if (!Info || __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) != 1) {
+      return {};
+    }
+    const uint32_t Types = std::min<uint32_t>(__atomic_load_n(&Info->NbRequests, __ATOMIC_RELAXED), 512);
+    const uint64_t* EvFields[6] = {&Info->EvKept, &Info->EvReused, &Info->EvShared, &Info->EvOtherThread, &Info->EvTooOld, &Info->EvPoolFull};
+    uint64_t Ev[6];
+    for (size_t i = 0; i < 6; ++i) {
+      Ev[i] = __atomic_load_n(EvFields[i], __ATOMIC_RELAXED);
+    }
+    if (!State->ServerHave) {
+      State->ServerHave = true;
+      for (uint32_t i = 0; i < Types; ++i) {
+        State->ServerPrevCount[i] = __atomic_load_n(&Info->Count[i], __ATOMIC_RELAXED);
+        State->ServerPrevTime[i] = __atomic_load_n(&Info->TimeNs[i], __ATOMIC_RELAXED);
+      }
+      memcpy(State->ServerPrevEv, Ev, sizeof(Ev));
+      if (!ServerRequestNamesRead) {
+        ReadServerRequestNames();
+      }
+      uint64_t SoFar {};
+      for (uint32_t i = 0; i < Types; ++i) {
+        SoFar += State->ServerPrevCount[i];
+      }
+      return fextl::fmt::format("# server calls: Wine's request counts (our Proton, __wine_d2r_server_calls) read: {} request types, {} "
+                                "requests so far; {}\n",
+                                Types, SoFar, ServerRequestNamesNote);
+    }
+    struct Item {
+      uint32_t Type;
+      uint64_t Count;
+      uint64_t Ns;
+    };
+    fextl::vector<Item> Items;
+    uint64_t Total {}, TotalNs {}, SelectNs {};
+    for (uint32_t i = 0; i < Types; ++i) {
+      const uint64_t Count = __atomic_load_n(&Info->Count[i], __ATOMIC_RELAXED);
+      const uint64_t Ns = __atomic_load_n(&Info->TimeNs[i], __ATOMIC_RELAXED);
+      const uint64_t DCount = Count >= State->ServerPrevCount[i] ? Count - State->ServerPrevCount[i] : 0;
+      const uint64_t DNs = Ns >= State->ServerPrevTime[i] ? Ns - State->ServerPrevTime[i] : 0;
+      State->ServerPrevCount[i] = Count;
+      State->ServerPrevTime[i] = Ns;
+      if (!DCount) {
+        continue;
+      }
+      Items.push_back({i, DCount, DNs});
+      Total += DCount;
+      if (ServerRequestName(i) == "select") {
+        SelectNs += DNs;
+      } else {
+        TotalNs += DNs;
+      }
+    }
+    std::sort(Items.begin(), Items.end(), [](const Item& a, const Item& b) { return a.Count > b.Count; });
+    fextl::string Out = fextl::fmt::format("  server calls {}/s, {} types, {:.1f} ms in round trips (selects {:.1f} ms with their waits) |", Total,
+                                           Items.size(), TotalNs / 1e6, SelectNs / 1e6);
+    for (size_t i = 0; i < std::min(Items.size(), ServerCallsShown); ++i) {
+      Out += fextl::fmt::format(" {} {} ({:.3f} ms)", ServerRequestName(Items[i].Type), Items[i].Count,
+                                Items[i].Ns / 1e6 / static_cast<double>(Items[i].Count));
+    }
+    if (Items.size() > ServerCallsShown) {
+      uint64_t Rest {};
+      for (size_t i = ServerCallsShown; i < Items.size(); ++i) {
+        Rest += Items[i].Count;
+      }
+      Out += fextl::fmt::format(" others {}", Rest);
+    }
+    uint64_t D[6];
+    for (size_t i = 0; i < 6; ++i) {
+      D[i] = Ev[i] >= State->ServerPrevEv[i] ? Ev[i] - State->ServerPrevEv[i] : 0;
+      State->ServerPrevEv[i] = Ev[i];
+    }
+    Out += fextl::fmt::format(" | event reuse: made from kept {}, kept at close {}, not kept: shared {}, other thread {}, too old {}, no room {}\n",
+                              D[1], D[0], D[2], D[3], D[4], D[5]);
+    return Out;
   }
 
   // '# memory lock holds' (build 150): the holds of 4 ms or more Wine noted since the last line, each with its start time
@@ -4461,6 +4640,7 @@ namespace {
       Line += ProbeLine(State, MsPerTick);
       Line += LockWaitLines(State, Seconds);
       Line += VmLockHoldLines(State, Seconds);
+      Line += ServerCallsLine(State);
       Line += FrameLines(State, Seconds);
       if (State->Profile) {
         Line += MainHitches(State, Seconds);
@@ -4845,6 +5025,19 @@ void StatsLogSetVmLockNotes(const void* Info) {
                    "stall probe: vq measured with a VirtualQuery (FEX_PROBE_VQ_NOTES=0); the probe line gives 'memory lock taken N/s' "
                    "from Wine's notes");
   }
+}
+
+void StatsLogSetServerCalls(const void* Info) {
+  auto* Calls = static_cast<ServerCallsInfo*>(const_cast<void*>(Info));
+  ServerCalls.store(Calls, std::memory_order_relaxed);
+  const uint32_t Version = Calls ? __atomic_load_n(&Calls->Version, __ATOMIC_ACQUIRE) : 0;
+  StatsLogNote(!Calls       ? "server calls: this Wine doesn't count its wineserver requests (__wine_d2r_server_calls: stock Proton or our "
+                              "Proton older than d2r6)" :
+               Version == 1 ? "server calls: Wine's wineserver request counts found (our Proton d2r6 and later, __wine_d2r_server_calls "
+                              "version 1): a 'server calls' line every second gives this process's requests by type, their time from "
+                              "send to reply (a select's includes its wait), and what Wine's anonymous event reuse did" :
+               Version == 0 ? "server calls: Wine's request counts are off (__wine_d2r_server_calls version 0: WINE_D2R_CALL_COUNTS=0)" :
+                              "server calls: Wine's request counts have an unknown layout, not read");
 }
 
 void StatsLogSetLockProbe(void (*ProbeFunction)()) {

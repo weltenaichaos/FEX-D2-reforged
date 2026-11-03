@@ -82,4 +82,9 @@ void StatsLogSetLockProbe(void (*Probe)());
 // name the thread that held the lock, where it took it and for how long, and '# memory lock holds' lines list the holds
 // of 4 ms or more Wine noted since the last line.
 void StatsLogSetVmLockNotes(const void* Info);
+
+// Wineserver request counts (build 154): Info = PE ntdll's export __wine_d2r_server_calls (our Proton d2r6 and later),
+// nullptr when this Wine has none. A 'server calls' line then gives every second this process's wineserver requests by
+// type (count and time from send to reply) and what Wine's anonymous event reuse did.
+void StatsLogSetServerCalls(const void* Info);
 } // namespace FEX::Windows
