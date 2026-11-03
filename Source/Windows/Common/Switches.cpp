@@ -556,6 +556,15 @@ namespace {
     // Build 111: off. In the build 110 log lighting passes took as long with kept constants as without (-0.1%, +-1.3%)
     // although ~30% fewer constants were loaded per draw, so constant loading isn't what holds the next draw back.
     {"FEX_TU_CONST_KEEP", "0"},
+    // Build 149: in b148's heavy scenes (GPU 90%+) the frame gen layer's generated present blocked 18-26 ms inside
+    // vkQueuePresentKHR, so the real frame due 16.7 ms later missed its slot every frame (the judder), and the game's
+    // submits waited behind the layer's queue lock meanwhile. Stock Mesa's present first waits for the fence of the
+    // image's last present ("throttle"); that present's empty submit signals only after all GPU work submitted before it
+    // on the queue, and KGSL gives one queue for the game and the layer. FEX's Turnip fex18 skips that wait while the
+    // fence is still pending (no blit, no present timing: Turnip on GameNative's X server), and counts the present's
+    // throttle, wait, submit and queue_present times. alt = in every other 10 s, compared on the 'turnip present' lines;
+    // 1 = always; 0 = stock.
+    {"FEX_TU_PRESENT_NOWAIT", "alt"},
   };
 
   // In the order the stats log lists them.
@@ -692,6 +701,7 @@ namespace {
     "FEX_TU_DRAW_SETUP",
     "FEX_TU_CS_ATOMICS",
     "FEX_TU_CONST_KEEP",
+    "FEX_TU_PRESENT_NOWAIT",
   };
 
   bool UseD2RDefaults {};

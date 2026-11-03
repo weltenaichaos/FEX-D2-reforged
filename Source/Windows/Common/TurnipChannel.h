@@ -58,6 +58,10 @@
 //    processor loads whose buffer address didn't change since they were loaded stay in the shaders' constants instead
 //    of being loaded again with every draw ("kept" draw state group); only ranges whose address changes load with the
 //    draw. Slot::Sysmem bit 2 = pass recorded with it. KeepEmits..KeepMoves in the extension (ExtSize 0x440).
+//  - (fex18 and later) Status2 (0x440; all Status bits are used) with Status2Present: the driver's vkQueuePresentKHR
+//    reports each call (PrCalls..PrTotalMaxUs, ExtSize 0x4e8), and with ModePresentNoThrottle in 'Mode' (read at every
+//    present) it doesn't wait for the fence of the image's last present while that is still pending (the stock
+//    "throttle", which waits for all GPU work submitted before that present on the one KGSL queue).
 // Keep this layout identical to struct tu_fex_channel / tu_fex_slot in turnip-patches/.
 
 #include <cstddef>
@@ -85,6 +89,9 @@ constexpr uint32_t ModeCsAlt = 0x800;
 // fex17 and later: unchanged root constant buffer ranges stay in the constants (kept group). Slot::Sysmem bit 2.
 constexpr uint32_t ModeConstKeep = 0x1000;
 constexpr uint8_t SlotSysmemConstKeep = 0x4;
+// fex18 and later: presents don't wait for the image's last present while it is still pending (no blit, no present
+// timing). Read at every present, not per command buffer.
+constexpr uint32_t ModePresentNoThrottle = 0x2000;
 constexpr uint32_t FsArmW128 = 4;
 // fex15 and later: draw setup arms (4 = the second binary, however it was made).
 constexpr uint32_t FsArmAlt = 4;
@@ -139,6 +146,8 @@ constexpr uint32_t StatusSetupStats = 0x10000000; // fex15 and later: NopreShade
 constexpr uint32_t StatusCsAtomics = 0x20000000;  // fex16 and later: CompileCsAtomicsAlt honored
 constexpr uint32_t StatusCsStats = 0x40000000;    // fex16 and later: CsBinds..DispatchesSampled written, dispatch slots
 constexpr uint32_t StatusConstKeep = 0x80000000;  // fex17 and later: ModeConstKeep honored (a7xx with StatusCpUbo)
+// Channel::Status2 bits (fex18 and later)
+constexpr uint32_t Status2Present = 0x1; // the present hook is in place: ModePresentNoThrottle honored, Pr* written
 
 // KGSL_PERFCOUNTER_GROUP_*
 constexpr uint32_t GroupCp = 0x0;
@@ -275,6 +284,29 @@ struct Channel {
   volatile uint64_t KeepRuns;
   volatile uint64_t KeepForced;
   volatile uint64_t KeepMoves;
+  // 0x440 (fex18 and later, driver, only when ExtSize covers it): more status bits (Status2*).
+  volatile uint32_t Status2;
+  uint32_t Pad444;
+  // 0x448: vkQueuePresentKHR calls through the driver's WSI, [0] = without ModePresentNoThrottle, [1] = with it, and of
+  // their swapchains the ones whose throttle fence was still pending (the image's last present not done on the GPU).
+  volatile uint64_t PrCalls[2];
+  volatile uint64_t PrPending[2];
+  // 0x468: ([1] only) of the pending ones, presented without the wait; (both) swapchains that keep the stock wait (blit,
+  // software device, present timing).
+  volatile uint64_t PrSkipped;
+  volatile uint64_t PrStockPath;
+  // 0x478: sums: presents since the image's last present, nanoseconds in the throttle step (fence status, waits,
+  // resets), of that blocked in the fence wait, in the present's queue submit, in the swapchain's queue_present, the
+  // whole call.
+  volatile uint64_t PrGap[2];
+  volatile uint64_t PrThrottleNs[2];
+  volatile uint64_t PrWaitNs[2];
+  volatile uint64_t PrSubmitNs[2];
+  volatile uint64_t PrQueueNs[2];
+  volatile uint64_t PrTotalNs[2];
+  // 0x4d8: largest fence wait and whole call (microseconds) since FEX last set them to 0.
+  volatile uint32_t PrWaitMaxUs[2];
+  volatile uint32_t PrTotalMaxUs[2];
 };
 // 'Size' = the layout before fex11.
 constexpr uint32_t ChannelBaseSize = 0x2a8;
@@ -290,6 +322,10 @@ constexpr uint32_t ChannelArmSize = 0x3a8;
 constexpr uint32_t ChannelSetupSize = 0x3d0;
 // The fex16 layout (compute counts).
 constexpr uint32_t ChannelCsSize = 0x400;
+// The fex17 layout (kept constants counts).
+constexpr uint32_t ChannelKeepSize = 0x440;
+// The fex18 layout (Status2, present counts).
+constexpr uint32_t ChannelPresentSize = 0x4e8;
 
 // Slot::Attachments of a dispatch slot (fex16 and later). Such a slot has Width/Height = workgroups in x/y, Colors =
 // workgroups in z (up to 254), Draws = the stock binary's instruction count (the same in both binaries' slots, to tell
@@ -347,7 +383,13 @@ static_assert(offsetof(Channel, CsAltRefused) == 0x3f0);
 static_assert(offsetof(Channel, DispatchesSampled) == 0x3f8);
 static_assert(offsetof(Channel, KeepEmits) == ChannelCsSize);
 static_assert(offsetof(Channel, KeepVec4Kept) == 0x420);
-static_assert(sizeof(Channel) == 0x440);
+static_assert(offsetof(Channel, Status2) == ChannelKeepSize);
+static_assert(offsetof(Channel, PrCalls) == 0x448);
+static_assert(offsetof(Channel, PrSkipped) == 0x468);
+static_assert(offsetof(Channel, PrGap) == 0x478);
+static_assert(offsetof(Channel, PrTotalNs) == 0x4c8);
+static_assert(offsetof(Channel, PrWaitMaxUs) == 0x4d8);
+static_assert(sizeof(Channel) == ChannelPresentSize);
 static_assert(sizeof(Slot) == 48);
 
 // The channel EnvironmentVariablesHandling set up for this process (FEX_TU_CHANNEL), or nullptr.
@@ -383,4 +425,7 @@ uint32_t CsAtomicsSwitch();
 // FEX_TU_CONST_KEEP (build 110): 0 stock (every driver-loaded root constant buffer range loaded with every draw), 1
 // ModeConstKeep always, 2 (alt) in every other second (needs the stats log; without it nothing flips it, so it stays on).
 uint32_t ConstKeepSwitch();
+// FEX_TU_PRESENT_NOWAIT (build 149): 0 stock (the present waits for the image's last present), 1 ModePresentNoThrottle
+// always, 2 (alt) in every other 10 s (needs the stats log; without it nothing flips it, so it stays on).
+uint32_t PresentNoWaitSwitch();
 } // namespace FEX::Windows::Turnip

@@ -261,6 +261,7 @@ namespace {
   uint64_t ArmBindsLast[T::FsArms] {}; // ArmBinds at the last report (fex14)
   uint32_t SetupLast[4] {};            // NopreShaders, MergeShaders, CntlShaders, SetupRefused at the last note (fex15)
   uint32_t CsAltLast[2] {};            // CsAltShaders, CsAltRefused at the last note (fex16)
+  uint64_t PresentLast[10][2] {};      // the Pr* counters at the last report (fex18)
 
   bool ReadSlot(uint64_t RingCpu, uint32_t Index, uint32_t SlotSize, uint8_t* Out) {
     SIZE_T Read = 0;
@@ -365,9 +366,17 @@ namespace {
     const char* ConstKeep = !KeepSw                                 ? "off (FEX_TU_CONST_KEEP=0)" :
                             Chan->Patch < 17                        ? "NOT available (driver older than fex17)" :
                             !(Status & T::StatusConstKeep)          ? "NOT honored (needs root constant buffers loaded by the command processor)" :
-                            Chan->ExtSize < sizeof(T::Channel)      ? "ON, counts NOT written" :
+                            Chan->ExtSize < T::ChannelKeepSize      ? "ON, counts NOT written" :
                             KeepSw == 2                             ? "in every other second (FEX_TU_CONST_KEEP=alt)" :
                                                                       "ON (FEX_TU_CONST_KEEP=1)";
+    // fex18: presents without the wait behind queued GPU work (FEX_TU_PRESENT_NOWAIT).
+    const uint32_t PresentSw = FEX::Windows::Turnip::PresentNoWaitSwitch();
+    const uint32_t Status2 = Chan->Patch >= 18 ? __atomic_load_n(&Chan->Status2, __ATOMIC_ACQUIRE) : 0;
+    const char* Present = Chan->Patch < 18                    ? "NOT available (driver older than fex18)" :
+                          !(Status2 & T::Status2Present)      ? "NOT available (driver's present hook not in place: TU_FEX_PRESENT=0?)" :
+                          !PresentSw                          ? "off (FEX_TU_PRESENT_NOWAIT=0), presents counted" :
+                          PresentSw == 2                      ? "in every other 10 s (FEX_TU_PRESENT_NOWAIT=alt), presents counted" :
+                                                                "ON (FEX_TU_PRESENT_NOWAIT=1), presents counted";
     const char* Dispatches = Chan->Patch < 16                   ? "not timed (driver older than fex16)" :
                              !(Status & T::StatusCsStats)       ? "not timed (counts not written)" :
                              !Chan->SampleMinDraws              ? "not timed (FEX_TU_SAMPLE_DRAWS=0)" :
@@ -392,11 +401,12 @@ namespace {
       "preamble loads first {}, list loops read ahead {}, root constant buffers loaded by the command processor {}, other root "
       "constant buffer reads through the shaders' UBO table {}, pipeline switches send only what changed {}, lighting shaders "
       "without alias.tex helpers {}, lighting shaders without preamble {}, lighting shader wave/draw setups {}, compute atomics once "
-      "per wave {}, unchanged root constant buffers kept in the constants {}, compute dispatches {}, depth clears at the start of direct passes {}, available memory for the memory budget {}, "
+      "per wave {}, unchanged root constant buffers kept in the constants {}, presents without waiting behind queued GPU work {}, "
+      "compute dispatches {}, depth clears at the start of direct passes {}, available memory for the memory budget {}, "
       "{} of {} GPU counters reserved{}{}; ring {}x{} bytes; counters: {}",
       Driver, Chan->Patch, Status, (Status & T::StatusDescPatch) ? "honored" : "NOT honored",
       (Status & T::StatusNotA7xx) ? " (not an a7xx GPU)" : "", EarlyPreamble, PreambleLoads, LoopPrefetch, CpUbo, UboTable, Switches, NoAlias, NoPre,
-      WaveSetups, CsAtomics, ConstKeep, Dispatches, DepthClear,
+      WaveSetups, CsAtomics, ConstKeep, Present, Dispatches, DepthClear,
       Budget,
       Chan->CountersReserved,
       Chan->CounterCount,
@@ -404,12 +414,15 @@ namespace {
       Chan->RingCount, Chan->SlotSize, Counters.empty() ? "-" : Counters));
   }
 
-  void Delta(int Index, const volatile uint64_t* Now, uint64_t Out[2]) {
+  void Delta(int Index, const volatile uint64_t* Now, uint64_t Out[2], uint64_t (*Table)[2]) {
     for (int i = 0; i < 2; ++i) {
       const uint64_t V = Now[i];
-      Out[i] = V - Last[Index][i];
-      Last[Index][i] = V;
+      Out[i] = V - Table[Index][i];
+      Table[Index][i] = V;
     }
+  }
+  void Delta(int Index, const volatile uint64_t* Now, uint64_t Out[2]) {
+    Delta(Index, Now, Out, Last);
   }
 
   int FindCounter(uint32_t Count, uint32_t Group, uint32_t Countable) {
@@ -850,6 +863,16 @@ namespace {
       CurrentMode = Mode;
       __atomic_store_n(&Chan->Mode, CurrentMode, __ATOMIC_RELAXED);
     }
+    // Build 149: presents without the wait behind queued GPU work (driver fex18) in every other 10 s (the driver reads the
+    // bit at every present). 10 s halves, not seconds: frame gen pacing settles over a few seconds after a change.
+    if (FEX::Windows::Turnip::PresentNoWaitSwitch() == 2) {
+      const bool On = !(((Ticks + 1) / 10) & 1);
+      const uint32_t Mode = (CurrentMode & ~T::ModePresentNoThrottle) | (On ? T::ModePresentNoThrottle : 0);
+      if (Mode != CurrentMode) {
+        CurrentMode = Mode;
+        __atomic_store_n(&Chan->Mode, CurrentMode, __ATOMIC_RELAXED);
+      }
+    }
     ++Ticks;
     if (!(Status & T::StatusAttached)) {
       if (!NotedMissing && Ticks == 120) {
@@ -892,6 +915,50 @@ namespace {
     } else {
       Out += fextl::fmt::format("  turnip: cmdbufs {} | descriptor updates {} | push {} | passes sampled {} small {}\n", CmdBufs[0],
                                 Emits[0], PushAll, Misc[0], Misc[1]);
+    }
+
+    // Presents through the driver this second (fex18 and later), by setting: [0] stock wait, [1] without the wait
+    // (ModePresentNoThrottle). 'back after' = presents since the image's last present (0 = the image just presented);
+    // 'pending' = its last present's fence not signaled yet (stock then waits for it, 'wait'); 'whole' = the driver's
+    // vkQueuePresentKHR from start to end.
+    if (Chan->Patch >= 18 && (__atomic_load_n(&Chan->Status2, __ATOMIC_ACQUIRE) & T::Status2Present)) {
+      uint64_t PCalls[2], PPending[2], PGap[2], PThrottle[2], PWait[2], PSubmit[2], PQueue[2], PTotal[2], PMisc[2];
+      Delta(0, Chan->PrCalls, PCalls, PresentLast);
+      Delta(1, Chan->PrPending, PPending, PresentLast);
+      Delta(2, Chan->PrGap, PGap, PresentLast);
+      Delta(3, Chan->PrThrottleNs, PThrottle, PresentLast);
+      Delta(4, Chan->PrWaitNs, PWait, PresentLast);
+      Delta(5, Chan->PrSubmitNs, PSubmit, PresentLast);
+      Delta(6, Chan->PrQueueNs, PQueue, PresentLast);
+      Delta(7, Chan->PrTotalNs, PTotal, PresentLast);
+      const uint64_t MiscNow[2] = {Chan->PrSkipped, Chan->PrStockPath};
+      Delta(8, MiscNow, PMisc, PresentLast);
+      uint32_t WaitMax[2], TotalMax[2];
+      for (int i = 0; i < 2; ++i) {
+        WaitMax[i] = __atomic_exchange_n(&Chan->PrWaitMaxUs[i], 0u, __ATOMIC_RELAXED);
+        TotalMax[i] = __atomic_exchange_n(&Chan->PrTotalMaxUs[i], 0u, __ATOMIC_RELAXED);
+      }
+      if (PCalls[0] || PCalls[1]) {
+        const auto Arm = [&](int i) {
+          const double N = static_cast<double>(PCalls[i]);
+          return fextl::fmt::format("{} {} presents, back after {:.2f}, pending {}{} | throttle {:.2f} ms, wait {:.2f} (max {:.1f}), "
+                                    "submit {:.2f}, queue_present {:.2f}, whole {:.2f} (max {:.1f}) ms per present",
+                                    i ? "nowait" : "stock", PCalls[i], PGap[i] / N, PPending[i],
+                                    i ? fextl::fmt::format(" (presented without waiting {})", PMisc[0]) : fextl::string(),
+                                    PThrottle[i] / N / 1e6, PWait[i] / N / 1e6, WaitMax[i] / 1000.0, PSubmit[i] / N / 1e6,
+                                    PQueue[i] / N / 1e6, PTotal[i] / N / 1e6, TotalMax[i] / 1000.0);
+        };
+        Out += fextl::fmt::format("  turnip present: nowait {} this second", (ModeThisSecond & T::ModePresentNoThrottle) ? "on" : "off");
+        for (int i = 0; i < 2; ++i) {
+          if (PCalls[i]) {
+            Out += " | " + Arm(i);
+          }
+        }
+        if (PMisc[1]) {
+          Out += fextl::fmt::format(" | swapchains that keep the wait (blit or present timing) {}", PMisc[1]);
+        }
+        Out += '\n';
+      }
     }
 
     // Graphics pipeline binds as recorded this second (fex11 and later, counted at vkEndCommandBuffer): draw state blocks
@@ -1052,7 +1119,7 @@ namespace {
     // recorded this second, without and with the mode, the vec4s the command processor loads per build, and with the mode
     // the vec4s left in place, the times the kept group was set again (forced by a pipeline bind or a barrier) and the root
     // constant buffers moved out of it.
-    if (Chan->Patch >= 17 && (Status & T::StatusConstKeep) && Chan->ExtSize >= sizeof(T::Channel)) {
+    if (Chan->Patch >= 17 && (Status & T::StatusConstKeep) && Chan->ExtSize >= T::ChannelKeepSize) {
       uint64_t KEmits[2], KVec4[2], KKept[2], KRuns[2];
       Delta(18, Chan->KeepEmits, KEmits);
       Delta(19, Chan->KeepVec4, KVec4);

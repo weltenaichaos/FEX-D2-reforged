@@ -475,3 +475,27 @@ address stays fixed, here all but 7 and 8; mode 0x454 vs 0x1454, compile 0x21f, 
 the changing block moves, kept made again with 8 ranges; draws 3-8: CONST only, one 4-vec4 range plus the
 push constants). Sysmem and gmem, pipeline switches (PAT=01243, 0000500005, depth-only pipelines), REBIND
 and a barrier in the pass ran without asserts; counts as expected.
+
+- `0018-fex18-present-throttle.patch` (fex18, with FEX build 149): presents don't wait behind queued GPU work.
+  Stock `wsi_common_queue_present` first waits for the fence of the presented image's last present
+  ("throttle"). That present's submit is empty (NO_BLIT), but a fence signal covers all work submitted before
+  it on the queue, and KGSL gives Turnip one queue. D2R's frame gen layer presents on the game's queue, so in
+  heavy scenes (b148: GPU 90%+) its generated present blocked 18-26 ms behind the game's next frame, the real
+  present due 16.7 ms later missed its slot every frame, and the game's own submits waited behind the layer's
+  queue lock meanwhile.
+  - `wsi_device::fex_present_mode` / `fex_present_done` (new in `wsi_common.h`, NULL = stock), set by
+    `tu_fex_wsi_init` from `tu_wsi_init` when the channel covers `TU_FEX_CHANNEL_PRESENT_SIZE` (0x4e8).
+    With the hook the throttle step checks the fence first (`GetFenceStatus`); signaled fences are reset
+    and reused as in stock.
+  - `TU_FEX_MODE_PRESENT_NO_THROTTLE` 0x2000 (read at every present, not part of `TU_FEX_MODE_MASK`): a
+    still pending fence of a swapchain without blit, software device or present timing is not waited for;
+    it stays with the earlier present (not reset, not signaled twice) and this present's submit leaves it
+    out. The next present of the image uses it again once it signaled. Wait semaphores, present id and
+    the X11 path are unchanged; the image is the application's to finish (the layer and VKD3D wait for
+    their frames to be drawn before presenting).
+  - `status2` 0x440 (all 32 `status` bits are used): `TU_FEX_STATUS2_PRESENT` 0x1. Counts per setting
+    ([0] stock wait, [1] mode bit): `pr_calls` 0x448, `pr_pending` 0x458, `pr_skipped` 0x468 ([1]),
+    `pr_stock_path` 0x470, `pr_gap` 0x478 (presents since the image's last present), nanosecond sums
+    `pr_throttle_ns` 0x488, `pr_wait_ns` 0x498, `pr_submit_ns` 0x4a8, `pr_queue_ns` 0x4b8, `pr_total_ns`
+    0x4c8, and maxima `pr_wait_max_us` 0x4d8, `pr_total_max_us` 0x4e0 (FEX sets them to 0 when it reads).
+  - Unix env `TU_FEX_PRESENT=0` leaves the hook out (stock present).

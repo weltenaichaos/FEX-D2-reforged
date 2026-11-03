@@ -1176,6 +1176,8 @@ NTSTATUS ProcessInit() {
     // The stall probe's "fexlock": how long taking FEX's global memory/SMC lock takes (every VirtualProtect, VirtualAlloc,
     // VirtualFree and code write by the game holds it).
     FEX::Windows::StatsLogSetLockProbe([] { std::scoped_lock Lock(ThreadCreationMutex); });
+    // Build 149: our Proton d2r4 and later note who holds Wine's memory lock (PE ntdll export __wine_d2r_vm_lock).
+    FEX::Windows::StatsLogSetVmLockNotes(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_vm_lock")));
     FEX::Windows::StatsLogNote(PoliteMs ? fextl::fmt::format("codelock: writers wait up to {}ms without blocking compiles", PoliteMs) :
                                           fextl::string("codelock: writers queue at once (upstream)"));
     FEX::Windows::StatsLogNote(

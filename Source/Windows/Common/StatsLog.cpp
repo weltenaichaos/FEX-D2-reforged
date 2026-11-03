@@ -318,10 +318,65 @@ namespace {
   constexpr size_t LockSnapSlots = 16;
   constexpr size_t LockSnapTextSize = 1536;
   constexpr size_t MaxLockWaitLines = 300;
+  // Wine's memory lock holder notes (build 149): our Proton d2r4 and later keep, in PE ntdll's export __wine_d2r_vm_lock,
+  // who holds the unix side's memory lock (virtual_mutex) now, where in dlls/ntdll/unix/virtual.c it took it and since
+  // when (CLOCK_MONOTONIC), plus its holds of 4 ms or more in a 16 slot ring. Layout version 1 = struct d2r_vm_lock_info
+  // of proton-patches/11.0-1/0006-ntdll-memory-lock-notes-its-holder.patch. Only the holder writes; a reader takes tid,
+  // line and since_ns and checks tid again.
+  struct VmLockHold {
+    uint32_t Line;
+    uint32_t Tid; // Windows thread id
+    uint32_t HeldUs;
+    uint32_t Pad;
+    uint64_t EndNs; // CLOCK_MONOTONIC when it was let go
+  };
+  struct VmLockInfo {
+    uint32_t Version;   // 1 once Wine writes here (0: WINE_D2R_VM_NOTES=0)
+    uint32_t Tid;       // holder now, 0 when free
+    uint32_t Line;      // where the holder now took it
+    uint32_t LongHolds; // holds of 4 ms or more so far; the next goes to Holds[LongHolds % 16]
+    uint64_t SinceNs;   // CLOCK_MONOTONIC when the holder now took it
+    uint64_t HoldsTotal;
+    VmLockHold Holds[16];
+  };
+  static_assert(sizeof(VmLockInfo) == 416);
+  std::atomic<VmLockInfo*> VmLock {};
+  constexpr size_t MaxVmHoldLines = 900;
+
+  // The holder as Wine noted it: State 0 = no notes, 1 = free, 2 = held, 3 = it changed while being read.
+  struct VmHolder {
+    uint32_t State;
+    uint32_t Tid;
+    uint32_t Line;
+    uint32_t HeldUs;
+  };
+  VmHolder ReadVmHolder() {
+    auto* Info = VmLock.load(std::memory_order_relaxed);
+    if (!Info || __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) != 1) {
+      return {};
+    }
+    for (int Try = 0; Try < 3; ++Try) {
+      const uint32_t Tid = __atomic_load_n(&Info->Tid, __ATOMIC_ACQUIRE);
+      if (!Tid) {
+        return {.State = 1};
+      }
+      const uint32_t Line = __atomic_load_n(&Info->Line, __ATOMIC_RELAXED);
+      const uint64_t Since = __atomic_load_n(&Info->SinceNs, __ATOMIC_RELAXED);
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(&Info->Tid, __ATOMIC_RELAXED) == Tid) {
+        const int64_t Now = Linux::MonotonicNs();
+        const uint64_t Held = Now > 0 && static_cast<uint64_t>(Now) > Since ? (static_cast<uint64_t>(Now) - Since) / 1000 : 0;
+        return {.State = 2, .Tid = Tid, .Line = Line, .HeldUs = static_cast<uint32_t>(std::min<uint64_t>(Held, UINT32_MAX))};
+      }
+    }
+    return {.State = 3};
+  }
+
   struct LockSnap {
     std::atomic<uint32_t> Ready; // 0 free, 1 being written, 2 written
     uint64_t Start;              // counter value when the probe's VirtualQuery began
     uint32_t AtMs;               // how long it had waited then
+    VmHolder Holder;             // Wine's notes on the holder then (build 149)
     char Text[LockSnapTextSize];
   };
   // Written by the probe thread only.
@@ -379,6 +434,19 @@ namespace {
     };
     CallCount QueueCalls[10];
     uint32_t QueueOther;
+    // Build 149: the present threads, sampled the same way: the frame gen layer's (lsfg-present), VKD3D's (vkd3d-fex-prese)
+    // and Mesa's X11 present queue (WSI swapchain q). In b148's heavy scenes the layer's generated present blocked 18-26 ms
+    // in the driver; this says in what.
+    static constexpr size_t FrameCallSlots = 8;
+    static constexpr size_t FrameThreads = 3;
+    struct FrameSampler {
+      int Tid;
+      int Fd = -1;
+      uint32_t Samples;
+      CallCount Calls[FrameCallSlots];
+      uint32_t Other;
+    };
+    FrameSampler Frame[FrameThreads];
     fextl::unordered_map<int, SchedPrev> Tasks;
     fextl::unordered_map<int, SchedPrev> Procs;
     fextl::unordered_map<int, fextl::string> ProcNames;
@@ -1587,6 +1655,66 @@ namespace {
   constexpr uint64_t RunningKey = ~0ull;
   constexpr uint64_t OutsideKey = ~1ull; // blocked, but not in a system call
 
+  // What a /proc/self/task/<tid>/syscall text says the thread is doing, as a CallCount key.
+  uint64_t SyscallKey(char* Buffer) {
+    if (Buffer[0] == 'r') {
+      return RunningKey;
+    }
+    if (Buffer[0] == '-') {
+      return OutsideKey;
+    }
+    char* P = Buffer;
+    const uint64_t Nr = strtoull(P, &P, 10);
+    uint64_t Args[2] {};
+    for (auto& A : Args) {
+      A = strtoull(P, &P, 16);
+    }
+    uint64_t Key = Nr << 32;
+    if (Nr == 29) { // ioctl: the request says which driver call
+      Key |= Args[1] & 0xffffffff;
+    } else if (Nr == 98) { // futex: the operation, without the private flag
+      Key |= Args[1] & 0x7f;
+    }
+    return Key;
+  }
+
+  void AddCall(SchedState::CallCount* Calls, size_t Count, uint32_t& Other, uint64_t Key) {
+    for (size_t i = 0; i < Count; ++i) {
+      if (Calls[i].N && Calls[i].Key == Key) {
+        ++Calls[i].N;
+        return;
+      }
+    }
+    for (size_t i = 0; i < Count; ++i) {
+      if (!Calls[i].N) {
+        Calls[i] = {Key, 1};
+        return;
+      }
+    }
+    ++Other;
+  }
+
+  // Build 149: one sample of each present thread found.
+  void SchedSampleFrameThreads() {
+    for (auto& F : Sched.Frame) {
+      if (F.Fd < 0) {
+        continue;
+      }
+      char Buffer[256];
+      const int64_t Len = Linux::Pread(F.Fd, Buffer, sizeof(Buffer) - 1, 0);
+      if (Len <= 0) {
+        // The thread is gone (a new swapchain makes a new one): found again by name.
+        Linux::Close(F.Fd);
+        F.Fd = -1;
+        F.Tid = 0;
+        continue;
+      }
+      Buffer[Len] = 0;
+      ++F.Samples;
+      AddCall(F.Calls, SchedState::FrameCallSlots, F.Other, SyscallKey(Buffer));
+    }
+  }
+
   // One sample of what the queue thread is doing, from /proc/self/task/<tid>/syscall.
   void SchedSampleQueue() {
     if (Sched.QueueFd < 0) {
@@ -1607,39 +1735,8 @@ namespace {
     }
     Sched.QueueEverRead = true;
     Buffer[Len] = 0;
-    uint64_t Key;
-    if (Buffer[0] == 'r') {
-      Key = RunningKey;
-    } else if (Buffer[0] == '-') {
-      Key = OutsideKey;
-    } else {
-      char* P = Buffer;
-      const uint64_t Nr = strtoull(P, &P, 10);
-      uint64_t Args[2] {};
-      for (auto& A : Args) {
-        A = strtoull(P, &P, 16);
-      }
-      Key = Nr << 32;
-      if (Nr == 29) { // ioctl: the request says which driver call
-        Key |= Args[1] & 0xffffffff;
-      } else if (Nr == 98) { // futex: the operation, without the private flag
-        Key |= Args[1] & 0x7f;
-      }
-    }
     ++Sched.QueueSamples;
-    for (auto& C : Sched.QueueCalls) {
-      if (C.N && C.Key == Key) {
-        ++C.N;
-        return;
-      }
-    }
-    for (auto& C : Sched.QueueCalls) {
-      if (!C.N) {
-        C = {Key, 1};
-        return;
-      }
-    }
-    ++Sched.QueueOther;
+    AddCall(Sched.QueueCalls, std::size(Sched.QueueCalls), Sched.QueueOther, SyscallKey(Buffer));
   }
 
   const char* SyscallName(uint64_t Nr) {
@@ -1678,7 +1775,28 @@ namespace {
     const uint32_t Arg = static_cast<uint32_t>(Key);
     const char* Name = SyscallName(Nr);
     fextl::string Out = Name ? fextl::string(Name) : fextl::fmt::format("nr{}", Nr);
-    if (Nr == 29) {
+    // KGSL (the Adreno kernel driver, ioctl type 0x09), build 149: the calls Turnip makes, by number.
+    const char* Kgsl = nullptr;
+    if (Nr == 29 && ((Arg >> 8) & 0xff) == 0x09) {
+      switch (Arg & 0xff) {
+      case 0x02: Kgsl = "kgsl_getproperty"; break;
+      case 0x07: Kgsl = "kgsl_wait_timestamp"; break;
+      case 0x16: Kgsl = "kgsl_read_timestamp"; break;
+      case 0x33: Kgsl = "kgsl_timestamp_event"; break;
+      case 0x34: Kgsl = "kgsl_gpumem_alloc"; break;
+      case 0x35: Kgsl = "kgsl_gpumem_free"; break;
+      case 0x3b: Kgsl = "kgsl_perfcounter_read"; break;
+      case 0x45: Kgsl = "kgsl_gpuobj_alloc"; break;
+      case 0x46: Kgsl = "kgsl_gpuobj_free"; break;
+      case 0x4a: Kgsl = "kgsl_gpu_command"; break;
+      case 0x56: Kgsl = "kgsl_bind_ranges"; break;
+      case 0x57: Kgsl = "kgsl_gpu_aux_command"; break;
+      default: break;
+      }
+    }
+    if (Kgsl) {
+      Out += fextl::fmt::format("({})", Kgsl);
+    } else if (Nr == 29) {
       Out += fextl::fmt::format("({:#x})", Arg);
     } else if (Nr == 98 && Arg == 0) {
       Out += "(wait)";
@@ -1702,6 +1820,7 @@ namespace {
     SchedSampleOne(Sched.MainFd, Sched.MainSamples, Sched.MainRunnable, Sched.MainCores, &MainCpu);
     SchedSampleOne(Sched.ServerFd, Sched.ServerSamples, Sched.ServerRunnable, Sched.ServerCores);
     SchedSampleQueue();
+    SchedSampleFrameThreads();
     CorePauseSample();
     ClockSampleTick(MainCpu);
   }
@@ -2026,6 +2145,47 @@ namespace {
         Sched.QueueTid = Busiest;
         Sched.QueueFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/syscall", Busiest).c_str());
       }
+
+      // Build 149: what the present threads did this second, then find them again by name (the busiest of each name).
+      static constexpr const char* FrameComms[SchedState::FrameThreads] = {"lsfg-present", "vkd3d-fex-prese", "WSI swapchain q"};
+      fextl::string FrameText;
+      for (size_t f = 0; f < SchedState::FrameThreads; ++f) {
+        auto& F = Sched.Frame[f];
+        if (F.Fd >= 0 && F.Samples) {
+          SchedState::CallCount Calls[SchedState::FrameCallSlots];
+          memcpy(Calls, F.Calls, sizeof(Calls));
+          std::sort(std::begin(Calls), std::end(Calls), [](const auto& a, const auto& b) { return a.N > b.N; });
+          FrameText += fextl::fmt::format(" | {}/{} ({}):", FrameComms[f], F.Tid, F.Samples);
+          for (const auto& C : Calls) {
+            if (C.N) {
+              FrameText += fextl::fmt::format(" {} {}%", QueueCallName(C.Key), (C.N * 100 + F.Samples / 2) / F.Samples);
+            }
+          }
+          if (F.Other) {
+            FrameText += fextl::fmt::format(" other {}%", (F.Other * 100 + F.Samples / 2) / F.Samples);
+          }
+        }
+        memset(F.Calls, 0, sizeof(F.Calls));
+        F.Samples = F.Other = 0;
+        int Found {};
+        double FoundRun = -1.0;
+        for (const auto& R : Rows) {
+          if (strcmp(R.Comm, FrameComms[f]) == 0 && R.RunMs > FoundRun) {
+            Found = R.Tid;
+            FoundRun = R.RunMs;
+          }
+        }
+        if (Found && Found != F.Tid && !Sched.QueueUnreadable) {
+          if (F.Fd >= 0) {
+            Linux::Close(F.Fd);
+          }
+          F.Tid = Found;
+          F.Fd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/syscall", Found).c_str());
+        }
+      }
+      if (!FrameText.empty()) {
+        Out += fextl::fmt::format("  sched present threads (samples every 10 ms){}\n", FrameText);
+      }
     }
 
     // Every 5 seconds: the other processes of this user that used the CPU (Wine's other processes, the wineserver, the
@@ -2176,6 +2336,9 @@ namespace {
     fextl::vector<ProbeEvent> ProbeEvents;
     uint64_t LockWaitPrinted; // end of the last memory lock wait given a line
     size_t LockWaitLines;
+    uint32_t VmLongSeen;      // Wine's long hold count at the last '# memory lock holds' line (build 149)
+    bool VmLongStarted;
+    size_t VmHoldLines;
 
     // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
     struct MainTick {
@@ -2361,6 +2524,8 @@ namespace {
         continue;
       }
       ++Stage;
+      // Wine's own note first: the holder may let go while the thread list is read.
+      const VmHolder Holder = ReadVmHolder();
       LockSnapArgs A {.Self = P->ProbeTid.load(std::memory_order_relaxed)};
       Linux::ForEachEntry("/proc/self/task", LockSnapTask, &A);
       for (auto& S : P->Snaps) {
@@ -2368,6 +2533,7 @@ namespace {
         if (S.Ready.compare_exchange_strong(Free, 1, std::memory_order_acquire)) {
           S.Start = Start;
           S.AtMs = static_cast<uint32_t>(Waited * 1000 / Freq);
+          S.Holder = Holder;
           snprintf(S.Text, sizeof(S.Text), "%u not waiting:%s %u asleep in waits (%u in futex)", A.Listed, A.Text.c_str(), A.Waiting, A.Futex);
           S.Ready.store(2, std::memory_order_release);
           break;
@@ -3226,6 +3392,153 @@ namespace {
   // last ones: the watch thread's thread lists taken during the wait, then what the sampled threads were doing meanwhile.
   LogState::Run CollectFrameRun(LogState* State, uint64_t Begin, uint64_t End);
 
+  // Where virtual.c took the memory lock, by line, from our Proton's share/wine/d2r-vm-lock-lines.txt ("line function"
+  // per row, made by tools/proton/vm-lock-lines.sh), found next to the ntdll.so this process mapped. Read once.
+  fextl::vector<std::pair<uint32_t, fextl::string>> VmLockLineTable;
+  bool VmLockLinesRead {};
+  fextl::string VmLockLinesNote;
+
+  void ReadVmLockLines() {
+    VmLockLinesRead = true;
+    fextl::string Ntdll;
+    const int Fd = Linux::Open("/proc/self/maps");
+    if (Fd >= 0) {
+      static char Chunk[65536];
+      fextl::string Tail;
+      constexpr std::string_view Key = "/aarch64-unix/ntdll.so";
+      for (uint64_t Offset = 0; Offset < (64ull << 20) && Ntdll.empty();) {
+        const int64_t Len = Linux::Pread(Fd, Chunk, sizeof(Chunk), Offset);
+        if (Len <= 0) {
+          break;
+        }
+        Offset += Len;
+        fextl::string Text = Tail;
+        Text.append(Chunk, Len);
+        const size_t At = Text.find(Key);
+        if (At != fextl::string::npos) {
+          const size_t LineBegin = Text.rfind('\n', At);
+          const size_t Slash = Text.find('/', LineBegin == fextl::string::npos ? 0 : LineBegin);
+          if (Slash != fextl::string::npos && Slash <= At) {
+            Ntdll = Text.substr(Slash, At + Key.size() - Slash);
+          }
+          break;
+        }
+        const size_t LastNewline = Text.rfind('\n');
+        Tail = LastNewline == fextl::string::npos ? Text : Text.substr(LastNewline);
+      }
+      Linux::Close(Fd);
+    }
+    constexpr std::string_view Lib = "lib/wine/aarch64-unix/ntdll.so";
+    if (Ntdll.size() <= Lib.size() || Ntdll.compare(Ntdll.size() - Lib.size(), Lib.size(), Lib) != 0) {
+      VmLockLinesNote = fextl::fmt::format("line table not found (ntdll.so {})", Ntdll.empty() ? "not in /proc/self/maps" : Ntdll);
+      return;
+    }
+    const fextl::string Path = Ntdll.substr(0, Ntdll.size() - Lib.size()) + "share/wine/d2r-vm-lock-lines.txt";
+    static char Buffer[16384];
+    const int64_t Len = Linux::ReadSmallFile(Path.c_str(), Buffer, sizeof(Buffer));
+    if (Len <= 0) {
+      VmLockLinesNote = fextl::fmt::format("line table {} can't be read ({})", Path, Len);
+      return;
+    }
+    const char* Cursor = Buffer;
+    const char* End = Buffer + Len;
+    while (Cursor < End) {
+      char* After {};
+      const unsigned long Line = strtoul(Cursor, &After, 10);
+      const char* NameBegin = After;
+      while (NameBegin < End && *NameBegin == ' ') {
+        ++NameBegin;
+      }
+      const char* NameEnd = NameBegin;
+      while (NameEnd < End && *NameEnd != '\n' && *NameEnd != '\r' && *NameEnd != ' ') {
+        ++NameEnd;
+      }
+      if (Line && NameEnd > NameBegin) {
+        VmLockLineTable.push_back({static_cast<uint32_t>(Line), fextl::string(NameBegin, NameEnd)});
+      }
+      Cursor = NameEnd;
+      while (Cursor < End && *Cursor != '\n') {
+        ++Cursor;
+      }
+      ++Cursor;
+    }
+    VmLockLinesNote = fextl::fmt::format("line table {} ({} places)", Path, VmLockLineTable.size());
+  }
+
+  fextl::string VmLockLineName(uint32_t Line) {
+    if (!VmLockLinesRead) {
+      ReadVmLockLines();
+    }
+    for (const auto& [L, Name] : VmLockLineTable) {
+      if (L == Line) {
+        return fextl::fmt::format("{} {}", Line, Name);
+      }
+    }
+    return fextl::fmt::format("{}", Line);
+  }
+
+  // Wine's note on the holder in a '# memory lock wait' snapshot ("" without notes).
+  fextl::string VmHolderText(const VmHolder& H) {
+    switch (H.State) {
+    case 1: return "Wine's notes: lock free (let go just before); ";
+    case 2:
+      return fextl::fmt::format("Wine's notes: HELD by tid={} {} for {:.1f} ms, taken at virtual.c:{}; ", H.Tid, QueryThreadName(H.Tid),
+                                H.HeldUs / 1000.0, VmLockLineName(H.Line));
+    case 3: return "Wine's notes: holder changed while read; ";
+    default: return {};
+    }
+  }
+
+  // '# memory lock holds' (build 149): the holds of 4 ms or more Wine noted since the last line, each with its start time
+  // (t=, from its end and length), length, where virtual.c took the lock and the holder.
+  fextl::string VmLockHoldLines(LogState* State, uint64_t Seconds) {
+    auto* Info = VmLock.load(std::memory_order_relaxed);
+    if (!Info || __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) != 1) {
+      return {};
+    }
+    const uint32_t Long = __atomic_load_n(&Info->LongHolds, __ATOMIC_ACQUIRE);
+    if (!State->VmLongStarted) {
+      // Holds from before the log (process start) are left out.
+      State->VmLongStarted = true;
+      State->VmLongSeen = Long;
+      if (!VmLockLinesRead) {
+        ReadVmLockLines();
+      }
+      return fextl::fmt::format("# memory lock holds: Wine's notes (our Proton, __wine_d2r_vm_lock) read: {} holds so far, {} of "
+                                "4+ ms; {}\n",
+                                __atomic_load_n(&Info->HoldsTotal, __ATOMIC_RELAXED), Long, VmLockLinesNote);
+    }
+    if (Long == State->VmLongSeen) {
+      return {};
+    }
+    uint32_t New = Long - State->VmLongSeen;
+    const uint32_t Lost = New > 16 ? New - 16 : 0;
+    New -= Lost;
+    State->VmLongSeen = Long;
+    if (State->VmHoldLines >= MaxVmHoldLines) {
+      return {};
+    }
+    ++State->VmHoldLines;
+    const uint64_t NowCounter = GetCounter();
+    const int64_t NowMono = Linux::MonotonicNs();
+    const double Freq = static_cast<double>(State->CounterFreq);
+    fextl::string Out = fextl::fmt::format("# memory lock holds: {} of 4+ ms since the last line{}:", New + Lost,
+                                           Lost ? fextl::fmt::format(" (oldest {} not listed)", Lost) : fextl::string {});
+    for (uint32_t i = Long - New; i != Long; ++i) {
+      const auto& Slot = Info->Holds[i % 16];
+      const uint32_t Line = __atomic_load_n(&Slot.Line, __ATOMIC_RELAXED);
+      const uint32_t Tid = __atomic_load_n(&Slot.Tid, __ATOMIC_RELAXED);
+      const uint32_t HeldUs = __atomic_load_n(&Slot.HeldUs, __ATOMIC_RELAXED);
+      const uint64_t EndNs = __atomic_load_n(&Slot.EndNs, __ATOMIC_RELAXED);
+      const double AgoS = NowMono > 0 && static_cast<uint64_t>(NowMono) > EndNs ? (static_cast<uint64_t>(NowMono) - EndNs) / 1e9 : 0.0;
+      const double StartTicks = static_cast<double>(NowCounter) - (AgoS + HeldUs / 1e6) * Freq;
+      const uint64_t StartCounter = StartTicks > 0 ? static_cast<uint64_t>(StartTicks) : 0;
+      Out += fextl::fmt::format(" t={} {:.1f} ms virtual.c:{} tid={} {};", FrameTime(State, Seconds, StartCounter), HeldUs / 1000.0,
+                                VmLockLineName(Line), Tid, QueryThreadName(Tid));
+    }
+    return Out + "\n";
+  }
+
   fextl::string LockWaitLines(LogState* State, uint64_t Seconds) {
     if (!Probe) {
       return {};
@@ -3247,7 +3560,7 @@ namespace {
                                 static_cast<double>(E.Ticks) * MsPerTick);
       for (auto& S : Probe->Snaps) {
         if (S.Ready.load(std::memory_order_acquire) == 2 && S.Start == Start) {
-          Out += fextl::fmt::format(" | at {} ms: {}", S.AtMs, S.Text);
+          Out += fextl::fmt::format(" | at {} ms: {}{}", S.AtMs, VmHolderText(S.Holder), S.Text);
           S.Ready.store(0, std::memory_order_release);
         }
       }
@@ -4066,6 +4379,7 @@ namespace {
       Line += GpuLine();
       Line += ProbeLine(State, MsPerTick);
       Line += LockWaitLines(State, Seconds);
+      Line += VmLockHoldLines(State, Seconds);
       Line += FrameLines(State, Seconds);
       if (State->Profile) {
         Line += MainHitches(State, Seconds);
@@ -4425,6 +4739,19 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
 
 FEXCore::Utils::WritePriorityMutex::ContentionStats* StatsLogCodeLockStats() {
   return &CodeLockStats;
+}
+
+void StatsLogSetVmLockNotes(const void* Info) {
+  auto* Notes = static_cast<VmLockInfo*>(const_cast<void*>(Info));
+  VmLock.store(Notes, std::memory_order_relaxed);
+  const uint32_t Version = Notes ? __atomic_load_n(&Notes->Version, __ATOMIC_ACQUIRE) : 0;
+  StatsLogNote(!Notes        ? "memory lock: this Wine has no holder notes (__wine_d2r_vm_lock: stock Proton or our Proton older than "
+                               "d2r4), so '# memory lock wait' lines can't name the holder" :
+               Version == 1  ? "memory lock: Wine's holder notes found (our Proton d2r4 and later, __wine_d2r_vm_lock version 1): '# memory "
+                               "lock wait' lines name the holder ('Wine's notes: HELD by'), '# memory lock holds' lines list its holds of "
+                               "4 ms or more" :
+               Version == 0  ? "memory lock: Wine's holder notes are off (__wine_d2r_vm_lock version 0: WINE_D2R_VM_NOTES=0)" :
+                               "memory lock: Wine's holder notes have an unknown layout, not read");
 }
 
 void StatsLogSetLockProbe(void (*ProbeFunction)()) {

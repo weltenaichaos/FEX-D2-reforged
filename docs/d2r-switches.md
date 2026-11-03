@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 148, VKD3D fex41, Turnip fex17, frame generation layer 13 (TEST version 4). The build numbers in the
+State: FEX build 149, VKD3D fex41, Turnip fex18, frame generation layer 13, our Proton d2r4 (TEST version 4). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -16,7 +16,7 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
   those, `0` means "nice 0", not off.
 - The logging version lists every switch with its value in the `# switches:` line near the top of the log. Built-in
   values are marked `(default)`.
-- VKD3D switches need our VKD3D (fex41), Turnip switches our Turnip (fex17), frame generation switches our layer. A
+- VKD3D switches need our VKD3D (fex41), Turnip switches our Turnip (fex18), frame generation switches our layer. A
   VKD3D switch does nothing when its matching `VKD3D_FEX_*` variable is already set.
 - If you changed any switch, say so when you report a problem.
 
@@ -126,6 +126,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_TU_DEPTH_CLEAR` | `1` | Depth and colour clears at the start of a pass run as one 3D draw (Turnip fex3, fex8). | `0` |
 | `FEX_TU_BUDGET_CACHE` | `1` | The GPU memory budget is read at most every 250 ms instead of every frame (Turnip fex5). | `0` |
 | `FEX_TU_DRAW_SETUP` | `4` | The lighting shaders run without a setup step at all, their constants loaded by the command processor: lighting about 5% faster (Turnip fex15). | `0` |
+| `FEX_TU_PRESENT_NOWAIT` | `alt` | A frame goes to the screen without first waiting for the GPU work queued before that image's last trip to the screen (Turnip fex18, build 149). In build 148's heavy scenes the frame generation layer's presents waited 18-26 ms there, so real frames missed their slot. `alt` = on and off every 10 s for the comparison (the log's `turnip present` lines), `1` = always on. | `0` |
 
 ## Frame generation layer
 

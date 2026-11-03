@@ -1,0 +1,407 @@
+diff --git a/src/freedreno/vulkan/tu_fex.cc b/src/freedreno/vulkan/tu_fex.cc
+index ec7261f..8d319be 100644
+--- a/src/freedreno/vulkan/tu_fex.cc
++++ b/src/freedreno/vulkan/tu_fex.cc
+@@ -29,6 +29,8 @@
+ #include "tu_device.h"
+ #include "tu_knl.h"
+ 
++#include "wsi_common.h"
++
+ static int
+ tu_fex_ioctl(int fd, unsigned long request, void *arg)
+ {
+@@ -436,6 +438,71 @@ tu_fex_available_memory(uint64_t *available)
+    return ok;
+ }
+ 
++/* fex18: the present hook (wsi_device::fex_present_mode/_done). The WSI
++ * belongs to the physical device, so it uses the process's channel like
++ * the memory budget query does. */
++static struct tu_fex_channel *tu_fex_present_chan;
++
++static uint32_t
++tu_fex_present_mode(void)
++{
++   const uint32_t mode =
++      __atomic_load_n(&tu_fex_present_chan->mode, __ATOMIC_RELAXED);
++   return (mode & TU_FEX_MODE_PRESENT_NO_THROTTLE) ? WSI_FEX_PRESENT_NO_THROTTLE : 0;
++}
++
++static void
++tu_fex_store_max(volatile uint32_t *slot, uint64_t ns)
++{
++   const uint64_t us64 = ns / 1000;
++   const uint32_t us = us64 > UINT32_MAX ? UINT32_MAX : (uint32_t)us64;
++   uint32_t cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
++   while (us > cur &&
++          !__atomic_compare_exchange_n(slot, &cur, us, true, __ATOMIC_RELAXED,
++                                       __ATOMIC_RELAXED)) {
++   }
++}
++
++static void
++tu_fex_present_done(const struct wsi_fex_present *p)
++{
++   struct tu_fex_channel *c = tu_fex_present_chan;
++   const unsigned k = (p->mode & WSI_FEX_PRESENT_NO_THROTTLE) ? 1 : 0;
++   __atomic_fetch_add(&c->pr_calls[k], 1, __ATOMIC_RELAXED);
++   if (p->pending)
++      __atomic_fetch_add(&c->pr_pending[k], p->pending, __ATOMIC_RELAXED);
++   if (p->skipped)
++      __atomic_fetch_add(&c->pr_skipped, p->skipped, __ATOMIC_RELAXED);
++   if (p->stock_path)
++      __atomic_fetch_add(&c->pr_stock_path, p->stock_path, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->pr_gap[k], p->gap, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->pr_throttle_ns[k], p->throttle_ns, __ATOMIC_RELAXED);
++   if (p->wait_ns) {
++      __atomic_fetch_add(&c->pr_wait_ns[k], p->wait_ns, __ATOMIC_RELAXED);
++      tu_fex_store_max(&c->pr_wait_max_us[k], p->wait_ns);
++   }
++   __atomic_fetch_add(&c->pr_submit_ns[k], p->submit_ns, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->pr_queue_ns[k], p->queue_ns, __ATOMIC_RELAXED);
++   __atomic_fetch_add(&c->pr_total_ns[k], p->total_ns, __ATOMIC_RELAXED);
++   tu_fex_store_max(&c->pr_total_max_us[k], p->total_ns);
++}
++
++void
++tu_fex_wsi_init(struct wsi_device *wsi)
++{
++   struct tu_fex_channel *chan = tu_fex_budget_channel();
++   if (!chan || chan->ext_size < TU_FEX_CHANNEL_PRESENT_SIZE ||
++       !tu_fex_readable(chan, TU_FEX_CHANNEL_PRESENT_SIZE))
++      return;
++   const char *pr = getenv("TU_FEX_PRESENT");
++   if (pr && !strcmp(pr, "0"))
++      return;
++   tu_fex_present_chan = chan;
++   wsi->fex_present_mode = tu_fex_present_mode;
++   wsi->fex_present_done = tu_fex_present_done;
++   __atomic_fetch_or(&chan->status2, TU_FEX_STATUS2_PRESENT, __ATOMIC_RELEASE);
++}
++
+ uint32_t
+ tu_fex_begin_cmdbuf(struct tu_device *dev)
+ {
+diff --git a/src/freedreno/vulkan/tu_fex.h b/src/freedreno/vulkan/tu_fex.h
+index 1a0e70c..65f6c46 100644
+--- a/src/freedreno/vulkan/tu_fex.h
++++ b/src/freedreno/vulkan/tu_fex.h
+@@ -79,7 +79,7 @@
+ #define TU_FEX_MAGIC 0x58465554u /* 'TUFX' */
+ #define TU_FEX_VERSION 1
+ /* Patch level of this driver build, shown in FEX's log. */
+-#define TU_FEX_PATCH 17
++#define TU_FEX_PATCH 18
+ #define TU_FEX_MAX_COUNTERS 24
+ 
+ /* tu_fex_channel::mode bits */
+@@ -185,6 +185,18 @@
+  * render pass. Primary command buffers only. Passes recorded with it have
+  * tu_fex_slot::sysmem bit 2 set. */
+ #define TU_FEX_MODE_CONST_KEEP 0x1000u
++/* fex18 (needs TU_FEX_STATUS2_PRESENT): vkQueuePresentKHR does not wait for
++ * the throttle fence of the presented image when it is still pending
++ * (wsi_common_queue_present, WSI_FEX_PRESENT_NO_THROTTLE). That fence
++ * belongs to the image's last present, and its empty submit signals only
++ * once all GPU work submitted before it on the queue is done: D2R's frame
++ * gen layer presents on the game's only queue (KGSL has one), so in heavy
++ * scenes its presents waited 9-26 ms behind the game's next frame. Only
++ * swapchains without a blit (Turnip on GameNative's X server: NO_BLIT),
++ * without present timing and on a hardware device; the fence stays with
++ * the earlier present and this present's submit leaves it out. Read at
++ * every present, not per command buffer. */
++#define TU_FEX_MODE_PRESENT_NO_THROTTLE 0x2000u
+ /* Mode bits for command buffers (tu_fex_begin_cmdbuf). */
+ #define TU_FEX_MODE_MASK 0x1f6fu
+ /* fex5: the memory budget query reads /proc/meminfo at most every 250 ms and
+@@ -524,6 +536,35 @@ struct tu_fex_channel {
+    volatile uint64_t keep_runs;
+    volatile uint64_t keep_forced;
+    volatile uint64_t keep_moves;
++   /* 0x440 (fex18, driver; only when ext_size covers it): more status bits
++    * (TU_FEX_STATUS2_*; all 32 of 'status' are used). */
++   volatile uint32_t status2;
++   uint32_t pad_444;
++   /* 0x448: vkQueuePresentKHR calls through the driver's WSI, [0] = without
++    * TU_FEX_MODE_PRESENT_NO_THROTTLE, [1] = with it, and of their
++    * swapchains the ones whose throttle fence was still pending (the
++    * image's last present not done on the GPU yet). */
++   volatile uint64_t pr_calls[2];
++   volatile uint64_t pr_pending[2];
++   /* 0x468: [1] only: of the pending ones, presented without the wait; and
++    * (both) swapchains that keep the stock wait (blit, software device,
++    * present timing). */
++   volatile uint64_t pr_skipped;
++   volatile uint64_t pr_stock_path;
++   /* 0x478: sums: presents since the image's last present (how soon an
++    * image comes back), nanoseconds in the throttle step (fence status,
++    * waits, resets), of that blocked in WaitForFences, in the present's
++    * queue submit, in the swapchain's queue_present, the whole call. */
++   volatile uint64_t pr_gap[2];
++   volatile uint64_t pr_throttle_ns[2];
++   volatile uint64_t pr_wait_ns[2];
++   volatile uint64_t pr_submit_ns[2];
++   volatile uint64_t pr_queue_ns[2];
++   volatile uint64_t pr_total_ns[2];
++   /* 0x4d8: largest WaitForFences and whole call (microseconds) since FEX
++    * last set them to 0. */
++   volatile uint32_t pr_wait_max_us[2];
++   volatile uint32_t pr_total_max_us[2];
+ };
+ /* Size of the layout before fex11 (what 'size' holds). */
+ #define TU_FEX_CHANNEL_BASE_SIZE 0x2a8u
+@@ -541,6 +582,13 @@ struct tu_fex_channel {
+ #define TU_FEX_CHANNEL_CS_SIZE 0x400u
+ /* Size of the fex17 layout (kept constants statistics). */
+ #define TU_FEX_CHANNEL_KEEP_SIZE 0x440u
++/* Size of the fex18 layout (status2, present statistics). */
++#define TU_FEX_CHANNEL_PRESENT_SIZE 0x4e8u
++
++/* tu_fex_channel::status2 bits (driver, fex18) */
++/* The present hook is in place (TU_FEX_MODE_PRESENT_NO_THROTTLE honored,
++ * pr_* written). Unix env TU_FEX_PRESENT=0 leaves it out. */
++#define TU_FEX_STATUS2_PRESENT 0x1u
+ 
+ /* tu_fex_slot::mode bit (fex3): the pass clears a depth/stencil attachment
+  * at its start, so TU_FEX_MODE_DEPTH_CLEAR_3D may change its time. */
+@@ -606,7 +654,13 @@ static_assert(__builtin_offsetof(struct tu_fex_channel, cs_alt_shaders) == 0x3e0
+ static_assert(__builtin_offsetof(struct tu_fex_channel, dispatches_sampled) == 0x3f8, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, keep_emits) == TU_FEX_CHANNEL_CS_SIZE, "layout shared with FEX");
+ static_assert(__builtin_offsetof(struct tu_fex_channel, keep_vec4_kept) == 0x420, "layout shared with FEX");
+-static_assert(sizeof(struct tu_fex_channel) == TU_FEX_CHANNEL_KEEP_SIZE, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, status2) == TU_FEX_CHANNEL_KEEP_SIZE, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, pr_calls) == 0x448, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, pr_skipped) == 0x468, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, pr_gap) == 0x478, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, pr_total_ns) == 0x4c8, "layout shared with FEX");
++static_assert(__builtin_offsetof(struct tu_fex_channel, pr_wait_max_us) == 0x4d8, "layout shared with FEX");
++static_assert(sizeof(struct tu_fex_channel) == TU_FEX_CHANNEL_PRESENT_SIZE, "layout shared with FEX");
+ static_assert(sizeof(struct tu_fex_slot) == 48, "layout shared with FEX");
+ 
+ struct tu_device;
+@@ -736,6 +790,11 @@ struct tu_fex_device {
+ 
+ void tu_fex_device_init(struct tu_device *dev);
+ 
++struct wsi_device;
++/* fex18: installs the present hook (wsi_device::fex_present_mode) when the
++ * channel covers TU_FEX_CHANNEL_PRESENT_SIZE. Called by tu_wsi_init. */
++void tu_fex_wsi_init(struct wsi_device *wsi);
++
+ /* fex8: compute loop unrolling in effect (false without a channel). */
+ static inline bool
+ tu_fex_cs_unroll(const struct tu_fex_device *fex)
+diff --git a/src/freedreno/vulkan/tu_wsi.cc b/src/freedreno/vulkan/tu_wsi.cc
+index 4db6d5e..992b561 100644
+--- a/src/freedreno/vulkan/tu_wsi.cc
++++ b/src/freedreno/vulkan/tu_wsi.cc
+@@ -14,6 +14,7 @@
+ #include "wsi_common_drm.h"
+ 
+ #include "tu_device.h"
++#include "tu_fex.h"
+ 
+ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ tu_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
+@@ -52,6 +53,8 @@ tu_wsi_init(struct tu_physical_device *physical_device)
+    physical_device->wsi_device.supports_modifiers = true;
+    physical_device->wsi_device.can_present_on_device =
+       tu_wsi_can_present_on_device;
++   /* FEX-D2-reforged fex18: present statistics and the throttle switch. */
++   tu_fex_wsi_init(&physical_device->wsi_device);
+ 
+    physical_device->vk.wsi_device = &physical_device->wsi_device;
+ 
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index f40f078..08ae53b 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -2449,12 +2449,71 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++)
+       results[i] = VK_SUCCESS;
+ 
++   /* fex18 (FEX-D2-reforged): with wsi->fex_present_mode set, the throttle
++    * first checks the image's fence. It belongs to the image's last present,
++    * whose empty submit signals only after all GPU work submitted before it
++    * on this queue. With WSI_FEX_PRESENT_NO_THROTTLE and the fence still
++    * pending, a swapchain without blit and present timing presents without
++    * waiting: the fence stays with that earlier present (it is not reset or
++    * signaled again) and this present's submit leaves it out. Such a
++    * submit has no command buffers; the image itself is the application's
++    * to finish (it waits through the present's wait semaphores). */
++   const bool fex = wsi->fex_present_mode != NULL;
++   struct wsi_fex_present fex_info = {0};
++   int64_t fex_start = 0, fex_t = 0;
++   bool fex_timing = false;
++   STACK_ARRAY(bool, fex_no_fence, pPresentInfo->swapchainCount);
++   for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++)
++      fex_no_fence[i] = false;
++   if (fex) {
++      fex_start = os_time_get_nano();
++      fex_info.mode = wsi->fex_present_mode();
++      fex_info.swapchains = pPresentInfo->swapchainCount;
++      const VkPresentTimingsInfoEXT *timings =
++         vk_find_struct_const(pPresentInfo->pNext, PRESENT_TIMINGS_INFO_EXT);
++      fex_timing = (timings && timings->pTimingInfos) ||
++                   dev->enabled_extensions.GOOGLE_display_timing;
++   }
++
+    /* First, do the throttle waits, creating the throttle fences if needed */
+    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
+       VK_FROM_HANDLE(wsi_swapchain, swapchain, pPresentInfo->pSwapchains[i]);
+       uint32_t image_index = pPresentInfo->pImageIndices[i];
+ 
+-      if (swapchain->fences[image_index] == VK_NULL_HANDLE) {
++      if (fex && swapchain->fences[image_index] != VK_NULL_HANDLE) {
++         MESA_TRACE_SCOPE("throttle");
++         const bool eligible = swapchain->blit.type == WSI_SWAPCHAIN_NO_BLIT &&
++                               !wsi->sw && !fex_timing;
++         if (!eligible)
++            fex_info.stock_path++;
++         struct wsi_image *image =
++            swapchain->get_wsi_image(swapchain, image_index);
++         fex_info.gap += swapchain->present_serial - image->present_serial;
++
++         results[i] = wsi->GetFenceStatus(vk_device_to_handle(dev),
++                                          swapchain->fences[image_index]);
++         if (results[i] == VK_NOT_READY) {
++            fex_info.pending++;
++            if (eligible && (fex_info.mode & WSI_FEX_PRESENT_NO_THROTTLE)) {
++               fex_no_fence[i] = true;
++               fex_info.skipped++;
++               results[i] = VK_SUCCESS;
++               continue;
++            }
++            const int64_t wait_start = os_time_get_nano();
++            results[i] = wsi->WaitForFences(vk_device_to_handle(dev),
++                                            1, &swapchain->fences[image_index],
++                                            true, ~0ull);
++            fex_info.wait_ns += os_time_get_nano() - wait_start;
++         }
++         if (results[i] != VK_SUCCESS)
++            continue;
++
++         results[i] = wsi->ResetFences(vk_device_to_handle(dev),
++                                       1, &swapchain->fences[image_index]);
++         if (results[i] != VK_SUCCESS)
++            continue;
++      } else if (swapchain->fences[image_index] == VK_NULL_HANDLE) {
+          const VkFenceCreateInfo fence_info = {
+             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+             .pNext = NULL,
+@@ -2479,6 +2538,11 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+       }
+    }
+ 
++   if (fex) {
++      fex_t = os_time_get_nano();
++      fex_info.throttle_ns = fex_t - fex_start;
++   }
++
+    /* Gather up all the semaphores we need to wait on */
+    STACK_ARRAY(VkSemaphoreSubmitInfo, semaphore_wait_infos,
+                pPresentInfo->waitSemaphoreCount);
+@@ -2622,8 +2686,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+ 
+       wsi_image_signal_info_init(&image_signal_infos[i]);
+ 
+-      wsi_image_signal_info_add_fence(&image_signal_infos[i],
+-                                      swapchain->fences[image_index]);
++      if (!fex_no_fence[i])
++         wsi_image_signal_info_add_fence(&image_signal_infos[i],
++                                         swapchain->fences[image_index]);
+ 
+       if (swapchain->image_info.explicit_sync) {
+          /* We will signal this acquire value ourselves when GPU work is done. */
+@@ -2775,8 +2840,12 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+          .signalSemaphoreInfoCount = signal_semaphore_count,
+          .pSignalSemaphoreInfos = signal_semaphore_infos,
+       };
++      if (fex)
++         fex_t = os_time_get_nano();
+       VkResult result = wsi_queue_submit2_unordered(wsi, queue, &submit_info,
+                                                     fence_count, fences);
++      if (fex)
++         fex_info.submit_ns = os_time_get_nano() - fex_t;
+       if (result != VK_SUCCESS) {
+          /* If this failed, everything failed */
+          for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
+@@ -2895,9 +2964,13 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+       if (regions && regions->pRegions)
+          region = &regions->pRegions[i];
+ 
++      if (fex)
++         fex_t = os_time_get_nano();
+       results[i] = swapchain->queue_present(swapchain, image_index,
+                                             image_signal_infos[i].present_id,
+                                             region);
++      if (fex)
++         fex_info.queue_ns += os_time_get_nano() - fex_t;
+       if (results[i] != VK_SUCCESS && results[i] != VK_SUBOPTIMAL_KHR)
+          continue;
+ 
+@@ -2919,6 +2992,12 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+    STACK_ARRAY_FINISH(image_signal_infos);
+    STACK_ARRAY_FINISH(semaphore_wait_infos);
+    STACK_ARRAY_FINISH(results);
++   STACK_ARRAY_FINISH(fex_no_fence);
++
++   if (fex && wsi->fex_present_done) {
++      fex_info.total_ns = os_time_get_nano() - fex_start;
++      wsi->fex_present_done(&fex_info);
++   }
+ 
+    return final_result;
+ }
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index cfb921d..2a5d9a5 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -54,6 +54,29 @@ struct driOptionCache;
+ 
+ #define VK_ICD_WSI_PLATFORM_MAX (VK_ICD_WSI_PLATFORM_METAL + 1)
+ 
++/* fex18: present without the throttle wait when the image's last present
++ * is still running on the GPU (no blit, no present timing). */
++#define WSI_FEX_PRESENT_NO_THROTTLE 0x1u
++
++/* fex18: one wsi_common_queue_present call, for wsi_device::fex_present_done. */
++struct wsi_fex_present {
++   uint32_t mode;         /* WSI_FEX_PRESENT_* this call ran with */
++   uint32_t swapchains;   /* swapchains presented */
++   uint32_t pending;      /* throttle fences not signaled yet when checked
++                           * (the image's last present still on the GPU) */
++   uint32_t skipped;      /* of those, presented without waiting
++                           * (WSI_FEX_PRESENT_NO_THROTTLE) */
++   uint32_t stock_path;   /* swapchains that keep the wait (blit, software
++                           * device, present timing) */
++   uint32_t pad;
++   uint64_t gap;          /* presents since each image's last present (sum) */
++   uint64_t throttle_ns;  /* the throttle step: status checks, waits, resets */
++   uint64_t wait_ns;      /* of that, blocked in WaitForFences */
++   uint64_t submit_ns;    /* the present's queue submit */
++   uint64_t queue_ns;     /* swapchain->queue_present (all swapchains) */
++   uint64_t total_ns;     /* the whole call */
++};
++
+ struct wsi_device {
+    /* Allocator for the instance */
+    VkAllocationCallbacks instance_alloc;
+@@ -207,6 +230,16 @@ struct wsi_device {
+     */
+    struct vk_queue *(*get_blit_queue)(VkDevice device);
+ 
++   /*
++    * FEX-D2-reforged fex18 (see src/freedreno/vulkan/tu_fex.h). If set,
++    * wsi_common_queue_present asks fex_present_mode once per call whether
++    * to present without the throttle wait (WSI_FEX_PRESENT_NO_THROTTLE) and
++    * reports what the call did with fex_present_done. Both run on the
++    * presenting thread. NULL = stock.
++    */
++   uint32_t (*fex_present_mode)(void);
++   void (*fex_present_done)(const struct wsi_fex_present *info);
++
+ #define WSI_CB(cb) PFN_vk##cb cb
+    WSI_CB(AllocateMemory);
+    WSI_CB(AllocateCommandBuffers);

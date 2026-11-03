@@ -65,6 +65,8 @@ int SetNice(int Tid, int Nice);
 void SleepNs(uint64_t Ns);
 // The run time of a thread of this process in ns, exact even while it runs (its thread CPU clock), or a negative errno.
 int64_t ThreadCpuNs(int Tid);
+// CLOCK_MONOTONIC in nanoseconds (Wine's own notes use it), or a negative errno.
+int64_t MonotonicNs();
 // The state letter of a thread's stat file kept open ("/proc/self/task/<tid>/stat": 'R' = running or ready to run, 'S'
 // sleeping, 'D' waiting for storage ...), or 0 when it can't be read.
 char PreadTaskState(int Fd);

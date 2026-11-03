@@ -25,7 +25,9 @@
 # of compute shaders whose memory atomics hit one address for the whole wave, with those atomics
 # done once per wave, picked per second, plus time and GPU counters around big dispatches, and
 # (fex17) push set UBO ranges whose address didn't change kept in the shaders' constants in a
-# draw state group of their own, so a draw loads only the ranges that changed.
+# draw state group of their own, so a draw loads only the ranges that changed, and (fex18)
+# vkQueuePresentKHR without the throttle wait for an image whose last present is still queued
+# behind GPU work (no blit, no present timing), picked per 10 s, with present times counted.
 # Without FEX's link the driver behaves like stock Turnip.
 #
 # Recipe after The412Banner/banners-turnip build_turnip.sh (NDK r29, KGSL only).
@@ -40,7 +42,7 @@ on:
 env:
   MESA_TAG: mesa-26.3.0-rc2
   MESA_COMMIT: b34c71d9ff2f6514a1f947609d00e49be639edf8
-  FEX_PATCH: fex17
+  FEX_PATCH: fex18
   NDK: android-ndk-r29
   SDK: "34"
 
@@ -147,8 +149,11 @@ jobs:
           grep -q "TU_FEX_COMPILE_PUSH_SPECULATE" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_descriptor_set.cc"
           grep -q "tu_fex_clear_3d" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
           grep -q "tu_fex_color_clear_3d_index" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
-          grep -q "define TU_FEX_PATCH 17" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
+          grep -q "define TU_FEX_PATCH 18" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_fex.h"
           grep -q "tu_fex_keep_update" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
+          grep -q "WSI_FEX_PRESENT_NO_THROTTLE" "$GITHUB_WORKSPACE/mesa/src/vulkan/wsi/wsi_common.c"
+          grep -q "tu_fex_wsi_init" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_wsi.cc"
+          strings "$so" | grep -q TU_FEX_PRESENT
           grep -q "nir_opt_uniform_atomics_filtered" "$GITHUB_WORKSPACE/mesa/src/compiler/nir/nir_opt_uniform_atomics.c"
           grep -q "ir3_nir_fex_uniform_atomics" "$GITHUB_WORKSPACE/mesa/src/freedreno/ir3/ir3_nir.c"
           grep -q "tu_fex_dispatch_begin" "$GITHUB_WORKSPACE/mesa/src/freedreno/vulkan/tu_cmd_buffer.cc"
@@ -197,7 +202,7 @@ jobs:
           {
             "schemaVersion": 1,
             "name": "Turnip ${MESA_VERSION} FEX ${FEX_PATCH} (build ${{ github.run_number }})",
-            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets, preamble loads first, list loops read ahead, 3D depth and color clears, compute loops unrolled further, root constant buffers loaded by the command processor or read through the shader's UBO table and a cached memory budget, and unchanged root constant buffer ranges kept in the shaders' constants (fex17), via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
+            "description": "Mesa ${MESA_VERSION} Turnip (KGSL) with FEX-D2-reforged turnip-patches: descriptor cache fix, GPU counters, early preambles for push descriptor sets, preamble loads first, list loops read ahead, 3D depth and color clears, compute loops unrolled further, root constant buffers loaded by the command processor or read through the shader's UBO table and a cached memory budget, unchanged root constant buffer ranges kept in the shaders' constants (fex17) and presents without the throttle wait behind queued GPU work (fex18), via FEX's link (TU_FEX_CHANNEL). Behaves like stock Turnip without FEX's link.",
             "author": "FEX-D2-reforged",
             "packageVersion": "${{ github.run_number }}",
             "vendor": "Mesa",
@@ -362,6 +367,18 @@ jobs:
             emit and barrier inside a pass. Host check: 640 -> 184 vec4 over 8 D2R-like draws, sysmem and
             gmem, pipeline switches and barriers. Status bit 0x80000000; the channel extension (0x400,
             ext_size 0x440) adds the counts.
+            fex18 (FEX build 149 and later, FEX_TU_PRESENT_NOWAIT=alt|1|0): vkQueuePresentKHR waits
+            (stock "throttle") for the fence of the presented image's last present. That present's empty
+            submit signals only after all GPU work submitted before it on the queue, and KGSL gives one
+            queue, so D2R's frame gen layer, which presents on the game's queue, waited 9-26 ms a present
+            behind the game's next frame in heavy scenes. With FEX's mode bit (0x2000, read at every
+            present) a swapchain without blit and present timing (Turnip on GameNative's X server:
+            NO_BLIT) presents at once when that fence is still pending: the fence stays with the earlier
+            present (not reset, not signaled again) and this submit leaves it out; the image is the
+            application's to finish, as it is in stock without the wait. The driver counts presents,
+            pending fences, skips, the image's distance to its last present and the times of the
+            throttle step, the fence wait, the submit and queue_present for both settings. Status2 bit 0x1
+            (channel extension 0x440, ext_size 0x4e8); Unix env TU_FEX_PRESENT=0 leaves the hook out.
             Without FEX's link it behaves like stock Turnip.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

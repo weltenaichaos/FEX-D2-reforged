@@ -273,6 +273,15 @@ int64_t ThreadCpuNs(int Tid) {
   return Result < 0 ? Result : Time.Seconds * 1'000'000'000 + Time.Nanoseconds;
 }
 
+int64_t MonotonicNs() {
+  struct {
+    int64_t Seconds;
+    int64_t Nanoseconds;
+  } Time {};
+  const int64_t Result = Syscall(NR_clock_gettime, 1 /* CLOCK_MONOTONIC */, reinterpret_cast<intptr_t>(&Time));
+  return Result < 0 ? Result : Time.Seconds * 1'000'000'000 + Time.Nanoseconds;
+}
+
 char PreadTaskState(int Fd) {
   char Buffer[256];
   const int64_t Len = Fd >= 0 ? Pread(Fd, Buffer, sizeof(Buffer) - 1, 0) : -9;

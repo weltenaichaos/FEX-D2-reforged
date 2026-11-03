@@ -76,4 +76,10 @@ FEXCore::Utils::WritePriorityMutex::ContentionStats* StatsLogCodeLockStats();
 // memory map lock), Probe (FEX's global memory/SMC lock), and every 16ms a wineserver round trip. Each second's longest
 // of each goes on a "probe" line, and every "# frame" line gets the longest ones that overlapped that frame.
 void StatsLogSetLockProbe(void (*Probe)());
+
+// Wine's memory lock holder notes (build 149): Info = PE ntdll's export __wine_d2r_vm_lock (our Proton d2r4 and later,
+// struct d2r_vm_lock_info of proton-patches/11.0-1/0006), nullptr when this Wine has none. '# memory lock wait' lines then
+// name the thread that held the lock, where it took it and for how long, and '# memory lock holds' lines list the holds
+// of 4 ms or more Wine noted since the last line.
+void StatsLogSetVmLockNotes(const void* Info);
 } // namespace FEX::Windows
