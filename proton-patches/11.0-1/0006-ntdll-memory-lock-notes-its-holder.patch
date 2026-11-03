@@ -12,7 +12,9 @@ holder only; a reader takes tid, line and since_ns and checks tid again.
 
 The hooks wrap server_enter/leave_uninterrupted_section and mutex_lock/unlock inside
 unix/virtual.c (all of them lock virtual_mutex there), so no call site changes. Cost:
-two vDSO clock reads per outermost hold.
+two vDSO clock reads per outermost hold. Each lock place also leaves its line in
+section d2r_vm_sites of ntdll.so, so the build can prove that the line table it ships
+(share/wine/d2r-vm-lock-lines.txt) names the lines of the code that was compiled.
 
 WINE_D2R_VM_NOTES=0 leaves the notes off (read once per process at start).
 ---
@@ -95,10 +97,10 @@ index 2f649ca..d077c7b 100644
  struct ntdll_thread_data
  {
 diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
-index afd45ed..53a1e73 100644
+index afd45ed..6e39320 100644
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
-@@ -296,6 +296,85 @@ static struct wine_rb_tree views_tree;
+@@ -296,6 +296,90 @@ static struct wine_rb_tree views_tree;
  static pthread_mutex_t virtual_mutex;
  static BOOL d2r_vm_io_locked;  /* WINE_D2R_VM_IO=0: I/O under virtual_mutex as stock Wine */
  
@@ -176,9 +178,14 @@ index afd45ed..53a1e73 100644
 +    (mutex_unlock)( mutex );
 +}
 +
-+#define server_enter_uninterrupted_section( mutex, sigset ) d2r_enter_section( mutex, sigset, __LINE__ )
++/* each place that takes the lock also leaves its line in section d2r_vm_sites of ntdll.so,
++ * so the build can prove the line table it ships (share/wine/d2r-vm-lock-lines.txt)
++ * names the lines of the code that was really compiled */
++#define D2R_VM_SITE() ({ static const int __attribute__((used, retain, section("d2r_vm_sites"))) \
++                         d2r_vm_site = __LINE__; d2r_vm_site; })
++#define server_enter_uninterrupted_section( mutex, sigset ) d2r_enter_section( mutex, sigset, D2R_VM_SITE() )
 +#define server_leave_uninterrupted_section( mutex, sigset ) d2r_leave_section( mutex, sigset )
-+#define mutex_lock( mutex ) d2r_mutex_lock( mutex, __LINE__ )
++#define mutex_lock( mutex ) d2r_mutex_lock( mutex, D2R_VM_SITE() )
 +#define mutex_unlock( mutex ) d2r_mutex_unlock( mutex )
 +
  static const UINT page_shift = 12;

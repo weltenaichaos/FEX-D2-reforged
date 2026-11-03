@@ -83,6 +83,31 @@ check_0006() {
   done
   if ascii_in "$NTSO" __wine_d2r_vm_lock; then ok 0006 "${NTSO#$LIB/} looks up __wine_d2r_vm_lock"; else bad 0006 "${NTSO#$LIB/} never looks up __wine_d2r_vm_lock"; fi
   if ascii_in "$NTSO" WINE_D2R_VM_NOTES; then ok 0006 "${NTSO#$LIB/} reads WINE_D2R_VM_NOTES"; else bad 0006 "${NTSO#$LIB/} lacks WINE_D2R_VM_NOTES"; fi
+  # the shipped line table (VM_LINES) must list exactly the lines the binary notes (every
+  # lock place leaves its line in section d2r_vm_sites), and each of them must be a lock
+  # place in the compiled source (VM_SOURCE: virtual.c after all patches)
+  local built table l miss=
+  built=$(python3 -I "$(dirname "$0")/elf-section-u32.py" "$NTSO" d2r_vm_sites 2>&1 | sort -n | tr '\n' ' ')
+  table=$( [ -s "${VM_LINES:-}" ] && cut -d' ' -f1 "$VM_LINES" | sort -n | tr '\n' ' ')
+  if [ -z "$table" ]; then bad 0006 "no line table given (VM_LINES)"
+  elif [ "$built" = "$table" ]; then ok 0006 "line table matches the $(echo $built | wc -w) lock places built into ${NTSO#$LIB/}"
+  else bad 0006 "line table doesn't match ${NTSO#$LIB/}: built '$built', table '$table'"; fi
+  if [ -s "${VM_SOURCE:-}" ]; then
+    for l in $table; do
+      sed -n "${l}p" "$VM_SOURCE" | grep -qE 'server_enter_uninterrupted_section\( *&virtual_mutex|mutex_lock\( *&virtual_mutex' || miss="$miss $l"
+    done
+    if [ -z "$miss" ]; then ok 0006 "every table line takes the lock in the compiled virtual.c"; else bad 0006 "table lines without a lock in the compiled virtual.c:$miss"; fi
+  else bad 0006 "no compiled virtual.c given (VM_SOURCE)"; fi
+}
+
+# 0007: NtContinue/NtContinueEx to x64 code enter the emulator directly; off switch is there
+check_0007() {
+  local s n
+  for s in 'NtContinue' 'NtContinueEx'; do
+    n=$($OBJDUMP -d --no-show-raw-insn --disassemble-symbols="#$s\$hp_target" "$NT" 2>/dev/null | grep -c 'dispatch_emulation')
+    if [ "$n" -ge 1 ]; then ok 0007 "#$s calls dispatch_emulation"; else bad 0007 "#$s never calls dispatch_emulation (stock syscall only)"; fi
+  done
+  if utf16_in "$NT" WINE_D2R_FAST_CONTINUE; then ok 0007 "${NT#$LIB/} reads WINE_D2R_FAST_CONTINUE"; else bad 0007 "${NT#$LIB/} lacks WINE_D2R_FAST_CONTINUE"; fi
 }
 
 for p in "$PATCHES"/*.patch; do

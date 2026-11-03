@@ -1,0 +1,107 @@
+ntdll: NtContinue to x64 code enters the emulator without a syscall on ARM64EC.
+
+Backport of GameNative/proton-wine 5f2dad0 (#86, proton_11.0-2), the NtContinue part.
+When NtContinue targets x64 code, the unix side only sets the context and returns into
+KiUserEmulationDispatcher, which takes the slow full-context return: about 87 us per
+handled guest exception. D2R's protection thread handles guest exceptions all the time
+and spends 6-10% of a core inside NtContinue (b150: tid 800, 17% CPU, NtContinue 6.2%
+of every second on average). For a non-alertable continue with a full context to
+non-EC code, the PE side now calls dispatch_emulation directly (1.5 us measured by
+GameNative). It falls back to the syscall when a suspend is pending, a debugger is
+attached, there is no emulator, or the current frame could overlap the target stack.
+
+WINE_D2R_FAST_CONTINUE=0 always takes the syscall as stock Wine (read once per process
+at start).
+---
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index 313882a..9de4eff 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -4679,6 +4679,13 @@ void loader_init( CONTEXT *context, void **entry )
+             ERR( "d2r: every wake takes the wait list lock as in stock Wine (WINE_D2R_WAKE_FAST=0).\n" );
+             d2r_wake_slow = TRUE;
+         }
++#ifdef __arm64ec__
++        if (get_env( L"WINE_D2R_FAST_CONTINUE", env_str, sizeof(env_str)) && env_str[0] == L'0')
++        {
++            ERR( "d2r: NtContinue to x64 code takes the syscall as in stock Wine (WINE_D2R_FAST_CONTINUE=0).\n" );
++            d2r_continue_slow = TRUE;
++        }
++#endif
+ 
+         peb->ProcessHeap        = RtlCreateHeap( heap_flags, NULL, 0, 0, NULL, NULL );
+ 
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index 8600619..cde0daa 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -56,6 +56,9 @@ extern BOOL heap_zero_hack;
+ extern BOOL heap_top_down_hack;
+ extern BOOL d2r_wait_lock_spin;
+ extern BOOL d2r_wake_slow;
++#ifdef __arm64ec__
++extern BOOL d2r_continue_slow;
++#endif
+ 
+ /* exceptions */
+ extern NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *context );
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 3a8576d..badada9 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -63,6 +63,8 @@ static NTSTATUS (WINAPI *pThreadInit)(void);
+ static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
+ static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
+ 
++void dispatch_emulation( ARM64_NT_CONTEXT *arm_ctx );
++
+ static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+ static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
+ extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispatcher");
+@@ -655,19 +657,46 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
+     return status;
+ }
+ 
++BOOL d2r_continue_slow = FALSE;  /* WINE_D2R_FAST_CONTINUE=0: always the syscall, as stock Wine */
++
++static BOOL can_continue_in_emulator( const CONTEXT *context, ULONG_PTR frame )
++{
++    CHPE_V2_CPU_AREA_INFO *cpu_area = get_arm64ec_cpu_area();
++
++    if (d2r_continue_slow) return FALSE;
++    if (!pBeginSimulation) return FALSE;
++    if ((context->ContextFlags & CONTEXT_AMD64_FULL) != CONTEXT_AMD64_FULL) return FALSE;
++    if (RtlIsEcCode( context->Rip )) return FALSE;
++    if (frame >= context->Rsp &&
++        (frame < cpu_area->EmulatorStackLimit || frame > cpu_area->EmulatorStackBase)) return FALSE;
++    if (NtCurrentTeb()->Peb->BeingDebugged) return FALSE;
++    if (cpu_area->SuspendDoorbell && *cpu_area->SuspendDoorbell) return FALSE;
++    return TRUE;
++}
++
+ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
+     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++    if (!alertable && can_continue_in_emulator( context, (ULONG_PTR)__builtin_frame_address(0) ))
++        dispatch_emulation( &arm_ctx );
+     return syscall_NtContinue( &arm_ctx, alertable );
+ }
+ 
+ NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
++    BOOL alertable;
++
++    if ((UINT_PTR)args > 0xff)
++        alertable = args->ContinueFlags & KCONTINUE_FLAG_TEST_ALERT;
++    else
++        alertable = !!args;
+ 
+     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++    if (!alertable && can_continue_in_emulator( context, (ULONG_PTR)__builtin_frame_address(0) ))
++        dispatch_emulation( &arm_ctx );
+     return syscall_NtContinueEx( &arm_ctx, args );
+ }
+ 

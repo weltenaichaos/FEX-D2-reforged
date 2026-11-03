@@ -38,7 +38,7 @@ env:
   PROTON_REPO: GameNative/proton-wine
   PROTON_REF: f7c016668db739f563e3d4781c27ed085843d63a
   PROTON_VERSION: 11.0-1
-  D2R_TAG: d2r4
+  D2R_TAG: d2r5
   CCACHE_DIR: /home/runner/.ccache
   CCACHE_COMPILERCHECK: content
   CCACHE_MAXSIZE: 3G
@@ -76,8 +76,6 @@ jobs:
             git apply --verbose "$p"
           done
           git diff --stat
-          # where virtual.c takes the memory lock, to read patch 0006's line numbers
-          bash fex-src/tools/proton/vm-lock-lines.sh dlls/ntdll/unix/virtual.c > "$RUNNER_TEMP/vm-lock-lines.txt"
           # keep the patch folder out of the source tree (configure/autogen don't need it)
           mv fex-src "$RUNNER_TEMP/fex-src"
 
@@ -197,6 +195,13 @@ jobs:
           OBJDUMP=$HOME/toolchains/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64/bin/llvm-objdump
           [ -x "$OBJDUMP" ] || OBJDUMP=$(command -v llvm-objdump-18 || command -v llvm-objdump)
           echo "objdump: $OBJDUMP"
+          # patch 0006's line table: the places the built ntdll.so takes the memory lock (its own
+          # list), named from virtual.c as compiled, i.e. after GameNative's Android patches from
+          # the Configure step (they move lines; a table made before them was 15 lines off in d2r4)
+          bash $RUNNER_TEMP/fex-src/tools/proton/vm-lock-lines.sh dlls/ntdll/unix/virtual.c \
+            $HOME/compiled-files-aarch64/lib/wine/aarch64-unix/ntdll.so > $RUNNER_TEMP/vm-lock-lines.txt
+          cat $RUNNER_TEMP/vm-lock-lines.txt
+          VM_LINES=$RUNNER_TEMP/vm-lock-lines.txt VM_SOURCE=dlls/ntdll/unix/virtual.c \
           OBJDUMP=$OBJDUMP bash $RUNNER_TEMP/fex-src/tools/proton/check-patches.sh $HOME/compiled-files-aarch64 \
             $RUNNER_TEMP/fex-src/proton-patches/${PROTON_VERSION} | tee $RUNNER_TEMP/checks.txt
 
@@ -267,6 +272,7 @@ jobs:
             echo "- WINE_D2R_WAKE_FAST=0: every wake takes the wait list lock as in stock Wine (0004)"
             echo "- WINE_D2R_VM_IO=0: pipe, device and socket I/O under the memory lock as in stock Wine (0005)"
             echo "- WINE_D2R_VM_NOTES=0: the memory lock keeps no holder notes (0006)"
+            echo "- WINE_D2R_FAST_CONTINUE=0: NtContinue to x64 code takes the syscall as in stock Wine (0007)"
             echo
             echo "Binary checks of this build:"
             echo '```'
