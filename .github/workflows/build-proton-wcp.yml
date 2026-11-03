@@ -38,7 +38,7 @@ env:
   PROTON_REPO: GameNative/proton-wine
   PROTON_REF: f7c016668db739f563e3d4781c27ed085843d63a
   PROTON_VERSION: 11.0-1
-  D2R_TAG: d2r5
+  D2R_TAG: d2r6
   CCACHE_DIR: /home/runner/.ccache
   CCACHE_COMPILERCHECK: content
   CCACHE_MAXSIZE: 3G
@@ -208,6 +208,11 @@ jobs:
           bash $RUNNER_TEMP/fex-src/tools/proton/vm-lock-lines.sh dlls/ntdll/unix/virtual.c \
             $HOME/compiled-files-aarch64/lib/wine/aarch64-unix/ntdll.so > $RUNNER_TEMP/vm-lock-lines.txt
           cat $RUNNER_TEMP/vm-lock-lines.txt
+          # patch 0008's request name table, from server_protocol.h as compiled (autogen.sh
+          # regenerates it after GameNative's protocol.def patch, so numbers differ from git's)
+          bash $RUNNER_TEMP/fex-src/tools/proton/server-requests.sh include/wine/server_protocol.h > $RUNNER_TEMP/server-requests.txt
+          wc -l $RUNNER_TEMP/server-requests.txt
+          REQ_NAMES=$RUNNER_TEMP/server-requests.txt \
           VM_LINES=$RUNNER_TEMP/vm-lock-lines.txt VM_SOURCE=dlls/ntdll/unix/virtual.c \
           OBJDUMP=$OBJDUMP bash $RUNNER_TEMP/fex-src/tools/proton/check-patches.sh $HOME/compiled-files-aarch64 \
             $RUNNER_TEMP/fex-src/proton-patches/${PROTON_VERSION} | tee $RUNNER_TEMP/checks.txt
@@ -225,6 +230,7 @@ jobs:
             echo "binary checks:"; cat $RUNNER_TEMP/checks.txt
           } > share/wine/d2r-proton.txt
           cp $RUNNER_TEMP/vm-lock-lines.txt share/wine/d2r-vm-lock-lines.txt
+          cp $RUNNER_TEMP/server-requests.txt share/wine/d2r-server-requests.txt
           cat share/wine/d2r-proton.txt
           cat > profile.json <<EOF
           {
@@ -280,6 +286,8 @@ jobs:
             echo "- WINE_D2R_VM_IO=0: pipe, device and socket I/O under the memory lock as in stock Wine (0005)"
             echo "- WINE_D2R_VM_NOTES=0: the memory lock keeps no holder notes (0006)"
             echo "- WINE_D2R_FAST_CONTINUE=0: NtContinue to x64 code takes the syscall as in stock Wine (0007)"
+            echo "- WINE_D2R_EVENT_REUSE=0: anonymous events are closed as in stock Wine (0008)"
+            echo "- WINE_D2R_CALL_COUNTS=0: no wineserver request counters (0008)"
             echo
             echo "Binary checks of this build:"
             echo '```'

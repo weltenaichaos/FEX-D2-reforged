@@ -112,6 +112,23 @@ check_0007() {
   if utf16_in "$NT" WINE_D2R_FAST_CONTINUE; then ok 0007 "${NT#$LIB/} reads WINE_D2R_FAST_CONTINUE"; else bad 0007 "${NT#$LIB/} lacks WINE_D2R_FAST_CONTINUE"; fi
 }
 
+# 0008: anonymous events kept for reuse (off switch), request counters in PE ntdll's
+# __wine_d2r_server_calls, and the shipped request name table (REQ_NAMES, made from the
+# compiled server_protocol.h) has as many lines as the build has request types
+check_0008() {
+  local f n t
+  for f in "$NT" "$NT32"; do
+    if exports "$f" __wine_d2r_server_calls; then ok 0008 "${f#$LIB/} exports __wine_d2r_server_calls"; else bad 0008 "${f#$LIB/} lacks __wine_d2r_server_calls"; fi
+  done
+  if ascii_in "$NTSO" WINE_D2R_EVENT_REUSE; then ok 0008 "${NTSO#$LIB/} reads WINE_D2R_EVENT_REUSE"; else bad 0008 "${NTSO#$LIB/} lacks WINE_D2R_EVENT_REUSE"; fi
+  if ascii_in "$NTSO" WINE_D2R_CALL_COUNTS; then ok 0008 "${NTSO#$LIB/} reads WINE_D2R_CALL_COUNTS"; else bad 0008 "${NTSO#$LIB/} lacks WINE_D2R_CALL_COUNTS"; fi
+  if ascii_in "$NTSO" __wine_d2r_server_calls; then ok 0008 "${NTSO#$LIB/} looks up __wine_d2r_server_calls"; else bad 0008 "${NTSO#$LIB/} never looks up __wine_d2r_server_calls"; fi
+  n=$(python3 -I "$(dirname "$0")/elf-section-u32.py" "$NTSO" d2r_server_reqs 2>/dev/null)
+  t=$( [ -s "${REQ_NAMES:-}" ] && wc -l < "$REQ_NAMES")
+  if [ -n "$n" ] && [ "$n" = "$t" ]; then ok 0008 "request name table has the $n request types of ${NTSO#$LIB/}"
+  else bad 0008 "request name table has '${t:-no file}' lines, ${NTSO#$LIB/} has '${n:-no section}' request types"; fi
+}
+
 for p in "$PATCHES"/*.patch; do
   n=$(basename "$p"); n=${n%%-*}
   if declare -F "check_$n" >/dev/null; then "check_$n"; else bad "$n" "no check for $(basename "$p") in check-patches.sh"; fi

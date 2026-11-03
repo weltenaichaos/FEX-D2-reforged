@@ -1,0 +1,536 @@
+ntdll: anonymous events closed right after they were made are kept for reuse; request counters.
+
+D2R's protection thread makes an unnamed auto-reset event (initially set) and closes it
+0.2 ms later, about 1,500 times a second (b150: tid 600, 1,534 pairs/s), and never waits
+on it. Each pair costs two wineserver round trips (create_event, close_handle), so about
+3,000 server calls a second; wineserver CPU went from 138 ms/s with that loop idle to
+270 ms/s while it runs, on a device where every core is already short.
+
+An event that NtCreateEvent makes with EVENT_ALL_ACCESS and no name, root directory,
+security descriptor, quality of service or attribute other than OBJ_CASE_INSENSITIVE /
+OBJ_OPENIF is noted as fresh (handle, making thread, type, time). When the thread that
+made it closes it within 10 ms and nothing else can hold a reference to it, NtClose keeps
+it open in a pool (16 per type) instead of sending close_handle. A fresh event is left out
+when it is duplicated (NtDuplicateObject), given to an I/O call (NtReadFile, NtWriteFile,
+the scatter/gather versions, NtDeviceIoControlFile, NtFsControlFile, NtLockFile,
+NtNotifyChangeDirectoryFile, NtNotifyChangeMultipleKeys, socket event select), has its
+handle flags changed (NtSetInformationObject) or is waited on by another thread. The next
+plain NtCreateEvent of the same type takes a kept event back and sets its state with
+NtSetEvent or NtResetEvent; the inproc sync fd stays cached, so no server call at all.
+A handle closed again while in the pool really closes.
+
+The unix side also counts every wineserver request by type, with its round trip time
+(CLOCK_MONOTONIC from send to reply; a select includes its wait), and the event reuse
+outcomes, in PE ntdll's export __wine_d2r_server_calls (struct d2r_server_calls, version
+1, 8,256 bytes) for FEX. Section d2r_server_reqs of ntdll.so holds REQ_NB_REQUESTS so the
+build can check the request name table it ships (share/wine/d2r-server-requests.txt).
+
+WINE_D2R_EVENT_REUSE=0 closes every event as stock Wine; WINE_D2R_CALL_COUNTS=0 leaves
+the counters off (version stays 0). Both are read once per process.
+---
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 59a28b8..0b5517c 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1757,6 +1757,7 @@
+ @ extern -private __wine_unixlib_handle
+ @ extern -private __wine_d2r_wait_lists
+ @ extern -private __wine_d2r_vm_lock
++@ extern -private __wine_d2r_server_calls
+ @ stdcall __wine_get_unix_env(ptr ptr long)
+ @ stdcall __wine_set_unix_env(ptr ptr)
+ @ stdcall wine_nt_to_unix_file_name(ptr ptr ptr long) compat_wine_nt_to_unix_file_name
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index c607e4f..1ba63a3 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -855,6 +855,10 @@ const ULONG __wine_d2r_wait_lists = 3;
+  * (struct d2r_vm_lock_info in unix/unix_private.h), read by FEX's lock watch. */
+ DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_vm_lock[64];
+ 
++/* d2r (patch 0008): wineserver request counters and event reuse counters, written by the
++ * unix side (struct d2r_server_calls in unix/unix_private.h), read by FEX */
++DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls[1032];
++
+ /* WINE_D2R_WAIT_LOCK=0 (read in loader_init): spin until free, as stock Wine does */
+ BOOL d2r_wait_lock_spin = FALSE;
+ 
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 7ca5d05..04e4a10 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -6534,6 +6534,8 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
+     ULONG_PTR cvalue = apc ? 0 : (ULONG_PTR)apc_user;
+     BOOL send_completion = FALSE, async_read, timeout_init_done = FALSE;
+ 
++    d2r_event_shared( event, FALSE );  /* d2r (patch 0008): the server may keep a reference to the event */
++
+     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\n",
+            handle, event, apc, apc_user, io, buffer, length, offset, key );
+ 
+@@ -6742,6 +6744,8 @@ NTSTATUS WINAPI NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
+     ULONG_PTR cvalue = apc ? 0 : (ULONG_PTR)apc_user;
+     BOOL send_completion = FALSE;
+ 
++    d2r_event_shared( event, FALSE );  /* d2r (patch 0008): the server may keep a reference to the event */
++
+     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p),partial stub!\n",
+            file, event, apc, apc_user, io, segments, length, offset, key );
+ 
+@@ -6821,6 +6825,8 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
+     BOOL send_completion = FALSE, async_write, append_write = FALSE, timeout_init_done = FALSE;
+     LARGE_INTEGER offset_eof;
+ 
++    d2r_event_shared( event, FALSE );  /* d2r (patch 0008): the server may keep a reference to the event */
++
+     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\n",
+            handle, event, apc, apc_user, io, buffer, length, offset, key );
+ 
+@@ -7041,6 +7047,8 @@ NTSTATUS WINAPI NtWriteFileGather( HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
+     UINT pos = 0, total = 0;
+     enum server_fd_type type;
+ 
++    d2r_event_shared( event, FALSE );  /* d2r (patch 0008): the server may keep a reference to the event */
++
+     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p),partial stub!\n",
+            file, event, apc, apc_user, io, segments, length, offset, key );
+ 
+@@ -7117,6 +7125,8 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
+     ULONG device = (code >> 16);
+     NTSTATUS status = STATUS_NOT_SUPPORTED;
+ 
++    d2r_event_shared( event, FALSE );  /* d2r (patch 0008): the server may keep a reference to the event */
++
+     TRACE( "(%p,%p,%p,%p,%p,0x%08x,%p,0x%08x,%p,0x%08x)\n",
+            handle, event, apc, apc_context, io, code,
+            in_buffer, in_size, out_buffer, out_size );
+@@ -7205,6 +7215,8 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
+     ULONG_PTR size = 0;
+     NTSTATUS status;
+ 
++    d2r_event_shared( event, FALSE );  /* d2r (patch 0008): the server may keep a reference to the event */
++
+     TRACE( "(%p,%p,%p,%p,%p,0x%08x,%p,0x%08x,%p,0x%08x)\n",
+            handle, event, apc, apc_context, io, code,
+            in_buffer, in_size, out_buffer, out_size );
+@@ -7464,6 +7476,8 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
+     HANDLE handle;
+     BOOLEAN async;
+ 
++    d2r_event_shared( event, FALSE );  /* d2r (patch 0008): the server may keep a reference to the event */
++
+     if (apc || io_status || key)
+     {
+         FIXME("Unimplemented yet parameter\n");
+@@ -7635,6 +7649,8 @@ NTSTATUS WINAPI NtNotifyChangeDirectoryFile( HANDLE handle, HANDLE event, PIO_AP
+     unsigned int status;
+     ULONG size = max( 4096, buffer_size );
+ 
++    d2r_event_shared( event, FALSE );  /* d2r (patch 0008): the server may keep a reference to the event */
++
+     TRACE( "%p %p %p %p %p %p %u %u %d\n",
+            handle, event, apc, apc_context, iosb, buffer, buffer_size, filter, subtree );
+ 
+@@ -8377,6 +8393,8 @@ NTSTATUS WINAPI NtSetInformationObject( HANDLE handle, OBJECT_INFORMATION_CLASS
+ {
+     unsigned int status;
+ 
++    d2r_event_shared( handle, FALSE );  /* d2r (patch 0008): handle flags change, never reuse the event */
++
+     TRACE("(%p,0x%08x,%p,0x%08x)\n", handle, info_class, ptr, len);
+ 
+     switch (info_class)
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 8ef845a..7376837 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2018,6 +2018,14 @@ static void load_ntdll_functions( HMODULE module )
+     if (!(getenv( "WINE_D2R_VM_NOTES" ) && getenv( "WINE_D2R_VM_NOTES" )[0] == '0') &&
+         (d2r_vm_lock = (void *)find_named_export( module, exports, "__wine_d2r_vm_lock" )))
+         d2r_vm_lock->version = 1;
++    /* d2r: wineserver request and event reuse counters for FEX (patch 0008), off with
++     * WINE_D2R_CALL_COUNTS=0 */
++    if (!(getenv( "WINE_D2R_CALL_COUNTS" ) && getenv( "WINE_D2R_CALL_COUNTS" )[0] == '0') &&
++        (d2r_server_calls = (void *)find_named_export( module, exports, "__wine_d2r_server_calls" )))
++    {
++        d2r_server_calls->nb_requests = REQ_NB_REQUESTS;
++        WriteRelease( (LONG *)&d2r_server_calls->version, 1 );
++    }
+ #undef GET_FUNC
+ }
+ 
+diff --git a/dlls/ntdll/unix/registry.c b/dlls/ntdll/unix/registry.c
+index 6b4457d..d1df93f 100644
+--- a/dlls/ntdll/unix/registry.c
++++ b/dlls/ntdll/unix/registry.c
+@@ -889,6 +889,7 @@ NTSTATUS WINAPI NtNotifyChangeMultipleKeys( HANDLE key, ULONG count, OBJECT_ATTR
+         if (ret) return ret;
+     }
+ 
++    d2r_event_shared( event, FALSE );  /* d2r (patch 0008): the server keeps a reference to the event */
+     SERVER_START_REQ( set_registry_notification )
+     {
+         req->hkey    = wine_server_obj_handle( key );
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 5d8a59b..f8476db 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -286,12 +286,31 @@ static inline unsigned int wait_reply( struct __server_request_info *req )
+ }
+ 
+ 
++/* d2r (patch 0008): requests by type for FEX, see struct d2r_server_calls */
++struct d2r_server_calls *d2r_server_calls;
++C_ASSERT( sizeof(struct d2r_server_calls) <= 1032 * sizeof(ULONG64) );  /* fits __wine_d2r_server_calls */
++C_ASSERT( REQ_NB_REQUESTS <= D2R_MAX_REQUESTS );
++C_ASSERT( offsetof(struct d2r_server_calls, ev_pool_full) == offsetof(struct d2r_server_calls, ev_kept) + 5 * sizeof(ULONG64) );
++/* the number of request types in this build, so the build can check the name table it ships */
++static const unsigned int __attribute__((used, retain, section("d2r_server_reqs"))) d2r_nb_requests = REQ_NB_REQUESTS;
++
++static inline ULONG64 d2r_call_now(void)
++{
++    struct timespec ts;
++
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return ts.tv_sec * (ULONG64)1000000000 + ts.tv_nsec;
++}
++
+ /***********************************************************************
+  *           server_call_unlocked
+  */
+ unsigned int server_call_unlocked( void *req_ptr )
+ {
+     struct __server_request_info * const req = req_ptr;
++    struct d2r_server_calls *calls = d2r_server_calls;
++    unsigned int type = req->u.req.request_header.req;  /* the reply overwrites it */
++    ULONG64 start = calls ? d2r_call_now() : 0;
+     unsigned int ret;
+ 
+     FTRACE_BLOCK_START("req %s", req->name)
+@@ -300,6 +319,11 @@ unsigned int server_call_unlocked( void *req_ptr )
+         ret = wait_reply( req );
+     TRACE_(client)("%s end\n", req->name);
+     FTRACE_BLOCK_END()
++    if (calls && type < D2R_MAX_REQUESTS)
++    {
++        __atomic_fetch_add( &calls->count[type], 1, __ATOMIC_RELAXED );
++        __atomic_fetch_add( &calls->time_ns[type], d2r_call_now() - start, __ATOMIC_RELAXED );
++    }
+     return ret;
+ }
+ 
+@@ -1856,6 +1880,9 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE
+ 
+     if (dest) *dest = 0;
+ 
++    /* d2r (patch 0008): a duplicated event has other references, never reuse it */
++    d2r_event_shared( source, FALSE );
++
+     if ((options & DUPLICATE_CLOSE_SOURCE) && source_process != NtCurrentProcess())
+     {
+         union apc_call call;
+@@ -1953,6 +1980,9 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
+     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
+         return STATUS_SUCCESS;
+ 
++    /* d2r (patch 0008): a fresh anonymous event may stay open for the next NtCreateEvent */
++    if (d2r_event_keep( handle )) return STATUS_SUCCESS;
++
+     /* hold fd_cache_mutex to prevent the fd from being added again between the
+      * call to remove_fd_from_cache and close_handle */
+     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
+index 96e8152..ac94d71 100644
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -1674,6 +1674,9 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+ 
+             TRACE( "event %p, mask %#x\n", params->event, params->mask );
+             if (out_size) FIXME( "unexpected output size %u\n", out_size );
++            /* d2r (patch 0008): the socket keeps a reference to the event; the buffer goes
++             * to the server below anyway */
++            if (in_size >= sizeof(*params)) d2r_event_shared( params->event, FALSE );
+ 
+             status = STATUS_BAD_DEVICE_TYPE;
+             break;
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 74a0c93..764ed04 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -1116,6 +1116,180 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous
+ }
+ 
+ 
++/* d2r (fex-d2-reforged, patch 0008): reuse of anonymous events.
++ * Some code makes an unnamed event and closes it again right away, over and over (D2R's
++ * protection thread: ~1,500 a second, never waited on), and every pair costs two
++ * wineserver round trips. An event that NtCreateEvent made without name, root directory,
++ * security descriptor or inherit flag, with EVENT_ALL_ACCESS, is noted as fresh. If the
++ * thread that made it closes it within D2R_EV_LIFE_NS, and nothing else can hold a
++ * reference to it (it was not duplicated, not given to an I/O call or socket event select,
++ * not waited on by another thread), NtClose keeps it open in a small pool instead. The next
++ * such NtCreateEvent of the same type takes it back and sets its state with NtSetEvent or
++ * NtResetEvent (no server call once the inproc sync fd is cached). WINE_D2R_EVENT_REUSE=0
++ * turns it off. */
++#define D2R_EV_SLOTS   256                /* fresh events, by handle value */
++#define D2R_EV_POOL    16                 /* kept events per type */
++#define D2R_EV_LIFE_NS (10 * 1000000)
++
++struct d2r_ev_slot
++{
++    HANDLE  handle;   /* 0 when free */
++    DWORD   tid;      /* thread that made it */
++    BOOL    manual;
++    ULONG64 born_ns;
++};
++
++static struct d2r_ev_slot d2r_ev_slots[D2R_EV_SLOTS];  /* all of this guarded by d2r_ev_mutex */
++static HANDLE d2r_ev_pool[2][D2R_EV_POOL];             /* [manual reset] */
++static unsigned int d2r_ev_pooled[2];
++static pthread_mutex_t d2r_ev_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++static inline ULONG64 d2r_ev_now(void)
++{
++    struct timespec ts;
++
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return ts.tv_sec * (ULONG64)1000000000 + ts.tv_nsec;
++}
++
++static inline DWORD d2r_ev_tid(void)
++{
++    return HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
++}
++
++static inline struct d2r_ev_slot *d2r_ev_slot( HANDLE handle )
++{
++    return &d2r_ev_slots[((ULONG_PTR)handle >> 2) % D2R_EV_SLOTS];
++}
++
++/* counters in __wine_d2r_server_calls */
++enum d2r_ev_counter { D2R_EV_KEPT, D2R_EV_REUSED, D2R_EV_SHARED, D2R_EV_OTHER_THREAD, D2R_EV_TOO_OLD, D2R_EV_POOL_FULL };
++
++static inline void d2r_ev_count( enum d2r_ev_counter which )
++{
++    struct d2r_server_calls *calls = d2r_server_calls;
++
++    if (calls) __atomic_fetch_add( &calls->ev_kept + which, 1, __ATOMIC_RELAXED );
++}
++
++static BOOL d2r_ev_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *env = getenv( "WINE_D2R_EVENT_REUSE" );
++
++        if (env && env[0] == '0')
++        {
++            ERR( "d2r: anonymous events are closed as in stock Wine (WINE_D2R_EVENT_REUSE=0).\n" );
++            on = 0;
++        }
++        else on = 1;
++    }
++    return on;
++}
++
++/* may an event made with these arguments come from the pool or go back to it? */
++static BOOL d2r_ev_plain( ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr )
++{
++    if (access != EVENT_ALL_ACCESS) return FALSE;
++    if (attr && ((attr->ObjectName && attr->ObjectName->Length) || attr->RootDirectory ||
++                 attr->SecurityDescriptor || attr->SecurityQualityOfService ||
++                 (attr->Attributes & ~(OBJ_CASE_INSENSITIVE | OBJ_OPENIF))))
++        return FALSE;
++    return d2r_ev_on();
++}
++
++static void d2r_ev_note( HANDLE handle, BOOL manual )
++{
++    struct d2r_ev_slot *slot = d2r_ev_slot( handle );
++    sigset_t sigset;
++
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    slot->tid = d2r_ev_tid();
++    slot->manual = manual;
++    slot->born_ns = d2r_ev_now();
++    __atomic_store_n( &slot->handle, handle, __ATOMIC_RELAXED );
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++}
++
++static HANDLE d2r_ev_take( BOOL manual )
++{
++    HANDLE handle = 0;
++    sigset_t sigset;
++
++    if (!__atomic_load_n( &d2r_ev_pooled[manual], __ATOMIC_RELAXED )) return 0;
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (d2r_ev_pooled[manual]) handle = d2r_ev_pool[manual][--d2r_ev_pooled[manual]];
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    return handle;
++}
++
++/* the handle goes somewhere that may keep a reference to its object (wait: only a wait by
++ * another thread than the maker counts), so a fresh event behind it is never reused */
++void d2r_event_shared( HANDLE handle, BOOL wait )
++{
++    struct d2r_ev_slot *slot = d2r_ev_slot( handle );
++    sigset_t sigset;
++
++    if (!handle || __atomic_load_n( &slot->handle, __ATOMIC_RELAXED ) != handle) return;
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (slot->handle == handle && (!wait || slot->tid != d2r_ev_tid()))
++    {
++        __atomic_store_n( &slot->handle, 0, __ATOMIC_RELAXED );
++        d2r_ev_count( D2R_EV_SHARED );
++    }
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++}
++
++/* NtClose: TRUE when the handle is a fresh event that stays open in the pool */
++BOOL d2r_event_keep( HANDLE handle )
++{
++    struct d2r_ev_slot *slot = d2r_ev_slot( handle );
++    int counter = -1;
++    unsigned int i, m;
++    BOOL kept = FALSE;
++    sigset_t sigset;
++
++    if (!handle) return FALSE;
++    if (__atomic_load_n( &slot->handle, __ATOMIC_RELAXED ) != handle &&
++        !__atomic_load_n( &d2r_ev_pooled[0], __ATOMIC_RELAXED ) &&
++        !__atomic_load_n( &d2r_ev_pooled[1], __ATOMIC_RELAXED ))
++        return FALSE;
++
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (slot->handle == handle)
++    {
++        __atomic_store_n( &slot->handle, 0, __ATOMIC_RELAXED );
++        if (slot->tid != d2r_ev_tid()) counter = D2R_EV_OTHER_THREAD;
++        else if (d2r_ev_now() - slot->born_ns >= D2R_EV_LIFE_NS) counter = D2R_EV_TOO_OLD;
++        else if (d2r_ev_pooled[slot->manual] >= D2R_EV_POOL) counter = D2R_EV_POOL_FULL;
++        else
++        {
++            d2r_ev_pool[slot->manual][d2r_ev_pooled[slot->manual]++] = handle;
++            counter = D2R_EV_KEPT;
++            kept = TRUE;
++        }
++    }
++    else
++    {
++        /* a handle already in the pool closed again (a double close): it really goes now,
++         * so the pool never hands out a handle the server may give to another object */
++        for (m = 0; m < 2; m++)
++            for (i = 0; i < d2r_ev_pooled[m]; i++)
++                if (d2r_ev_pool[m][i] == handle)
++                {
++                    d2r_ev_pool[m][i] = d2r_ev_pool[m][--d2r_ev_pooled[m]];
++                    break;
++                }
++    }
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (counter >= 0) d2r_ev_count( counter );
++    return kept;
++}
++
++
+ /**************************************************************************
+  *              NtCreateEvent (NTDLL.@)
+  */
+@@ -1125,12 +1299,28 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
++    BOOL plain;
+ 
+     TRACE( "access %#x, name %s, type %u, state %u\n", access,
+            attr ? debugstr_us(attr->ObjectName) : "(null)", type, state );
+ 
+     *handle = 0;
+     if (type != NotificationEvent && type != SynchronizationEvent) return STATUS_INVALID_PARAMETER;
++
++    /* d2r (patch 0008): take a kept anonymous event back */
++    if ((plain = d2r_ev_plain( access, attr )) && (*handle = d2r_ev_take( type == NotificationEvent )))
++    {
++        if (!(ret = state ? NtSetEvent( *handle, NULL ) : NtResetEvent( *handle, NULL )))
++        {
++            d2r_ev_note( *handle, type == NotificationEvent );
++            d2r_ev_count( D2R_EV_REUSED );
++            return STATUS_SUCCESS;
++        }
++        /* never seen; leave the handle alone (closing it could hit another object) */
++        ERR( "d2r: kept event %p can't be set (%#x), making a new one\n", *handle, ret );
++        *handle = 0;
++    }
++
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
+     SERVER_START_REQ( create_event )
+@@ -1145,6 +1335,7 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
+     SERVER_END_REQ;
+ 
+     free( objattr );
++    if (!ret && plain) d2r_ev_note( *handle, type == NotificationEvent );
+     return ret;
+ }
+ 
+@@ -2353,6 +2544,7 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
+     for (i = 0; i < count; i++)
+     {
+         if (is_pseudo_handle( handles[i] )) return STATUS_INVALID_HANDLE;
++        d2r_event_shared( handles[i], TRUE );  /* d2r (patch 0008) */
+     }
+ 
+     if ((ret = inproc_wait( count, handles, type, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+@@ -2381,6 +2573,7 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
+ 
+     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
+ 
++    d2r_event_shared( handle, TRUE );  /* d2r (patch 0008) */
+     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+     {
+         TRACE( "-> %#x\n", ret );
+@@ -2410,6 +2603,7 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
+ 
+     if (!signal) return STATUS_INVALID_HANDLE;
+ 
++    d2r_event_shared( wait, TRUE );  /* d2r (patch 0008) */
+     if ((ret = inproc_signal_and_wait( signal, wait, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+         return ret;
+ 
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index d077c7b..796de8a 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -123,6 +123,30 @@ struct d2r_vm_lock_info
+ 
+ extern struct d2r_vm_lock_info *d2r_vm_lock;
+ 
++/* d2r (patch 0008): wineserver requests by type (count and time in server_call_unlocked,
++ * a select's time includes its wait) and the anonymous event reuse counters, kept in PE
++ * ntdll's export __wine_d2r_server_calls for FEX. Version 1 layout. */
++#define D2R_MAX_REQUESTS 512
++
++struct d2r_server_calls
++{
++    ULONG   version;          /* 1 once the unix side writes here */
++    ULONG   nb_requests;      /* REQ_NB_REQUESTS of this build: count[] and time_ns[] entries in use */
++    ULONG64 ev_kept;          /* NtClose kept an anonymous event for reuse */
++    ULONG64 ev_reused;        /* NtCreateEvent took a kept event back, no server call */
++    ULONG64 ev_shared;        /* fresh events left out: duplicated, given to I/O, waited on by another thread */
++    ULONG64 ev_other_thread;  /* closed by another thread than the one that made it */
++    ULONG64 ev_too_old;       /* closed later than 10 ms after it was made */
++    ULONG64 ev_pool_full;     /* closed while the pool for its type was full (ev_kept..ev_pool_full in this order) */
++    ULONG64 pad;
++    ULONG64 count[D2R_MAX_REQUESTS];    /* by enum request */
++    ULONG64 time_ns[D2R_MAX_REQUESTS];  /* CLOCK_MONOTONIC from send to reply */
++};
++
++extern struct d2r_server_calls *d2r_server_calls;
++extern void d2r_event_shared( HANDLE handle, BOOL wait );
++extern BOOL d2r_event_keep( HANDLE handle );
++
+ /* thread private data, stored in NtCurrentTeb()->GdiTebBatch */
+ struct ntdll_thread_data
+ {
