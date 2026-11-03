@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 158, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r8 (build 10, entry proton-11.0-1-arm64ec-110). The build numbers in the
+State: FEX build 159, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r9 (build 11). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch

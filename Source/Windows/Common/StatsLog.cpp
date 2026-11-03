@@ -367,16 +367,27 @@ namespace {
 
   // Build 157: our Proton d2r8's second export __wine_d2r_server_calls_ext (struct d2r_server_calls_ext of
   // proton-patches/11.0-1/0009, version 1): what its completion port waits in the process did, and the Windows tid of
-  // the latest caller of each request type.
+  // the latest caller of each request type. Build 159: d2r9 (patch 0010) appends its timer reuse counters and says in
+  // Size how many bytes it writes (0 in d2r8, whose export ends at LastTid: Tm is read only when Size covers it).
   struct ServerCallsExtInfo {
     uint32_t Version;    // 1 once Wine writes it
     uint32_t NbRequests; // last_tid entries in use
     uint64_t Cp[5];      // woken, timed out, lost race, fallback, Ex batches without a last empty remove
-    uint64_t Pad[2];
+    uint32_t Size;       // bytes Wine writes (d2r9 and later; 0 before)
+    uint32_t Pad32;
+    uint64_t Pad;
     uint32_t LastTid[512];
+    // d2r9: kept at close, reused at create, reset in a request of its own, not kept: closed still set, shared (APC,
+    // period, set again, cancelled, duplicated, another thread), closed by another thread, too old, pool full.
+    uint64_t Tm[8];
   };
-  static_assert(sizeof(ServerCallsExtInfo) == 2112);
-  static_assert(offsetof(ServerCallsExtInfo, Cp) == 8 && offsetof(ServerCallsExtInfo, LastTid) == 64);
+  static_assert(sizeof(ServerCallsExtInfo) == 2176);
+  static_assert(offsetof(ServerCallsExtInfo, Cp) == 8 && offsetof(ServerCallsExtInfo, Size) == 48 &&
+                offsetof(ServerCallsExtInfo, LastTid) == 64 && offsetof(ServerCallsExtInfo, Tm) == 2112);
+  // Whether the export has d2r9's timer counters (read after Version, which Wine sets last).
+  bool ServerCallsExtHasTimers(const ServerCallsExtInfo* Ext) {
+    return __atomic_load_n(&Ext->Size, __ATOMIC_RELAXED) >= sizeof(ServerCallsExtInfo);
+  }
   std::atomic<ServerCallsExtInfo*> ServerCallsExt {};
   // Requests whose callers the Proton side asked for: shown with their latest caller even outside the busiest ten.
   constexpr const char* ServerCallsWatched[] = {"create_timer", "set_timer", "cancel_timer", "close_handle", "get_next_thread",
@@ -2398,6 +2409,7 @@ namespace {
     uint64_t ServerPrevTime[512];
     uint64_t ServerPrevEv[6];
     uint64_t ServerPrevCp[5]; // build 157
+    uint64_t ServerPrevTm[8]; // build 159
     bool ServerHave;
 
     // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
@@ -3713,6 +3725,11 @@ namespace {
         for (size_t i = 0; i < 5; ++i) {
           State->ServerPrevCp[i] = __atomic_load_n(&Ext->Cp[i], __ATOMIC_RELAXED);
         }
+        if (ServerCallsExtHasTimers(Ext)) {
+          for (size_t i = 0; i < 8; ++i) {
+            State->ServerPrevTm[i] = __atomic_load_n(&Ext->Tm[i], __ATOMIC_RELAXED);
+          }
+        }
       }
       if (!ServerRequestNamesRead) {
         ReadServerRequestNames();
@@ -3816,6 +3833,17 @@ namespace {
       }
       Out += fextl::fmt::format(" | completion waits in the process: woken {}, timed out {}, lost race {}, server path {}, batch ends saved {}",
                                 Cp[0], Cp[1], Cp[2], Cp[3], Cp[4]);
+      if (ServerCallsExtHasTimers(Ext)) {
+        uint64_t Tm[8];
+        for (size_t i = 0; i < 8; ++i) {
+          const uint64_t Now = __atomic_load_n(&Ext->Tm[i], __ATOMIC_RELAXED);
+          Tm[i] = Now >= State->ServerPrevTm[i] ? Now - State->ServerPrevTm[i] : 0;
+          State->ServerPrevTm[i] = Now;
+        }
+        Out += fextl::fmt::format(" | timer reuse: kept at close {}, made from kept {}, reset in a request of its own {}, not kept: still set {}, "
+                                  "shared {}, other thread {}, too old {}, no room {}",
+                                  Tm[0], Tm[1], Tm[2], Tm[3], Tm[4], Tm[5], Tm[6], Tm[7]);
+      }
     }
     Out += "\n";
     return Out;
@@ -5139,6 +5167,16 @@ void StatsLogSetServerCallsExt(const void* Info) {
                               "the last empty remove; WINE_D2R_COMPLETION_WAIT=0 turns them off)" :
                Version == 0 ? "server calls: Wine's latest callers are off (__wine_d2r_server_calls_ext version 0: WINE_D2R_CALL_COUNTS=0)" :
                               "server calls: Wine's latest callers have an unknown layout, not read");
+  if (Ext && Version == 1) {
+    StatsLogNote(ServerCallsExtHasTimers(Ext) ?
+                   "server calls: Wine's timer reuse counts found (our Proton d2r9 and later): 'timer reuse' = unnamed timers Wine kept "
+                   "open at close and handed back at the next create instead of asking the wineserver (kept at close, made from kept, "
+                   "reset in a request of its own = a reused timer that had to be made new in an extra call), and timers it closed for "
+                   "real (still set = closed before its setting was seen to fire, shared = APC, period, set again, cancelled, duplicated "
+                   "or used by another thread, other thread = closed by another thread, too old = older than 100 ms, no room = the "
+                   "kept list was full); WINE_D2R_TIMER_REUSE=0 turns it off" :
+                   "server calls: no timer reuse counts (our Proton older than d2r9)");
+  }
 }
 
 void StatsLogSetLockProbe(void (*ProbeFunction)()) {
