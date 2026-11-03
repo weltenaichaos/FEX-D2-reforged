@@ -325,7 +325,6 @@ namespace {
   bool TurnipDrawSetup {};    // the arms come from FEX_TU_DRAW_SETUP (arm 4 = no preamble at all, 5-7 fex15 setups)
   uint32_t TurnipCsAtomics {}; // FEX_TU_CS_ATOMICS: 0 off, 1 always, 2 alt
   uint32_t TurnipConstKeep {}; // FEX_TU_CONST_KEEP: 0 off, 1 always, 2 alt
-  uint32_t TurnipPresentNoWait {}; // FEX_TU_PRESENT_NOWAIT: 0 off, 1 always, 2 alt (10 s halves)
 
   // FEX_TU_WAVE_PAIR: 0 = off; alt = arms 0-4 a second each; digits 0-4 = those arms (one digit other than 0 = that arm
   // always).
@@ -587,14 +586,6 @@ namespace {
     // constants loaded per lighting draw (~100 vec4, all of them every draw) hold the next draw back; only ~16 of them change.
     const char* ConstKeep = Switch("FEX_TU_CONST_KEEP");
     TurnipConstKeep = SwitchOff(ConstKeep) ? 0 : (ConstKeep[0] == 'a' || ConstKeep[0] == 'A' || ConstKeep[0] == '2') ? 2 : 1;
-    // FEX_TU_PRESENT_NOWAIT: alt (D2R default in build 149) = the driver's vkQueuePresentKHR (fex18 and later) doesn't wait
-    // for the image's last present while that is still pending, in every other 10 s (TurnipReport flips the mode bit;
-    // without the stats log alt stays on); 1 = always; 0 = stock. Build 148: in heavy scenes the frame gen layer's
-    // presents blocked 18-26 ms; the stock wait covers all GPU work submitted before the image's last present on the one
-    // KGSL queue, i.e. the game's next frame.
-    const char* PresentNoWait = Switch("FEX_TU_PRESENT_NOWAIT");
-    TurnipPresentNoWait =
-      SwitchOff(PresentNoWait) ? 0 : (PresentNoWait[0] == 'a' || PresentNoWait[0] == 'A' || PresentNoWait[0] == '2') ? 2 : 1;
     // FEX_TU_NOPREAMBLE alt/lit (SetupTurnipNoPreamble): the second binary without preamble, picked with the same mode bit.
     // With wave setup 4 (the 128-pixel binary) asked for, that bit follows the wave setup instead.
     const bool AltFs = (TurnipWaveArms & (1u << Turnip::FsArmW128)) ? FirstArm == Turnip::FsArmW128 :
@@ -604,7 +595,7 @@ namespace {
                  (TurnipDepthClear >= 2 ? Turnip::ModeDepthClearFastZ : 0) | (TurnipBudgetCache ? Turnip::ModeBudgetCache : 0) |
                  (TurnipSwitch ? Turnip::ModeSwitch : 0) | (AltFs ? Turnip::ModeAltFs : 0) |
                  (FirstArm << Turnip::ModeFsArmShift) | (TurnipCsAtomics ? Turnip::ModeCsAlt : 0) |
-                 (TurnipConstKeep ? Turnip::ModeConstKeep : 0) | (TurnipPresentNoWait ? Turnip::ModePresentNoThrottle : 0);
+                 (TurnipConstKeep ? Turnip::ModeConstKeep : 0);
 
     // FEX_TU_COUNTERS: 1 (D2R default in build 102) = the list below, 0 = none. FEX_TU_SAMPLE_DRAWS: render passes with at
     // least this many draws get timed and counted (D2R default 100 in build 102: the main pass, the depth prepasses and
@@ -744,8 +735,7 @@ namespace {
                                     "command processor {}, other root constant buffer reads through the shaders' UBO table {}, pipeline "
                                     "switches send only what changed {}, lighting shaders without alias.tex helpers {}, lighting "
                                     "shaders without preamble {}, lighting shader wave/draw setups {}, compute atomics once per wave {}, "
-                                    "unchanged root constant buffers kept in the constants {}, presents without waiting behind queued GPU "
-                                    "work {}, depth clears at pass start {}, memory budget {}, {} GPU counters asked for, passes with {}+ draws "
+                                    "unchanged root constant buffers kept in the constants {}, depth clears at pass start {}, memory budget {}, {} GPU counters asked for, passes with {}+ draws "
                                     "(and from driver fex16 direct dispatches of 16+ workgroups) timed and counted; only FEX's "
                                     "Turnip build (fex1 and later) answers, a '# turnip: driver' note follows once it did",
                                     Text, TurnipDesc == 2 ? "alternating each second (FEX_TU_DESC=alt)" : TurnipDesc ? "on (FEX_TU_DESC=1)" : "off (FEX_TU_DESC=0)",
@@ -782,9 +772,6 @@ namespace {
                                     TurnipConstKeep == 2 ? "in every other second (FEX_TU_CONST_KEEP=alt, driver fex17 and later)" :
                                     TurnipConstKeep      ? "always (FEX_TU_CONST_KEEP=1, driver fex17 and later)" :
                                                            "off (FEX_TU_CONST_KEEP=0)",
-                                    TurnipPresentNoWait == 2 ? "in every other 10 s (FEX_TU_PRESENT_NOWAIT=alt, driver fex18 and later)" :
-                                    TurnipPresentNoWait      ? "always (FEX_TU_PRESENT_NOWAIT=1, driver fex18 and later)" :
-                                                               "off (FEX_TU_PRESENT_NOWAIT=0)",
                                     TurnipDepthClear == 2 ? "by a 3D draw, without fragment shader (fast Z, driver fex4 and later) "
                                                             "in every other second (FEX_TU_DEPTH_CLEAR=alt)" :
                                     TurnipDepthClear == 3 ? "by a 3D draw without fragment shader (fast Z, FEX_TU_DEPTH_CLEAR=fastz, "
@@ -922,9 +909,6 @@ namespace Turnip {
   }
   uint32_t ConstKeepSwitch() {
     return TurnipConstKeep;
-  }
-  uint32_t PresentNoWaitSwitch() {
-    return TurnipPresentNoWait;
   }
 } // namespace Turnip
 } // namespace FEX::Windows
