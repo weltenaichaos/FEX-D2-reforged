@@ -345,8 +345,8 @@ namespace {
   constexpr size_t MaxVmHoldLines = 900;
 
   // Wineserver request counts (build 154): our Proton d2r6 and later count every wine_server_call of this process in PE
-  // ntdll's export __wine_d2r_server_calls: per request number how many and the time from send to reply (a select's
-  // includes its wait), and what its anonymous event reuse did. Layout version 1 = struct d2r_server_calls of
+  // ntdll's export __wine_d2r_server_calls: per request number how many and the time from send to reply (for a select
+  // only its request: the wait for its objects comes after the reply), and what its anonymous event reuse did. Layout version 1 = struct d2r_server_calls of
   // proton-patches/11.0-1 (d2r6). Request names come from share/wine/d2r-server-requests.txt ("number name" per row).
   struct ServerCallsInfo {
     uint32_t Version;    // 1 once Wine counts (0: WINE_D2R_CALL_COUNTS=0)
@@ -364,6 +364,23 @@ namespace {
   static_assert(sizeof(ServerCallsInfo) == 8256);
   std::atomic<ServerCallsInfo*> ServerCalls {};
   constexpr size_t ServerCallsShown = 10;
+
+  // Build 157: our Proton d2r8's second export __wine_d2r_server_calls_ext (struct d2r_server_calls_ext of
+  // proton-patches/11.0-1/0009, version 1): what its completion port waits in the process did, and the Windows tid of
+  // the latest caller of each request type.
+  struct ServerCallsExtInfo {
+    uint32_t Version;    // 1 once Wine writes it
+    uint32_t NbRequests; // last_tid entries in use
+    uint64_t Cp[5];      // woken, timed out, lost race, fallback, Ex batches without a last empty remove
+    uint64_t Pad[2];
+    uint32_t LastTid[512];
+  };
+  static_assert(sizeof(ServerCallsExtInfo) == 2112);
+  static_assert(offsetof(ServerCallsExtInfo, Cp) == 8 && offsetof(ServerCallsExtInfo, LastTid) == 64);
+  std::atomic<ServerCallsExtInfo*> ServerCallsExt {};
+  // Requests whose callers the Proton side asked for: shown with their latest caller even outside the busiest ten.
+  constexpr const char* ServerCallsWatched[] = {"create_timer", "set_timer", "cancel_timer", "close_handle", "get_next_thread",
+                                                "get_thread_info"};
 
   // The holder as Wine noted it: State 0 = no notes, 1 = free, 2 = held, 3 = it changed while being read.
   struct VmHolder {
@@ -2380,6 +2397,7 @@ namespace {
     uint64_t ServerPrevCount[512];
     uint64_t ServerPrevTime[512];
     uint64_t ServerPrevEv[6];
+    uint64_t ServerPrevCp[5]; // build 157
     bool ServerHave;
 
     // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
@@ -3669,8 +3687,10 @@ namespace {
   }
 
   // 'server calls' (build 154): this process's wineserver requests in the last second from Wine's counts, the busiest
-  // types with how long each took on average (send to reply; a select's includes its wait), and Wine's anonymous event
-  // reuse. A first line notes where the names came from.
+  // types with how long each took on average (send to reply; for a select only the request, its wait comes after the
+  // reply), and Wine's anonymous event reuse. A first line notes where the names came from. Build 157, with our Proton
+  // d2r8's second export: each shown type's latest caller (@tid), the watched types outside the busiest ten, the
+  // callers' names, and what the completion port waits in the process did.
   fextl::string ServerCallsLine(LogState* State) {
     auto* Info = ServerCalls.load(std::memory_order_relaxed);
     if (!Info || __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) != 1) {
@@ -3689,6 +3709,11 @@ namespace {
         State->ServerPrevTime[i] = __atomic_load_n(&Info->TimeNs[i], __ATOMIC_RELAXED);
       }
       memcpy(State->ServerPrevEv, Ev, sizeof(Ev));
+      if (auto* Ext = ServerCallsExt.load(std::memory_order_relaxed); Ext && __atomic_load_n(&Ext->Version, __ATOMIC_ACQUIRE) == 1) {
+        for (size_t i = 0; i < 5; ++i) {
+          State->ServerPrevCp[i] = __atomic_load_n(&Ext->Cp[i], __ATOMIC_RELAXED);
+        }
+      }
       if (!ServerRequestNamesRead) {
         ReadServerRequestNames();
       }
@@ -3726,26 +3751,73 @@ namespace {
       }
     }
     std::sort(Items.begin(), Items.end(), [](const Item& a, const Item& b) { return a.Count > b.Count; });
-    fextl::string Out = fextl::fmt::format("  server calls {}/s, {} types, {:.1f} ms in round trips (selects {:.1f} ms with their waits) |", Total,
+    auto* Ext = ServerCallsExt.load(std::memory_order_relaxed);
+    if (Ext && __atomic_load_n(&Ext->Version, __ATOMIC_ACQUIRE) != 1) {
+      Ext = nullptr;
+    }
+    const uint32_t ExtTypes = Ext ? std::min<uint32_t>(__atomic_load_n(&Ext->NbRequests, __ATOMIC_RELAXED), 512) : 0;
+    fextl::vector<uint32_t> Callers;
+    // " @tid" of a type's latest caller, with the tid kept for the callers' names.
+    auto Caller = [&](uint32_t Type) -> fextl::string {
+      if (Type >= ExtTypes) {
+        return {};
+      }
+      const uint32_t Tid = __atomic_load_n(&Ext->LastTid[Type], __ATOMIC_RELAXED);
+      if (!Tid) {
+        return {};
+      }
+      if (std::find(Callers.begin(), Callers.end(), Tid) == Callers.end()) {
+        Callers.push_back(Tid);
+      }
+      return fextl::fmt::format(" @{}", Tid);
+    };
+    fextl::string Out = fextl::fmt::format("  server calls {}/s, {} types, {:.1f} ms in round trips (selects {:.1f} ms, requests only) |", Total,
                                            Items.size(), TotalNs / 1e6, SelectNs / 1e6);
     for (size_t i = 0; i < std::min(Items.size(), ServerCallsShown); ++i) {
-      Out += fextl::fmt::format(" {} {} ({:.3f} ms)", ServerRequestName(Items[i].Type), Items[i].Count,
-                                Items[i].Ns / 1e6 / static_cast<double>(Items[i].Count));
+      Out += fextl::fmt::format(" {} {} ({:.3f} ms){}", ServerRequestName(Items[i].Type), Items[i].Count,
+                                Items[i].Ns / 1e6 / static_cast<double>(Items[i].Count), Caller(Items[i].Type));
     }
     if (Items.size() > ServerCallsShown) {
       uint64_t Rest {};
+      fextl::string Watched;
       for (size_t i = ServerCallsShown; i < Items.size(); ++i) {
         Rest += Items[i].Count;
+        if (Ext) {
+          const fextl::string Name = ServerRequestName(Items[i].Type);
+          if (std::find_if(std::begin(ServerCallsWatched), std::end(ServerCallsWatched), [&](const char* W) { return Name == W; }) !=
+              std::end(ServerCallsWatched)) {
+            Watched += fextl::fmt::format(" {} {} ({:.3f} ms){}", Name, Items[i].Count, Items[i].Ns / 1e6 / static_cast<double>(Items[i].Count),
+                                          Caller(Items[i].Type));
+          }
+        }
       }
-      Out += fextl::fmt::format(" others {}", Rest);
+      Out += fextl::fmt::format(" others {}{}", Rest, Watched.empty() ? fextl::string {} : " | also" + Watched);
+    }
+    if (!Callers.empty()) {
+      Out += " | callers:";
+      for (size_t i = 0; i < Callers.size(); ++i) {
+        const fextl::string Name = QueryThreadName(Callers[i]);
+        Out += fextl::fmt::format("{} {} {}", i ? "," : "", Callers[i], Name.empty() ? "-" : Name);
+      }
     }
     uint64_t D[6];
     for (size_t i = 0; i < 6; ++i) {
       D[i] = Ev[i] >= State->ServerPrevEv[i] ? Ev[i] - State->ServerPrevEv[i] : 0;
       State->ServerPrevEv[i] = Ev[i];
     }
-    Out += fextl::fmt::format(" | event reuse: made from kept {}, kept at close {}, not kept: shared {}, other thread {}, too old {}, no room {}\n",
+    Out += fextl::fmt::format(" | event reuse: made from kept {}, kept at close {}, not kept: shared {}, other thread {}, too old {}, no room {}",
                               D[1], D[0], D[2], D[3], D[4], D[5]);
+    if (Ext) {
+      uint64_t Cp[5];
+      for (size_t i = 0; i < 5; ++i) {
+        const uint64_t Now = __atomic_load_n(&Ext->Cp[i], __ATOMIC_RELAXED);
+        Cp[i] = Now >= State->ServerPrevCp[i] ? Now - State->ServerPrevCp[i] : 0;
+        State->ServerPrevCp[i] = Now;
+      }
+      Out += fextl::fmt::format(" | completion waits in the process: woken {}, timed out {}, lost race {}, server path {}, batch ends saved {}",
+                                Cp[0], Cp[1], Cp[2], Cp[3], Cp[4]);
+    }
+    Out += "\n";
     return Out;
   }
 
@@ -5043,9 +5115,30 @@ void StatsLogSetServerCalls(const void* Info) {
                               "Proton older than d2r6)" :
                Version == 1 ? "server calls: Wine's wineserver request counts found (our Proton d2r6 and later, __wine_d2r_server_calls "
                               "version 1): a 'server calls' line every second gives this process's requests by type, their time from "
-                              "send to reply (a select's includes its wait), and what Wine's anonymous event reuse did" :
+                              "send to reply (for a select only its request: its wait comes after the reply), and what Wine's "
+                              "anonymous event reuse did" :
                Version == 0 ? "server calls: Wine's request counts are off (__wine_d2r_server_calls version 0: WINE_D2R_CALL_COUNTS=0)" :
                               "server calls: Wine's request counts have an unknown layout, not read");
+}
+
+void StatsLogSetServerCallsExt(const void* Info) {
+  auto* Ext = static_cast<ServerCallsExtInfo*>(const_cast<void*>(Info));
+  ServerCallsExt.store(Ext, std::memory_order_relaxed);
+  if (!ServerCalls.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const uint32_t Version = Ext ? __atomic_load_n(&Ext->Version, __ATOMIC_ACQUIRE) : 0;
+  StatsLogNote(!Ext         ? "server calls: no latest callers or completion port wait counts (__wine_d2r_server_calls_ext: our Proton "
+                              "older than d2r8)" :
+               Version == 1 ? "server calls: Wine's latest callers and completion port wait counts found (our Proton d2r8 and later, "
+                              "__wine_d2r_server_calls_ext version 1): '@tid' after a request type = the thread that sent the latest "
+                              "one, 'also' = timer, close and thread list requests outside the busiest ten, 'callers' = those threads' "
+                              "names, 'completion waits in the process' = the game's I/O completion port waits Wine did without the "
+                              "wineserver (woken = found an entry signaled, timed out = no server call at all, lost race and server path = "
+                              "went to the wineserver as stock Wine, batch ends saved = GetQueuedCompletionStatusEx batches that skipped "
+                              "the last empty remove; WINE_D2R_COMPLETION_WAIT=0 turns them off)" :
+               Version == 0 ? "server calls: Wine's latest callers are off (__wine_d2r_server_calls_ext version 0: WINE_D2R_CALL_COUNTS=0)" :
+                              "server calls: Wine's latest callers have an unknown layout, not read");
 }
 
 void StatsLogSetLockProbe(void (*ProbeFunction)()) {

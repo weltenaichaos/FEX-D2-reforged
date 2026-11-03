@@ -1458,6 +1458,7 @@ NTSTATUS ProcessInit() {
     FEX::Windows::StatsLogSetVmLockNotes(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_vm_lock")));
     // Build 154: our Proton d2r6 and later count this process's wineserver requests by type (__wine_d2r_server_calls).
     FEX::Windows::StatsLogSetServerCalls(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_server_calls")));
+    FEX::Windows::StatsLogSetServerCallsExt(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_server_calls_ext")));
     FEX::Windows::StatsLogNote(PoliteMs ? fextl::fmt::format("codelock: writers wait up to {}ms without blocking compiles", PoliteMs) :
                                           fextl::string("codelock: writers queue at once (upstream)"));
     FEX::Windows::StatsLogNote(FEX::Windows::LockBoost::Note());

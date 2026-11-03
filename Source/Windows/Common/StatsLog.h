@@ -87,4 +87,8 @@ void StatsLogSetVmLockNotes(const void* Info);
 // nullptr when this Wine has none. A 'server calls' line then gives every second this process's wineserver requests by
 // type (count and time from send to reply) and what Wine's anonymous event reuse did.
 void StatsLogSetServerCalls(const void* Info);
+// Build 157: Info = PE ntdll's second export __wine_d2r_server_calls_ext (our Proton d2r8 and later), nullptr when this
+// Wine has none. After StatsLogSetServerCalls. The 'server calls' line then also names each busy type's latest caller and
+// what Wine's completion port waits in the process did.
+void StatsLogSetServerCallsExt(const void* Info);
 } // namespace FEX::Windows
