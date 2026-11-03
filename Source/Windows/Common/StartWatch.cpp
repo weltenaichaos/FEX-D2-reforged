@@ -627,9 +627,22 @@ namespace {
     bool EarlyDumped = false;
     uint64_t NextLog = BeginMs + 250;
     uint64_t NextBeat = BeginMs + 1000;
+    // Build 152: after the first LightAfterMs (every failed start ended within 2 s) the watch goes light: the wineserver
+    // and launcher every 250 ms and the 'alive' line, no process list scans or Android log reads (b150: ~50 ms CPU a
+    // second on a big core next to the game otherwise).
+    constexpr uint64_t LightAfterMs = 15'000;
+    bool LightNoted = false;
     while (BootMs() - BeginMs < S.Seconds * 1000) {
-      for (uint64_t Slept = 0; Slept < PollNs; Slept += 2'000'000) {
-        Linux::SleepNs(2'000'000);
+      const bool Light = BootMs() - BeginMs >= LightAfterMs;
+      if (Light && !LightNoted) {
+        LightNoted = true;
+        Put(S, fextl::fmt::format("{} light mode from here: wineserver and launcher every 250 ms, alive once a second, no process list or "
+                                  "android log\n",
+                                  Stamp(S)));
+      }
+      const uint64_t Step = Light ? 250'000'000 : 2'000'000;
+      for (uint64_t Slept = 0; Slept < (Light ? 250'000'000 : PollNs); Slept += Step) {
+        Linux::SleepNs(Step);
         if (Server && !ServerGone) {
           char Path[48];
           snprintf(Path, sizeof(Path), "/proc/%d/stat", Server);
@@ -642,45 +655,47 @@ namespace {
           }
         }
       }
-      const auto Pids = ListPids();
-      fextl::vector<Proc> Next;
-      Next.reserve(Pids.size());
-      size_t k = 0;
-      for (int Pid : Pids) {
-        while (k < Known.size() && Known[k].Pid < Pid) {
+      if (!Light) {
+        const auto Pids = ListPids();
+        fextl::vector<Proc> Next;
+        Next.reserve(Pids.size());
+        size_t k = 0;
+        for (int Pid : Pids) {
+          while (k < Known.size() && Known[k].Pid < Pid) {
+            if (Known[k].Mine) {
+              const int64_t Lived = static_cast<int64_t>(BootMs()) - static_cast<int64_t>(Known[k].StartMs);
+              Put(S, fextl::fmt::format("{} ended: {}/{} after {:.2f} s\n", Stamp(S), Known[k].Name, Known[k].Pid,
+                                             static_cast<double>(Lived) / 1000.0));
+            }
+            ++k;
+          }
+          if (k < Known.size() && Known[k].Pid == Pid) {
+            Next.push_back(std::move(Known[k]));
+            ++k;
+          } else {
+            Proc P = Describe(S, Pid);
+            if (P.Mine) {
+              Put(S, fextl::fmt::format("{} started: {}\n", Stamp(S), ProcLine(S, Pid, P)));
+            }
+            Next.push_back(std::move(P));
+          }
+        }
+        for (; k < Known.size(); ++k) {
           if (Known[k].Mine) {
             const int64_t Lived = static_cast<int64_t>(BootMs()) - static_cast<int64_t>(Known[k].StartMs);
             Put(S, fextl::fmt::format("{} ended: {}/{} after {:.2f} s\n", Stamp(S), Known[k].Name, Known[k].Pid,
                                            static_cast<double>(Lived) / 1000.0));
           }
-          ++k;
         }
-        if (k < Known.size() && Known[k].Pid == Pid) {
-          Next.push_back(std::move(Known[k]));
-          ++k;
-        } else {
-          Proc P = Describe(S, Pid);
-          if (P.Mine) {
-            Put(S, fextl::fmt::format("{} started: {}\n", Stamp(S), ProcLine(S, Pid, P)));
-          }
-          Next.push_back(std::move(P));
-        }
+        Known = std::move(Next);
       }
-      for (; k < Known.size(); ++k) {
-        if (Known[k].Mine) {
-          const int64_t Lived = static_cast<int64_t>(BootMs()) - static_cast<int64_t>(Known[k].StartMs);
-          Put(S, fextl::fmt::format("{} ended: {}/{} after {:.2f} s\n", Stamp(S), Known[k].Name, Known[k].Pid,
-                                         static_cast<double>(Lived) / 1000.0));
-        }
-      }
-      Known = std::move(Next);
 
       if (Launcher && !LauncherGone && !ProcessExists(Launcher)) {
         LauncherGone = true;
         Put(S, fextl::fmt::format("{} ended: the launcher's app process {}\n", Stamp(S), Launcher));
       }
       const uint64_t Now = BootMs();
-      if (Now >= NextLog) {
+      if (!Light && Now >= NextLog) {
         // Every entry for the first 30 s (the failed starts ended at 1-2 s), then warnings and errors.
         const bool Early = Now - BeginMs < 30'000;
         NextLog = Now + (Early ? 100 : 250);
