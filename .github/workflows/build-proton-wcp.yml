@@ -43,6 +43,13 @@ env:
   CCACHE_COMPILERCHECK: content
   CCACHE_MAXSIZE: 3G
 
+# shell: bash runs every step with -eo pipefail, so a command that fails in front of
+# "| tee" fails its step. Without it, check-patches.sh's FAIL lines didn't stop the build
+# (d2r5 run 5 shipped with two FAIL 0007 lines from a too narrow check).
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     runs-on: ubuntu-24.04

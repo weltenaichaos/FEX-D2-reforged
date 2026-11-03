@@ -100,12 +100,14 @@ check_0006() {
   else bad 0006 "no compiled virtual.c given (VM_SOURCE)"; fi
 }
 
-# 0007: NtContinue/NtContinueEx to x64 code enter the emulator directly; off switch is there
+# 0007: NtContinue/NtContinueEx to x64 code enter the emulator directly; off switch is there.
+# Stock code only converts the context to ARM64 and makes the syscall; the fast path calls
+# dispatch_emulation, or has it inlined (then it calls context_arm_to_x64 itself).
 check_0007() {
   local s n
   for s in 'NtContinue' 'NtContinueEx'; do
-    n=$($OBJDUMP -d --no-show-raw-insn --disassemble-symbols="#$s\$hp_target" "$NT" 2>/dev/null | grep -c 'dispatch_emulation')
-    if [ "$n" -ge 1 ]; then ok 0007 "#$s calls dispatch_emulation"; else bad 0007 "#$s never calls dispatch_emulation (stock syscall only)"; fi
+    n=$($OBJDUMP -d --no-show-raw-insn --disassemble-symbols="#$s\$hp_target" "$NT" 2>/dev/null | grep -cE 'dispatch_emulation|context_arm_to_x64')
+    if [ "$n" -ge 1 ]; then ok 0007 "#$s enters the emulator directly"; else bad 0007 "#$s never enters the emulator (stock syscall only)"; fi
   done
   if utf16_in "$NT" WINE_D2R_FAST_CONTINUE; then ok 0007 "${NT#$LIB/} reads WINE_D2R_FAST_CONTINUE"; else bad 0007 "${NT#$LIB/} lacks WINE_D2R_FAST_CONTINUE"; fi
 }
