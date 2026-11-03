@@ -77,7 +77,7 @@ FEXCore::Utils::WritePriorityMutex::ContentionStats* StatsLogCodeLockStats();
 // of each goes on a "probe" line, and every "# frame" line gets the longest ones that overlapped that frame.
 void StatsLogSetLockProbe(void (*Probe)());
 
-// Wine's memory lock holder notes (build 149): Info = PE ntdll's export __wine_d2r_vm_lock (our Proton d2r4 and later,
+// Wine's memory lock holder notes (build 150): Info = PE ntdll's export __wine_d2r_vm_lock (our Proton d2r4 and later,
 // struct d2r_vm_lock_info of proton-patches/11.0-1/0006), nullptr when this Wine has none. '# memory lock wait' lines then
 // name the thread that held the lock, where it took it and for how long, and '# memory lock holds' lines list the holds
 // of 4 ms or more Wine noted since the last line.

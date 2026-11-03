@@ -191,6 +191,14 @@ namespace {
     // frame generation). Labels move with the world, the map stays or scrolls, the HUD stays; UI it can't match stays
     // as before. The number is the largest move searched per real frame, in pixels (at most 32).
     {"FEX_LSFG_UI_MOTION", "24"},
+    // Build 150: from the 2026-11-01 runs on, the frame generation layer's presents took 1-12 ms (median per run, the
+    // generated one 4-12 ms, 18-26 ms in b148's heavy scenes) where every run up to 2026-10-30 had 0.1 ms. Those runs
+    // started with MESA_VK_WSI_DEBUG=sw (GameNative sets it when the container's "Use DRI3" is off). Then GameNative's
+    // Vulkan wrapper (Mesa's window system code over Turnip) gives the swapchain CPU images: each present copies the
+    // picture on the GPU into a CPU buffer, on the one KGSL queue behind the game's queued work, waits on the presenting
+    // thread until that copy is done, and the X server copies it again. Without "sw" the wrapper hands the X server the
+    // picture's own buffer (AHardwareBuffer, no copy, no wait), as up to 2026-10-30. 0 leaves MESA_VK_WSI_DEBUG as it is.
+    {"FEX_WSI_DIRECT", "1"},
     // Build 125: the one hitch of the layer 13 run (144 ms at 1:25) was FEX's code lock: a game thread queuing for it on a
     // crowded core was pushed off its CPU inside Wine's wait-list spin lock (Wine keeps waiters in 256 shared lists, each
     // guarded by a spin lock in user code), and three job workers plus the protection thread (holding FEX's memory lock)
@@ -654,6 +662,7 @@ namespace {
     "FEX_LSFG_UI",
     "FEX_LSFG_UI_TOL",
     "FEX_LSFG_UI_MOTION",
+    "FEX_WSI_DIRECT",
     "FEX_KERNEL_FUTEX",
     "FEX_WINE_WAIT_FIX",
     "FEX_PIPE_WATCH",

@@ -238,6 +238,18 @@ namespace FEX::Windows {
 // The layer writes stats.txt next to its conf.toml every 500 ms; with the stats log a 'framegen' line shows it each second
 // (ARM64EC/Vkd3dReport.cpp).
 //
+// GameNative's Vulkan wrapper (libvulkan_wrapper.so: Mesa's window system code over Turnip, which an Android Turnip build
+// has none of) reads MESA_VK_WSI_DEBUG when the game's Vulkan instance looks at its GPU. GameNative sets it to "sw" when
+// the container's "Use DRI3" is off:
+//   FEX_WSI_DIRECT=1       (the D2R default from build 150) "sw" is taken out of MESA_VK_WSI_DEBUG in the game's Unix
+//                          environment (other flags stay; the game only). With "sw" the swapchain gets CPU images: each
+//                          present copies the picture on the GPU into a CPU buffer, on the one KGSL queue behind the
+//                          game's queued work, the presenting thread waits until that copy is done, and the X server
+//                          copies the buffer again. The frame generation layer's presents took 1-12 ms that way (runs
+//                          from 2026-11-01; 18-26 ms in b148's heavy scenes) against 0.1 ms in every run up to
+//                          2026-10-30, when the wrapper handed the X server each picture's own AHardwareBuffer (DRI3,
+//                          no copy, no wait). 0 = MESA_VK_WSI_DEBUG left as it is.
+//
 // FEX's Turnip build (build 69, turnip-patches/, Common/TurnipChannel.h). Stock Turnip writes SP_UPDATE_CNTL with all 8
 // bindless sets on every descriptor update, which drops the GPU's descriptor caches of every set; vkd3d keeps the root
 // constant buffers in a push descriptor set and pushes it before nearly every draw, so each draw of a fight's main pass

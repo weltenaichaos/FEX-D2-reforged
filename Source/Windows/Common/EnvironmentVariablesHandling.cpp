@@ -505,6 +505,62 @@ namespace {
     }
   }
 
+  // See EnvironmentVariablesHandling.h (FEX_WSI_DIRECT). Mesa splits MESA_VK_WSI_DEBUG at commas and spaces, and "all" alone
+  // turns every flag on. Only "sw" is taken out; the game only (the switch has no value elsewhere), so Steam keeps its own.
+  void SetupWsiDirect(FARPROC SetUnixEnv) {
+    const char* Value = Switch("FEX_WSI_DIRECT");
+    if (!Value) {
+      return;
+    }
+    const auto Before = StartUnixValue("MESA_VK_WSI_DEBUG");
+    if (SwitchOff(Value)) {
+      StatsLogNote(fextl::fmt::format("present path: FEX_WSI_DIRECT=0, MESA_VK_WSI_DEBUG left as it is ({})", Before));
+      return;
+    }
+    fextl::string After;
+    bool HadSw = false;
+    if (Before != "-") {
+      size_t i = 0;
+      while (i < Before.size()) {
+        const size_t End = Before.find_first_of(", ", i);
+        const size_t Stop = End == fextl::string::npos ? Before.size() : End;
+        if (Stop > i) {
+          const fextl::string Token = Before.substr(i, Stop - i);
+          if (Token == "sw") {
+            HadSw = true;
+          } else {
+            After += After.empty() ? "" : ",";
+            After += Token;
+          }
+        }
+        i = Stop + 1;
+      }
+    }
+    if (Before == "all") {
+      StatsLogNote("present path: MESA_VK_WSI_DEBUG=all (every flag, the software path too) left as it is: the Vulkan wrapper "
+                   "copies each picture into a CPU buffer and waits for that copy");
+      return;
+    }
+    if (!HadSw) {
+      StatsLogNote(fextl::fmt::format("present path: MESA_VK_WSI_DEBUG={} has no \"sw\": the Vulkan wrapper hands the X server each "
+                                      "picture's own buffer (DRI3), nothing to change",
+                                      Before));
+      return;
+    }
+    if (!SetUnixEnv) {
+      StatsLogNote("present path: this Wine has no __wine_set_unix_env, MESA_VK_WSI_DEBUG=sw stays: the Vulkan wrapper copies each "
+                   "picture into a CPU buffer and waits for that copy");
+      return;
+    }
+    const NTSTATUS SetStatus = reinterpret_cast<decltype(__wine_set_unix_env)>(SetUnixEnv)("MESA_VK_WSI_DEBUG", After.c_str());
+    StatsLogNote(fextl::fmt::format("present path: FEX_WSI_DIRECT={} -> MESA_VK_WSI_DEBUG={} -> {} (status {:#x}; GameNative sets "
+                                    "\"sw\" when the container's \"Use DRI3\" is off): GameNative's Vulkan wrapper hands the X "
+                                    "server each picture's own buffer (AHardwareBuffer) instead of copying it on the GPU into a "
+                                    "CPU buffer behind the game's queued work and waiting for that copy in vkQueuePresentKHR; "
+                                    "FEX_WSI_DIRECT=0 leaves it as it is",
+                                    Value, Before, After.empty() ? "(empty)" : After, static_cast<uint32_t>(SetStatus)));
+  }
+
   // See EnvironmentVariablesHandling.h and TurnipChannel.h. The driver reads TU_FEX_CHANNEL when the game's Vulkan
   // device is created; a stock Turnip ignores it.
   void SetupTurnipChannel(FARPROC SetUnixEnv) {
@@ -853,6 +909,7 @@ void SetupEnvironmentVariableValues(HMODULE NtDll) {
   SetupTurnipNoPreamble(Sym);
   SetupTurnipChannel(Sym);
   SetupLsfgSwitches(Sym);
+  SetupWsiDirect(Sym);
 
   // On an ARM system we are expecting uncached memory to have marked overhead due to atomic memory usage.
   // If `tu_override_uncached_as_cache_coherent` isn't already controlled by the user, then set it here.

@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 149, VKD3D fex41, Turnip fex18, frame generation layer 13, our Proton d2r4 (TEST version 4). The build numbers in the
+State: FEX build 150, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r4 (TEST version 4). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -16,7 +16,7 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
   those, `0` means "nice 0", not off.
 - The logging version lists every switch with its value in the `# switches:` line near the top of the log. Built-in
   values are marked `(default)`.
-- VKD3D switches need our VKD3D (fex41), Turnip switches our Turnip (fex18), frame generation switches our layer. A
+- VKD3D switches need our VKD3D (fex41), Turnip switches our Turnip (fex17), frame generation switches our layer. A
   VKD3D switch does nothing when its matching `VKD3D_FEX_*` variable is already set.
 - If you changed any switch, say so when you report a problem.
 
@@ -126,7 +126,6 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_TU_DEPTH_CLEAR` | `1` | Depth and colour clears at the start of a pass run as one 3D draw (Turnip fex3, fex8). | `0` |
 | `FEX_TU_BUDGET_CACHE` | `1` | The GPU memory budget is read at most every 250 ms instead of every frame (Turnip fex5). | `0` |
 | `FEX_TU_DRAW_SETUP` | `4` | The lighting shaders run without a setup step at all, their constants loaded by the command processor: lighting about 5% faster (Turnip fex15). | `0` |
-| `FEX_TU_PRESENT_NOWAIT` | `alt` | A frame goes to the screen without first waiting for the GPU work queued before that image's last trip to the screen (Turnip fex18, build 149). In build 148's heavy scenes the frame generation layer's presents waited 18-26 ms there, so real frames missed their slot. `alt` = on and off every 10 s for the comparison (the log's `turnip present` lines), `1` = always on. | `0` |
 
 ## Frame generation layer
 
@@ -141,6 +140,12 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_LSFG_UI` | `1` | Frame generation works on frames without the UI, and the UI is taken from the real frame, so the map and HUD don't smear (layer 11). | `0` |
 | `FEX_LSFG_UI_TOL` | `0` | How many 1/255 steps a pixel may differ and still not count as UI. | |
 | `FEX_LSFG_UI_MOTION` | `24` | The UI is drawn halfway along its own motion, so item names move with the world. The number is the largest move searched, in pixels (layers 12-13). | `0` |
+
+## Picture to the screen
+
+| Switch | Default | What it does | Off |
+|---|---|---|---|
+| `FEX_WSI_DIRECT` | `1` | Takes `sw` out of `MESA_VK_WSI_DEBUG` for the game (GameNative sets it when the container's "Use DRI3" is off). With `sw`, GameNative's Vulkan wrapper copies every picture on the GPU into a CPU buffer behind the game's queued work, waits for that copy inside the present, and the X server copies it again: the frame generation layer's presents took 1-12 ms (18-26 ms in heavy scenes) from 2026-11-01 on, against 0.1 ms in every run before. Without it the wrapper hands the X server the picture's own buffer (build 150). | `0` |
 
 ## Logging and measuring
 
