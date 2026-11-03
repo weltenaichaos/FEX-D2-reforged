@@ -73,6 +73,7 @@ $end_info$
 #include <type_traits>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <ntstatus.h>
@@ -871,7 +872,7 @@ struct Dll {
   const wchar_t* Name;
   const wchar_t* Path;
   uint64_t Base;      // where it is in this process
-  uint64_t Preferred; // the image base in its file
+  uint64_t Preferred; // where the other Wine programs have it
   uint64_t Size;
 };
 Dll Dlls[] = {
@@ -890,35 +891,138 @@ fextl::string Narrow(const wchar_t* Name) {
 }
 std::atomic<uint32_t> Redirects;
 
-// The image base written in a DLL's file (the header in memory may hold where it was loaded instead).
-uint64_t FileImageBase(const wchar_t* Path) {
-  UNICODE_STRING Name {};
-  RtlInitUnicodeString(&Name, Path);
-  OBJECT_ATTRIBUTES Attr {};
-  InitializeObjectAttributes(&Attr, &Name, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
-  IO_STATUS_BLOCK IOSB {};
-  HANDLE File {};
-  if (!NT_SUCCESS(NtOpenFile(&File, GENERIC_READ | SYNCHRONIZE, &Attr, &IOSB, FILE_SHARE_READ | FILE_SHARE_DELETE,
-                             FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE))) {
-    return 0;
+// Build 155: the "usual" place is where the other Wine programs of this container have the DLL (Wine picks builtin DLL
+// addresses itself; the image base in the file, 0x180000000, is not it). Read from /proc/<pid>/maps: the line that maps
+// the same file at offset 0. The address most of them use wins.
+fextl::string ReadAll(const char* Path) {
+  fextl::string Out;
+  const int Fd = FEX::Windows::Linux::Open(Path);
+  if (Fd < 0) {
+    return Out;
   }
-  alignas(8) uint8_t Header[4096] {};
-  LARGE_INTEGER Offset {};
-  const bool Read = NT_SUCCESS(NtReadFile(File, nullptr, nullptr, nullptr, &IOSB, Header, sizeof(Header), &Offset, nullptr));
-  NtClose(File);
-  if (!Read || IOSB.Information < 0x200) {
-    return 0;
+  char Buffer[16384];
+  uint64_t Offset = 0;
+  for (;;) {
+    const int64_t N = FEX::Windows::Linux::Pread(Fd, Buffer, sizeof(Buffer), Offset);
+    if (N <= 0) {
+      break;
+    }
+    Out.append(Buffer, static_cast<size_t>(N));
+    Offset += static_cast<uint64_t>(N);
+    if (Out.size() > (8u << 20)) {
+      break;
+    }
   }
-  const auto* Dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(Header);
-  if (Dos->e_magic != IMAGE_DOS_SIGNATURE || Dos->e_lfanew <= 0 ||
-      static_cast<uint64_t>(Dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > static_cast<uint64_t>(IOSB.Information)) {
-    return 0;
+  FEX::Windows::Linux::Close(Fd);
+  return Out;
+}
+
+struct MapLine {
+  uint64_t Start;
+  uint64_t Offset;
+  std::string_view Path;
+};
+
+// Calls Fn for each line of a maps text.
+template<typename F>
+void ForEachMap(const fextl::string& Maps, F&& Fn) {
+  size_t Pos = 0;
+  while (Pos < Maps.size()) {
+    size_t End = Maps.find('\n', Pos);
+    if (End == fextl::string::npos) {
+      End = Maps.size();
+    }
+    const std::string_view Line(Maps.data() + Pos, End - Pos);
+    Pos = End + 1;
+    // start-end perms offset dev inode path
+    MapLine M {};
+    M.Start = strtoull(Line.data(), nullptr, 16);
+    size_t Field = 0, i = 0;
+    while (i < Line.size() && Field < 5) {
+      while (i < Line.size() && Line[i] != ' ') {
+        ++i;
+      }
+      while (i < Line.size() && Line[i] == ' ') {
+        ++i;
+      }
+      ++Field;
+      if (Field == 2) {
+        M.Offset = strtoull(Line.data() + i, nullptr, 16);
+      }
+    }
+    if (Field == 5 && i < Line.size()) {
+      M.Path = Line.substr(i);
+      Fn(M);
+    }
   }
-  const auto* Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(Header + Dos->e_lfanew);
-  if (Nt->Signature != IMAGE_NT_SIGNATURE || Nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-    return 0;
+}
+
+void FindUsualBases() {
+  const fextl::string Own = ReadAll("/proc/self/maps");
+  fextl::string Paths[std::size(Dlls)];
+  ForEachMap(Own, [&](const MapLine& M) {
+    for (size_t d = 0; d < std::size(Dlls); ++d) {
+      if (Dlls[d].Base && M.Start == Dlls[d].Base && Paths[d].empty()) {
+        Paths[d] = fextl::string(M.Path);
+      }
+    }
+  });
+  const uint32_t Uid = FEX::Windows::Linux::GetUid();
+  const int Self = FEX::Windows::Linux::GetPid();
+  fextl::vector<int> Pids;
+  FEX::Windows::Linux::ForEachEntry(
+    "/proc",
+    [](const char* Name, void* Arg) {
+      const int Pid = atoi(Name);
+      if (Pid > 0) {
+        static_cast<fextl::vector<int>*>(Arg)->push_back(Pid);
+      }
+    },
+    &Pids);
+  constexpr size_t MaxBases = 8;
+  uint64_t Seen[std::size(Dlls)][MaxBases] {};
+  uint32_t Votes[std::size(Dlls)][MaxBases] {};
+  uint32_t Checked = 0;
+  for (int Pid : Pids) {
+    if (Pid == Self || Checked >= 40) {
+      continue;
+    }
+    char Path[48];
+    snprintf(Path, sizeof(Path), "/proc/%d", Pid);
+    FEX::Windows::Linux::FileInfo Info {};
+    if (!FEX::Windows::Linux::Stat(Path, Info) || Info.Uid != Uid) {
+      continue;
+    }
+    snprintf(Path, sizeof(Path), "/proc/%d/maps", Pid);
+    const fextl::string Maps = ReadAll(Path);
+    if (Maps.empty()) {
+      continue;
+    }
+    ++Checked;
+    ForEachMap(Maps, [&](const MapLine& M) {
+      for (size_t d = 0; d < std::size(Dlls); ++d) {
+        if (M.Offset != 0 || Paths[d].empty() || M.Path != std::string_view(Paths[d])) {
+          continue;
+        }
+        for (size_t b = 0; b < MaxBases; ++b) {
+          if (Seen[d][b] == M.Start || !Seen[d][b]) {
+            Seen[d][b] = M.Start;
+            ++Votes[d][b];
+            break;
+          }
+        }
+      }
+    });
   }
-  return Nt->OptionalHeader.ImageBase;
+  for (size_t d = 0; d < std::size(Dlls); ++d) {
+    uint32_t Best = 0;
+    for (size_t b = 0; b < MaxBases; ++b) {
+      if (Votes[d][b] > Best && Seen[d][b] != Dlls[d].Base) {
+        Best = Votes[d][b];
+        Dlls[d].Preferred = Seen[d][b];
+      }
+    }
+  }
 }
 
 void LookUp() {
@@ -928,16 +1032,18 @@ void LookUp() {
     FEX::Windows::StartWatchNote("system DLL redirect: off (FEX_SYSDLL_REDIRECT=0)");
     return;
   }
-  fextl::string Text = "system DLL redirect: looked up at the first call into free memory:";
   for (auto& D : Dlls) {
     D.Base = FrameLatency::FindModule(D.Name);
-    D.Preferred = FileImageBase(D.Path);
+  }
+  FindUsualBases();
+  fextl::string Text = "system DLL redirect: looked up at the first call into free memory (usual = where the other Wine programs have it):";
+  for (auto& D : Dlls) {
     if (D.Base) {
       const auto* Dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(D.Base);
       const auto* Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(D.Base + Dos->e_lfanew);
       D.Size = Nt->OptionalHeader.SizeOfImage;
     }
-    Text += fextl::fmt::format(" {} at {:X} (file base {:X}, size {:X})", Narrow(D.Name), D.Base,
+    Text += fextl::fmt::format(" {} at {:X} (usual {:X}, size {:X})", Narrow(D.Name), D.Base,
                                D.Preferred, D.Size);
   }
   FEX::Windows::StatsLogNote(Text);
