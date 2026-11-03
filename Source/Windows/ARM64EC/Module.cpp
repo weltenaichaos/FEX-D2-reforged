@@ -54,6 +54,7 @@ $end_info$
 #include "Windows/Common/PriorityGuard.h"
 #include "Windows/Common/StartWatch.h"
 #include "Windows/Common/LinuxSys.h"
+#include "Windows/Common/LockBoost.h"
 #include "Windows/Common/Switches.h"
 #include "CodeBuffer.h"
 #include "FrameLatency.h"
@@ -204,13 +205,25 @@ public:
         Current = State.exchange(2, std::memory_order_acquire);
       }
       while (Current != 0) {
+        // Build 156 (FEX_LOCK_BOOST): an owner that holds it too long gets raised; until then a timed wait.
+        struct {
+          int64_t Sec, Nsec;
+        } Timeout {};
+        const uint64_t Wait = Boosting ? Boost.Check(BoostKind) : 0;
+        if (Wait) {
+          Timeout = {static_cast<int64_t>(Wait / 1'000'000'000), static_cast<int64_t>(Wait % 1'000'000'000)};
+        }
         FEXCore::Utils::WritePriorityMutex::KernelFutexCall(
-          &State, FEXCore::Utils::WritePriorityMutex::KFUTEX_WAIT | FEXCore::Utils::WritePriorityMutex::KFUTEX_PRIVATE_FLAG, 2, nullptr, 0);
+          &State, FEXCore::Utils::WritePriorityMutex::KFUTEX_WAIT | FEXCore::Utils::WritePriorityMutex::KFUTEX_PRIVATE_FLAG, 2,
+          Wait ? &Timeout : nullptr, 0);
         Current = State.exchange(2, std::memory_order_acquire);
       }
     }
     Owner.store(Self, std::memory_order_relaxed);
     Depth = 1;
+    if (Boosting) {
+      Boost.Acquired();
+    }
   }
 
   bool try_lock() {
@@ -228,6 +241,9 @@ public:
     }
     Owner.store(Self, std::memory_order_relaxed);
     Depth = 1;
+    if (Boosting) {
+      Boost.Acquired();
+    }
     return true;
   }
 
@@ -239,11 +255,22 @@ public:
     if (--Depth) {
       return;
     }
+    const uint64_t BoostSince = Boosting ? Boost.Releasing() : 0;
     Owner.store(0, std::memory_order_relaxed);
     if (State.exchange(0, std::memory_order_release) == 2) {
       FEXCore::Utils::WritePriorityMutex::KernelFutexCall(
         &State, FEXCore::Utils::WritePriorityMutex::KFUTEX_WAKE | FEXCore::Utils::WritePriorityMutex::KFUTEX_PRIVATE_FLAG, 1, nullptr, 0);
     }
+    if (Boosting) {
+      Boost.Released(BoostKind, BoostSince);
+    }
+  }
+
+  // Build 156: owners get raised by waiters (FEX_LOCK_BOOST), as lock kind Kind. Once, in ProcessInit, before any other
+  // thread can take it, after WritePriorityMutex::LockBoost is set.
+  void SetBoostKind(uint32_t Kind) {
+    BoostKind = Kind;
+    Boosting = FEXCore::Utils::WritePriorityMutex::KernelFutex && FEXCore::Utils::WritePriorityMutex::LockBoost && Kind;
   }
 
 private:
@@ -251,6 +278,9 @@ private:
   std::atomic<uint32_t> Owner {};
   uint32_t Depth {}; // only the owner touches it
   std::recursive_mutex Fallback;
+  bool Boosting {};
+  uint32_t BoostKind {};
+  FEXCore::Utils::WritePriorityMutex::BoostSlot Boost {};
 };
 
 MemoryLock ThreadCreationMutex;
@@ -1374,6 +1404,12 @@ NTSTATUS ProcessInit() {
   const char* PoliteSwitch = FEX::Windows::Switch("FEX_CODELOCK_POLITE");
   const uint32_t PoliteMs = PoliteSwitch ? std::min<uint32_t>(strtoul(PoliteSwitch, nullptr, 10), 5000) : 0;
   CTX->GetCodeInvalidationMutex().SetPoliteWriteWait(PoliteMs);
+  // Build 156 (FEX_LOCK_BOOST): owners of FEX's code lock and memory lock that hold them long while others wait run at the
+  // main thread's priority until they let go (LockBoost.h). Here, while no other thread can take either lock.
+  if (FEX::Windows::LockBoost::Init()) {
+    CTX->GetCodeInvalidationMutex().SetBoostKind(FEX::Windows::LockBoost::KindCodeLock);
+    ThreadCreationMutex.SetBoostKind(FEX::Windows::LockBoost::KindMemoryLock);
+  }
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
   // FEX_SMC_HOTPAGE=<faults>: a page with that many write faults within 100 ms stops being write-protected and its code
@@ -1424,6 +1460,7 @@ NTSTATUS ProcessInit() {
     FEX::Windows::StatsLogSetServerCalls(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_server_calls")));
     FEX::Windows::StatsLogNote(PoliteMs ? fextl::fmt::format("codelock: writers wait up to {}ms without blocking compiles", PoliteMs) :
                                           fextl::string("codelock: writers queue at once (upstream)"));
+    FEX::Windows::StatsLogNote(FEX::Windows::LockBoost::Note());
     FEX::Windows::StatsLogNote(
       FEXCore::Utils::WritePriorityMutex::KernelFutex ?
         "locks: FEX's code lock and memory lock (fexlock) wait in the Linux kernel (futex), not through Wine's shared wait lists "

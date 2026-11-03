@@ -18,6 +18,7 @@ add_library(CommonWindows STATIC
   ThreadPlacer.cpp
   PriorityGuard.cpp
   LinuxSys.cpp
+  LockBoost.cpp
   InvalidationTracker.cpp
   ImageTracker.cpp
   Logging.cpp

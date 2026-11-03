@@ -53,6 +53,95 @@ constexpr int64_t KFUTEX_WAKE = 1;
 constexpr int64_t KFUTEX_WAIT_BITSET = 9;
 constexpr int64_t KFUTEX_WAKE_BITSET = 10;
 constexpr int64_t KFUTEX_PRIVATE_FLAG = 128;
+
+// CLOCK_MONOTONIC in ns (Linux arm64 clock_gettime, straight to the kernel), the clock of an absolute futex bitset wait.
+inline int64_t KernelMonotonicNs() {
+  struct {
+    int64_t Sec, Nsec;
+  } Ts {};
+  register int64_t X8 asm("x8") = 113; // __NR_clock_gettime
+  register int64_t X0 asm("x0") = 1;   // CLOCK_MONOTONIC
+  register int64_t X1 asm("x1") = reinterpret_cast<int64_t>(&Ts);
+  asm volatile("svc #0" : "+r"(X0) : "r"(X8), "r"(X1) : "memory", "cc");
+  return X0 < 0 ? X0 : Ts.Sec * 1'000'000'000 + Ts.Nsec;
+}
+
+// Build 156 (FEX_LOCK_BOOST): a thread holding a lock that others wait for, while it waits for a CPU itself (pushed off
+// it by the game's higher priority threads), keeps all of them waiting. In the b154 run FEX's code lock was held 56, 59
+// and 111 ms in calm play while the main thread and the job workers waited to compile, and a normal priority thread
+// waited 79-172 ms for a CPU in each of those seconds. A waiter that sees an owner hold the lock for AfterNs raises it
+// to the main thread's priority until it lets go. The frontend sets the hooks before a second thread exists; with them
+// unset nothing is tracked.
+struct LockBoostHooks {
+  int (*SelfTid)(); // the calling thread's Linux tid
+  // What the owner Tid's raise would undo (its tid and nice packed, never 0), or 0 when it needs none (already that high).
+  uint64_t (*Prepare)(int Tid);
+  void (*Apply)(uint64_t Raised, uint32_t Kind, uint64_t HeldNs);
+  // Puts the owner's priority back. HeldNs: its whole hold when the owner lets go, 0 when a waiter undoes a late raise.
+  void (*Restore)(uint64_t Raised, uint32_t Kind, uint64_t HeldNs);
+  uint64_t AfterNs;
+};
+inline const LockBoostHooks* LockBoost = nullptr;
+
+// The owner side of one lock for LockBoost: who holds it and since when, and a raise a waiter made.
+struct BoostSlot {
+  std::atomic<int> OwnerTid {};
+  std::atomic<uint64_t> OwnerSince {}; // cycle counter
+  std::atomic<uint64_t> Raised {};
+
+  static uint64_t TicksToNs(uint64_t Ticks) {
+    const uint64_t Freq = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency;
+    return Freq ? Ticks / Freq * 1'000'000'000 + Ticks % Freq * 1'000'000'000 / Freq : 0;
+  }
+
+  // The owner, right after taking the lock.
+  void Acquired() {
+    OwnerSince.store(FEXCore::Utils::SpinWaitLock::GetCycleCounter(), std::memory_order_relaxed);
+    OwnerTid.store(LockBoost->SelfTid(), std::memory_order_seq_cst);
+  }
+  // The owner, before letting go: no waiter raises it from now on. Returns when it took the lock.
+  uint64_t Releasing() {
+    const uint64_t Since = OwnerSince.load(std::memory_order_relaxed);
+    OwnerTid.store(0, std::memory_order_seq_cst);
+    return Since;
+  }
+  // The owner, after letting go: undoes a raise made while it held the lock.
+  void Released(uint32_t Kind, uint64_t Since) {
+    if (Raised.load(std::memory_order_seq_cst)) {
+      if (const uint64_t R = Raised.exchange(0, std::memory_order_seq_cst)) {
+        LockBoost->Restore(R, Kind, TicksToNs(FEXCore::Utils::SpinWaitLock::GetCycleCounter() - Since));
+      }
+    }
+  }
+  // A waiter, before it sleeps: raises an owner that has held the lock AfterNs or longer. Returns how long to sleep at
+  // most before looking again (an owner that hasn't held it that long yet), 0 for no limit.
+  uint64_t Check(uint32_t Kind) {
+    if (Raised.load(std::memory_order_relaxed)) {
+      return 0;
+    }
+    const int Tid = OwnerTid.load(std::memory_order_seq_cst);
+    if (!Tid) {
+      return 0;
+    }
+    const uint64_t Held = TicksToNs(FEXCore::Utils::SpinWaitLock::GetCycleCounter() - OwnerSince.load(std::memory_order_relaxed));
+    if (Held < LockBoost->AfterNs) {
+      return LockBoost->AfterNs - Held + 100'000;
+    }
+    const uint64_t P = LockBoost->Prepare(Tid);
+    uint64_t Free = 0;
+    if (!P || !Raised.compare_exchange_strong(Free, P, std::memory_order_seq_cst)) {
+      return 0;
+    }
+    LockBoost->Apply(P, Kind, Held);
+    // Let go meanwhile: whoever took the raise may have undone it before it was made, so undo it here (twice is harmless).
+    if (OwnerTid.load(std::memory_order_seq_cst) != Tid || Raised.load(std::memory_order_seq_cst) != P) {
+      uint64_t Mine = P;
+      Raised.compare_exchange_strong(Mine, 0, std::memory_order_seq_cst);
+      LockBoost->Restore(P, Kind, 0);
+    }
+    return 0;
+  }
+};
 #endif
 
 // Exclusive lock timings for one mutex, read and reset by the stats log. Durations and times are in cycle counter
@@ -67,6 +156,7 @@ struct ContentionStats {
   std::atomic<uint64_t> MaxHoldAt;
   std::atomic<uint64_t> ReaderSleeps; // shared locks that had to sleep (all of them counted, not only exclusive ones)
   std::atomic<uint64_t> WriterSleeps;
+  std::atomic<int> MaxHoldTid; // Linux tid of the longest hold's owner (build 156, with LockBoost on), 0 = not known
 };
 
 // A custom mutex that prioritizes exclusive locks.
@@ -103,6 +193,9 @@ public:
     LockSlow();
     if (Stats) {
       NoteAcquired(WaitBegin);
+    }
+    if (BoostKind) {
+      Boost.Acquired();
     }
   }
 
@@ -250,6 +343,7 @@ public:
     if (Stats && HeldSince) {
       NoteReleased();
     }
+    const uint64_t BoostSince = BoostKind ? Boost.Releasing() : 0;
 #endif
 
     uint32_t Expected = AtomicFutex.load(std::memory_order_relaxed);
@@ -281,6 +375,9 @@ public:
 
 #ifdef FEX_WRITE_PRIORITY_MUTEX_EXTRAS
     WakePoliteWriters();
+    if (BoostKind) {
+      Boost.Released(BoostKind, BoostSince);
+    }
 #endif
   }
 
@@ -332,6 +429,9 @@ public:
     if (Acquired && Stats) {
       NoteAcquired(0);
     }
+    if (Acquired && BoostKind) {
+      Boost.Acquired();
+    }
 #endif
     return Acquired;
   }
@@ -365,6 +465,12 @@ public:
   // Exclusive lock timings go to Stats from now on (nullptr stops them). Stats must outlive the mutex's use.
   void SetContentionStats(ContentionStats* NewStats) {
     Stats = NewStats;
+  }
+
+  // Build 156: exclusive owners of this mutex get raised by waiters (LockBoost), as lock kind Kind (non-zero). Only before
+  // a second thread can take it, after LockBoost is set.
+  void SetBoostKind(uint32_t Kind) {
+    BoostKind = LockBoost ? Kind : 0;
   }
 #endif
 
@@ -408,8 +514,10 @@ private:
       Stats->WriterSleeps.fetch_add(1, std::memory_order_relaxed);
     }
     if (KernelFutex) {
-      // As on Linux: the whole word, writers' wake bit. A signal or a changed word just sends it round the loop again.
-      KernelFutexCall(&Futex, KFUTEX_WAIT_BITSET | KFUTEX_PRIVATE_FLAG, Expected, nullptr, FUTEX_BITSET_WAIT_WRITERS);
+      // As on Linux: the whole word, writers' wake bit. A signal or a changed word just sends it round the loop again,
+      // and so does the end of a boost wait (BoostWaitUntil).
+      Timespec Until {};
+      KernelFutexCall(&Futex, KFUTEX_WAIT_BITSET | KFUTEX_PRIVATE_FLAG, Expected, BoostWaitUntil(Until), FUTEX_BITSET_WAIT_WRITERS);
       return;
     }
 #endif
@@ -423,7 +531,8 @@ private:
       Stats->ReaderSleeps.fetch_add(1, std::memory_order_relaxed);
     }
     if (KernelFutex) {
-      KernelFutexCall(&Futex, KFUTEX_WAIT_BITSET | KFUTEX_PRIVATE_FLAG, Expected, nullptr, FUTEX_BITSET_WAIT_READERS);
+      Timespec Until {};
+      KernelFutexCall(&Futex, KFUTEX_WAIT_BITSET | KFUTEX_PRIVATE_FLAG, Expected, BoostWaitUntil(Until), FUTEX_BITSET_WAIT_READERS);
       return;
     }
 #endif
@@ -605,7 +714,30 @@ private:
     if (Held > Stats->MaxHold.load(std::memory_order_relaxed)) {
       Stats->MaxHold.store(Held, std::memory_order_relaxed);
       Stats->MaxHoldAt.store(Now, std::memory_order_relaxed);
+      Stats->MaxHoldTid.store(BoostKind ? Boost.OwnerTid.load(std::memory_order_relaxed) : 0, std::memory_order_relaxed);
     }
+  }
+
+  struct Timespec {
+    int64_t Sec, Nsec;
+  };
+  // A sleeping waiter's deadline (absolute CLOCK_MONOTONIC, as a bitset futex wait takes it) for raising the exclusive
+  // owner, or nullptr to sleep until woken (no owner to raise, raised already, or LockBoost off for this mutex).
+  const Timespec* BoostWaitUntil(Timespec& Out) {
+    if (!BoostKind) {
+      return nullptr;
+    }
+    const uint64_t Wait = Boost.Check(BoostKind);
+    if (!Wait) {
+      return nullptr;
+    }
+    const int64_t Now = KernelMonotonicNs();
+    if (Now <= 0) {
+      return nullptr;
+    }
+    const int64_t At = Now + static_cast<int64_t>(Wait);
+    Out = {At / 1'000'000'000, At % 1'000'000'000};
+    return &Out;
   }
 
   // Polite writers spin on WFE for the first 0.2ms (200k ns), then sleep in 1ms steps.
@@ -617,6 +749,8 @@ private:
   uint64_t HeldSince {};
   uint32_t PoliteWaiters {};
   uint32_t PoliteWaitSequence {};
+  uint32_t BoostKind {};
+  BoostSlot Boost {};
 #endif
 
   constexpr static uint32_t WRITE_OWNED_BIT = 1U << 31;

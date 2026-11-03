@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/LinuxSys.h"
+#include "Windows/Common/LockBoost.h"
 #include "Windows/Common/SHMStats.h"
 #include "Windows/Common/Switches.h"
 
@@ -4321,15 +4322,21 @@ namespace {
     const uint64_t MaxHoldAt = Take(CodeLockStats.MaxHoldAt);
     const uint64_t ReaderSleeps = Take(CodeLockStats.ReaderSleeps);
     const uint64_t WriterSleeps = Take(CodeLockStats.WriterSleeps);
+    const int MaxHoldTid = CodeLockStats.MaxHoldTid.exchange(0, std::memory_order_relaxed);
     if (!Locks && !GiveUps && !ReaderSleeps && !WriterSleeps) {
       return {};
+    }
+    // Build 156 (with FEX_LOCK_BOOST on): who held it longest, from 5 ms on.
+    fextl::string HoldBy;
+    if (MaxHoldTid && MaxHold * MsPerTick >= 5.0) {
+      HoldBy = fextl::fmt::format(" by {} {}", MaxHoldTid, FEX::Windows::LockBoost::ThreadName(MaxHoldTid));
     }
     auto Bin = [State](uint64_t At) {
       return At > State->SecondStart ? static_cast<int64_t>((At - State->SecondStart) * TimelineBins / State->CounterFreq) : -1;
     };
     // Build 125: how often a compile (reader) or a writer had to sleep for the lock, and through what.
-    return fextl::fmt::format("  codelock writes={} slow={} giveup={} wait={:.1f}ms@{} hold={:.1f}ms@{} sleeps readers={} writers={} ({})\n",
-                              Locks, Slow, GiveUps, MaxWait * MsPerTick, Bin(MaxWaitAt), MaxHold * MsPerTick, Bin(MaxHoldAt),
+    return fextl::fmt::format("  codelock writes={} slow={} giveup={} wait={:.1f}ms@{} hold={:.1f}ms@{}{} sleeps readers={} writers={} ({})\n",
+                              Locks, Slow, GiveUps, MaxWait * MsPerTick, Bin(MaxWaitAt), MaxHold * MsPerTick, Bin(MaxHoldAt), HoldBy,
                               ReaderSleeps, WriterSleeps, FEXCore::Utils::WritePriorityMutex::KernelFutex ? "kernel" : "wine");
   }
 
@@ -4665,6 +4672,7 @@ namespace {
       }
 
       Line += CodeLockLine(State, MsPerTick);
+      Line += FEX::Windows::LockBoost::Line();
       // How long the log thread's own work between the last two sampling seconds took (nothing is sampled meanwhile).
       Line += fextl::fmt::format("  logger work={:.1f}ms\n", State->WorkTicks * MsPerTick);
 

@@ -205,6 +205,11 @@ namespace {
     // spun on that spin lock for ~120 ms, which kept the stuck thread off a CPU longer still. FEX's code lock and memory
     // lock now sleep and wake in the Linux kernel (futex), whose wait lists can't be held by a thread that isn't running.
     {"FEX_KERNEL_FUTEX", "1"},
+    // Build 156: in the b154 run FEX's code lock was held 56, 59 and 111 ms in calm play while the main thread and the job
+    // workers waited to compile (frames of 76, 53 and 131 ms), and in each of those seconds a normal priority thread
+    // waited 79-172 ms for a CPU on the crowded big cores. A thread that holds FEX's code lock or memory lock this many ms
+    // while another waits for it runs at the main thread's priority (nice -20) until it lets go (LockBoost.h). 0 = off.
+    {"FEX_LOCK_BOOST", "4"},
     // Build 142: the build 118 and 139 freezes (no frames, main thread stuck in RtlWakeConditionVariable at 95% CPU, job
     // workers spinning in SleepConditionVariableSRW) were a race in Proton 11.0's ntdll wait lists that upstream Wine has
     // fixed: a waker marked a waiter woken before unlinking it, a waiter coming back on its own left at once, and the list
@@ -665,6 +670,7 @@ namespace {
     "FEX_LSFG_UI_MOTION",
     "FEX_WSI_DIRECT",
     "FEX_KERNEL_FUTEX",
+    "FEX_LOCK_BOOST",
     "FEX_WINE_WAIT_FIX",
     "FEX_PIPE_WATCH",
     "FEX_FRAME_THREADS",

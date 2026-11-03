@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 154, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r7 (build 9, entry proton-11.0-1-arm64ec-109). The build numbers in the
+State: FEX build 156, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r7 (build 9, entry proton-11.0-1-arm64ec-109). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -56,6 +56,7 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
 | `FEX_JIT_REUSE` | `1` | The same for freshly translated code. The game's protection rewrites its code every minute or two (build 95). | `0` |
 | `FEX_SMC_HOTPAGE` | `16` | A memory page that its own code writes to this often within 100 ms stops being write-protected; its code checks itself instead. This fixed the protection's regular freezes (build 54). | `0` |
 | `FEX_KERNEL_FUTEX` | `1` | FEX's internal locks wait in the Linux kernel instead of Wine's wait lists. Fixed a 144 ms freeze (build 125). | `0` |
+| `FEX_LOCK_BOOST` | `4` | A thread that holds FEX's code lock or memory lock this many ms while another thread waits for it runs at the main thread's priority (nice -20) until it lets go. In the b154 run the code lock was held 56-111 ms by a thread that waited for a CPU itself (build 156). Needs `FEX_KERNEL_FUTEX`. | `0` |
 | `FEX_WINE_WAIT_FIX` | `1` | Wine's wait lists (every lock and condition variable in the process) run with upstream Wine's fix for a race that froze the game for good (build 118 and 139 runs). FEX checks ntdll's code first and leaves it alone if it doesn't match. On our Proton d2r1 (order fix only) FEX still swaps in for its sleeping list lock; from d2r2 on (both fixes, export `__wine_d2r_wait_lists` = 2) FEX stays out. `2` = the same fix with Wine's spin lock (build 142-144). | `0` |
 
 ## CPU cores and priorities
@@ -74,7 +75,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_MAINCORE_AWAY_SHARE` | `1` | While the main thread is away, the game's other threads may use its core (build 123). | `0` |
 | `FEX_MAINCORE_ESCAPE_NICE` | `-20` | The main thread's priority while it is away. | `off` |
 | `FEX_MAINCORE_OTHERS` | `user` | Other programs of the app (steam.exe, the launcher) are kept off the main thread's core (builds 76-77). `process` keeps only the game's own threads off. | `off` |
-| `FEX_HELPER_CORES` | `little` | FEX's helper threads (disk cache writer and others) run on the little cores (build 49). | `off` |
+| `FEX_HELPER_CORES` | `little` | FEX's helper threads (stats log, priority guard, escape watcher, rumble sender, file cache dropper) run on the little cores (build 49). Since GameNative gives the game cores 3-7, Wine refused this and they ran on the big cores; from build 156 FEX moves them at the Linux level. | `off` |
 | `FEX_LOADER_CORES` | `little` | The game's protection/loader thread is found and moved to the little cores (builds 62-63, 81). | `off` |
 | `FEX_LOADER_GAME_EXCEPTIONS` | `400` | A thread with this many exceptions in the game's own code within 2 s is a game thread and is never moved (build 65). | `0` |
 | `FEX_PRIO` | `normal` | Every thread at normal Windows priority. Wine on Android turns Windows priorities into extreme Linux values (build 48). | `keep` |

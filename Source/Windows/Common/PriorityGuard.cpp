@@ -2488,6 +2488,115 @@ namespace {
     return Out;
   }
 
+  // FEX's own threads that may leave the game's cores for the slowest ones (FEX_HELPER_CORES=little): the stats log (its
+  // 2ms sampler and per-second work), this guard, the rumble sender, the file cache dropper and the escape watcher. The
+  // stall probe measures what game threads see, and the disk cache writer, prefetcher and unpack cache threads hold locks
+  // or feed loads the game waits on, so they stay.
+  bool MovableHelper(std::string_view Name) {
+    return Name == "FEXStatsLog" || Name == "FEXPrioGuard" || Name == "FEXThreadPin" || Name == "FEXFrameLatency" || Name == "FEXRumble" ||
+           Name == "FEXFileCache" || Name == "FEXMainWatch";
+  }
+
+  // Build 156: the movable helpers on the slowest cores at the Linux level where Wine refuses them. GameNative gives the
+  // game cores 3-7 (process mask 0xf8 from about t=3), Wine then keeps every thread's cores inside that, so in every run
+  // up to b154 the stats log, this guard, the escape watcher and the file cache dropper ran on the big cores next to the
+  // game ("# cores: tid=N FEXStatsLog affinity 0xf8 -> 0x78"), and on the main thread's core while it was shared. The
+  // loader thread is moved the same way (LoaderRound). Found by their Linux names in /proc/self/task (Wine names a
+  // thread's Linux task after its Windows name); their cores are read every round, as Wine puts them back on the game's
+  // cores when the process's cores change.
+  struct HelperThread {
+    int LinuxTid;
+    fextl::string Name;
+    uint32_t Sets;
+    uint32_t Failures;
+  };
+  struct HelperKeeper {
+    fextl::vector<HelperThread> Threads;
+    uint32_t ScannedAt; // round of the last /proc scan, 0 = scan at the next round
+    uint32_t Expected;  // movable helpers Wine listed at that scan
+    bool Noted;
+  };
+
+  void ScanHelpers(HelperKeeper& K) {
+    struct Args {
+      fextl::vector<HelperThread> Found;
+      const fextl::vector<HelperThread>* Old;
+    } A {.Old = &K.Threads};
+    Linux::ForEachEntry(
+      "/proc/self/task",
+      [](const char* Name, void* Arg) {
+        auto& A = *static_cast<Args*>(Arg);
+        const int Tid = atoi(Name);
+        if (Tid <= 0) {
+          return;
+        }
+        char Path[64];
+        snprintf(Path, sizeof(Path), "/proc/self/task/%d/comm", Tid);
+        char Comm[32];
+        if (Linux::ReadSmallFile(Path, Comm, sizeof(Comm)) <= 0) {
+          return;
+        }
+        if (char* End = strchr(Comm, '\n')) {
+          *End = 0;
+        }
+        if (!MovableHelper(Comm)) {
+          return;
+        }
+        HelperThread H {.LinuxTid = Tid, .Name = Comm};
+        for (const auto& O : *A.Old) {
+          if (O.LinuxTid == Tid && O.Name == H.Name) {
+            H.Sets = O.Sets;
+            H.Failures = O.Failures;
+          }
+        }
+        A.Found.push_back(std::move(H));
+      },
+      &A);
+    K.Threads = std::move(A.Found);
+  }
+
+  void KeepHelpersLittle(HelperKeeper& K, const Config& C, uint32_t Round, uint32_t Movable, uint64_t ProcessMask) {
+    // Again when Wine lists another number of them (one started or ended, at most every 10 s) and once a minute.
+    if (!K.ScannedAt || Round - K.ScannedAt >= 30 || (Movable != K.Expected && Round - K.ScannedAt >= 5)) {
+      ScanHelpers(K);
+      K.ScannedAt = Round;
+      K.Expected = Movable;
+      if (!K.Noted) {
+        K.Noted = true;
+        fextl::string Names;
+        for (const auto& H : K.Threads) {
+          Names += fextl::fmt::format(" {}/{}", H.Name, H.LinuxTid);
+        }
+        StatsLogNote(fextl::fmt::format("cores: Wine keeps FEX's helpers on the game's cores {:#x}; {} of the {} it lists found by their "
+                                        "Linux names and moved to the slowest cores {:#x} directly (build 156; FEX_HELPER_CORES=off "
+                                        "leaves them):{}",
+                                        ProcessMask, K.Threads.size(), Movable, C.LittleMask, Names.empty() ? fextl::string(" none") : Names));
+      }
+    }
+    for (auto& H : K.Threads) {
+      const uint64_t Now = Linux::GetAffinity(H.LinuxTid);
+      if (!Now) {
+        K.ScannedAt = 0; // ended
+        continue;
+      }
+      // Only the slowest cores (GetAffinity leaves out cores the kernel has paused).
+      if (!(Now & ~C.LittleMask)) {
+        continue;
+      }
+      const int Result = Linux::SetAffinity(H.LinuxTid, C.LittleMask);
+      if (Result == 0) {
+        ++H.Sets;
+      } else {
+        ++H.Failures;
+      }
+      const uint32_t N = H.Sets + H.Failures;
+      if (N <= 3 || N % 50 == 0) {
+        StatsLogNote(fextl::fmt::format("cores: FEX helper {} (Linux {}) Linux cores {:#x} -> {:#x}, result {}, set #{}", H.Name, H.LinuxTid,
+                                        Now, C.LittleMask, Result, N));
+      }
+    }
+  }
+
   void* GuardThread(void* Arg) {
     const auto* C = static_cast<Config*>(Arg);
     const uint32_t SelfTID = GetCurrentThreadId();
@@ -2515,6 +2624,7 @@ namespace {
     Keeper.StatusPath = fextl::fmt::format("/proc/self/task/{}/status", Keeper.Tid);
     uint64_t KeepFast {}, KeepWide {};
     LoaderFinder Finder {.C = C};
+    HelperKeeper Helpers {};
     OthersKeeper Others {};
     Others.SelfPid = Linux::GetPid();
     Others.Uid = Linux::GetUid();
@@ -2580,11 +2690,7 @@ namespace {
           T.Name = QueryName(Next);
           T.Named = true;
           T.FEX = T.Name.size() >= 3 && T.Name.compare(0, 3, "FEX") == 0;
-          // Only the stats log (its 2ms sampler and per-second work), this guard, the rumble sender and the file cache dropper move: the stall
-          // probe measures what game threads see, and the disk cache writer, prefetcher and unpack cache threads hold locks
-          // or feed loads the game waits on.
-          T.KeepCores = !(T.Name == "FEXStatsLog" || T.Name == "FEXPrioGuard" || T.Name == "FEXThreadPin" || T.Name == "FEXFrameLatency" ||
-                          T.Name == "FEXRumble" || T.Name == "FEXFileCache" || T.Name == "FEXMainWatch");
+          T.KeepCores = !MovableHelper(T.Name);
         }
         T.Main = TID == C->MainTID || T.Name == "Main";
         Entries.push_back({Next, TID, Basic, &T, T.Main});
@@ -2677,6 +2783,15 @@ namespace {
 
       for (HANDLE H : Handles) {
         NtClose(H);
+      }
+
+      // Build 156: where Wine refuses the slowest cores, FEX's movable helpers go there at the Linux level.
+      if (C->HelpersLittle && C->LittleMask && ProcessMask && (C->LittleMask & ProcessMask) != C->LittleMask) {
+        uint32_t Movable = 1; // this guard, left out of Entries
+        for (const auto& E : Entries) {
+          Movable += E.T->FEX && !E.T->KeepCores;
+        }
+        KeepHelpersLittle(Helpers, *C, Round, Movable, ProcessMask);
       }
 
       if (C->Loader != LoaderMode::Off) {
