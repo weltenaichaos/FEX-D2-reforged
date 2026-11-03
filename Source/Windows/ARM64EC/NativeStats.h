@@ -74,6 +74,8 @@ extern uint64_t FEXNativeTextEnd;
 extern int FEXNativeSkipHitAdler;
 // FEX_NATIVE_ADLER_NEON (default 1): compute adler32 with NEON instead of zlib's C code.
 extern int FEXNativeAdlerNeon;
+// FEX_INFLATE_FAST (default 1, build 158): FEX's own inflate_fast (InflateFast.c) instead of zlib's.
+extern int FEXNativeInflateChunk;
 
 #ifdef __cplusplus
 }

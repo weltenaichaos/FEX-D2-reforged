@@ -53,6 +53,8 @@ int GetPid();
 uint32_t GetUid();
 // The calling thread's Linux tid.
 int GetTid();
+// Sets the calling thread's Linux name (its comm, prctl PR_SET_NAME; the first 15 characters). 0 or a negative errno.
+int SetOwnName(const char* Name);
 // Reads Size bytes of this process's memory at Address through /proc/self/mem. False where any of it isn't mapped
 // (it never faults), and no wineserver round trip, unlike NtReadVirtualMemory.
 bool ReadOwnMemory(uint64_t Address, void* Out, size_t Size);

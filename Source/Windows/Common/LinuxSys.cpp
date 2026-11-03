@@ -26,6 +26,8 @@ namespace {
   constexpr int64_t NR_getuid = 174;
   constexpr int64_t NR_gettid = 178;
   constexpr int64_t NR_getrusage = 165;
+  constexpr int64_t NR_prctl = 167;
+  constexpr int64_t PR_SET_NAME = 15;
   constexpr int64_t NR_nanosleep = 101;
   constexpr int64_t NR_clock_gettime = 113;
   constexpr int64_t RUSAGE_THREAD = 1;
@@ -234,6 +236,14 @@ uint32_t GetUid() {
 
 int GetTid() {
   return static_cast<int>(Syscall(NR_gettid));
+}
+
+int SetOwnName(const char* Name) {
+  char Comm[16] {};
+  for (size_t i = 0; i + 1 < sizeof(Comm) && Name[i]; ++i) {
+    Comm[i] = Name[i];
+  }
+  return static_cast<int>(Syscall(NR_prctl, PR_SET_NAME, reinterpret_cast<intptr_t>(Comm)));
 }
 
 bool ReadOwnMemory(uint64_t Address, void* Out, size_t Size) {

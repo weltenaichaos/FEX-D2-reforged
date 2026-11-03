@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 157, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r8 (build 10, entry proton-11.0-1-arm64ec-110). The build numbers in the
+State: FEX build 158, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r8 (build 10, entry proton-11.0-1-arm64ec-110). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -26,11 +26,13 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
 |---|---|---|---|
 | `FEX_NATIVE_ZLIB` | `1` | The game's data unpacking (zlib) runs as native ARM code instead of being translated. | `0` |
 | `FEX_NATIVE_MD5` | `1` | The same for the game's MD5 checksums. | `0` |
+| `FEX_INFLATE_FAST` | `1` | That unpacking uses FEX's own inner loop: input 8 bytes at a time, repeats copied 8-16 bytes at a time instead of byte by byte. In the b157 run the game unpacked 1.52 GB in play in 6.9 s of CPU, and one 93 ms frame was 38 ms of it on the main thread. On a PC this loop was 1.3-2.2x as fast as zlib's, with the same output on 16,000 test streams (build 158). | `0` |
 | `FEX_UNPACK_CACHE` | `1` | Unpacked game data is stored in `AppData\Local\fex-emu\UnpackCache` (up to 16 GB), so the next load reads it instead of unpacking again. Needs `FEX_NATIVE_ZLIB`. | `0` |
 | `FEX_UNPACK_CACHE_DIRECT` | `1` | That cache is read past Android's file cache, so it doesn't fill the device's memory (build 58). | `0` |
 | `FEX_UNPACK_CACHE_PLAY` | `1` | During play, cache data that isn't in memory yet is left to the game to unpack, and read-ahead is shorter (build 62). | `0` |
 | `FEX_UNPACK_CACHE_AHEAD` | `ramp` | Read-ahead grows along the game's reads instead of reading 8 MB past every hit (build 83). | `fixed` |
 | `FEX_UNPACK_CACHE_MAIN_PLAY` | `1` | The game's main thread never waits for storage for cache data while frames are coming (build 90). | `0` |
+| `FEX_UNPACK_CACHE_FRAMES` | `1` | The same for every thread, also while the game streams in a new area with many lookups. In the b157 run the game's threads read 4,150 pieces from storage in play this way, 0.76 ms each, where unpacking one takes about 0.2 ms, and the cache read 1.97 GB ahead, half of it never used. Loading screens keep the full cache (build 158). | `0` |
 | `FEX_UNPACK_CACHE_LEARN` | `256` | Cache data the main thread needed during play is remembered across sessions and read in at the start and at loading screens (budget in MB, build 90). | `0` |
 | `FEX_UNPACK_CACHE_FLUSH` | `1` | New cache data is written in 8 MB batches instead of piece by piece (build 91). | `0` |
 | `FEX_GAME_FILES_UNCACHED` | `1` | The game's own data files are kept out of Android's file cache. Before this, Android's memory killer closed other apps at every area load, and they restarted on all cores (builds 59-61). Needed by the next switch. | `0` |
@@ -75,7 +77,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_MAINCORE_AWAY_SHARE` | `1` | While the main thread is away, the game's other threads may use its core (build 123). | `0` |
 | `FEX_MAINCORE_ESCAPE_NICE` | `-20` | The main thread's priority while it is away. | `off` |
 | `FEX_MAINCORE_OTHERS` | `user` | Other programs of the app (steam.exe, the launcher) are kept off the main thread's core (builds 76-77). `process` keeps only the game's own threads off. | `off` |
-| `FEX_HELPER_CORES` | `little` | FEX's helper threads (stats log, priority guard, escape watcher, rumble sender, file cache dropper) run on the little cores (build 49). Since GameNative gives the game cores 3-7, Wine refused this and they ran on the big cores; from build 156 FEX moves them at the Linux level. | `off` |
+| `FEX_HELPER_CORES` | `little` | FEX's helper threads (stats log, priority guard, escape watcher, rumble sender, file cache dropper) run on the little cores (build 49). Since GameNative gives the game cores 3-7, Wine refused this and they ran on the big cores; from build 156 FEX moves them at the Linux level. From build 158 every FEX thread sets its own Linux name when it starts, so the search by name finds the stats log too (in b157 it kept the name "D2R.exe" and stayed on the game's cores). | `off` |
 | `FEX_LOADER_CORES` | `little` | The game's protection/loader thread is found and moved to the little cores (builds 62-63, 81). | `off` |
 | `FEX_LOADER_GAME_EXCEPTIONS` | `400` | A thread with this many exceptions in the game's own code within 2 s is a game thread and is never moved (build 65). | `0` |
 | `FEX_PRIO` | `normal` | Every thread at normal Windows priority. Wine on Android turns Windows priorities into extreme Linux values (build 48). | `keep` |

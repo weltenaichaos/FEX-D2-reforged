@@ -56,6 +56,14 @@ $end_info$
 // that second, so it counted as a load. Now a hit the main thread can't take from memory while frames are coming (the
 // last began under 250 ms ago, GameFiles::FramesComing) is always left to the game.
 //
+// Every thread while frames come (FEX_UNPACK_CACHE_FRAMES, from build 158): when the game streams in a new area during
+// play, its job workers look up thousands of streams a second, so the lookup-rate gate counted those seconds as loads. In
+// the build 157 run the game's threads read 4,150 hits from disk during play this way, 0.76 ms each (3.2 s in all), where
+// unpacking the same ~60 KB takes 0.16-0.27 ms (less with build 158's own inflate_fast), and 1.97 GB were read ahead, about
+// half of it never used. Now while frames are coming any thread leaves a hit it can't take from memory to the game, and
+// read-ahead goes PlayAheadChunks past a hit, as in play. Loading screens (no frames, or the loading screen detector's
+// light frames) keep the full cache.
+//
 // Learned streams (FEX_UNPACK_CACHE_LEARN, from build 90): the same 105 ms frame also unpacked 7.6 MB itself (20.9 ms) for
 // streams that were stored but not in memory. The streams the main thread looks up in frames of play are much the same
 // every session (like its game file reads, see GameFiles.h build 89), so their places in data.bin (whole 64 KB blocks)
@@ -237,6 +245,8 @@ struct Cache {
   bool PlayGate {};
   // Build 90: the main thread never reads a hit from disk while frames are coming (FEX_UNPACK_CACHE_MAIN_PLAY).
   bool MainPlay {};
+  // Build 158: no thread reads a hit from disk while frames are coming (FEX_UNPACK_CACHE_FRAMES).
+  bool FramesPlay {};
   uint64_t WindowTicks {1};
   std::atomic<uint64_t> WindowStart {};
   std::atomic<uint32_t> WindowLookups {};
@@ -1196,7 +1206,9 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
   if (Play) {
     __atomic_fetch_add(&FEXUnpackCacheStats.PlayLookups, 1, __ATOMIC_RELAXED);
   }
-  const uint64_t Distance = Play ? PlayAheadChunks : AheadChunks;
+  // Build 158: any thread while frames are coming, see FEX_UNPACK_CACHE_FRAMES above.
+  const bool Frames = C->FramesPlay && GameFiles::FramesComing();
+  const uint64_t Distance = Play || Frames ? PlayAheadChunks : AheadChunks;
 
   Entry E;
   {
@@ -1266,13 +1278,16 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
     if (Ahead) {
       NoteDiskHit(C, E, Distance);
     }
-    if (Play || (MainPlay && C->MainPlay)) {
+    if (Play || (MainPlay && C->MainPlay) || Frames) {
       // Left to the game: its own unpacking is faster than this read, see FEX_UNPACK_CACHE_PLAY above. The entry stays.
       __atomic_fetch_add(&FEXUnpackCacheStats.PlaySkips, 1, __ATOMIC_RELAXED);
       __atomic_fetch_add(&FEXUnpackCacheStats.PlaySkipBytes, E.Produced, __ATOMIC_RELAXED);
-      if (!Play) {
+      if (!Play && MainPlay && C->MainPlay) {
         __atomic_fetch_add(&FEXUnpackCacheStats.MainPlaySkips, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&FEXUnpackCacheStats.MainPlaySkipBytes, E.Produced, __ATOMIC_RELAXED);
+      } else if (!Play) {
+        __atomic_fetch_add(&FEXUnpackCacheStats.FramesSkips, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&FEXUnpackCacheStats.FramesSkipBytes, E.Produced, __ATOMIC_RELAXED);
       }
       return 0;
     }
@@ -1752,6 +1767,9 @@ bool Init(bool MD5Cache) {
   // also needs data.bin's Linux file (FEX_UNPACK_CACHE_DIRECT=1).
   const char* MainPlayEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_MAIN_PLAY");
   C->MainPlay = MainPlayEnv && MainPlayEnv[0] == '1' && GameFiles::Running();
+  // Build 158, see the top of this file: the same for every thread.
+  const char* FramesEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_FRAMES");
+  C->FramesPlay = FramesEnv && FramesEnv[0] == '1' && GameFiles::Running();
   const char* LearnEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_LEARN");
   const uint64_t LearnMB = std::min<uint64_t>(LearnEnv && LearnEnv[0] ? strtoull(LearnEnv, nullptr, 10) : 0, 4096);
   fextl::string LearnNote;
@@ -1809,6 +1827,13 @@ bool Init(bool MD5Cache) {
                                            "250 ms ago): it is left to the game to unpack (FEX_UNPACK_CACHE_MAIN_PLAY=0 turns it off)" :
                                            "unpack cache: the main thread reads hits from disk like any thread (FEX_UNPACK_CACHE_MAIN_PLAY=1 needs "
                                            "FEX_GAME_FILES_UNCACHED=1)");
+  FEX::Windows::StatsLogNote(C->FramesPlay ? fextl::fmt::format(
+                                               "unpack cache: build 158: no thread reads a hit from disk while frames are coming, also when the game "
+                                               "streams in a new area with many lookups: it is left to the game to unpack, and read-ahead goes {} MB "
+                                               "past a hit as in play; loading screens keep the full cache (FEX_UNPACK_CACHE_FRAMES=0 turns it off)",
+                                               PlayAheadChunks * ChunkSize >> 20) :
+                                             "unpack cache: other threads read hits from disk while frames come when lookups are many "
+                                             "(FEX_UNPACK_CACHE_FRAMES=1 needs FEX_GAME_FILES_UNCACHED=1)");
   if (MD5Cache) {
     FEX::Windows::StatsLogNote(OpenMD5Cache(Dir, Reset));
   } else {
@@ -1888,11 +1913,11 @@ fextl::string StatsLine() {
                               fextl::string {},
                             MB(Waiting), D.Dropped, D.Failures, Size >> 20, WriterState.load(std::memory_order_relaxed),
                             TheCache->Full ? " full" : "", D.MD5Hits, D.MD5Lookups, MB(D.MD5HitBytes), Ms(D.MD5Ticks), D.MD5Stores);
-  if (D.MainPlaySkips || D.LearnedHits || D.LearnedNotCached) {
-    Out += fextl::fmt::format("  ucache main thread in play: left to the game {}/{:.1f}MB | learned streams: from the file cache {}/{:.1f}ms, "
-                                        "not there {}/{:.1f}ms\n",
-                                        D.MainPlaySkips, MB(D.MainPlaySkipBytes), D.LearnedHits, Ms(D.LearnedTicks), D.LearnedNotCached,
-                                        Ms(D.LearnedNotCachedTicks));
+  if (D.MainPlaySkips || D.FramesSkips || D.LearnedHits || D.LearnedNotCached) {
+    Out += fextl::fmt::format("  ucache main thread in play: left to the game {}/{:.1f}MB | other threads while frames come (build 158): left to the "
+                              "game {}/{:.1f}MB | learned streams: from the file cache {}/{:.1f}ms, not there {}/{:.1f}ms\n",
+                              D.MainPlaySkips, MB(D.MainPlaySkipBytes), D.FramesSkips, MB(D.FramesSkipBytes), D.LearnedHits, Ms(D.LearnedTicks),
+                              D.LearnedNotCached, Ms(D.LearnedNotCachedTicks));
   }
   return Out + Learned::Line();
 }

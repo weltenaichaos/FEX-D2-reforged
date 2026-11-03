@@ -262,6 +262,10 @@ namespace {
     // storage was at its low clock during play and the main thread's 11 disk hits at an area entry took 36.9 ms (3.4 ms
     // each, against ~0.2 ms to unpack one), in a 105 ms frame (see ARM64EC/NativeUnpackCache.cpp).
     {"FEX_UNPACK_CACHE_MAIN_PLAY", "1"},
+    // Build 158: the same for every thread. When the game streamed in a new area during play, its workers' many lookups
+    // counted as a load: in the build 157 run they read 4,150 hits from disk in play, 0.76 ms each, against 0.16-0.27 ms
+    // to unpack one, and 1.97 GB were read ahead, about half never used (see ARM64EC/NativeUnpackCache.cpp).
+    {"FEX_UNPACK_CACHE_FRAMES", "1"},
     // Build 90: the streams the main thread looks up in frames of play are learned across sessions and read into the
     // file cache at the start and at every loading screen (budget in MB). The same 105 ms frame unpacked 7.6 MB of
     // stored streams itself (20.9 ms) because they weren't in memory.
@@ -589,6 +593,7 @@ namespace {
     "FEX_UNPACK_CACHE_PLAY",
     "FEX_UNPACK_CACHE_AHEAD",
     "FEX_UNPACK_CACHE_MAIN_PLAY",
+    "FEX_UNPACK_CACHE_FRAMES",
     "FEX_UNPACK_CACHE_LEARN",
     "FEX_UNPACK_CACHE_FLUSH",
     "FEX_CODE_BUFFER_START",
@@ -617,6 +622,7 @@ namespace {
     "FEX_MEM_HEADROOM_GUARD_MB",
     "FEX_UNPACK_CACHE_SKIP_ADLER",
     "FEX_NATIVE_ADLER_NEON",
+    "FEX_INFLATE_FAST",
     "FEX_NATIVE_MD5_CACHE",
     "FEX_JOBWAIT",
     "FEX_JOBWAIT_BACKOFF",
