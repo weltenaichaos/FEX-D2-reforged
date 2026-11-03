@@ -9,6 +9,6 @@
 FLAGS='sometimes-uninitialized|uninitialized|conditional-uninitialized|return-type|array-bounds|array-bounds-pointer-arithmetic|shift-count-overflow|shift-count-negative|shift-negative-value|shift-overflow|unsequenced|return-stack-address|dangling|null-dereference|static-in-inline'
 list=$(grep -aoE "[^ ]+:[0-9]+:[0-9]+: warning: .*\[-W($FLAGS)\]" "$1" | sed -E 's|^(\.\./)+||' | sort -u)
 [ -n "$list" ] && echo "$list"
-echo "-- $(printf '%s' "$list" | grep -c .) unique warnings of these kinds$( [ -n "$list" ] && echo ', by flag:')"
+echo "-- $(printf '%s' "$list" | grep -c .) unique warnings of these kinds (of $(grep -acE ':[0-9]+:[0-9]+: warning: ' "$1") warning lines in the log)$( [ -n "$list" ] && echo ', by flag:')"
 [ -n "$list" ] && echo "$list" | grep -oE '\[-W[a-z-]+\]$' | sort | uniq -c | sort -rn
 exit 0
