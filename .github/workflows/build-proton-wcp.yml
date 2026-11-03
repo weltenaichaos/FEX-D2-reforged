@@ -38,7 +38,7 @@ env:
   PROTON_REPO: GameNative/proton-wine
   PROTON_REF: f7c016668db739f563e3d4781c27ed085843d63a
   PROTON_VERSION: 11.0-1
-  D2R_TAG: d2r8
+  D2R_TAG: d2r9
   # Optimization of the unix side (ntdll.so, wineserver, win32u.so, winevulkan.so, ...).
   # GameNative's build script sets CFLAGS to warning flags only, so configure's default
   # "-g -O2" never applies and their stock packages run the whole unix side unoptimized
@@ -311,8 +311,9 @@ jobs:
             echo "- WINE_D2R_VM_NOTES=0: the memory lock keeps no holder notes (0006)"
             echo "- WINE_D2R_FAST_CONTINUE=0: NtContinue to x64 code takes the syscall as in stock Wine (0007)"
             echo "- WINE_D2R_EVENT_REUSE=0: anonymous events are closed as in stock Wine (0008)"
-            echo "- WINE_D2R_CALL_COUNTS=0: no wineserver request counters (0008, 0009)"
+            echo "- WINE_D2R_CALL_COUNTS=0: no wineserver request counters (0008, 0009, 0010)"
             echo "- WINE_D2R_COMPLETION_WAIT=0: completion port waits go to the server as in stock Wine (0009)"
+            echo "- WINE_D2R_TIMER_REUSE=0: anonymous timers are closed and made new as in stock Wine (0010)"
             echo
             echo "Compiler warnings that point at undefined behaviour (list in share/wine/d2r-build-warnings.txt):"
             echo '```'

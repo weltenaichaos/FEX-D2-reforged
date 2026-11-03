@@ -155,6 +155,27 @@ check_0009() {
   if [ "${n:-0}" -ge 2 ]; then ok 0009 "wineserver's remove_completion resets the sync of an empty port too"; else bad 0009 "wineserver's remove_completion resets the sync '${n:-0}' times (want 2)"; fi
 }
 
+# function(s) $2 of ELF $1 build the set_timer marker 0xd2d2f4e5 (the high half of the argument;
+# mov #0xf4e5 + movk #0xd2d2, lsl #16 or #48), or the file holds it as data (a literal pool)
+marker_in() {
+  local d
+  d=$($OBJDUMP -d --no-show-raw-insn --disassemble-symbols="$2" "$1" 2>/dev/null)
+  if printf '%s\n' "$d" | grep -qE '#0xf4e5' && printf '%s\n' "$d" | grep -qE '#0xd2d2, lsl #(16|48)'; then return 0; fi
+  python3 -I -c 'import sys; sys.exit(0 if open(sys.argv[1],"rb").read().count(bytes.fromhex("e5f4d2d2")) else 1)' "$1"
+}
+
+# 0010: anonymous timer reuse (off switch); NtCreateTimer can take a kept timer (it locks the
+# table of fresh handles, stock never does); NtSetTimer and the wineserver's set_timer know
+# the marker that puts a reused timer back to a new timer's state
+check_0010() {
+  local n
+  if ascii_in "$NTSO" WINE_D2R_TIMER_REUSE; then ok 0010 "${NTSO#$LIB/} reads WINE_D2R_TIMER_REUSE"; else bad 0010 "${NTSO#$LIB/} lacks WINE_D2R_TIMER_REUSE"; fi
+  n=$(calls_to "$NTSO" NtCreateTimer 'd2r_tm_take|d2r_tm_note|server_enter_uninterrupted_section')
+  if [ "${n:-0}" -ge 1 ]; then ok 0010 "NtCreateTimer can take a kept timer"; else bad 0010 "NtCreateTimer never looks at the kept timers (stock)"; fi
+  if marker_in "$NTSO" NtSetTimer,d2r_tm_set; then ok 0010 "NtSetTimer sends the fresh-timer marker"; else bad 0010 "NtSetTimer has no fresh-timer marker"; fi
+  if marker_in "$WS" req_set_timer,d2r_timer_fresh; then ok 0010 "wineserver's set_timer knows the fresh-timer marker"; else bad 0010 "wineserver's set_timer has no fresh-timer marker (stock)"; fi
+}
+
 for p in "$PATCHES"/*.patch; do
   n=$(basename "$p"); n=${n%%-*}
   if declare -F "check_$n" >/dev/null; then "check_$n"; else bad "$n" "no check for $(basename "$p") in check-patches.sh"; fi

@@ -1,0 +1,743 @@
+ntdll, server: anonymous timers are kept for reuse; timer counters for FEX.
+
+With patch 0009 in (b157, Proton d2r8) D2R's protection thread (b157 tid 596) makes an
+unnamed timer, sets it, waits for it and closes it about 93 times a second in play: a
+create_timer, set_timer, get_inproc_sync_fd and close_handle request each time
+(create_timer and set_timer both at a median of 93/s, cancel_timer 0).
+
+As 0008 does for events, NtClose now keeps such a timer open in a small pool (16 per type)
+when nothing can still happen to it: made by NtCreateTimer with an access that can set and
+wait (TIMER_MODIFY_STATE and SYNCHRONIZE) and no name, root, security descriptor or other
+attributes than OBJ_CASE_INSENSITIVE and OBJ_OPENIF; closed by the thread that made it
+within 100 ms; never set with an APC or a period, never set again before its last setting
+fired, every setting seen to fire by a wait of that thread; never cancelled, duplicated or
+given new handle flags, and never set, waited on or queried by another thread. Then no
+timeout or APC is pending in the server, a synchronization timer's signal was taken by that
+wait and a notification timer's is still set. NtCreateTimer of the same type and access
+takes a kept timer back: no create_timer, no close_handle, and the inproc sync fd stays
+cached, so no get_inproc_sync_fd either. Three of the four requests per cycle go.
+
+The server's timer still holds the old due time and signaled flag (Proton 11 never clears a
+synchronization timer's flag once it fired). So the first NtSetTimer of a reused timer
+carries a marker in the argument of the request (unused without an APC) and the server
+first puts the timer back to the state create_timer gives (no timeout or APC, not signaled,
+sync reset, due time 0, period 0), then sets it, in the same request. Anything that could
+see the old state before that (a wait on a notification timer that fired, NtCancelTimer,
+NtQueryTimer, a setting with an APC, duplication, new handle flags, any use by another
+thread) sends the marker in a request of its own first. The marker carries a reuse number
+and the server acts on the first marker of each reuse only, so a thread that looks at the
+timer while the first setting is on its way still finds a new timer, and that setting is
+never undone. A program's own argument that looks like the marker (without APC) is sent as
+NULL; the server never reads it then.
+
+For FEX, appended to __wine_d2r_server_calls_ext at byte 2112 (8 x ULONG64, to byte 2175):
+tm_kept, tm_reused, tm_reset (marker in a request of its own), tm_armed (closed before its
+setting was seen to fire), tm_shared (left out: APC or period, set again before it fired,
+cancelled, duplicated, another thread), tm_other_thread, tm_too_old, tm_pool_full. The
+export grows to 2,176 bytes; size (ULONG at byte 48, padding before) says how many bytes
+the build writes: 2,176 now, 0 in d2r8. Version stays 1. On with the request counts
+(WINE_D2R_CALL_COUNTS).
+
+Model test: the pool code compiled from sync.c against a model wineserver with timer.c's
+rules and esync waits runs random programs of creates (several access masks), sets
+(relative, absolute, infinite, with APC, periodic, arguments that look like the marker),
+waits (single, any, all), cancels, queries, duplicates and closes from two threads, where a
+set request can stay on its way for 1 to 4 steps while the other thread acts. Every result
+the program sees is compared with the same program under WINE_D2R_TIMER_REUSE=0: 800
+programs of 20,000 steps (400 seeds, normal and tiny pool sizes), 0 differences, and a
+reused timer always has the asked type and access. With the reuse number check taken out of
+the server 24 of 60 seeds differ, with the unset entry dropped before the request 45 of 60,
+so the test does see these races. A D2R-like loop (make, set 1 ms, wait, close): 3 counted
+server calls per cycle down to 1 (the model does not count get_inproc_sync_fd).
+
+WINE_D2R_TIMER_REUSE=0 closes anonymous timers and makes new ones as stock Wine. Read once
+per process.
+---
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index 3652d38..baff5b9 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -861,7 +861,7 @@ DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls[1032];
+ 
+ /* d2r (patch 0009): latest caller per request type and completion port wait counters
+  * (struct d2r_server_calls_ext, D2R_SERVER_CALLS_EXT_U64), read by FEX */
+-DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls_ext[264];
++DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls_ext[272];  /* 272 since patch 0010 */
+ 
+ /* WINE_D2R_WAIT_LOCK=0 (read in loader_init): spin until free, as stock Wine does */
+ BOOL d2r_wait_lock_spin = FALSE;
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index eb13b29..93f27a7 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2029,6 +2029,7 @@ static void load_ntdll_functions( HMODULE module )
+         if ((d2r_server_calls_ext = (void *)find_named_export( module, exports, "__wine_d2r_server_calls_ext" )))
+         {
+             d2r_server_calls_ext->nb_requests = REQ_NB_REQUESTS;
++            d2r_server_calls_ext->size = sizeof(*d2r_server_calls_ext);  /* patch 0010 */
+             WriteRelease( (LONG *)&d2r_server_calls_ext->version, 1 );
+         }
+     }
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 352e89a..9efdac6 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -295,6 +295,9 @@ C_ASSERT( sizeof(struct d2r_server_calls_ext) == D2R_SERVER_CALLS_EXT_U64 * size
+ C_ASSERT( offsetof(struct d2r_server_calls_ext, cp_woken) == 8 );
+ C_ASSERT( offsetof(struct d2r_server_calls_ext, cp_extra_saved) == offsetof(struct d2r_server_calls_ext, cp_woken) + 4 * sizeof(ULONG64) );
+ C_ASSERT( offsetof(struct d2r_server_calls_ext, last_tid) == 64 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, size) == 48 );  /* patch 0010 */
++C_ASSERT( offsetof(struct d2r_server_calls_ext, tm_kept) == 2112 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, tm_pool_full) == offsetof(struct d2r_server_calls_ext, tm_kept) + 7 * sizeof(ULONG64) );
+ C_ASSERT( REQ_NB_REQUESTS <= D2R_MAX_REQUESTS );
+ C_ASSERT( offsetof(struct d2r_server_calls, ev_pool_full) == offsetof(struct d2r_server_calls, ev_kept) + 5 * sizeof(ULONG64) );
+ /* the number of request types in this build, so the build can check the name table it ships */
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index d4c7a82..a355e39 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -1137,6 +1137,10 @@ struct d2r_ev_slot
+     DWORD   tid;      /* thread that made it */
+     BOOL    manual;
+     ULONG64 born_ns;
++    BYTE    timer;    /* patch 0010: a timer, not an event */
++    BYTE    armed;    /* timer: set with a due time, not yet seen to fire */
++    BYTE    left;     /* timer: a notification timer seen to fire, so still signaled */
++    ACCESS_MASK access;  /* timer: access it was made with */
+ };
+ 
+ static struct d2r_ev_slot d2r_ev_slots[D2R_EV_SLOTS];  /* all of this guarded by d2r_ev_mutex */
+@@ -1210,6 +1214,7 @@ static void d2r_ev_note( HANDLE handle, BOOL manual )
+     slot->tid = d2r_ev_tid();
+     slot->manual = manual;
+     slot->born_ns = d2r_ev_now();
++    slot->timer = 0;
+     __atomic_store_n( &slot->handle, handle, __ATOMIC_RELAXED );
+     server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
+ }
+@@ -1226,24 +1231,342 @@ static HANDLE d2r_ev_take( BOOL manual )
+     return handle;
+ }
+ 
++/* d2r (fex-d2-reforged, patch 0010): reuse of anonymous timers.
++ * D2R's protection thread makes an unnamed timer, sets it, waits until it fires and closes it,
++ * ~93 times a second in play (b157 tid 596): create_timer, set_timer, get_inproc_sync_fd and
++ * close_handle every time. A timer that NtCreateTimer made with an access that can set and
++ * wait (TIMER_MODIFY_STATE and SYNCHRONIZE) and the plain attributes of d2r_ev_plain is noted
++ * in the table of fresh events. NtClose keeps it open in a small pool only when nothing can
++ * still happen to it: closed by the thread that made it within D2R_TM_LIFE_NS; never set with
++ * an APC or a period, never set again before its last setting was seen to fire, and every
++ * setting seen to fire by a wait of that thread; never duplicated, given new handle flags,
++ * cancelled, or set, waited on or queried by another thread. Then no timeout or APC is pending
++ * in the server, a synchronization timer's signal was taken by that wait, and a notification
++ * timer is still signaled. NtCreateTimer of the same type and access takes a kept timer back
++ * (cached inproc sync fd, no server call). The server still holds the old signaled flag and
++ * due time, so the program's first NtSetTimer carries a marker (server/timer.c) that puts the
++ * timer back to a new timer's state before it is set, in the same request. Anything else that
++ * could see the old state first (a wait on a notification timer that fired, NtCancelTimer,
++ * NtQueryTimer, duplication, new handle flags, another thread) sends the marker on its own
++ * first. The server acts on the first marker of each reuse only. WINE_D2R_TIMER_REUSE=0 turns
++ * it off. */
++#define D2R_TM_POOL    16                 /* kept timers per type */
++#define D2R_TM_LIFE_NS (100 * (ULONG64)1000000)
++#define D2R_TM_UNSET   32                 /* reused timers the program hasn't set yet */
++/* set_timer marker: the high half of the argument of a request without APC (an argument the
++ * server never uses then; the same value is in server/timer.c); bits 1-31 hold the reuse number,
++ * bit 0 says "only make it new, don't set it". The server makes a timer new once per reuse
++ * number, so any thread may send the marker, in any order with the program's first setting:
++ * a thread that sees the timer while that setting is on its way still finds it unset */
++#define D2R_TIMER_MARKER 0xd2d2f4e5u
++
++static inline client_ptr_t d2r_tm_marker( unsigned int gen, BOOL only )
++{
++    return ((client_ptr_t)D2R_TIMER_MARKER << 32) | ((client_ptr_t)gen << 1) | (only ? 1 : 0);
++}
++
++struct d2r_tm_kept
++{
++    HANDLE       handle;
++    ACCESS_MASK  access;    /* a reused timer is handed out only for the same access */
++    BOOL         signaled;  /* a notification timer that fired: its sync is still signaled */
++    unsigned int gen;       /* unset list: reuse number */
++};
++
++static struct d2r_tm_kept d2r_tm_pool[2][D2R_TM_POOL];  /* [notification timer], d2r_ev_mutex */
++static unsigned int d2r_tm_pooled[2];
++static struct d2r_tm_kept d2r_tm_unset[D2R_TM_UNSET];   /* d2r_ev_mutex */
++static unsigned int d2r_tm_unsets;
++static unsigned int d2r_tm_gen;                         /* last reuse number (1 to 2^31-1), d2r_ev_mutex */
++
++/* counters in __wine_d2r_server_calls_ext */
++enum d2r_tm_counter { D2R_TM_KEPT, D2R_TM_REUSED, D2R_TM_RESET, D2R_TM_ARMED, D2R_TM_SHARED, D2R_TM_OTHER_THREAD,
++                      D2R_TM_TOO_OLD, D2R_TM_POOL_FULL };
++
++static inline void d2r_tm_count( enum d2r_tm_counter which )
++{
++    struct d2r_server_calls_ext *ext = d2r_server_calls_ext;
++
++    if (ext) __atomic_fetch_add( &ext->tm_kept + which, 1, __ATOMIC_RELAXED );
++}
++
++static BOOL d2r_tm_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *env = getenv( "WINE_D2R_TIMER_REUSE" );
++
++        if (env && env[0] == '0')
++        {
++            ERR( "d2r: anonymous timers are closed as in stock Wine (WINE_D2R_TIMER_REUSE=0).\n" );
++            on = 0;
++        }
++        else on = 1;
++    }
++    return on;
++}
++
++/* may a timer made with these arguments come from the pool or go back to it? Any access
++ * that can set and wait (the pool is by access); the plain attributes of d2r_ev_plain */
++static BOOL d2r_tm_plain( ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr )
++{
++    if ((access & (TIMER_MODIFY_STATE | SYNCHRONIZE)) != (TIMER_MODIFY_STATE | SYNCHRONIZE)) return FALSE;
++    if (attr && ((attr->ObjectName && attr->ObjectName->Length) || attr->RootDirectory ||
++                 attr->SecurityDescriptor || attr->SecurityQualityOfService ||
++                 (attr->Attributes & ~(OBJ_CASE_INSENSITIVE | OBJ_OPENIF))))
++        return FALSE;
++    return d2r_tm_on();
++}
++
++static void d2r_tm_note( HANDLE handle, BOOL manual, ACCESS_MASK access )
++{
++    struct d2r_ev_slot *slot = d2r_ev_slot( handle );
++    sigset_t sigset;
++
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    slot->tid = d2r_ev_tid();
++    slot->manual = manual;
++    slot->access = access;
++    slot->born_ns = d2r_ev_now();
++    slot->timer = 1;
++    slot->armed = slot->left = 0;
++    __atomic_store_n( &slot->handle, handle, __ATOMIC_RELAXED );
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++}
++
++/* d2r_ev_mutex held for the d2r_tm_unset helpers */
++static int d2r_tm_unset_find( HANDLE handle )
++{
++    unsigned int i;
++
++    for (i = 0; i < d2r_tm_unsets; i++) if (d2r_tm_unset[i].handle == handle) return i;
++    return -1;
++}
++
++static void d2r_tm_unset_drop( int i )
++{
++    d2r_tm_unset[i] = d2r_tm_unset[--d2r_tm_unsets];
++    __atomic_store_n( &d2r_tm_unsets, d2r_tm_unsets, __ATOMIC_RELAXED );
++}
++
++/* the unset entry of this reuse goes, once the server made the timer new (d2r_ev_mutex not held) */
++static void d2r_tm_unset_done( HANDLE handle, unsigned int gen )
++{
++    sigset_t sigset;
++    int i;
++
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if ((i = d2r_tm_unset_find( handle )) >= 0 && d2r_tm_unset[i].gen == gen) d2r_tm_unset_drop( i );
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++}
++
++/* a reused timer goes back to a new timer's state in the server (signal, flag, due time) in a
++ * request of its own, before what would see the old state (d2r_ev_mutex not held) */
++static void d2r_tm_fresh( HANDLE handle, unsigned int gen )
++{
++    SERVER_START_REQ( set_timer )
++    {
++        req->handle = wine_server_obj_handle( handle );
++        req->expire = TIMEOUT_INFINITE;
++        req->arg    = d2r_tm_marker( gen, TRUE );
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    d2r_tm_count( D2R_TM_RESET );
++    d2r_tm_unset_done( handle, gen );
++}
++
++static HANDLE d2r_tm_take( BOOL manual, ACCESS_MASK access )
++{
++    HANDLE handle = 0;
++    sigset_t sigset;
++    unsigned int i;
++
++    if (!__atomic_load_n( &d2r_tm_pooled[manual], __ATOMIC_RELAXED )) return 0;
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    /* a reused timer needs its unset entry until the program sets it; no room: a new one */
++    for (i = d2r_tm_pooled[manual]; i > 0 && d2r_tm_unsets < D2R_TM_UNSET; i--)
++    {
++        if (d2r_tm_pool[manual][i - 1].access != access) continue;
++        if (!(d2r_tm_gen = (d2r_tm_gen + 1) & 0x7fffffff)) d2r_tm_gen = 1;
++        d2r_tm_unset[d2r_tm_unsets] = d2r_tm_pool[manual][i - 1];
++        d2r_tm_unset[d2r_tm_unsets].gen = d2r_tm_gen;
++        handle = d2r_tm_unset[d2r_tm_unsets].handle;
++        d2r_tm_pool[manual][i - 1] = d2r_tm_pool[manual][d2r_tm_pooled[manual] - 1];
++        __atomic_store_n( &d2r_tm_unsets, d2r_tm_unsets + 1, __ATOMIC_RELAXED );
++        __atomic_store_n( &d2r_tm_pooled[manual], d2r_tm_pooled[manual] - 1, __ATOMIC_RELAXED );
++        break;
++    }
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    return handle;
++}
++
++/* NtSetTimer, before its request: the argument to send. The first setting of a reused
++ * timer carries the marker (with an APC the marker goes in a request of its own first);
++ * *gen: its reuse number, for d2r_tm_unset_done after the request, or 0 */
++static void *d2r_tm_set( HANDLE handle, LONGLONG expire, PTIMER_APC_ROUTINE callback, void *arg,
++                         ULONG period, unsigned int *gen )
++{
++    struct d2r_ev_slot *slot = d2r_ev_slot( handle );
++    unsigned int fresh = 0;
++    sigset_t sigset;
++    int i;
++
++    *gen = 0;
++    /* the server never uses the argument without an APC: never let it look like a marker */
++    if (!callback && (unsigned int)((client_ptr_t)(ULONG_PTR)arg >> 32) == D2R_TIMER_MARKER) arg = NULL;
++    if (!handle || (__atomic_load_n( &slot->handle, __ATOMIC_RELAXED ) != handle &&
++                    !__atomic_load_n( &d2r_tm_unsets, __ATOMIC_RELAXED )))
++        return arg;
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (d2r_tm_unsets && (i = d2r_tm_unset_find( handle )) >= 0)
++    {
++        if (callback) fresh = d2r_tm_unset[i].gen;
++        else
++        {
++            /* the entry stays until the request is done: another thread that looks at the
++             * timer meanwhile still makes it new first */
++            *gen = d2r_tm_unset[i].gen;
++            arg = (void *)(ULONG_PTR)d2r_tm_marker( *gen, FALSE );
++        }
++    }
++    if (slot->handle == handle && slot->timer)
++    {
++        if (callback || period || slot->armed || slot->tid != d2r_ev_tid())
++        {
++            __atomic_store_n( &slot->handle, 0, __ATOMIC_RELAXED );
++            d2r_tm_count( D2R_TM_SHARED );
++        }
++        else
++        {
++            slot->armed = (expire != TIMEOUT_INFINITE);
++            slot->left = 0;
++        }
++    }
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (fresh) d2r_tm_fresh( handle, fresh );
++    return arg;
++}
++
++/* NtCancelTimer and NtQueryTimer, before their request: a reused timer the program hasn't
++ * set yet goes back to a new timer's state first; cancelling, or a query by another thread,
++ * leaves a fresh timer out of the pool (so a marker still on its way from another thread
++ * never meets a later reuse) */
++static void d2r_tm_look( HANDLE handle, BOOL cancel )
++{
++    struct d2r_ev_slot *slot = d2r_ev_slot( handle );
++    unsigned int fresh = 0;
++    sigset_t sigset;
++    int i;
++
++    if (!handle || (__atomic_load_n( &slot->handle, __ATOMIC_RELAXED ) != handle &&
++                    !__atomic_load_n( &d2r_tm_unsets, __ATOMIC_RELAXED )))
++        return;
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (d2r_tm_unsets && (i = d2r_tm_unset_find( handle )) >= 0) fresh = d2r_tm_unset[i].gen;
++    if ((cancel || slot->tid != d2r_ev_tid()) && slot->handle == handle && slot->timer)
++    {
++        __atomic_store_n( &slot->handle, 0, __ATOMIC_RELAXED );
++        d2r_tm_count( D2R_TM_SHARED );
++    }
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (fresh) d2r_tm_fresh( handle, fresh );
++}
++
++/* a wait returned with this handle signaled (and taken): a timer of the waiting thread
++ * that was set is seen to fire */
++static void d2r_tm_signaled( HANDLE handle )
++{
++    struct d2r_ev_slot *slot = d2r_ev_slot( handle );
++    sigset_t sigset;
++
++    if (!handle || __atomic_load_n( &slot->handle, __ATOMIC_RELAXED ) != handle) return;
++    server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (slot->handle == handle && slot->timer && slot->tid == d2r_ev_tid())
++    {
++        if (slot->armed)
++        {
++            slot->armed = 0;
++            slot->left = slot->manual;
++        }
++        else if (!slot->manual)
++        {
++            /* a signal from no setting seen here: leave it out of the pool */
++            __atomic_store_n( &slot->handle, 0, __ATOMIC_RELAXED );
++            d2r_tm_count( D2R_TM_SHARED );
++        }
++    }
++    server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++}
++
++static void d2r_tm_waited( DWORD count, const HANDLE *handles, WAIT_TYPE type, NTSTATUS status )
++{
++    DWORD i;
++
++    if (type == WaitAny && (DWORD)status < count) d2r_tm_signaled( handles[status] );
++    else if (type == WaitAll && status == STATUS_WAIT_0)
++        for (i = 0; i < count; i++) d2r_tm_signaled( handles[i] );
++}
++
+ /* the handle goes somewhere that may keep a reference to its object (wait: only a wait by
+- * another thread than the maker counts), so a fresh event behind it is never reused */
++ * another thread than the maker counts), so a fresh event or timer behind it is never
++ * reused; a reused timer the program hasn't set yet goes back to a new timer's state first
++ * when the waiter could see its old signal or someone else could see anything (patch 0010) */
+ void d2r_event_shared( HANDLE handle, BOOL wait )
+ {
+     struct d2r_ev_slot *slot = d2r_ev_slot( handle );
++    unsigned int fresh = 0;
+     sigset_t sigset;
++    int i;
+ 
+-    if (!handle || __atomic_load_n( &slot->handle, __ATOMIC_RELAXED ) != handle) return;
++    if (!handle || (__atomic_load_n( &slot->handle, __ATOMIC_RELAXED ) != handle &&
++                    !__atomic_load_n( &d2r_tm_unsets, __ATOMIC_RELAXED )))
++        return;
+     server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (d2r_tm_unsets && (i = d2r_tm_unset_find( handle )) >= 0 &&
++        (!wait || d2r_tm_unset[i].signaled || slot->handle != handle || slot->tid != d2r_ev_tid()))
++        fresh = d2r_tm_unset[i].gen;
+     if (slot->handle == handle && (!wait || slot->tid != d2r_ev_tid()))
+     {
+         __atomic_store_n( &slot->handle, 0, __ATOMIC_RELAXED );
+-        d2r_ev_count( D2R_EV_SHARED );
++        if (slot->timer) d2r_tm_count( D2R_TM_SHARED );
++        else d2r_ev_count( D2R_EV_SHARED );
+     }
+     server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
++    if (fresh) d2r_tm_fresh( handle, fresh );
++}
++
++/* NtClose, a fresh timer (patch 0010): TRUE when it stays open in the pool; d2r_ev_mutex held */
++static BOOL d2r_tm_keep( HANDLE handle, struct d2r_ev_slot *slot )
++{
++    int counter, u = d2r_tm_unsets ? d2r_tm_unset_find( handle ) : -1;
++    BOOL signaled = slot->left, kept = FALSE;
++
++    if (u >= 0)
++    {
++        signaled |= d2r_tm_unset[u].signaled;
++        d2r_tm_unset_drop( u );
++    }
++    if (slot->tid != d2r_ev_tid()) counter = D2R_TM_OTHER_THREAD;
++    else if (slot->armed) counter = D2R_TM_ARMED;
++    else if (d2r_ev_now() - slot->born_ns >= D2R_TM_LIFE_NS) counter = D2R_TM_TOO_OLD;
++    else if (d2r_tm_pooled[slot->manual] >= D2R_TM_POOL) counter = D2R_TM_POOL_FULL;
++    else
++    {
++        d2r_tm_pool[slot->manual][d2r_tm_pooled[slot->manual]].handle = handle;
++        d2r_tm_pool[slot->manual][d2r_tm_pooled[slot->manual]].access = slot->access;
++        d2r_tm_pool[slot->manual][d2r_tm_pooled[slot->manual]].signaled = signaled;
++        __atomic_store_n( &d2r_tm_pooled[slot->manual], d2r_tm_pooled[slot->manual] + 1, __ATOMIC_RELAXED );
++        counter = D2R_TM_KEPT;
++        kept = TRUE;
++    }
++    d2r_tm_count( counter );
++    return kept;
+ }
+ 
+-/* NtClose: TRUE when the handle is a fresh event that stays open in the pool */
++/* NtClose: TRUE when the handle is a fresh event or timer that stays open in the pool */
+ BOOL d2r_event_keep( HANDLE handle )
+ {
+     struct d2r_ev_slot *slot = d2r_ev_slot( handle );
+@@ -1255,11 +1578,19 @@ BOOL d2r_event_keep( HANDLE handle )
+     if (!handle) return FALSE;
+     if (__atomic_load_n( &slot->handle, __ATOMIC_RELAXED ) != handle &&
+         !__atomic_load_n( &d2r_ev_pooled[0], __ATOMIC_RELAXED ) &&
+-        !__atomic_load_n( &d2r_ev_pooled[1], __ATOMIC_RELAXED ))
++        !__atomic_load_n( &d2r_ev_pooled[1], __ATOMIC_RELAXED ) &&
++        !__atomic_load_n( &d2r_tm_pooled[0], __ATOMIC_RELAXED ) &&
++        !__atomic_load_n( &d2r_tm_pooled[1], __ATOMIC_RELAXED ) &&
++        !__atomic_load_n( &d2r_tm_unsets, __ATOMIC_RELAXED ))
+         return FALSE;
+ 
+     server_enter_uninterrupted_section( &d2r_ev_mutex, &sigset );
+-    if (slot->handle == handle)
++    if (slot->handle == handle && slot->timer)
++    {
++        __atomic_store_n( &slot->handle, 0, __ATOMIC_RELAXED );
++        kept = d2r_tm_keep( handle, slot );
++    }
++    else if (slot->handle == handle)
+     {
+         __atomic_store_n( &slot->handle, 0, __ATOMIC_RELAXED );
+         if (slot->tid != d2r_ev_tid()) counter = D2R_EV_OTHER_THREAD;
+@@ -1274,6 +1605,8 @@ BOOL d2r_event_keep( HANDLE handle )
+     }
+     else
+     {
++        int u;
++
+         /* a handle already in the pool closed again (a double close): it really goes now,
+          * so the pool never hands out a handle the server may give to another object */
+         for (m = 0; m < 2; m++)
+@@ -1283,6 +1616,17 @@ BOOL d2r_event_keep( HANDLE handle )
+                     d2r_ev_pool[m][i] = d2r_ev_pool[m][--d2r_ev_pooled[m]];
+                     break;
+                 }
++        /* patch 0010: the same for timers; and a reused timer that lost its table entry
++         * goes out of the unset list, since its handle value can come back for anything */
++        for (m = 0; m < 2; m++)
++            for (i = 0; i < d2r_tm_pooled[m]; i++)
++                if (d2r_tm_pool[m][i].handle == handle)
++                {
++                    d2r_tm_pool[m][i] = d2r_tm_pool[m][d2r_tm_pooled[m] - 1];
++                    __atomic_store_n( &d2r_tm_pooled[m], d2r_tm_pooled[m] - 1, __ATOMIC_RELAXED );
++                    break;
++                }
++        if (d2r_tm_unsets && (u = d2r_tm_unset_find( handle )) >= 0) d2r_tm_unset_drop( u );
+     }
+     server_leave_uninterrupted_section( &d2r_ev_mutex, &sigset );
+     if (counter >= 0) d2r_ev_count( counter );
+@@ -2372,12 +2716,22 @@ NTSTATUS WINAPI NtCreateTimer( HANDLE *handle, ACCESS_MASK access, const OBJECT_
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
++    BOOL plain;
+ 
+     TRACE( "access %#x, name %s, type %u\n", access,
+            attr ? debugstr_us(attr->ObjectName) : "(null)", type );
+ 
+     *handle = 0;
+     if (type != NotificationTimer && type != SynchronizationTimer) return STATUS_INVALID_PARAMETER;
++
++    /* d2r (patch 0010): take a kept anonymous timer back */
++    if ((plain = d2r_tm_plain( access, attr )) && (*handle = d2r_tm_take( type == NotificationTimer, access )))
++    {
++        d2r_tm_note( *handle, type == NotificationTimer, access );
++        d2r_tm_count( D2R_TM_REUSED );
++        return STATUS_SUCCESS;
++    }
++
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
+     SERVER_START_REQ( create_timer )
+@@ -2391,6 +2745,7 @@ NTSTATUS WINAPI NtCreateTimer( HANDLE *handle, ACCESS_MASK access, const OBJECT_
+     SERVER_END_REQ;
+ 
+     free( objattr );
++    if (!ret && plain) d2r_tm_note( *handle, type == NotificationTimer, access );
+     return ret;
+ 
+ }
+@@ -2429,10 +2784,11 @@ NTSTATUS WINAPI NtOpenTimer( HANDLE *handle, ACCESS_MASK access, const OBJECT_AT
+ NTSTATUS WINAPI NtSetTimer( HANDLE handle, const LARGE_INTEGER *when, PTIMER_APC_ROUTINE callback,
+                             void *arg, BOOLEAN resume, ULONG period, BOOLEAN *state )
+ {
+-    unsigned int ret = STATUS_SUCCESS;
++    unsigned int ret = STATUS_SUCCESS, gen;
+ 
+     TRACE( "(%p,%p,%p,%p,%08x,0x%08x,%p)\n", handle, when, callback, arg, resume, period, state );
+ 
++    arg = d2r_tm_set( handle, when->QuadPart, callback, arg, period, &gen );  /* d2r (patch 0010) */
+     SERVER_START_REQ( set_timer )
+     {
+         req->handle   = wine_server_obj_handle( handle );
+@@ -2444,6 +2800,7 @@ NTSTATUS WINAPI NtSetTimer( HANDLE handle, const LARGE_INTEGER *when, PTIMER_APC
+         if (state) *state = reply->signaled;
+     }
+     SERVER_END_REQ;
++    if (gen) d2r_tm_unset_done( handle, gen );  /* d2r (patch 0010) */
+ 
+     /* set error but can still succeed */
+     if (resume && ret == STATUS_SUCCESS) return STATUS_TIMER_RESUME_IGNORED;
+@@ -2460,6 +2817,7 @@ NTSTATUS WINAPI NtCancelTimer( HANDLE handle, BOOLEAN *state )
+ 
+     TRACE( "handle %p, state %p\n", handle, state );
+ 
++    d2r_tm_look( handle, TRUE );  /* d2r (patch 0010) */
+     SERVER_START_REQ( cancel_timer )
+     {
+         req->handle = wine_server_obj_handle( handle );
+@@ -2488,6 +2846,7 @@ NTSTATUS WINAPI NtQueryTimer( HANDLE handle, TIMER_INFORMATION_CLASS class,
+     case TimerBasicInformation:
+         if (len < sizeof(TIMER_BASIC_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
+ 
++        d2r_tm_look( handle, FALSE );  /* d2r (patch 0010) */
+         SERVER_START_REQ( get_timer_info )
+         {
+             req->handle = wine_server_obj_handle( handle );
+@@ -2550,6 +2909,7 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
+     if ((ret = inproc_wait( count, handles, type, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+     {
+         TRACE( "-> %#x\n", ret );
++        d2r_tm_waited( count, handles, type, ret );  /* d2r (patch 0010) */
+         return ret;
+     }
+ 
+@@ -2558,6 +2918,7 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
+     for (i = 0; i < count; i++) select_op.wait.handles[i] = wine_server_obj_handle( handles[i] );
+     ret = server_wait( &select_op, offsetof( union select_op, wait.handles[count] ), flags, timeout );
+     TRACE( "-> %#x\n", ret );
++    d2r_tm_waited( count, handles, type, ret );  /* d2r (patch 0010) */
+     return ret;
+ }
+ 
+@@ -2577,6 +2938,7 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
+     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+     {
+         TRACE( "-> %#x\n", ret );
++        if (ret == STATUS_WAIT_0) d2r_tm_signaled( handle );  /* d2r (patch 0010) */
+         return ret;
+     }
+ 
+@@ -2585,6 +2947,7 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
+     select_op.wait.handles[0] = wine_server_obj_handle( handle );
+     ret = server_wait( &select_op, offsetof( union select_op, wait.handles[1] ), flags, timeout );
+     TRACE( "-> %#x\n", ret );
++    if (ret == STATUS_WAIT_0) d2r_tm_signaled( handle );  /* d2r (patch 0010) */
+     return ret;
+ }
+ 
+@@ -2604,14 +2967,16 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
+     if (!signal) return STATUS_INVALID_HANDLE;
+ 
+     d2r_event_shared( wait, TRUE );  /* d2r (patch 0008) */
+-    if ((ret = inproc_signal_and_wait( signal, wait, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+-        return ret;
+-
+-    if (alertable) flags |= SELECT_ALERTABLE;
+-    select_op.signal_and_wait.op = SELECT_SIGNAL_AND_WAIT;
+-    select_op.signal_and_wait.wait = wine_server_obj_handle( wait );
+-    select_op.signal_and_wait.signal = wine_server_obj_handle( signal );
+-    return server_wait( &select_op, sizeof(select_op.signal_and_wait), flags, timeout );
++    if ((ret = inproc_signal_and_wait( signal, wait, alertable, timeout )) == STATUS_NOT_IMPLEMENTED)
++    {
++        if (alertable) flags |= SELECT_ALERTABLE;
++        select_op.signal_and_wait.op = SELECT_SIGNAL_AND_WAIT;
++        select_op.signal_and_wait.wait = wine_server_obj_handle( wait );
++        select_op.signal_and_wait.signal = wine_server_obj_handle( signal );
++        ret = server_wait( &select_op, sizeof(select_op.signal_and_wait), flags, timeout );
++    }
++    if (ret == STATUS_WAIT_0) d2r_tm_signaled( wait );  /* d2r (patch 0010) */
++    return ret;
+ }
+ 
+ 
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 4b96310..3e5f030 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -149,7 +149,8 @@ extern struct d2r_server_calls *d2r_server_calls;
+ /* d2r (patch 0009): more for FEX in a second export, __wine_d2r_server_calls_ext, so FEX
+  * builds that read version 1 of __wine_d2r_server_calls keep working: the latest caller of
+  * each request type and what the completion port waits in the process did. On with the
+- * request counts (WINE_D2R_CALL_COUNTS). Version 1 layout (2,112 bytes). */
++ * request counts (WINE_D2R_CALL_COUNTS). Version 1 layout; later patches only append, and
++ * size says how much this build writes (0 in patch 0009's build: 2,112 bytes). */
+ struct d2r_server_calls_ext
+ {
+     ULONG   version;          /* 1 once the unix side writes here */
+@@ -159,12 +160,23 @@ struct d2r_server_calls_ext
+     ULONG64 cp_lost_race;     /* signaled, but no entry left when asked: rest of the wait in the server, as stock */
+     ULONG64 cp_fallback;      /* waits esync can't do in the process: stock server path */
+     ULONG64 cp_extra_saved;   /* GetQueuedCompletionStatusEx batches that stopped without a last empty remove */
+-    ULONG64 pad[2];
++    ULONG   size;             /* bytes of this struct the build writes (patch 0010 and later) */
++    ULONG   pad0;
++    ULONG64 pad1;
+     ULONG   last_tid[D2R_MAX_REQUESTS]; /* Windows thread id of the latest caller, by enum request */
++    /* patch 0010: anonymous timer reuse, at byte 2112 */
++    ULONG64 tm_kept;          /* NtClose kept an anonymous timer for reuse */
++    ULONG64 tm_reused;        /* NtCreateTimer took a kept timer back, no server call */
++    ULONG64 tm_reset;         /* a reused timer made new in a request of its own (cancel, query, APC set, wait on a fired one) */
++    ULONG64 tm_armed;         /* closed while a setting wasn't seen to fire (maybe pending): really closed */
++    ULONG64 tm_shared;        /* left out: APC or period, set again before it fired, cancelled, duplicated, other thread */
++    ULONG64 tm_other_thread;  /* closed by another thread than the one that made it */
++    ULONG64 tm_too_old;       /* closed later than 100 ms after it was made */
++    ULONG64 tm_pool_full;     /* closed while the pool for its type was full (tm_kept..tm_pool_full in this order) */
+ };
+ 
+ extern struct d2r_server_calls_ext *d2r_server_calls_ext;
+-#define D2R_SERVER_CALLS_EXT_U64 264  /* size of __wine_d2r_server_calls_ext in ULONG64 */
++#define D2R_SERVER_CALLS_EXT_U64 272  /* size of __wine_d2r_server_calls_ext in ULONG64 */
+ extern void d2r_event_shared( HANDLE handle, BOOL wait );
+ extern BOOL d2r_event_keep( HANDLE handle );
+ 
+diff --git a/server/timer.c b/server/timer.c
+index a4309d5..27b2f3b 100644
+--- a/server/timer.c
++++ b/server/timer.c
+@@ -62,6 +62,7 @@ struct timer
+     struct thread       *thread;    /* thread that set the APC function */
+     client_ptr_t         callback;  /* callback APC function */
+     client_ptr_t         arg;       /* callback argument */
++    unsigned int         d2r_gen;   /* d2r (patch 0010): reuse number ntdll last made it new for */
+ };
+ 
+ static void timer_dump( struct object *obj, int verbose );
+@@ -112,6 +113,7 @@ static struct timer *create_timer( struct object *root, const struct unicode_str
+             timer->period   = 0;
+             timer->timeout  = NULL;
+             timer->thread   = NULL;
++            timer->d2r_gen  = 0;
+ 
+             if (!(timer->sync = create_internal_sync( manual, 0 )))
+             {
+@@ -201,6 +203,23 @@ static int set_timer( struct timer *timer, timeout_t expire, unsigned int period
+     return signaled;
+ }
+ 
++/* d2r (fex-d2-reforged, patch 0010): ntdll keeps anonymous timers open for reuse and puts a
++ * reused timer back to a new timer's state with this marker in the high half of the argument
++ * of a set_timer request without APC (an argument the server never uses then; ntdll never
++ * sends it for anything else, the same value is in dlls/ntdll/unix/sync.c). Bits 1-31: reuse
++ * number, the timer is made new on the first marker of each; bit 0: don't set it after. */
++#define D2R_TIMER_MARKER 0xd2d2f4e5u
++
++/* the state create_timer gives a new timer: no timeout or APC, not signaled, due time 0 */
++static void d2r_timer_fresh( struct timer *timer )
++{
++    cancel_timer( timer );
++    timer->signaled = 0;
++    reset_sync( timer->sync );
++    timer->when     = 0;
++    timer->period   = 0;
++}
++
+ static void timer_dump( struct object *obj, int verbose )
+ {
+     struct timer *timer = (struct timer *)obj;
+@@ -268,7 +287,19 @@ DECL_HANDLER(set_timer)
+     if ((timer = (struct timer *)get_handle_obj( current->process, req->handle,
+                                                  TIMER_MODIFY_STATE, &timer_ops )))
+     {
+-        reply->signaled = set_timer( timer, req->expire, req->period, req->callback, req->arg );
++        if (!req->callback && (unsigned int)(req->arg >> 32) == D2R_TIMER_MARKER)
++        {
++            /* d2r (patch 0010): as if the program had just made this timer, then its setting */
++            unsigned int gen = (unsigned int)req->arg >> 1;
++
++            if (timer->d2r_gen != gen)
++            {
++                d2r_timer_fresh( timer );
++                timer->d2r_gen = gen;
++            }
++            if (!(req->arg & 1)) reply->signaled = set_timer( timer, req->expire, req->period, 0, 0 );
++        }
++        else reply->signaled = set_timer( timer, req->expire, req->period, req->callback, req->arg );
+         release_object( timer );
+     }
+ }
