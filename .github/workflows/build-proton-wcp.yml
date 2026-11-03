@@ -197,7 +197,7 @@ jobs:
 
       - name: Build
         run: |
-          bash build-scripts/build-step-arm64ec.sh --build
+          bash build-scripts/build-step-arm64ec.sh --build 2>&1 | tee $RUNNER_TEMP/build.log
           if [ "$USE_CCACHE" = 1 ]; then
             ccache -s | tee $RUNNER_TEMP/ccache-stats.txt
             HITS=$(ccache --print-stats | awk -F'\t' '$1=="direct_cache_hit"||$1=="preprocessed_cache_hit"{h+=$2} $1=="cache_miss"{m+=$2} END{if(h+m) printf "%d", 100*h/(h+m); else print 0}')
@@ -232,6 +232,10 @@ jobs:
           # the tiny header helpers an unoptimized build emits in every object
           NM=$(command -v llvm-nm-18 || command -v llvm-nm) \
           bash $RUNNER_TEMP/fex-src/tools/proton/check-unix-opt.sh $HOME/compiled-files-aarch64 | tee -a $RUNNER_TEMP/checks.txt
+          # compiler warnings that point at undefined behaviour an optimizer can turn into wrong
+          # code (information, shipped as share/wine/d2r-build-warnings.txt)
+          bash $RUNNER_TEMP/fex-src/tools/proton/compile-warnings.sh $RUNNER_TEMP/build.log > $RUNNER_TEMP/build-warnings.txt
+          cat $RUNNER_TEMP/build-warnings.txt
 
       - name: Package wcp
         run: |
@@ -248,6 +252,7 @@ jobs:
           } > share/wine/d2r-proton.txt
           cp $RUNNER_TEMP/vm-lock-lines.txt share/wine/d2r-vm-lock-lines.txt
           cp $RUNNER_TEMP/server-requests.txt share/wine/d2r-server-requests.txt
+          cp $RUNNER_TEMP/build-warnings.txt share/wine/d2r-build-warnings.txt
           cat share/wine/d2r-proton.txt
           cat > profile.json <<EOF
           {
@@ -307,6 +312,11 @@ jobs:
             echo "- WINE_D2R_FAST_CONTINUE=0: NtContinue to x64 code takes the syscall as in stock Wine (0007)"
             echo "- WINE_D2R_EVENT_REUSE=0: anonymous events are closed as in stock Wine (0008)"
             echo "- WINE_D2R_CALL_COUNTS=0: no wineserver request counters (0008)"
+            echo
+            echo "Compiler warnings that point at undefined behaviour (list in share/wine/d2r-build-warnings.txt):"
+            echo '```'
+            sed -n '/^-- /,$p' $RUNNER_TEMP/build-warnings.txt
+            echo '```'
             echo
             echo "Binary checks of this build:"
             echo '```'
