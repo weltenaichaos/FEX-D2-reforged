@@ -38,7 +38,12 @@ env:
   PROTON_REPO: GameNative/proton-wine
   PROTON_REF: f7c016668db739f563e3d4781c27ed085843d63a
   PROTON_VERSION: 11.0-1
-  D2R_TAG: d2r6
+  D2R_TAG: d2r7
+  # Optimization of the unix side (ntdll.so, wineserver, win32u.so, winevulkan.so, ...).
+  # GameNative's build script sets CFLAGS to warning flags only, so configure's default
+  # "-g -O2" never applies and their stock packages run the whole unix side unoptimized
+  # (-O0); the PE side gets -O2 from configure's CROSSCFLAGS default either way.
+  UNIX_OPT: -O2
   CCACHE_DIR: /home/runner/.ccache
   CCACHE_COMPILERCHECK: content
   CCACHE_MAXSIZE: 3G
@@ -172,6 +177,13 @@ jobs:
           [ "$(grep -c ccache $S)" = 3 ] || { echo "::error::build script changed, ccache not routed"; exit 1; }
           ccache -z
 
+      - name: Optimize the unix side
+        run: |
+          S=build-scripts/build-step-arm64ec.sh
+          sed -i 's|^export C_OPTS="-Wno-declaration-after-statement |export C_OPTS="'"$UNIX_OPT"' -Wno-declaration-after-statement |' $S
+          grep -n '^export C_OPTS=' $S
+          grep -q "^export C_OPTS=\"$UNIX_OPT -Wno-declaration-after-statement " $S || { echo "::error::build script changed, unix side not optimized"; exit 1; }
+
       - name: Build sysvshm library
         run: bash build-scripts/build-step-arm64ec.sh --build-sysvshm
 
@@ -216,6 +228,10 @@ jobs:
           VM_LINES=$RUNNER_TEMP/vm-lock-lines.txt VM_SOURCE=dlls/ntdll/unix/virtual.c \
           OBJDUMP=$OBJDUMP bash $RUNNER_TEMP/fex-src/tools/proton/check-patches.sh $HOME/compiled-files-aarch64 \
             $RUNNER_TEMP/fex-src/proton-patches/${PROTON_VERSION} | tee $RUNNER_TEMP/checks.txt
+          # the unix side really is optimized (UNIX_OPT): no binary keeps out-of-line copies of
+          # the tiny header helpers an unoptimized build emits in every object
+          NM=$(command -v llvm-nm-18 || command -v llvm-nm) \
+          bash $RUNNER_TEMP/fex-src/tools/proton/check-unix-opt.sh $HOME/compiled-files-aarch64 | tee -a $RUNNER_TEMP/checks.txt
 
       - name: Package wcp
         run: |
@@ -227,6 +243,7 @@ jobs:
             echo "source ${PROTON_REPO} @ ${PROTON_REF}"
             echo "patch set ${PATCH_HASH}: $(cd $RUNNER_TEMP/fex-src/proton-patches/${PROTON_VERSION} && ls *.patch | tr '\n' ' ')"
             echo "fex-d2-reforged ${GITHUB_SHA}, ${BUILD_KIND}"
+            echo "unix side built with ${UNIX_OPT} (GameNative's script: no optimization)"
             echo "binary checks:"; cat $RUNNER_TEMP/checks.txt
           } > share/wine/d2r-proton.txt
           cp $RUNNER_TEMP/vm-lock-lines.txt share/wine/d2r-vm-lock-lines.txt
@@ -237,7 +254,7 @@ jobs:
             "type": "Proton",
             "versionName": "${PROTON_VERSION}-arm64ec",
             "versionCode": ${VERSION_CODE},
-            "description": "Proton ${PROTON_VERSION} arm64ec ${D2R_TAG} (build ${GITHUB_RUN_NUMBER}, patch set ${PATCH_HASH}): GameNative 11.0-1 + fex-d2-reforged proton-patches",
+            "description": "Proton ${PROTON_VERSION} arm64ec ${D2R_TAG} (build ${GITHUB_RUN_NUMBER}, patch set ${PATCH_HASH}, unix ${UNIX_OPT}): GameNative 11.0-1 + fex-d2-reforged proton-patches",
             "files": [],
             "wine": {
               "binPath": "bin",
@@ -267,6 +284,8 @@ jobs:
             echo "Our own Proton for D2R on the AYN Thor: GameNative's Proton ${PROTON_VERSION} ARM64EC"
             echo "(${PROTON_REPO} proton_11.0 @ ${PROTON_REF}, built like their SDK 28 package)"
             echo "with this repo's proton-patches/${PROTON_VERSION} on top. Patch set **${PATCH_HASH}**, ${BUILD_KIND}."
+            echo "Unix side (ntdll.so, wineserver, win32u.so, winevulkan.so, ...) built with **${UNIX_OPT}**;"
+            echo "GameNative's build script leaves it unoptimized (CFLAGS without -O), their stock package too."
             echo
             echo "Shows up in GameNative as **proton-${PROTON_VERSION}-arm64ec-${VERSION_CODE}**. GameNative keeps one"
             echo "Proton per version name, so importing it replaces the Proton 11.0-1 installed before (stock or an"
