@@ -16,8 +16,6 @@ namespace {
   constexpr int RaisedNice = -20; // the main thread's
   constexpr uint32_t Kinds = 3;   // index = lock kind
 
-  thread_local int CachedTid;
-
   // "/proc/self/task/<Tid>/<File>" into Out, without the C library (it can run inside an exception handler).
   void TaskPath(char (&Out)[64], int Tid, const char* File) {
     char* P = Out;
@@ -41,13 +39,11 @@ namespace {
     *P = 0;
   }
 
+  // No thread_local here: FEX's Windows DLLs have no TLS directory (their own CRT), so a thread_local lands in TLS slot
+  // 0, which is the game's own (or not set up yet while Wine starts a thread). Build 156 cached the tid that way, and its
+  // starts failed. One gettid call per lock taken instead.
   int SelfTid() {
-    int Tid = CachedTid;
-    if (!Tid) {
-      Tid = Linux::GetTid();
-      CachedTid = Tid;
-    }
-    return Tid;
+    return Linux::GetTid();
   }
 
   // A thread's state letter and CPU from its stat file ('?' and -1 when it can't be read). Only raw Linux calls and the

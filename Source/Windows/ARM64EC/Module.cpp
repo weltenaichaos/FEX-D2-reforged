@@ -1144,11 +1144,11 @@ static bool RetryStaleNoExecFault(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT&
     return true;
   }
 
-  // Bound the retries so a disagreement between the tracker and the compiler can never become a hang.
-  static thread_local uint64_t LastRip {};
-  static thread_local uint32_t Retries {};
-  Retries = (Rip == LastRip) ? Retries + 1 : 0;
-  LastRip = Rip;
+  // Bound the retries so a disagreement between the tracker and the compiler can never become a hang. Per thread in its
+  // FEX state (a thread_local here would land in TLS slot 0, the game's: FEX's DLLs have no TLS directory).
+  auto& Retries = Thread->NoExecRetries;
+  Retries = (Rip == Thread->NoExecRetryRip) ? Retries + 1 : 0;
+  Thread->NoExecRetryRip = Rip;
   if (Retries >= 16) {
     Retries = 0;
     return false;
