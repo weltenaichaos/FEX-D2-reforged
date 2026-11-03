@@ -859,6 +859,131 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
 // is published, leaving it cached for good: every later run raises an execute fault for a page that is executable.
 // Decrypt-on-demand protectors (Overwatch_loader.dll) then spin forever, since their handler has nothing left to
 // unlock. Real hardware would just run the code, so when the fault is stale drop the cached code and resume at RIP.
+// Build 151: the failed D2R starts (black screen, ~1.5 s in) all crash the same way. Something builds a small code stub in
+// the game process (a private executable page) that calls kernel32 at the address kernel32 has in the process that
+// built it: its usual base (0x6FFF630000 with our Proton, + 0x62600). In a failed start Wine had loaded kernel32 and
+// kernelbase of the game process elsewhere (0x7FF5700000: the usual place was taken when they were mapped), so the call
+// lands on free memory and the game dies with "Unhandled exception c0000005". Windows keeps these DLLs at the same
+// address in every process, which such code relies on. Here a call into free memory that is inside where kernel32,
+// kernelbase or ntdll would have been continues at the same offset of where they are. FEX_SYSDLL_REDIRECT=0 turns it off.
+namespace SysDllRedirect {
+struct Dll {
+  const wchar_t* Name;
+  const wchar_t* Path;
+  uint64_t Base;      // where it is in this process
+  uint64_t Preferred; // the image base in its file
+  uint64_t Size;
+};
+Dll Dlls[] = {
+  {L"kernel32.dll", L"\\??\\C:\\windows\\system32\\kernel32.dll", 0, 0, 0},
+  {L"kernelbase.dll", L"\\??\\C:\\windows\\system32\\kernelbase.dll", 0, 0, 0},
+  {L"ntdll.dll", L"\\??\\C:\\windows\\system32\\ntdll.dll", 0, 0, 0},
+};
+std::atomic<int> State; // 0 not looked up, 1 looked up, -1 off
+
+fextl::string Narrow(const wchar_t* Name) {
+  fextl::string Out;
+  for (; *Name; ++Name) {
+    Out += static_cast<char>(*Name);
+  }
+  return Out;
+}
+std::atomic<uint32_t> Redirects;
+
+// The image base written in a DLL's file (the header in memory may hold where it was loaded instead).
+uint64_t FileImageBase(const wchar_t* Path) {
+  UNICODE_STRING Name {};
+  RtlInitUnicodeString(&Name, Path);
+  OBJECT_ATTRIBUTES Attr {};
+  InitializeObjectAttributes(&Attr, &Name, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+  IO_STATUS_BLOCK IOSB {};
+  HANDLE File {};
+  if (!NT_SUCCESS(NtOpenFile(&File, GENERIC_READ | SYNCHRONIZE, &Attr, &IOSB, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                             FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE))) {
+    return 0;
+  }
+  alignas(8) uint8_t Header[4096] {};
+  LARGE_INTEGER Offset {};
+  const bool Read = NT_SUCCESS(NtReadFile(File, nullptr, nullptr, nullptr, &IOSB, Header, sizeof(Header), &Offset, nullptr));
+  NtClose(File);
+  if (!Read || IOSB.Information < 0x200) {
+    return 0;
+  }
+  const auto* Dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(Header);
+  if (Dos->e_magic != IMAGE_DOS_SIGNATURE || Dos->e_lfanew <= 0 ||
+      static_cast<uint64_t>(Dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > static_cast<uint64_t>(IOSB.Information)) {
+    return 0;
+  }
+  const auto* Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(Header + Dos->e_lfanew);
+  if (Nt->Signature != IMAGE_NT_SIGNATURE || Nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    return 0;
+  }
+  return Nt->OptionalHeader.ImageBase;
+}
+
+void LookUp() {
+  const char* Value = FEX::Windows::Switch("FEX_SYSDLL_REDIRECT");
+  if (Value && Value[0] == '0') {
+    State.store(-1);
+    FEX::Windows::StartWatchNote("system DLL redirect: off (FEX_SYSDLL_REDIRECT=0)");
+    return;
+  }
+  fextl::string Text = "system DLL redirect: looked up at the first call into free memory:";
+  for (auto& D : Dlls) {
+    D.Base = FrameLatency::FindModule(D.Name);
+    D.Preferred = FileImageBase(D.Path);
+    if (D.Base) {
+      const auto* Dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(D.Base);
+      const auto* Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(D.Base + Dos->e_lfanew);
+      D.Size = Nt->OptionalHeader.SizeOfImage;
+    }
+    Text += fextl::fmt::format(" {} at {:X} (file base {:X}, size {:X})", Narrow(D.Name), D.Base,
+                               D.Preferred, D.Size);
+  }
+  FEX::Windows::StatsLogNote(Text);
+  FEX::Windows::StartWatchNote(Text);
+  State.store(1);
+}
+
+// Where Rip would be if the DLL whose usual place holds it were there; 0 if none.
+uint64_t Target(uint64_t Rip) {
+  if (State.load() < 0) {
+    return 0;
+  }
+  MEMORY_BASIC_INFORMATION Info {};
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Rip), MemoryBasicInformation, &Info, sizeof(Info), nullptr) !=
+        STATUS_SUCCESS ||
+      Info.State != MEM_FREE) {
+    return 0;
+  }
+  if (State.load() == 0) {
+    static std::mutex Lock;
+    std::scoped_lock Guard {Lock};
+    if (State.load() == 0) {
+      LookUp();
+    }
+    if (State.load() < 0) {
+      return 0;
+    }
+  }
+  for (const auto& D : Dlls) {
+    if (D.Base && D.Preferred && D.Size && D.Base != D.Preferred && Rip - D.Preferred < D.Size) {
+      const uint64_t New = D.Base + (Rip - D.Preferred);
+      if (Redirects.fetch_add(1, std::memory_order_relaxed) < 20) {
+        const auto Text = fextl::fmt::format("system DLL redirect: call to {:X} (free memory, where {} usually is, +{:X}) continues at {:X} "
+                                             "(tid {})",
+                                             Rip, Narrow(D.Name), Rip - D.Preferred, New,
+                                             GetCurrentThreadId());
+        FEX::Windows::StatsLogNote(Text);
+        FEX::Windows::StartWatchNote(Text);
+      }
+      return New;
+    }
+  }
+  return 0;
+}
+} // namespace SysDllRedirect
+
 static bool RetryStaleNoExecFault(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT& Context) {
   auto* Thread = CPUArea.ThreadState();
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
@@ -871,6 +996,17 @@ static bool RetryStaleNoExecFault(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT&
     ReconstructThreadState(Thread, Context);
   }
   const uint64_t Rip = Thread->CurrentFrame->State.rip;
+
+  // Build 151: a call to where a system DLL usually is (see SysDllRedirect) continues where it is.
+  if (const uint64_t New = SysDllRedirect::Target(Rip)) {
+    Thread->CurrentFrame->State.rip = New;
+    Fault.FaultToTopAndGeneratedException = false;
+    Context.Pc = CPUArea.DispatcherLoopTopEnterECFillSRA();
+    Context.Sp = CPUArea.EmulatorStackBase();
+    Context.X11 = 0;                                        // ENTRY_FILL_SRA_SINGLE_INST_REG: normal block
+    Context.X17 = reinterpret_cast<uint64_t>(CPUArea.Area); // EC_ENTRY_CPUAREA_REG
+    return true;
+  }
 
   // Bound the retries so a disagreement between the tracker and the compiler can never become a hang.
   static thread_local uint64_t LastRip {};

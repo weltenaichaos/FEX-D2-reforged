@@ -171,6 +171,7 @@ The **clean version** sets two switches of its own instead:
 | `FEX_CRASH_NOTE` | `D:\` | If the game ends with an error, a small file `fexcrash-D2R.exe-b<N>-<time>-<pid>.txt` with the last errors. Nothing otherwise. `0` = none. |
 | `FEX_START_WATCH` | `D:\` | Both versions, build 128 (Android log from build 132): for every start a small file `fexstart-D2R.exe-b<N>-<time>-<pid>.txt` with the container's processes and GameNative's own app process starting and ending in the first 2 minutes, and GameNative's warnings and errors from Android's log (a failed start's included), to find what ends a start that stays black. Build 136: written through Linux (keeps going while Wine hangs) with `## threads` blocks (every thread's state and wait) at 1 s and after any second of near-zero CPU in the first 30 s. Build 140: every exception FEX passes on outside the game's exe (first 400), with the memory region and file at the code and the faulting address, code bytes and stack top. `0` = none. |
 | `FEX_START_WATCH_S` | `120` | How many seconds the start watch follows processes (5-3600). | |
+| `FEX_SYSDLL_REDIRECT` | `1` | Build 151: a call into free memory where kernel32, kernelbase or ntdll usually are (code built by another process using its own addresses) continues at the same offset of where Wine loaded them in this process. Fixes the failed starts where Wine loaded kernel32 elsewhere and D2R crashed ~1.5 s in. `0` = off. | |
 
 ## Tried and left off
 
