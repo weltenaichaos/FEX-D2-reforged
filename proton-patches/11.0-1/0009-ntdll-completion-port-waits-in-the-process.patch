@@ -1,0 +1,362 @@
+ntdll, server: completion port waits in the process with esync; latest callers for FEX.
+
+With patch 0008 in (b154, Proton d2r7) calm play still sends about 790 remove_completion
+and about as many select requests a second. D2R's file I/O threads sit in
+GetQueuedCompletionStatus(Ex) on a completion port. Stock ntdll checks a port in the
+process only for zero-timeout calls and only with ntsync (inproc_device_fd), so with esync
+every call is a remove_completion and, for an empty queue, a select on the thread's
+completion wait that the server then has to time out or wake.
+
+The server keeps a port's sync signaled while its queue holds entries, and with esync that
+sync is an eventfd the process can poll (ESYNC_MANUAL_SERVER). NtRemoveIoCompletion and
+NtRemoveIoCompletionEx now wait on the port handle in the process (alertable as asked) and
+send remove_completion only once the port is signaled; NtRemoveIoCompletionEx takes more
+entries while the port stays signaled, without the last remove that finds it empty. A wait
+that times out costs no server call. When another thread took the entry first, the rest of
+the wait is the stock one (the thread's completion wait in the server, then
+get_thread_completion). A port closed during the wait gives STATUS_ABANDONED_WAIT_0 as in
+stock Wine. Without esync, or for a wait esync can't do, the stock path runs.
+
+server/completion.c: a server-side waiter that takes the last entry now resets the port's
+sync, and remove_completion clears it when it finds the queue empty. In stock Wine an
+empty port could stay signaled after a server-side waiter took the last entry; nothing in
+the process waited on that sync with esync, so it never showed.
+
+For FEX, a second export __wine_d2r_server_calls_ext (struct d2r_server_calls_ext,
+version 1, 2,112 bytes): what the in-process waits did (cp_woken, cp_timed_out,
+cp_lost_race, cp_fallback, cp_extra_saved at bytes 8 to 47) and the Windows thread id of
+the latest caller of each request type (last_tid[512] at byte 64). It is on with the
+request counts (WINE_D2R_CALL_COUNTS). __wine_d2r_server_calls stays version 1, so FEX
+builds that read it keep working. Also corrects 0008's note: a select's time is its request
+only; the blocking wait comes after the reply.
+
+Model test (eventfd port, single-threaded server model, 400,000 entries, 6 in-process and 2
+stock consumers, batches of 1 to 4): no entry lost or taken twice; an idle 2 ms wait makes
+no server call; without the server reset an empty port was found still signaled 107 times,
+with it 0.
+
+WINE_D2R_COMPLETION_WAIT=0 sends every completion port wait to the server as stock Wine.
+Read once per process.
+---
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 0b5517c..85e9fa6 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1758,6 +1758,7 @@
+ @ extern -private __wine_d2r_wait_lists
+ @ extern -private __wine_d2r_vm_lock
+ @ extern -private __wine_d2r_server_calls
++@ extern -private __wine_d2r_server_calls_ext
+ @ stdcall __wine_get_unix_env(ptr ptr long)
+ @ stdcall __wine_set_unix_env(ptr ptr)
+ @ stdcall wine_nt_to_unix_file_name(ptr ptr ptr long) compat_wine_nt_to_unix_file_name
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index 1ba63a3..3652d38 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -859,6 +859,10 @@ DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_vm_lock[64];
+  * unix side (struct d2r_server_calls in unix/unix_private.h), read by FEX */
+ DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls[1032];
+ 
++/* d2r (patch 0009): latest caller per request type and completion port wait counters
++ * (struct d2r_server_calls_ext, D2R_SERVER_CALLS_EXT_U64), read by FEX */
++DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls_ext[264];
++
+ /* WINE_D2R_WAIT_LOCK=0 (read in loader_init): spin until free, as stock Wine does */
+ BOOL d2r_wait_lock_spin = FALSE;
+ 
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 7376837..eb13b29 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2025,6 +2025,12 @@ static void load_ntdll_functions( HMODULE module )
+     {
+         d2r_server_calls->nb_requests = REQ_NB_REQUESTS;
+         WriteRelease( (LONG *)&d2r_server_calls->version, 1 );
++        /* patch 0009: latest callers and completion port wait counters */
++        if ((d2r_server_calls_ext = (void *)find_named_export( module, exports, "__wine_d2r_server_calls_ext" )))
++        {
++            d2r_server_calls_ext->nb_requests = REQ_NB_REQUESTS;
++            WriteRelease( (LONG *)&d2r_server_calls_ext->version, 1 );
++        }
+     }
+ #undef GET_FUNC
+ }
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index f8476db..352e89a 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -289,6 +289,12 @@ static inline unsigned int wait_reply( struct __server_request_info *req )
+ /* d2r (patch 0008): requests by type for FEX, see struct d2r_server_calls */
+ struct d2r_server_calls *d2r_server_calls;
+ C_ASSERT( sizeof(struct d2r_server_calls) <= 1032 * sizeof(ULONG64) );  /* fits __wine_d2r_server_calls */
++/* patch 0009: latest callers and completion port wait counters for FEX */
++struct d2r_server_calls_ext *d2r_server_calls_ext;
++C_ASSERT( sizeof(struct d2r_server_calls_ext) == D2R_SERVER_CALLS_EXT_U64 * sizeof(ULONG64) );  /* __wine_d2r_server_calls_ext */
++C_ASSERT( offsetof(struct d2r_server_calls_ext, cp_woken) == 8 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, cp_extra_saved) == offsetof(struct d2r_server_calls_ext, cp_woken) + 4 * sizeof(ULONG64) );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, last_tid) == 64 );
+ C_ASSERT( REQ_NB_REQUESTS <= D2R_MAX_REQUESTS );
+ C_ASSERT( offsetof(struct d2r_server_calls, ev_pool_full) == offsetof(struct d2r_server_calls, ev_kept) + 5 * sizeof(ULONG64) );
+ /* the number of request types in this build, so the build can check the name table it ships */
+@@ -323,6 +329,9 @@ unsigned int server_call_unlocked( void *req_ptr )
+     {
+         __atomic_fetch_add( &calls->count[type], 1, __ATOMIC_RELAXED );
+         __atomic_fetch_add( &calls->time_ns[type], d2r_call_now() - start, __ATOMIC_RELAXED );
++        if (d2r_server_calls_ext)
++            __atomic_store_n( &d2r_server_calls_ext->last_tid[type], HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
++                              __ATOMIC_RELAXED );
+     }
+     return ret;
+ }
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 764ed04..d4c7a82 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -3051,6 +3051,142 @@ NTSTATUS WINAPI NtSetIoCompletionEx( HANDLE completion_handle, HANDLE completion
+     return ret;
+ }
+ 
++/* d2r (fex-d2-reforged, patch 0009): completion port waits in the process with esync.
++ * The server keeps a completion port's sync signaled while its queue holds entries; with
++ * esync that sync is an eventfd the process can poll. Stock code checks it in the process
++ * only for zero-timeout calls and only with ntsync, so with esync every
++ * GetQueuedCompletionStatus(Ex) went to the server: remove_completion, and for an empty
++ * queue a select on the thread's completion wait that the server then had to time out
++ * (D2R's AIO threads, b154: ~790 of each a second in calm play). Now the wait for "the
++ * queue has an entry" polls the port's fd in the process (alertable as asked) and
++ * remove_completion is sent only once the port is signaled; a wait that times out costs no
++ * server call. When another thread takes the entry first, the rest of the wait is the
++ * stock one (on the thread's completion wait in the server). A port closed during the
++ * wait gives STATUS_ABANDONED_WAIT_0 as in stock Wine. Ports esync can't wait on take the
++ * stock path. WINE_D2R_COMPLETION_WAIT=0 restores the stock path everywhere.
++ * server/completion.c: a server-side waiter that takes the last entry now resets the
++ * port's sync, and remove_completion clears it when it finds the queue empty, so an empty
++ * port no longer stays signaled (it did in stock Wine; nothing in the process waited on it). */
++extern int do_esync(void);
++
++enum d2r_cp_counter { D2R_CP_WOKEN, D2R_CP_TIMED_OUT, D2R_CP_LOST_RACE, D2R_CP_FALLBACK, D2R_CP_EXTRA_SAVED };
++
++static inline void d2r_cp_count( enum d2r_cp_counter which )
++{
++    struct d2r_server_calls_ext *ext = d2r_server_calls_ext;
++
++    if (ext) __atomic_fetch_add( &ext->cp_woken + which, 1, __ATOMIC_RELAXED );
++}
++
++static BOOL d2r_cp_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *env = getenv( "WINE_D2R_COMPLETION_WAIT" );
++
++        if (!do_esync()) on = 0;
++        else if (env && env[0] == '0')
++        {
++            ERR( "d2r: completion port waits go to the server as in stock Wine (WINE_D2R_COMPLETION_WAIT=0).\n" );
++            on = 0;
++        }
++        else on = 1;
++    }
++    return on;
++}
++
++/* waits in the process until the port holds an entry, then takes up to count entries.
++ * STATUS_NOT_IMPLEMENTED: nothing done, take the stock path. */
++static NTSTATUS d2r_cp_remove( HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count,
++                               ULONG *removed, const LARGE_INTEGER *timeout, BOOLEAN alertable )
++{
++    static const LARGE_INTEGER zero;
++    HANDLE wait_handle = NULL;
++    LARGE_INTEGER end;
++    NTSTATUS status;
++    ULONG i = 0;
++
++    *removed = 0;
++    if (timeout && timeout->QuadPart < 0)
++    {
++        NtQuerySystemTime( &end );
++        end.QuadPart -= timeout->QuadPart;  /* absolute, for the rest of the wait after a lost race */
++    }
++    else if (timeout) end = *timeout;
++
++    status = inproc_wait( 1, &handle, WaitAny, alertable, timeout );
++    if (status == STATUS_TIMEOUT)
++    {
++        d2r_cp_count( D2R_CP_TIMED_OUT );
++        return status;
++    }
++    if (status == STATUS_USER_APC) return status;  /* the APCs ran in the wait */
++    if (status != STATUS_WAIT_0)
++    {
++        d2r_cp_count( D2R_CP_FALLBACK );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    d2r_cp_count( D2R_CP_WOKEN );
++
++    while (i < count)
++    {
++        SERVER_START_REQ( remove_completion )
++        {
++            req->handle = wine_server_obj_handle( handle );
++            req->alertable = alertable;
++            if (!(status = wine_server_call( req )))
++            {
++                info[i].CompletionKey             = reply->ckey;
++                info[i].CompletionValue           = reply->cvalue;
++                info[i].IoStatusBlock.Information = reply->information;
++                info[i].IoStatusBlock.Status      = reply->status;
++            }
++            else wait_handle = wine_server_ptr_handle( reply->wait_handle );
++        }
++        SERVER_END_REQ;
++        if (status) break;
++        /* stop when the port looks empty instead of asking the server once more */
++        if (++i < count && inproc_wait( 1, &handle, WaitAny, FALSE, &zero ) != STATUS_WAIT_0)
++        {
++            d2r_cp_count( D2R_CP_EXTRA_SAVED );
++            break;
++        }
++    }
++    if (i)
++    {
++        *removed = i;
++        return STATUS_SUCCESS;
++    }
++    if (status == STATUS_USER_APC) return NtDelayExecution( TRUE, NULL );  /* run them, as stock */
++    /* the port was closed while we waited */
++    if (status == STATUS_INVALID_HANDLE) return STATUS_ABANDONED_WAIT_0;
++    if (status != STATUS_PENDING) return status;
++
++    /* another thread took the entry first: the rest of the wait as in stock Wine, on the
++     * thread's completion wait that remove_completion just registered */
++    d2r_cp_count( D2R_CP_LOST_RACE );
++    if (timeout && !timeout->QuadPart) return STATUS_TIMEOUT;
++    status = server_wait_for_object( wait_handle, alertable, timeout ? &end : NULL );
++    if (status != WAIT_OBJECT_0) return status;
++
++    SERVER_START_REQ( get_thread_completion )
++    {
++        if (!(status = wine_server_call( req )))
++        {
++            info[0].CompletionKey             = reply->ckey;
++            info[0].CompletionValue           = reply->cvalue;
++            info[0].IoStatusBlock.Information = reply->information;
++            info[0].IoStatusBlock.Status      = reply->status;
++            *removed = 1;
++        }
++    }
++    SERVER_END_REQ;
++    return status;
++}
++
++
+ /***********************************************************************
+  *             NtRemoveIoCompletion (NTDLL.@)
+  */
+@@ -3062,6 +3198,25 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
+ 
+     TRACE( "(%p, %p, %p, %p, %p)\n", handle, key, value, io, timeout );
+ 
++    /* d2r (patch 0009): wait in the process with esync */
++    if (d2r_cp_on())
++    {
++        FILE_IO_COMPLETION_INFORMATION entry;
++        ULONG n;
++
++        if ((status = d2r_cp_remove( handle, &entry, 1, &n, timeout, FALSE )) != STATUS_NOT_IMPLEMENTED)
++        {
++            if (!status)
++            {
++                *key            = entry.CompletionKey;
++                *value          = entry.CompletionValue;
++                io->Information = entry.IoStatusBlock.Information;
++                io->Status      = entry.IoStatusBlock.Status;
++            }
++            return status;
++        }
++    }
++
+     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
+     {
+         status = NtWaitForSingleObject( handle, FALSE, timeout );
+@@ -3117,6 +3272,10 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
+ 
+     if (!count) return STATUS_INVALID_PARAMETER;
+ 
++    /* d2r (patch 0009): wait in the process with esync */
++    if (d2r_cp_on() && (status = d2r_cp_remove( handle, info, count, &i, timeout, alertable )) != STATUS_NOT_IMPLEMENTED)
++        goto done;
++
+     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
+     {
+         status = NtWaitForSingleObject( handle, alertable, timeout );
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 796de8a..4b96310 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -123,9 +123,10 @@ struct d2r_vm_lock_info
+ 
+ extern struct d2r_vm_lock_info *d2r_vm_lock;
+ 
+-/* d2r (patch 0008): wineserver requests by type (count and time in server_call_unlocked,
+- * a select's time includes its wait) and the anonymous event reuse counters, kept in PE
+- * ntdll's export __wine_d2r_server_calls for FEX. Version 1 layout. */
++/* d2r (patch 0008): wineserver requests by type (count and time in server_call_unlocked;
++ * a select's time is its request only, the blocking wait comes after the reply) and the
++ * anonymous event reuse counters, kept in PE ntdll's export __wine_d2r_server_calls for
++ * FEX. Version 1 layout (8,256 bytes), unchanged by patch 0009. */
+ #define D2R_MAX_REQUESTS 512
+ 
+ struct d2r_server_calls
+@@ -144,6 +145,26 @@ struct d2r_server_calls
+ };
+ 
+ extern struct d2r_server_calls *d2r_server_calls;
++
++/* d2r (patch 0009): more for FEX in a second export, __wine_d2r_server_calls_ext, so FEX
++ * builds that read version 1 of __wine_d2r_server_calls keep working: the latest caller of
++ * each request type and what the completion port waits in the process did. On with the
++ * request counts (WINE_D2R_CALL_COUNTS). Version 1 layout (2,112 bytes). */
++struct d2r_server_calls_ext
++{
++    ULONG   version;          /* 1 once the unix side writes here */
++    ULONG   nb_requests;      /* REQ_NB_REQUESTS of this build: last_tid[] entries in use */
++    ULONG64 cp_woken;         /* completion port waits in the process that found the port signaled */
++    ULONG64 cp_timed_out;     /* ... that timed out: no server call at all */
++    ULONG64 cp_lost_race;     /* signaled, but no entry left when asked: rest of the wait in the server, as stock */
++    ULONG64 cp_fallback;      /* waits esync can't do in the process: stock server path */
++    ULONG64 cp_extra_saved;   /* GetQueuedCompletionStatusEx batches that stopped without a last empty remove */
++    ULONG64 pad[2];
++    ULONG   last_tid[D2R_MAX_REQUESTS]; /* Windows thread id of the latest caller, by enum request */
++};
++
++extern struct d2r_server_calls_ext *d2r_server_calls_ext;
++#define D2R_SERVER_CALLS_EXT_U64 264  /* size of __wine_d2r_server_calls_ext in ULONG64 */
+ extern void d2r_event_shared( HANDLE handle, BOOL wait );
+ extern BOOL d2r_event_keep( HANDLE handle );
+ 
+diff --git a/server/completion.c b/server/completion.c
+index dbcf4e2..e40d261 100644
+--- a/server/completion.c
++++ b/server/completion.c
+@@ -150,6 +150,9 @@ static void completion_wait_satisfied( struct object *obj, struct wait_queue_ent
+     msg = LIST_ENTRY( msg_entry, struct comp_msg, queue_entry );
+     --wait->completion->depth;
+     list_remove( &msg->queue_entry );
++    /* d2r (patch 0009): the port's sync must say "queue not empty", as remove_completion keeps
++     * it; left set, waits on the port in the process (ntdll, esync) wake for nothing */
++    if (list_empty( &wait->completion->queue )) reset_sync( wait->completion->sync );
+     if (wait->msg) free( wait->msg );
+     wait->msg = msg;
+ }
+@@ -404,6 +407,7 @@ DECL_HANDLER(remove_completion)
+     if (!entry)
+     {
+         reply->wait_handle = current->completion_wait->handle;
++        reset_sync( completion->sync );  /* d2r (patch 0009): queue empty, clear a stale signal */
+         set_error( STATUS_PENDING );
+     }
+     else

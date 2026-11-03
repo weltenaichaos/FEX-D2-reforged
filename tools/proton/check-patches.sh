@@ -11,6 +11,7 @@ PATCHES=$2
 NT=$LIB/aarch64-windows/ntdll.dll
 NT32=$LIB/i386-windows/ntdll.dll
 NTSO=$LIB/aarch64-unix/ntdll.so
+WS=$1/bin/wineserver
 fail=0
 
 ok()  { echo "OK   $1: $2"; }
@@ -127,6 +128,31 @@ check_0008() {
   t=$( [ -s "${REQ_NAMES:-}" ] && wc -l < "$REQ_NAMES")
   if [ -n "$n" ] && [ "$n" = "$t" ]; then ok 0008 "request name table has the $n request types of ${NTSO#$LIB/}"
   else bad 0008 "request name table has '${t:-no file}' lines, ${NTSO#$LIB/} has '${n:-no section}' request types"; fi
+}
+
+# calls from one function of an ELF binary to any of the given functions
+calls_to() {
+  $OBJDUMP -d --no-show-raw-insn --disassemble-symbols="$2" "$1" 2>/dev/null | grep -cE "\bbl?\b.*<($3)(@plt)?>"
+}
+
+# 0009: completion port waits in the process (off switch), both NtRemoveIoCompletion calls
+# wait in the process, the server resets a port's sync once its queue is empty (stock: once,
+# in remove_completion), and PE ntdll exports __wine_d2r_server_calls_ext
+check_0009() {
+  local f s n
+  for f in "$NT" "$NT32"; do
+    if exports "$f" __wine_d2r_server_calls_ext; then ok 0009 "${f#$LIB/} exports __wine_d2r_server_calls_ext"; else bad 0009 "${f#$LIB/} lacks __wine_d2r_server_calls_ext"; fi
+  done
+  if ascii_in "$NTSO" WINE_D2R_COMPLETION_WAIT; then ok 0009 "${NTSO#$LIB/} reads WINE_D2R_COMPLETION_WAIT"; else bad 0009 "${NTSO#$LIB/} lacks WINE_D2R_COMPLETION_WAIT"; fi
+  if ascii_in "$NTSO" __wine_d2r_server_calls_ext; then ok 0009 "${NTSO#$LIB/} looks up __wine_d2r_server_calls_ext"; else bad 0009 "${NTSO#$LIB/} never looks up __wine_d2r_server_calls_ext"; fi
+  for s in NtRemoveIoCompletion NtRemoveIoCompletionEx; do
+    n=$(calls_to "$NTSO" "$s" 'd2r_cp_remove|inproc_wait|esync_wait_objects')
+    if [ "${n:-0}" -ge 1 ]; then ok 0009 "$s waits in the process"; else bad 0009 "$s never waits in the process (stock server path only)"; fi
+  done
+  n=$(calls_to "$WS" completion_wait_satisfied reset_sync)
+  if [ "${n:-0}" -ge 1 ]; then ok 0009 "wineserver's completion_wait_satisfied resets the port's sync"; else bad 0009 "wineserver's completion_wait_satisfied never resets the port's sync"; fi
+  n=$(calls_to "$WS" req_remove_completion reset_sync)
+  if [ "${n:-0}" -ge 2 ]; then ok 0009 "wineserver's remove_completion resets the sync of an empty port too"; else bad 0009 "wineserver's remove_completion resets the sync '${n:-0}' times (want 2)"; fi
 }
 
 for p in "$PATCHES"/*.patch; do
