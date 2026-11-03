@@ -622,6 +622,7 @@ namespace {
     "FEX_PRIO",
     "FEX_HELPER_PRIO",
     "FEX_STALLPROBE",
+    "FEX_PROBE_VQ_NOTES",
     "FEX_MAINCORE",
     "FEX_MAINCORE_WAIT",
     "FEX_MAINCORE_ESCAPE",

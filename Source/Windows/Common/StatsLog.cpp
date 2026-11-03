@@ -349,6 +349,7 @@ namespace {
     uint32_t Tid;
     uint32_t Line;
     uint32_t HeldUs;
+    uint64_t SinceNs; // CLOCK_MONOTONIC when the holder took it (State 2)
   };
   VmHolder ReadVmHolder() {
     auto* Info = VmLock.load(std::memory_order_relaxed);
@@ -366,7 +367,7 @@ namespace {
       if (__atomic_load_n(&Info->Tid, __ATOMIC_RELAXED) == Tid) {
         const int64_t Now = Linux::MonotonicNs();
         const uint64_t Held = Now > 0 && static_cast<uint64_t>(Now) > Since ? (static_cast<uint64_t>(Now) - Since) / 1000 : 0;
-        return {.State = 2, .Tid = Tid, .Line = Line, .HeldUs = static_cast<uint32_t>(std::min<uint64_t>(Held, UINT32_MAX))};
+        return {.State = 2, .Tid = Tid, .Line = Line, .HeldUs = static_cast<uint32_t>(std::min<uint64_t>(Held, UINT32_MAX)), .SinceNs = Since};
       }
     }
     return {.State = 3};
@@ -392,6 +393,18 @@ namespace {
   };
   ProbeShared* Probe {};
   std::atomic<void (*)()> LockProbe {};
+
+  // Build 153 (FEX_PROBE_VQ_NOTES, on unless 0): with Wine's holder notes (our Proton d2r4 and later) the probe reads who
+  // holds the memory lock and since when, instead of taking the lock with a VirtualQuery 250 times a second, and writes
+  // the '# memory lock wait' thread lists itself, so the lock watch thread ends. Without notes it measures as before.
+  bool ProbeVqNotesSwitch = true;
+  bool ProbeVqFromNotes() {
+    if (!ProbeVqNotesSwitch) {
+      return false;
+    }
+    auto* Info = VmLock.load(std::memory_order_relaxed);
+    return Info && __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) == 1;
+  }
 
   // Scheduler view (on with the stats log; FEX_SCHEDLOG=0 turns it off), read straight from Linux /proc so it costs no
   // wineserver round trips: where the main thread and the wineserver run (sampled every 10ms while runnable), how long
@@ -2339,6 +2352,8 @@ namespace {
     uint32_t VmLongSeen;      // Wine's long hold count at the last '# memory lock holds' line (build 150)
     bool VmLongStarted;
     size_t VmHoldLines;
+    uint64_t VmTakesPrev; // Wine's memory lock take count at the last probe line (build 153)
+    bool VmTakesHave;
 
     // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
     struct MainTick {
@@ -2501,6 +2516,26 @@ namespace {
     }
   }
 
+  // A '# memory lock wait' thread list for a wait (or, from Wine's notes, a hold) that began at Start and has lasted
+  // Waited ticks: Wine's note on the holder first (it may let go while the list is read), then every thread of the process
+  // that is not asleep in a wait, into a free slot the log thread takes.
+  void TakeLockSnap(ProbeShared* P, uint64_t Start, uint64_t Waited, uint64_t Freq) {
+    const VmHolder Holder = ReadVmHolder();
+    LockSnapArgs A {.Self = P->ProbeTid.load(std::memory_order_relaxed)};
+    Linux::ForEachEntry("/proc/self/task", LockSnapTask, &A);
+    for (auto& S : P->Snaps) {
+      uint32_t Free = 0;
+      if (S.Ready.compare_exchange_strong(Free, 1, std::memory_order_acquire)) {
+        S.Start = Start;
+        S.AtMs = static_cast<uint32_t>(Waited * 1000 / Freq);
+        S.Holder = Holder;
+        snprintf(S.Text, sizeof(S.Text), "%u not waiting:%s %u asleep in waits (%u in futex)", A.Listed, A.Text.c_str(), A.Waiting, A.Futex);
+        S.Ready.store(2, std::memory_order_release);
+        break;
+      }
+    }
+  }
+
   void* LockWatchThread(void*) {
     auto* P = Probe;
     const uint64_t Freq = GetCounterFrequency();
@@ -2510,6 +2545,10 @@ namespace {
     int Stage {};
     for (;;) {
       Linux::SleepNs(5'000'000);
+      if (ProbeVqFromNotes()) {
+        // Build 153: the probe follows the lock in Wine's notes and writes the lists itself; this thread isn't needed.
+        return nullptr;
+      }
       const uint64_t Start = P->VqStart.load(std::memory_order_acquire);
       if (!Start) {
         continue;
@@ -2524,21 +2563,7 @@ namespace {
         continue;
       }
       ++Stage;
-      // Wine's own note first: the holder may let go while the thread list is read.
-      const VmHolder Holder = ReadVmHolder();
-      LockSnapArgs A {.Self = P->ProbeTid.load(std::memory_order_relaxed)};
-      Linux::ForEachEntry("/proc/self/task", LockSnapTask, &A);
-      for (auto& S : P->Snaps) {
-        uint32_t Free = 0;
-        if (S.Ready.compare_exchange_strong(Free, 1, std::memory_order_acquire)) {
-          S.Start = Start;
-          S.AtMs = static_cast<uint32_t>(Waited * 1000 / Freq);
-          S.Holder = Holder;
-          snprintf(S.Text, sizeof(S.Text), "%u not waiting:%s %u asleep in waits (%u in futex)", A.Listed, A.Text.c_str(), A.Waiting, A.Futex);
-          S.Ready.store(2, std::memory_order_release);
-          break;
-        }
-      }
+      TakeLockSnap(P, Start, Waited, Freq);
     }
     return nullptr;
   }
@@ -2567,6 +2592,14 @@ namespace {
       Region = nullptr;
     }
     size_t Page {};
+    // The memory lock hold being followed in Wine's notes (build 153): when it was taken (Wine's clock and this
+    // counter), when it was last seen held, and how many thread lists were taken for it.
+    struct {
+      uint64_t Since, Start, Last;
+      int Stage;
+    } Hold {};
+    const uint64_t SnapFirst = Freq * LockSnapFirstMs / 1000;
+    const uint64_t SnapSecond = Freq * LockSnapSecondMs / 1000;
     for (uint64_t Round = 0;; ++Round) {
       // Sleep: how much later than asked a normal priority thread gets the CPU back.
       LARGE_INTEGER Interval {.QuadPart = -ProbeSleep100ns};
@@ -2575,25 +2608,62 @@ namespace {
       uint64_t T1 = GetCounter();
       Record(ProbeSleep, T1, T1 - T0 > SleepTicks ? T1 - T0 - SleepTicks : 0);
 
-      // VirtualQuery: Wine's process-wide memory lock (virtual_mutex), taken by every memory call and Wine fault.
-      MEMORY_BASIC_INFORMATION Info {};
-      T0 = GetCounter();
-      P->VqStart.store(T0, std::memory_order_release);
-      NtQueryVirtualMemory(NtCurrentProcess(), Region ? Region : static_cast<void*>(&Info), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
-      T1 = GetCounter();
-      P->VqStart.store(0, std::memory_order_release);
-      Record(ProbeVQ, T1, T1 - T0);
+      // Wine's process-wide memory lock (virtual_mutex), taken by every memory call and Wine fault.
+      if (ProbeVqFromNotes()) {
+        // Build 153: read from Wine's notes, without taking the lock. A hold is followed from the first round that sees
+        // it until a round sees the lock free or taken again; its event is how long it had lasted when last seen, so a
+        // long hold's length is known to within one round (4 ms) and most short holds are never seen.
+        const VmHolder H = ReadVmHolder();
+        const uint64_t Now = GetCounter();
+        if (H.State == 1 || H.State == 2) {
+          const bool Same = H.State == 2 && Hold.Since && Hold.Since == H.SinceNs;
+          if (!Same && Hold.Since) {
+            Record(ProbeVQ, Hold.Last, Hold.Last - Hold.Start);
+            Hold = {};
+            P->VqStart.store(0, std::memory_order_release);
+          }
+          if (H.State == 2) {
+            if (Same) {
+              Hold.Last = Now;
+            } else {
+              const uint64_t Age = static_cast<uint64_t>(H.HeldUs) * Freq / 1'000'000;
+              Hold = {.Since = H.SinceNs, .Start = Now > Age ? Now - Age : 1, .Last = Now};
+              P->VqStart.store(Hold.Start, std::memory_order_release);
+            }
+            const uint64_t Age = Hold.Last - Hold.Start;
+            if ((Hold.Stage == 0 && Age >= SnapFirst) || (Hold.Stage == 1 && Age >= SnapSecond)) {
+              ++Hold.Stage;
+              TakeLockSnap(P, Hold.Start, Age, Freq);
+            }
+          }
+        }
+      } else {
+        // VirtualQuery: waits for the lock like every memory call and Wine fault.
+        MEMORY_BASIC_INFORMATION Info {};
+        T0 = GetCounter();
+        P->VqStart.store(T0, std::memory_order_release);
+        NtQueryVirtualMemory(NtCurrentProcess(), Region ? Region : static_cast<void*>(&Info), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
+        T1 = GetCounter();
+        P->VqStart.store(0, std::memory_order_release);
+        Record(ProbeVQ, T1, T1 - T0);
+      }
 
       // First touch of a page: the kernel's per-process memory map lock, held for writing by every mprotect/mmap/munmap.
       if (Region) {
         if (Page == ProbeFaultPages) {
-          void* Base = Region;
-          SIZE_T Size = RegionSize;
-          NtFreeVirtualMemory(NtCurrentProcess(), &Base, &Size, MEM_DECOMMIT);
-          Base = Region;
-          Size = RegionSize;
-          if (NtAllocateVirtualMemory(NtCurrentProcess(), &Base, 0, &Size, MEM_COMMIT, PAGE_READWRITE) != STATUS_SUCCESS) {
-            Region = nullptr;
+          // Build 153: the pages go back with madvise straight through Linux, so the probe doesn't take Wine's memory lock
+          // for it (a decommit and commit through Wine held that lock 4-4.5 ms in the b150 run, at t=18 and t=154); the
+          // next touches fault in fresh pages all the same. The Wine calls stay as the fallback.
+          constexpr int64_t NrMadvise = 233, MadvDontNeed = 4;
+          if (Linux::Syscall(NrMadvise, reinterpret_cast<int64_t>(Region), static_cast<int64_t>(RegionSize), MadvDontNeed) != 0) {
+            void* Base = Region;
+            SIZE_T Size = RegionSize;
+            NtFreeVirtualMemory(NtCurrentProcess(), &Base, &Size, MEM_DECOMMIT);
+            Base = Region;
+            Size = RegionSize;
+            if (NtAllocateVirtualMemory(NtCurrentProcess(), &Base, 0, &Size, MEM_COMMIT, PAGE_READWRITE) != STATUS_SUCCESS) {
+              Region = nullptr;
+            }
           }
           Page = 0;
         }
@@ -3385,6 +3455,16 @@ namespace {
       const int64_t Bin = At > State->SecondStart ? static_cast<int64_t>((At - State->SecondStart) * TimelineBins / State->CounterFreq) : -1;
       Line += fextl::fmt::format(" {}={:.1f}ms@{}", ProbeNames[k], static_cast<double>(Ticks) * MsPerTick, Bin);
     }
+    // Build 153: how often Wine's memory lock was taken this second, from its notes (every memory call, Wine fault and
+    // VirtualQuery of every thread, FEX's included).
+    if (auto* Info = VmLock.load(std::memory_order_relaxed); Info && __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) == 1) {
+      const uint64_t Total = __atomic_load_n(&Info->HoldsTotal, __ATOMIC_RELAXED);
+      if (State->VmTakesHave && Total >= State->VmTakesPrev) {
+        Line += fextl::fmt::format(" | memory lock taken {}/s{}", Total - State->VmTakesPrev, ProbeVqFromNotes() ? " (vq from Wine's notes)" : "");
+      }
+      State->VmTakesPrev = Total;
+      State->VmTakesHave = true;
+    }
     return Line + "\n";
   }
 
@@ -3556,8 +3636,9 @@ namespace {
         continue;
       }
       ++State->LockWaitLines;
-      Out += fextl::fmt::format("# memory lock wait t={} {:.0f}ms (Wine's memory lock, the stall probe's VirtualQuery)", FrameTime(State, Seconds, Start),
-                                static_cast<double>(E.Ticks) * MsPerTick);
+      Out += fextl::fmt::format("# memory lock wait t={} {:.0f}ms (Wine's memory lock, {})", FrameTime(State, Seconds, Start),
+                                static_cast<double>(E.Ticks) * MsPerTick,
+                                ProbeVqFromNotes() ? "a hold the stall probe saw in Wine's notes" : "the stall probe's VirtualQuery");
       for (auto& S : Probe->Snaps) {
         if (S.Ready.load(std::memory_order_acquire) == 2 && S.Start == Start) {
           Out += fextl::fmt::format(" | at {} ms: {}{}", S.AtMs, VmHolderText(S.Holder), S.Text);
@@ -4720,6 +4801,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   const auto WineSync = WineSyncLine();
   fwrite(WineSync.data(), 1, WineSync.size(), File);
   const char* StallProbe = Switch("FEX_STALLPROBE");
+  const char* VqNotes = Switch("FEX_PROBE_VQ_NOTES");
+  ProbeVqNotesSwitch = !(VqNotes && VqNotes[0] == '0');
   static fextl::unique_ptr<FEXCore::Threads::Thread> ProbeThreadObject;
   if (State->Profile && !(StallProbe && StallProbe[0] == '0')) {
     Probe = new ProbeShared {};
@@ -4752,6 +4835,16 @@ void StatsLogSetVmLockNotes(const void* Info) {
                                "4 ms or more" :
                Version == 0  ? "memory lock: Wine's holder notes are off (__wine_d2r_vm_lock version 0: WINE_D2R_VM_NOTES=0)" :
                                "memory lock: Wine's holder notes have an unknown layout, not read");
+  if (Probe && Version == 1) {
+    StatsLogNote(ProbeVqNotesSwitch ?
+                   "stall probe: vq from Wine's notes (build 153, FEX_PROBE_VQ_NOTES=1): the probe no longer takes Wine's memory lock "
+                   "with a VirtualQuery every 4 ms; vq = how long a hold it saw had lasted (holds are seen every 4 ms), '# memory lock "
+                   "wait' lines = holds seen at 15 ms or more, with the thread lists taken by the probe (no lock watch thread); the "
+                   "probe line also gives 'memory lock taken N/s' from Wine's count; FEX_PROBE_VQ_NOTES=0 measures with the "
+                   "VirtualQuery again" :
+                   "stall probe: vq measured with a VirtualQuery (FEX_PROBE_VQ_NOTES=0); the probe line gives 'memory lock taken N/s' "
+                   "from Wine's notes");
+  }
 }
 
 void StatsLogSetLockProbe(void (*ProbeFunction)()) {
