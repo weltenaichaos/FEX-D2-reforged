@@ -52,6 +52,7 @@ $end_info$
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/ThreadPlacer.h"
 #include "Windows/Common/PriorityGuard.h"
+#include "Windows/Common/ThreadTable.h"
 #include "Windows/Common/StartWatch.h"
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/LockBoost.h"
@@ -1471,6 +1472,12 @@ NTSTATUS ProcessInit() {
         "(FEX_KERNEL_FUTEX=0)");
   } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
+  }
+  // Build 161: our Proton d2r10's thread table (ThreadTable.h): the priority guard and the stats log read threads from it
+  // instead of asking the wineserver.
+  FEX::Windows::ThreadTable::Init(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_threads")));
+  if (StatsLog) {
+    FEX::Windows::StatsLogNote(FEX::Windows::ThreadTable::Note());
   }
   WineWaitFix::StartStats(StatsLog);
   FEX::Windows::StartThreadPlacer(AppConfigName);

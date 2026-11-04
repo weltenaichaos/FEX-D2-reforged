@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 160, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r9 (build 11). The build numbers in the
+State: FEX build 161, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r10 (build 12). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -163,6 +163,7 @@ These only run in the **logging version** (`2610-d2rfix28s-thor`). The clean ver
 | `FEX_STATSLOG_TIMELINE`, `FEX_SCHEDLOG`, `FEX_GPULOG`, `FEX_STALLPROBE` | on | Per-thread timeline, CPU wait times, GPU clock, lock and wineserver probes. `0` turns each off. From build 133 a wait of 15 ms or more for Wine's memory lock gets a `# memory lock wait` line that lists every thread not asleep at 15 and 45 ms (Linux call, state, CPU), to find the thread holding the lock. |
 | `FEX_PROBE_VQ_NOTES` | `1` | Build 153: with our Proton's memory lock notes (d2r4 and later) the stall probe reads who holds Wine's memory lock and since when, instead of taking the lock with a VirtualQuery every 4 ms. `vq` on the probe line is then the longest hold it saw, `# memory lock wait` lines are holds seen at 15 ms or more, and the probe line adds `memory lock taken N/s` (every memory call, Wine fault and VirtualQuery of the process). The lock watch thread ends, and the probe's 16 MB test region is refreshed with madvise without Wine's lock. `0` measures with the VirtualQuery again. |
 | (no switch) | on | Build 154: with our Proton d2r6 and later, a `server calls` line every second gives the game process's wineserver requests by type (how many, average time from send to reply; a `select` includes its wait) and what Wine's reuse of short-lived events did. Wine's own `WINE_D2R_CALL_COUNTS=0` turns the counting off. |
+| (no switch) | on | Build 161: with our Proton d2r10 and later, FEX's priority guard and stats log read the game's threads (ids, names, priorities, cores, TEBs) from Wine's thread table, and their CPU times from Linux, instead of asking the wineserver about every thread (b159: ~66 thread list and ~160 thread info requests a second). This also works in the clean version. Every 5 s a `registry` line names the registry keys and values the game's threads asked for last. Wine's own `WINE_D2R_THREAD_TABLE=0` brings back the old way. The stall probe's wineserver round trip runs every 32 ms instead of 16. |
 | `FEX_STATSLOG_APP`, `FEX_STATSLOG_SCAN` | unset | Log only the program named; a per-second scan of the game's code for the log. |
 | `FEX_LOADER_WATCH` | `1` | Counts the loader thread's calls. |
 | `FEX_PIPE_WATCH` | `1` | Build 146: the main thread's pipe reads and writes (Steam's round trip every frame), with each message's size and first 8 bytes; the Windows process that made the pipe, from the list of Windows processes; and that process's threads' time on a CPU and waiting for one (`pipe watch` and `pipe peer` lines). |

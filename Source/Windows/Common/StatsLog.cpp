@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "Windows/Common/StatsLog.h"
+#include "Windows/Common/ThreadTable.h"
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/LockBoost.h"
 #include "Windows/Common/SHMStats.h"
@@ -17,9 +18,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <ntstatus.h>
 #include <windef.h>
 #include <winternl.h>
@@ -298,7 +301,9 @@ namespace {
   enum ProbeKind : uint8_t { ProbeSleep, ProbeVQ, ProbeFault, ProbeLock, ProbeServer, ProbeKinds };
   constexpr const char* ProbeNames[ProbeKinds] = {"sleep", "vq", "fault", "fexlock", "server"};
   constexpr int64_t ProbeSleep100ns = 40'000; // 4ms between rounds
-  constexpr uint64_t ProbeServerEvery = 4;    // wineserver round trip every 4th round
+  // Wineserver round trip every 8th round (32 ms; build 161, every 4th before: our Proton's request counts time every
+  // request now, and this probe alone was 62 get_thread_info requests a second).
+  constexpr uint64_t ProbeServerEvery = 8;
   constexpr size_t ProbeFaultPages = 4096;    // 16MB, one fresh page per round, then decommitted and committed again
   constexpr double ProbeKeepMs = 2.0;         // events at least this long are kept for "# frame" lines
   constexpr size_t ProbeRingSize = 4096;
@@ -389,6 +394,56 @@ namespace {
     return __atomic_load_n(&Ext->Size, __ATOMIC_RELAXED) >= sizeof(ServerCallsExtInfo);
   }
   std::atomic<ServerCallsExtInfo*> ServerCallsExt {};
+
+  // Build 161: our Proton d2r10 (patch 0012) appends registry notes to the export (Size 3,728): the latest 8 key opens and
+  // the latest 4 value reads, each with its caller. In the b159 run one unnamed thread (tid 784) opened a key ~83 and
+  // read a value ~63 times a second (open_key, get_key_value and close_handle requests); these name the key.
+  struct RegistryNote {
+    uint32_t Seq; // odd while written
+    uint32_t Tid;
+    uint32_t Status;
+    uint32_t NameLen;
+    uint64_t Parent; // root directory handle (open) or key handle (value read)
+    uint64_t Result; // the key handle opened, 0 for value reads
+    char Name[96];   // path relative to Parent, or the value name; ASCII, cut to 95
+  };
+  static_assert(sizeof(RegistryNote) == 128);
+  struct ServerCallsRegistryInfo {
+    uint64_t OpenNext;  // key opens noted so far; the latest is Open[(OpenNext - 1) % 8]
+    uint64_t ValueNext; // value reads noted so far
+    RegistryNote Open[8];
+    RegistryNote Value[4];
+  };
+  constexpr size_t RegistryOffset = 2176;
+  static_assert(RegistryOffset + sizeof(ServerCallsRegistryInfo) == 3728 && RegistryOffset + offsetof(ServerCallsRegistryInfo, Open) == 2192 &&
+                RegistryOffset + offsetof(ServerCallsRegistryInfo, Value) == 3216);
+  const ServerCallsRegistryInfo* ServerCallsRegistry(const ServerCallsExtInfo* Ext) {
+    if (__atomic_load_n(&Ext->Size, __ATOMIC_RELAXED) < RegistryOffset + sizeof(ServerCallsRegistryInfo)) {
+      return nullptr;
+    }
+    return reinterpret_cast<const ServerCallsRegistryInfo*>(reinterpret_cast<const uint8_t*>(Ext) + RegistryOffset);
+  }
+  // One note read whole (the same sequence rule as Wine's thread table); false while Wine keeps writing it.
+  bool ReadRegistryNote(const RegistryNote& N, RegistryNote& Out) {
+    uint64_t Words[sizeof(RegistryNote) / sizeof(uint64_t)];
+    const auto* Src = reinterpret_cast<const uint64_t*>(&N);
+    for (int Try = 0; Try < 64; ++Try) {
+      const uint32_t S0 = __atomic_load_n(&N.Seq, __ATOMIC_ACQUIRE);
+      if (S0 & 1) {
+        continue;
+      }
+      for (size_t w = 0; w < std::size(Words); ++w) {
+        Words[w] = __atomic_load_n(&Src[w], __ATOMIC_RELAXED);
+      }
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(&N.Seq, __ATOMIC_RELAXED) == S0) {
+        memcpy(&Out, Words, sizeof(Out));
+        Out.Name[sizeof(Out.Name) - 1] = 0;
+        return S0 != 0;
+      }
+    }
+    return false;
+  }
   // Requests whose callers the Proton side asked for: shown with their latest caller even outside the busiest ten.
   constexpr const char* ServerCallsWatched[] = {"create_timer", "set_timer", "cancel_timer", "close_handle", "get_next_thread",
                                                 "get_thread_info"};
@@ -2418,6 +2473,9 @@ namespace {
     uint64_t ServerPrevEv[6];
     uint64_t ServerPrevCp[5]; // build 157
     uint64_t ServerPrevTm[8]; // build 159
+    uint64_t RegPrevOpen, RegPrevValue; // build 161: registry notes counts at the last registry line
+    uint32_t RegRounds;
+    bool RegHave;
     bool ServerHave;
 
     // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
@@ -2814,6 +2872,12 @@ namespace {
   fextl::unordered_map<uint32_t, HANDLE> ThreadHandles;
 
   uint64_t QueryThreadCPUTime(uint32_t TID) {
+    // Build 161: from Linux (schedstat) by the Linux tid in our Proton d2r10's thread table, no wineserver request.
+    if (ThreadTable::Entry Listed; ThreadTable::Find(TID, Listed) && Listed.UnixTid > 0) {
+      if (const uint64_t Time = ThreadTable::CpuTime100ns(Listed)) {
+        return Time;
+      }
+    }
     auto [It, Inserted] = ThreadHandles.try_emplace(TID, nullptr);
     if (Inserted) {
       It->second = OpenThreadForQuery(TID);
@@ -2851,6 +2915,9 @@ namespace {
   std::atomic<uint64_t> SharedSecond {}; // the same for other threads, see StatsLogSecond
 
   fextl::string QueryThreadNameUncached(uint32_t TID) {
+    if (ThreadTable::Entry Listed; ThreadTable::Find(TID, Listed)) {
+      return ThreadTable::HelperName(Listed); // build 161
+    }
     HANDLE Handle = OpenThreadForQuery(TID);
     if (!Handle) {
       return {};
@@ -2882,6 +2949,10 @@ namespace {
   }
 
   const CHPE_V2_CPU_AREA_INFO* QueryCPUArea(uint32_t TID) {
+    // Build 161: the TEB from our Proton d2r10's thread table.
+    if (ThreadTable::Entry Listed; ThreadTable::Find(TID, Listed) && Listed.Teb) {
+      return *reinterpret_cast<CHPE_V2_CPU_AREA_INFO* const*>(static_cast<uintptr_t>(Listed.Teb) + 0x1788);
+    }
     HANDLE Handle {};
     CLIENT_ID ClientId {
       .UniqueProcess = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())),
@@ -3854,6 +3925,52 @@ namespace {
       }
     }
     Out += "\n";
+    // Build 161: every 5 s, the registry keys and values Wine noted last (d2r10), grouped by caller and name.
+    const auto* Reg = Ext ? ServerCallsRegistry(Ext) : nullptr;
+    if (Reg && !State->RegHave) {
+      State->RegHave = true;
+      State->RegPrevOpen = __atomic_load_n(&Reg->OpenNext, __ATOMIC_ACQUIRE);
+      State->RegPrevValue = __atomic_load_n(&Reg->ValueNext, __ATOMIC_ACQUIRE);
+    } else if (Reg && ++State->RegRounds % 5 == 0) {
+      const uint64_t OpenNow = __atomic_load_n(&Reg->OpenNext, __ATOMIC_ACQUIRE);
+      const uint64_t ValueNow = __atomic_load_n(&Reg->ValueNext, __ATOMIC_ACQUIRE);
+      const uint64_t Opens = OpenNow - std::min(OpenNow, State->RegPrevOpen);
+      const uint64_t Values = ValueNow - std::min(ValueNow, State->RegPrevValue);
+      State->RegPrevOpen = OpenNow;
+      State->RegPrevValue = ValueNow;
+      const auto Group = [&](const RegistryNote* Notes, size_t N, uint64_t Next) {
+        struct Seen {
+          uint32_t Tid;
+          uint32_t Status;
+          fextl::string Name;
+          uint32_t Times;
+        };
+        fextl::vector<Seen> List;
+        for (size_t i = 0; i < std::min<uint64_t>(N, Next); ++i) {
+          RegistryNote Copy;
+          if (!ReadRegistryNote(Notes[i], Copy)) {
+            continue;
+          }
+          fextl::string Name(Copy.Name);
+          auto It = std::find_if(List.begin(), List.end(), [&](const Seen& S) { return S.Tid == Copy.Tid && S.Name == Name; });
+          if (It != List.end()) {
+            ++It->Times;
+          } else {
+            List.push_back({Copy.Tid, Copy.Status, std::move(Name), 1});
+          }
+        }
+        fextl::string Text;
+        for (const auto& S : List) {
+          Text += fextl::fmt::format("{} tid={} {} x{} '{}'{}", Text.empty() ? "" : ",", S.Tid, QueryThreadName(S.Tid), S.Times, S.Name,
+                                     S.Status ? fextl::fmt::format(" status {:#x}", S.Status) : fextl::string {});
+        }
+        return Text.empty() ? fextl::string(" none") : " " + Text;
+      };
+      Out += fextl::fmt::format("  registry (our Proton d2r10's notes, last 5 s): {} key opens, {} value reads | latest {} opens:{} | "
+                                "latest {} value reads:{}\n",
+                                Opens, Values, std::min<uint64_t>(8, OpenNow), Group(Reg->Open, 8, OpenNow),
+                                std::min<uint64_t>(4, ValueNow), Group(Reg->Value, 4, ValueNow));
+    }
     return Out;
   }
 
@@ -5106,7 +5223,7 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
     static fextl::unique_ptr<FEXCore::Threads::Thread> LockWatchObject;
     LockWatchObject = FEXCore::Threads::Thread::Create(LockWatchThread, nullptr, {.LowPriority = false, .Internal = true}, "FEXLockWatch");
     const char* ProbeNote = "# stall probe: on, every 4ms: sleep (late wakeup), vq (Wine memory lock), fault (kernel memory map lock), "
-                            "fexlock (FEX memory/SMC lock), every 16ms server (wineserver round trip); FEX_STALLPROBE=0 turns it off. "
+                            "fexlock (FEX memory/SMC lock), every 32ms server (wineserver round trip); FEX_STALLPROBE=0 turns it off. "
                             "vq waits of 15 ms or more get a '# memory lock wait' line with every thread not asleep in a wait at 15 and "
                             "45 ms (Linux syscall, state, CPU) and what the sampled threads did meanwhile (build 133)\n";
     fwrite(ProbeNote, 1, strlen(ProbeNote), File);
@@ -5184,6 +5301,11 @@ void StatsLogSetServerCallsExt(const void* Info) {
                    "or used by another thread, other thread = closed by another thread, too old = older than 100 ms, no room = the "
                    "kept list was full); WINE_D2R_TIMER_REUSE=0 turns it off" :
                    "server calls: no timer reuse counts (our Proton older than d2r9)");
+    StatsLogNote(ServerCallsRegistry(Ext) ?
+                   "server calls: Wine's registry notes found (our Proton d2r10 and later; d2r10 keeps timers for reuse up to 10 s, so "
+                   "'too old' = closed more than 10 s after it was made): every 5 s a 'registry' line names the keys and values the "
+                   "latest 8 key opens and 4 value reads asked for, with their callers (build 161)" :
+                   "server calls: no registry notes (our Proton older than d2r10)");
   }
 }
 

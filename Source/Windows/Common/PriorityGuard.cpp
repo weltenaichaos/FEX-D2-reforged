@@ -3,6 +3,7 @@
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/Switches.h"
+#include "Windows/Common/ThreadTable.h"
 
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
@@ -25,6 +26,7 @@
 
 // Exported by ntdll (Defs/ntdll.def) but not declared by the bundled headers.
 extern "C" NTSTATUS WINAPI NtGetNextThread(HANDLE Process, HANDLE Thread, ACCESS_MASK Access, ULONG Attributes, ULONG Flags, HANDLE* Next);
+extern "C" NTSTATUS WINAPI NtOpenThread(HANDLE* Handle, ACCESS_MASK Access, const OBJECT_ATTRIBUTES* Attr, const CLIENT_ID* Id);
 
 namespace FEX::Windows {
 namespace {
@@ -295,6 +297,7 @@ namespace {
     uint32_t CoreFixes;
     uint32_t SeenAt;
     bool Main;
+    uint32_t Serial; // build 161: its serial in Wine's thread table, 0 = not from the table
     // Loader thread detection, see FEX_LOADER_CORES.
     int LinuxTid; // 0 = not an emulated thread, or not registered yet
     uint64_t Teb;
@@ -2625,6 +2628,8 @@ namespace {
     fextl::unordered_map<uint32_t, Tracked> Threads;
     fextl::vector<HANDLE> Handles;
     fextl::vector<Entry> Entries;
+    fextl::vector<ThreadTable::Entry> Listed; // build 161: Wine's thread table this round
+    uint32_t Opens {};                        // handles opened to change a thread listed there
     uint32_t Round {};
     bool ReportedWalkFailure {};
     uint64_t ReportedGameMask {};
@@ -2671,22 +2676,20 @@ namespace {
       HANDLE Next {};
       NTSTATUS WalkStatus;
       uint32_t Count {}, Fixed {}, CoreFixed {};
-      while ((WalkStatus = NtGetNextThread(NtCurrentProcess(), Handles.empty() ? nullptr : Handles.back(),
-                                           THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION, 0, 0, &Next)) ==
-             STATUS_SUCCESS) {
-        Handles.push_back(Next);
-        ThreadBasicInfo Basic {};
-        if (NtQueryInformationThread(Next, ThreadBasicInformation, &Basic, sizeof(Basic), nullptr) != STATUS_SUCCESS ||
-            Basic.ExitStatus != STATUS_PENDING) {
-          continue;
-        }
+      // One thread as Wine reports it; Next is its handle from the walk, nullptr when it came from the thread table.
+      const auto Note = [&](HANDLE Next, const ThreadBasicInfo& Basic, const ThreadTable::Entry* Listed) {
         const auto TID = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Basic.ClientId.UniqueThread));
         if (TID == SelfTID) {
-          continue;
+          return;
         }
         ++Count;
         auto [It, New] = Threads.try_emplace(TID);
         auto& T = It->second;
+        // Build 161: a tid Wine gave to a new thread (the table's serial changed) starts over.
+        if (!New && Listed && T.Serial && T.Serial != Listed->Serial) {
+          T = Tracked {};
+          New = true;
+        }
         T.SeenAt = Round;
         T.Teb = reinterpret_cast<uintptr_t>(Basic.TebBaseAddress);
         if (New) {
@@ -2697,7 +2700,16 @@ namespace {
         if (New || Basic.AffinityMask != T.SetTo) {
           T.Orig = Basic.AffinityMask;
         }
-        if (!T.Named || (T.Name.empty() && Round % 5 == 0)) {
+        if (Listed) {
+          T.Serial = Listed->Serial;
+          fextl::string Name = ThreadTable::HelperName(*Listed);
+          if (!T.Named || Name != T.Name) {
+            T.Name = std::move(Name);
+            T.Named = true;
+            T.FEX = T.Name.size() >= 3 && T.Name.compare(0, 3, "FEX") == 0;
+            T.KeepCores = !MovableHelper(T.Name);
+          }
+        } else if (!T.Named || (T.Name.empty() && Round % 5 == 0)) {
           T.Name = QueryName(Next);
           T.Named = true;
           T.FEX = T.Name.size() >= 3 && T.Name.compare(0, 3, "FEX") == 0;
@@ -2705,6 +2717,32 @@ namespace {
         }
         T.Main = TID == C->MainTID || T.Name == "Main";
         Entries.push_back({Next, TID, Basic, &T, T.Main});
+      };
+      if (ThreadTable::ReadAll(Listed)) {
+        // Build 161: our Proton d2r10's thread table, no wineserver requests. A handle is opened only to change a thread.
+        WalkStatus = STATUS_SUCCESS;
+        for (const auto& L : Listed) {
+          ThreadBasicInfo Basic {};
+          Basic.ExitStatus = STATUS_PENDING;
+          Basic.TebBaseAddress = reinterpret_cast<void*>(static_cast<uintptr_t>(L.Teb));
+          Basic.ClientId.UniqueThread = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(L.Tid));
+          Basic.AffinityMask = static_cast<KAFFINITY>(L.Affinity);
+          Basic.Priority = L.Priority;
+          Basic.BasePriority = L.BasePriority;
+          Note(nullptr, Basic, &L);
+        }
+      } else {
+        while ((WalkStatus = NtGetNextThread(NtCurrentProcess(), Handles.empty() ? nullptr : Handles.back(),
+                                             THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION, 0, 0,
+                                             &Next)) == STATUS_SUCCESS) {
+          Handles.push_back(Next);
+          ThreadBasicInfo Basic {};
+          if (NtQueryInformationThread(Next, ThreadBasicInformation, &Basic, sizeof(Basic), nullptr) != STATUS_SUCCESS ||
+              Basic.ExitStatus != STATUS_PENDING) {
+            continue;
+          }
+          Note(Next, Basic, nullptr);
+        }
       }
 
       // The cores the game gave its own threads: the most common affinity among threads other than FEX's and the main
@@ -2749,6 +2787,23 @@ namespace {
           C->Cores == CoreMode::Fast && FastUsable ? fextl::fmt::format("lose {:#x}", C->FastMask) : fextl::string("unchanged")));
       }
 
+      // Build 161: threads from the thread table get a handle only when one of them is changed (closed with the walk's).
+      const auto SetHandle = [&](Entry& E) -> HANDLE {
+        if (!E.Handle) {
+          CLIENT_ID ClientId {
+            .UniqueProcess = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())),
+            .UniqueThread = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(E.TID)),
+          };
+          OBJECT_ATTRIBUTES Attr {.Length = sizeof(Attr)};
+          HANDLE Opened {};
+          if (NtOpenThread(&Opened, THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION, &Attr, &ClientId) == STATUS_SUCCESS) {
+            E.Handle = Opened;
+            Handles.push_back(Opened);
+            ++Opens;
+          }
+        }
+        return E.Handle;
+      };
       for (auto& E : Entries) {
         auto& T = *E.T;
         const auto& Basic = E.Basic;
@@ -2760,7 +2815,7 @@ namespace {
           const bool PriorityOff = Basic.Priority < Expected || Basic.Priority > std::min<LONG>(Expected + 1, 15);
           if (Basic.BasePriority != Want || PriorityOff) {
             LONG Value = Want;
-            const NTSTATUS Status = NtSetInformationThread(E.Handle, ThreadBasePriority, &Value, sizeof(Value));
+            const NTSTATUS Status = NtSetInformationThread(SetHandle(E), ThreadBasePriority, &Value, sizeof(Value));
             ++T.Fixes;
             ++Fixed;
             // The first three fixes of a thread, then every 50th: a game that sets priorities every frame shows as a count.
@@ -2778,7 +2833,7 @@ namespace {
         const uint64_t Want = WantedAffinity(*C, T, E.IsMain, Current, GameMask, FastUsable, ProcessMask);
         if (Want && Want != Current) {
           KAFFINITY Value = Want;
-          const NTSTATUS Status = NtSetInformationThread(E.Handle, ThreadAffinityMaskClass, &Value, sizeof(Value));
+          const NTSTATUS Status = NtSetInformationThread(SetHandle(E), ThreadAffinityMaskClass, &Value, sizeof(Value));
           if (Status == STATUS_SUCCESS) {
             T.SetTo = Want;
           }
@@ -2856,7 +2911,7 @@ namespace {
         }
       }
 
-      if (Handles.empty() && !ReportedWalkFailure) {
+      if (Handles.empty() && Listed.empty() && !ReportedWalkFailure) {
         ReportedWalkFailure = true;
         StatsLogNote(fextl::fmt::format("prio: can't list the process's threads, NtGetNextThread status={:#x}", static_cast<uint32_t>(WalkStatus)));
       }
@@ -2881,8 +2936,15 @@ namespace {
           NowText += fextl::fmt::format(" {:#x}x{}", Mask, N);
         }
         StatsLogNote(fextl::fmt::format("prio: s={} threads={} fixed={} cores fixed={} | affinity at start{} | now{} | not normal at start "
-                                        "(tid:name:base/prio x fixes):{}",
-                                        Round * 2, Count, Fixed, CoreFixed, MaskText, NowText, Odd.empty() ? " none" : Odd));
+                                        "(tid:name:base/prio x fixes):{}{}",
+                                        Round * 2, Count, Fixed, CoreFixed, MaskText, NowText, Odd.empty() ? " none" : Odd,
+                                        ThreadTable::Available() ?
+                                          fextl::fmt::format(" | threads from Wine's thread table (build 161), {} handles opened to "
+                                                             "change one so far; table entries read {} (by every FEX helper), read "
+                                                             "again because Wine was writing them {}, skipped {}",
+                                                             Opens, ThreadTable::GetCounts().Reads, ThreadTable::GetCounts().Retries,
+                                                             ThreadTable::GetCounts().GaveUp) :
+                                          fextl::string {}));
       }
 
       for (auto It = Threads.begin(); It != Threads.end();) {
