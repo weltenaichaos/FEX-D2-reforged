@@ -11,7 +11,8 @@ class D2RWords(ctx: android.content.Context) {
     private val HAND = """
         to of all and the per by on in a two damage
         stash inventory personal shared difficulty normal nightmare night mare hell gold max pick up drop
-        compare hold sort close menu very slow fast class encampment act skills skill level levels resist resistance resistances
+        compare hold sort close menu very slow fast class encampment act
+        party quest log character skill tree options potions holy skills skill level levels resist resistance resistances
         increased enhanced faster cast rate hit recovery attack speed run walk run/walk life mana
         defense rating chance strike attacker takes cold fire lightning poison magic physical
         reduced reduces maximum minimum adds absorb absorbs light radius find gold gold items
@@ -53,6 +54,8 @@ class D2RWords(ctx: android.content.Context) {
     fun fixGlyphs(line: String): String = Companion.fixGlyphs(line)
 
     companion object {
+    private val NUMBER = Regex("(?<=^|[\\s+\\-:(])[|Il0-9]*[|0-9][|Il0-9]*(?=$|[\\s%:)\\-])")
+
     fun fixGlyphs(line: String): String {
         val sb = StringBuilder(line)
         for (i in sb.indices) {
@@ -69,12 +72,18 @@ class D2RWords(ctx: android.content.Context) {
             }
             if (o != null) sb.setCharAt(i, o)
         }
-        return sb.toString()
+        // "+||0" is "+110": bars and I/l inside a number are ones.
+        return NUMBER.replace(sb) { m ->
+            if (m.value.any { it.isDigit() } || m.range.first > 0 && sb[m.range.first - 1] == '+')
+                m.value.replace('|', '1').replace('I', '1').replace('l', '1')
+            else m.value
+        }
     }
     }
 
     /** Corrects each word of a line that isn't a known word but is close to one. */
-    fun fix(line: String): String {
+    fun fix(input: String): String {
+        val line = joinSplitWords(input)
         val sb = StringBuilder()
         var last = 0
         for (m in TOKEN.findAll(line)) {
@@ -89,7 +98,33 @@ class D2RWords(ctx: android.content.Context) {
         return sb.toString()
     }
 
-    private val TOKEN = Regex("[A-Za-z'@#θøØ]+")
+    /**
+     * Text recognition splits some words at D2R's wide letters ("D AMAGE",
+     * "DA MAGE"). Two neighbours whose join is a known word become one.
+     */
+    private fun joinSplitWords(line: String): String {
+        val parts = line.split(' ').toMutableList()
+        var i = 0
+        while (i < parts.size - 1) {
+            val a = parts[i]
+            val b = parts[i + 1]
+            if (a.isNotEmpty() && b.isNotEmpty() && a.all { it.isLetter() } && b.all { it.isLetter() }) {
+                val joined = (a + b).lowercase(Locale.ROOT)
+                val known = joined in SET || WORDS.any {
+                    it.length >= 4 && kotlin.math.abs(it.length - joined.length) <= 1 && Fuzzy.dist(joined, it, 0.5f) <= 0.4f
+                }
+                if (known && !(a.lowercase(Locale.ROOT) in SET && b.lowercase(Locale.ROOT) in SET)) {
+                    parts[i] = a + b
+                    parts.removeAt(i + 1)
+                    continue
+                }
+            }
+            i++
+        }
+        return parts.joinToString(" ")
+    }
+
+    private val TOKEN = Regex("[\\p{L}'@#]+")
 
     private fun fixWord(word: String): String {
         val lower = word.lowercase(Locale.ROOT)

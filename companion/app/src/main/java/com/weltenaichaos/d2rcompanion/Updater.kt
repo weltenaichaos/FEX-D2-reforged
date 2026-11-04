@@ -16,7 +16,7 @@ import java.net.URL
  */
 object Updater {
     private const val API =
-        "https://api.github.com/repos/weltenaichaos/FEX-D2-reforged/releases?per_page=50"
+        "https://api.github.com/repos/weltenaichaos/FEX-D2-reforged/releases?per_page=100"
     private const val PREFIX = "d2r-companion-"
 
     data class Release(val build: Int, val url: String, val size: Long)

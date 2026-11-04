@@ -94,9 +94,13 @@ class CaptureService : Service() {
             if (p.x.toLong() * p.y > size.x.toLong() * size.y) size = p
         }
         displays = sizes.toString().trim()
-        // Landscape game: the long side is the width.
-        width = maxOf(size.x, size.y)
-        height = minOf(size.x, size.y)
+        // Landscape game: the long side is the width. Build 4 still got
+        // 1240x1080 here on the Thor (the app only sees its own screen), so the
+        // capture is at least 1920x1080, the top screen's size: Android scales
+        // the mirrored screen to fit, and a smaller capture shrinks the text.
+        width = maxOf(size.x, size.y, 1920)
+        height = maxOf(minOf(size.x, size.y), 1080)
+        if (width * 9 != height * 16) height = width * 9 / 16
 
         val r = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         reader = r
