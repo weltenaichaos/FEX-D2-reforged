@@ -469,6 +469,10 @@ namespace {
        "the UI on generated frames as in the newest real frame, as in layer 11 (the number: the largest UI move per "
        "frame searched, pixels, up to 32)",
        true},
+      {"FEX_LSFG_GEN_AHEAD", "LSFG_D2R_GEN_AHEAD",
+       "a generated frame that started early goes to the layer's present thread only after the game's present slept "
+       "until its slot, as up to layer 13",
+       false},
     };
     for (const auto& S : Switches) {
       const char* Value = Switch(S.Name);

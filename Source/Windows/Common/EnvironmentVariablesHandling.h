@@ -230,6 +230,11 @@ namespace FEX::Windows {
 //                          123: item names on the ground stepped at the game's 30 FPS, as the UI of each generated frame
 //                          came from the newest real frame. The UI is still copied from the real frame, never generated.
 //                          0 or "off" = the UI as in the newest real frame (layer 11).
+//   FEX_LSFG_GEN_AHEAD=1   (the D2R default from build 162, layer 14) a frame that started early (FEX_LSFG_EARLY) hands its
+//                          generated frame to the layer's present thread before the game's present sleeps until that
+//                          frame's slot, and the present thread waits for the slot itself. Up to layer 13 it went there
+//                          after that sleep, so it waited for VKD3D's present thread to wake first (build 161 run: 8% of
+//                          the generated frames 1 ms or more late, real frames 0.4%). 0 = LSFG_D2R_GEN_AHEAD=0.
 //   FEX_LSFG_GEN_GAP=50    (the D2R default from build 117, layer 10) a game frame that comes more than this many ms after
 //                          the one before (a freeze) gets no generated frame, only itself at the generated frame's slot: a
 //                          frame made between two pictures that far apart in time guesses a big jump (build 116: once a

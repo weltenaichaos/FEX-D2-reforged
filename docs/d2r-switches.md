@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 161, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r10 (build 12). The build numbers in the
+State: FEX build 162, VKD3D fex41, Turnip fex17, frame generation layer 14, our Proton d2r10 (build 12). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -145,6 +145,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_LSFG_UI` | `1` | Frame generation works on frames without the UI, and the UI is taken from the real frame, so the map and HUD don't smear (layer 11). | `0` |
 | `FEX_LSFG_UI_TOL` | `0` | How many 1/255 steps a pixel may differ and still not count as UI. | |
 | `FEX_LSFG_UI_MOTION` | `24` | The UI is drawn halfway along its own motion, so item names move with the world. The number is the largest move searched, in pixels (layers 12-13). | `0` |
+| `FEX_LSFG_GEN_AHEAD` | `1` | The generated frame goes to the layer's present thread before the game's present waits for the frame's slot, so it doesn't wait for the game's thread to wake up (layer 14; b161: 8% of generated frames 1 ms or more late). | `0` |
 
 ## Picture to the screen
 

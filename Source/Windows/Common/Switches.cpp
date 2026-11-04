@@ -191,6 +191,12 @@ namespace {
     // frame generation). Labels move with the world, the map stays or scrolls, the HUD stays; UI it can't match stays
     // as before. The number is the largest move searched per real frame, in pixels (at most 32).
     {"FEX_LSFG_UI_MOTION", "24"},
+    // Build 162 (layer 14): in the build 161 run 8% of the generated frames went out 1 ms or more after their slot (the
+    // real frames 0.4%). A frame that started early (FEX_LSFG_EARLY) gave its generated frame to the layer's present
+    // thread only once the game's present had slept until that frame's slot, on VKD3D's present thread, which waited up
+    // to 27 ms a second for a CPU in busy stretches (t=277-293, 335-348). The layer now hands it over before that sleep,
+    // and its present thread (nice -20, awake 1 ms early) waits for the slot itself, as it does for the real frame.
+    {"FEX_LSFG_GEN_AHEAD", "1"},
     // Build 150: from the 2026-11-01 runs on, the frame generation layer's presents took 1-12 ms (median per run, the
     // generated one 4-12 ms, 18-26 ms in b148's heavy scenes) where every run up to 2026-10-30 had 0.1 ms. Those runs
     // started with MESA_VK_WSI_DEBUG=sw (GameNative sets it when the container's "Use DRI3" is off). Then GameNative's
@@ -685,6 +691,7 @@ namespace {
     "FEX_LSFG_UI",
     "FEX_LSFG_UI_TOL",
     "FEX_LSFG_UI_MOTION",
+    "FEX_LSFG_GEN_AHEAD",
     "FEX_WSI_DIRECT",
     "FEX_KERNEL_FUTEX",
     "FEX_LOCK_BOOST",
