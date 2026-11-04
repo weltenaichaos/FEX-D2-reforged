@@ -22,6 +22,7 @@ class ItemDb(ctx: Context) {
 
     private val entries: List<Entry>
     private val bases: List<Entry>
+    private val baseByName: Map<String, Entry>
 
     init {
         val list = ArrayList<Entry>()
@@ -43,8 +44,6 @@ class ItemDb(ctx: Context) {
         bases = list.filter { it.kind == Kind.BASE }
         baseByName = bases.associateBy { it.key }
     }
-
-    private val baseByName: Map<String, Entry>
 
     /** The base item entry for a name ("Giant Sword"). */
     fun base(name: String): Entry? = baseByName[name.lowercase(Locale.ROOT)]
