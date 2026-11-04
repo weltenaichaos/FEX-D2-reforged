@@ -102,12 +102,12 @@ class D2RWords(ctx: android.content.Context) {
         t = Regex("(?<=^|[\\s+\\-:(])([|Il](?:\\s?[|Il])*)\\s?(?=\\d)").replace(t) { m ->
             "1".repeat(m.groupValues[1].count { it != ' ' })
         }
-        return NUMBER.replace(t) { m ->
-            if (m.value.any { it.isDigit() } || m.range.first > 0 && t[m.range.first - 1] == '+')
+        val u = t
+        return NUMBER.replace(u) { m ->
+            if (m.value.any { it.isDigit() } || m.range.first > 0 && u[m.range.first - 1] == '+')
                 m.value.replace('|', '1').replace('I', '1').replace('l', '1')
             else m.value
         }
-    }
     }
     }
 
