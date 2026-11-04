@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 165, VKD3D fex43, Turnip fex17, frame generation layer 14, our Proton d2r12 (build 14). The build numbers in the
+State: FEX build 165, VKD3D fex44, Turnip fex17, frame generation layer 14, our Proton d2r12 (build 14). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -121,6 +121,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `VKD3D_FEX_START_ROOMY_MS` | `10` | Set directly (no FEX switch). Frames with this much room (ms) or more don't limit frame start pacing outside GPU-bound scenes: the room measured tops out at ~15 ms, so they held the hold-back low in steps for 11-17 s after a late frame (VKD3D fex41). 4-30. | `0` |
 | `VKD3D_FEX_START_CAP_MS` | `4` | Set directly (no FEX switch). After a frame comes late or nearly late with 24 ms or more held back (outside GPU-bound scenes), frame start pacing stays at least this many ms below that hold-back (not under 20 ms); the ceiling rises 1 ms per 450 frames (~15 s) without another. Above ~28 ms frames came late 5 times as often, and the hold-back kept climbing back there (VKD3D fex42). 1-15. | `0` (= fex41) |
 | `VKD3D_FEX_START_BUSY_SKIP` | `1` | Set directly (no FEX switch). Frames whose spare time came from a busy GPU no longer limit frame start pacing's 256-frame memory; they still count among the last 64 frames (~2 s). After each heavy fight they kept the hold-back at 0-3 ms for up to 8.5 s while new frames had ~15 ms of room: 70 s of the b163 multiplayer run at 66 ms from frame start to screen (VKD3D fex43). | `0` (= fex42) |
+| `VKD3D_FEX_START_BURST_FRAMES` | `64` | Set directly (no FEX switch). Frames late or nearly late with the hold-back on that come within this many frames of each other are one burst: if the first stayed out of frame start pacing's 256-frame memory (fex40), the rest do too. Up to fex43 the second put both in, so one burst of slow game frames (the game unpacking a new part of the area) kept the hold-back at 0 for ~8.5 s: b165 t=984, 66 ms from frame start to screen until t=992; b164 51 bursts, 265 s at ~63 ms. A later such frame within the 256 frames still puts the burst in. The `frame start` line ends with `same burst, left out too N (VKD3D fex44)` (VKD3D fex44). | `0` (= fex43), 1-255 |
 
 ## Turnip (graphics driver)
 
