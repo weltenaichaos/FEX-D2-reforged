@@ -1,0 +1,583 @@
+kernelbase: OutputDebugString without a listener; ntdll: NtFlushBuffersFile notes for FEX.
+
+In b162 (Proton d2r11) D2R's character select screen had a 70-115 ms frame every 10 s
+(t=651, 660, 670, 680, 690). In each of those seconds the Battle.net SDK thread (BGS_Thread)
+wrote ~600 log lines with OutputDebugStringW, the wineserver got 590-672 open_mapping requests,
+and the main thread waited 50-90 ms in RtlAcquireSRWLockExclusive.
+
+Wine's OutputDebugStringW raises DBG_PRINTEXCEPTION_WIDE_C, calls OutputDebugStringA, which
+raises DBG_PRINTEXCEPTION_C, and then calls OpenFileMappingW("DBWIN_BUFFER"): one wineserver
+request that fails when no debug monitor (DebugView) runs. Without a debugger both exceptions
+are caught again by their own __EXCEPT. On ARM64EC each one also converts the context to x64
+and goes through the emulator's ResetToConsistentState.
+
+- The two exceptions are raised only when something but that __EXCEPT could see them: a
+  debugger (PEB BeingDebugged; Wine's NtRaiseException sends a debug event only then), a
+  vectored exception handler (they run before the frame handlers, so a protection's VEH still
+  sees every message), or, on ARM64EC, a patched x64 KiUserExceptionDispatcher or a wow64 hook.
+  ntdll's new __wine_d2r_exception_watchers() answers that (1 debugger, 2 VEH, 4 x64 hook,
+  0 nobody). When it says 0, the __EXCEPT would have run and nothing else, so leaving the
+  raise out changes nothing anyone can see. OutputDebugStringW still calls the exported
+  OutputDebugStringA, as in stock, for hooks on it.
+- After a look for DBWIN_BUFFER found none, the next look is 1 s later instead of on the next
+  call (a monitor started in between misses up to 1 s of messages). While a monitor runs,
+  every call looks, as in stock.
+WINE_D2R_ODS_FAST=0 turns both off. The switch and ntdll's exports are looked up once in
+kernelbase's DllMain, since GetProcAddress takes the loader lock and OutputDebugString never did.
+
+Counters for FEX in __wine_d2r_server_calls_ext (now 4360 bytes, 545 ULONG64), on with the
+request counts (WINE_D2R_CALL_COUNTS):
+- at byte 3728, written by kernelbase (found with GetProcAddress, so the same copy as the unix
+  side and FEX use): ods_w_calls, ods_w_ns, ods_a_calls, ods_a_ns, ods_max_ns, ods_raised,
+  ods_dbwin_opens, ods_dbwin_skipped (ULONG64), ods_last_tid, ods_watchers (ULONG).
+  A calls made by W count as A calls too, and W time includes them.
+- at byte 3800, NtFlushBuffersFile(Ex) (BGS_Thread also flushes its log file; FEX can now see
+  whether main waits behind those fsyncs): flush_calls, flush_ns, flush_max_ns,
+  flush_other_calls, flush_other_ns, flush_next; flush_tid[8] at 3848 (tid, count, ns, max_ns,
+  last_end_ns, 32 bytes, first 8 threads that flush); flush[8] at 4104 (seq, tid, status,
+  kind, start_ns, ns, 32 bytes, the latest 8 calls, same seq rule as the registry notes).
+  Times are CLOCK_MONOTONIC ns, like FEX's own clock.
+
+Tests: model test of OutputDebugStringA/W (/home/claude/pw/odstest, the patch's own function
+text with mocked calls): 20000 random A/W calls with a monitor coming and going, per mode: no
+watchers (0 raises, 5973 looks instead of 20000), VEH (every raise seen, 29943 as stock),
+switch off (stock counts), debugger (as stock), counters off, not set up (as stock); 0
+differences in what a VEH, debugger or monitor gets except the documented 1 s; last error kept;
+no GetProcAddress after set-up. Negative controls (always skip, never look again, 10 ms window,
+A or W raising without watchers) caught. Flush notes
+(/home/claude/pw/flushtest, the patch's own functions): 12 threads x 20000 calls x 40 rounds
+with a reader thread checking the notes: 0 wrong counts or slots, 0 torn reads in 168 million;
+negative controls (slot taken without compare-exchange, note written without the seq claim)
+caught. PE side compiles for x86_64, i686, aarch64 and arm64ec with no new warnings.
+---
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index e1784fc..c6dd8d4 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -176,6 +176,101 @@ static LONG WINAPI debug_exception_handler( EXCEPTION_POINTERS *eptr )
+     return (rec->ExceptionCode == DBG_PRINTEXCEPTION_C) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+ }
+ 
++/* d2r (fex-d2-reforged, patch 0015): OutputDebugString without a debugger or a debug monitor.
++ *
++ * Every OutputDebugStringW call raises DBG_PRINTEXCEPTION_WIDE_C and then, in
++ * OutputDebugStringA, DBG_PRINTEXCEPTION_C, each caught again by its own __EXCEPT when no
++ * debugger is attached, and then tries OpenFileMappingW("DBWIN_BUFFER"), a wineserver round
++ * trip that fails when no monitor (DebugView) runs. In b162 D2R's Battle.net SDK thread
++ * (BGS_Thread) made 590-838 such calls in one second every 10 s in the character screen, and
++ * the main thread had a 70-115 ms frame in each of those seconds. On ARM64EC every exception
++ * also converts the context to x64 and goes through the emulator's ResetToConsistentState.
++ * - The exceptions are raised only when something could see them: a debugger, a vectored
++ *   exception handler, or a hooked x64 KiUserExceptionDispatcher (ntdll's
++ *   __wine_d2r_exception_watchers). Otherwise only the __EXCEPT here would catch them, so
++ *   leaving them out changes nothing anyone can see.
++ * - After DBWIN_BUFFER was not found, it is looked for again after 1 s instead of on every
++ *   call (a monitor started meanwhile misses up to 1 s of messages).
++ * WINE_D2R_ODS_FAST=0 turns both off. Calls, time, raises and DBWIN lookups are counted in
++ * ntdll's __wine_d2r_server_calls_ext (at byte 3728) when the request counts are on. */
++#define D2R_EXT_SIZE     12          /* ULONG index of the export's size word (byte 48) */
++#define D2R_EXT_ODS      (3728 / 8)  /* ULONG64 index of ods_w_calls */
++#define D2R_EXT_ODS_END  3800        /* the build writes at least this much when the counters are on */
++
++enum { D2R_ODS_W_CALLS, D2R_ODS_W_NS, D2R_ODS_A_CALLS, D2R_ODS_A_NS, D2R_ODS_MAX_NS, D2R_ODS_RAISED,
++       D2R_ODS_DBWIN_OPENS, D2R_ODS_DBWIN_SKIPPED, D2R_ODS_LAST };
++
++struct d2r_ods
++{
++    ULONG64      *counts;   /* the ODS counters, NULL when off */
++    LARGE_INTEGER start;
++    ULONG         watchers; /* see __wine_d2r_exception_watchers; ~0 when unknown or switched off */
++    BOOL          fast;     /* WINE_D2R_ODS_FAST isn't 0 */
++};
++
++static LONG d2r_ods_state;                 /* 0 not set up, 1 on, 2 switched off */
++static ULONG (CDECL *d2r_ods_watchers)(void);
++static ULONG64 *d2r_ods_ext;               /* ntdll's __wine_d2r_server_calls_ext */
++static LONG d2r_dbwin_next;                /* GetTickCount() for the next DBWIN_BUFFER look, 0 = every call */
++
++/* from DllMain: GetProcAddress takes the loader lock, which OutputDebugString never does */
++void d2r_ods_init(void)
++{
++    HMODULE ntdll = GetModuleHandleW( L"ntdll.dll" );
++    char value[16];
++    DWORD len = GetEnvironmentVariableA( "WINE_D2R_ODS_FAST", value, sizeof(value) );
++
++    if (ntdll)
++    {
++        d2r_ods_watchers = (void *)GetProcAddress( ntdll, "__wine_d2r_exception_watchers" );
++        d2r_ods_ext = (ULONG64 *)GetProcAddress( ntdll, "__wine_d2r_server_calls_ext" );
++    }
++    WriteRelease( &d2r_ods_state, (len && len < sizeof(value) && value[0] == '0') ? 2 : 1 );
++}
++
++static void d2r_ods_begin( struct d2r_ods *ods )
++{
++    ULONG64 *ext;
++
++    /* not set up (no DllMain yet): as stock */
++    ods->fast = ReadAcquire( &d2r_ods_state ) == 1;
++    ods->watchers = (ods->fast && d2r_ods_watchers) ? d2r_ods_watchers() : ~0u;
++    ods->counts = NULL;
++    if ((ext = d2r_ods_ext) && ReadAcquire( (LONG *)ext ) == 1 &&
++        ((volatile ULONG *)ext)[D2R_EXT_SIZE] >= D2R_EXT_ODS_END)
++    {
++        ods->counts = ext + D2R_EXT_ODS;
++        NtQueryPerformanceCounter( &ods->start, NULL );
++    }
++}
++
++static void d2r_ods_count( struct d2r_ods *ods, unsigned int counter )
++{
++    if (ods->counts) InterlockedIncrement64( (LONG64 *)&ods->counts[counter] );
++}
++
++static void d2r_ods_end( struct d2r_ods *ods, BOOL wide )
++{
++    ULONG64 *c = ods->counts;
++    LARGE_INTEGER end;
++    LONG64 ns, max;
++
++    if (!c) return;
++    NtQueryPerformanceCounter( &end, NULL );
++    ns = (end.QuadPart - ods->start.QuadPart) * 100;  /* 100 ns ticks */
++    InterlockedIncrement64( (LONG64 *)&c[wide ? D2R_ODS_W_CALLS : D2R_ODS_A_CALLS] );
++    InterlockedExchangeAdd64( (LONG64 *)&c[wide ? D2R_ODS_W_NS : D2R_ODS_A_NS], ns );
++    max = ReadNoFence64( (LONG64 *)&c[D2R_ODS_MAX_NS] );
++    while (ns > max)
++    {
++        LONG64 prev = InterlockedCompareExchange64( (LONG64 *)&c[D2R_ODS_MAX_NS], ns, max );
++        if (prev == max) break;
++        max = prev;
++    }
++    WriteNoFence( (LONG *)&c[D2R_ODS_LAST], GetCurrentThreadId() );
++    WriteNoFence( (LONG *)&c[D2R_ODS_LAST] + 1, ods->watchers );
++}
++
+ /***********************************************************************
+  *           OutputDebugStringA   (kernelbase.@)
+  */
+@@ -185,10 +280,17 @@ void WINAPI DECLSPEC_HOTPATCH OutputDebugStringA( LPCSTR str )
+     static HANDLE DBWinMutex = NULL;
+     static BOOL mutex_inited = FALSE;
+     BOOL caught_by_dbg = TRUE;
++    struct d2r_ods ods;
+ 
+     if (!str) str = "";
+     WARN( "%s\n", debugstr_a(str) );
+ 
++    d2r_ods_begin( &ods );
++    /* patch 0015: nobody but the __EXCEPT here could see it */
++    if (!ods.watchers) caught_by_dbg = FALSE;
++    else
++    {
++    d2r_ods_count( &ods, D2R_ODS_RAISED );
+     /* raise exception, WaitForDebugEvent() will generate a corresponding debug event */
+     __TRY
+     {
+@@ -202,7 +304,12 @@ void WINAPI DECLSPEC_HOTPATCH OutputDebugStringA( LPCSTR str )
+         caught_by_dbg = FALSE;
+     }
+     __ENDTRY
+-    if (caught_by_dbg) return;
++    }
++    if (caught_by_dbg)
++    {
++        d2r_ods_end( &ods, FALSE );
++        return;
++    }
+ 
+     /* send string to a system-wide monitor */
+     if (!mutex_inited)
+@@ -220,9 +327,18 @@ void WINAPI DECLSPEC_HOTPATCH OutputDebugStringA( LPCSTR str )
+ 
+     if (DBWinMutex)
+     {
+-        HANDLE mapping;
++        HANDLE mapping = NULL;
++        LONG next = ods.fast ? ReadNoFence( &d2r_dbwin_next ) : 0;
+ 
+-        mapping = OpenFileMappingW( FILE_MAP_WRITE, FALSE, L"DBWIN_BUFFER" );
++        /* patch 0015: no monitor less than 1 s ago, don't look again yet */
++        if (next && (LONG)(GetTickCount() - next) < 0)
++            d2r_ods_count( &ods, D2R_ODS_DBWIN_SKIPPED );
++        else
++        {
++            d2r_ods_count( &ods, D2R_ODS_DBWIN_OPENS );
++            mapping = OpenFileMappingW( FILE_MAP_WRITE, FALSE, L"DBWIN_BUFFER" );
++            if (ods.fast) WriteNoFence( &d2r_dbwin_next, mapping ? 0 : (LONG)((GetTickCount() + 1000) | 1) );
++        }
+         if (mapping)
+         {
+             LPVOID buffer;
+@@ -264,6 +380,7 @@ void WINAPI DECLSPEC_HOTPATCH OutputDebugStringA( LPCSTR str )
+             CloseHandle( mapping );
+         }
+     }
++    d2r_ods_end( &ods, FALSE );
+     SetLastError( last_error );
+ }
+ 
+@@ -280,14 +397,20 @@ void WINAPI DECLSPEC_HOTPATCH OutputDebugStringW( LPCWSTR str )
+ {
+     UNICODE_STRING strW;
+     STRING strA;
++    struct d2r_ods ods;
+ 
+     WARN( "%s\n", debugstr_w(str) );
+ 
++    d2r_ods_begin( &ods );
+     RtlInitUnicodeString( &strW, str );
+     if (!RtlUnicodeStringToAnsiString( &strA, &strW, TRUE ))
+     {
+-        BOOL exc_handled;
++        BOOL exc_handled = FALSE;
+ 
++        /* patch 0015: raised only when something but the __EXCEPT here could see it */
++        if (ods.watchers)
++        {
++        d2r_ods_count( &ods, D2R_ODS_RAISED );
+         __TRY
+         {
+             ULONG_PTR args[4];
+@@ -303,12 +426,14 @@ void WINAPI DECLSPEC_HOTPATCH OutputDebugStringW( LPCWSTR str )
+             exc_handled = FALSE;
+         }
+         __ENDTRY
++        }
+ 
+         if (!exc_handled)
+             OutputDebugStringA( strA.Buffer );
+ 
+         RtlFreeAnsiString( &strA );
+     }
++    d2r_ods_end( &ods, TRUE );
+ }
+ 
+ 
+diff --git a/dlls/kernelbase/kernelbase.h b/dlls/kernelbase/kernelbase.h
+index e46ca0f..30040cc 100644
+--- a/dlls/kernelbase/kernelbase.h
++++ b/dlls/kernelbase/kernelbase.h
+@@ -37,6 +37,7 @@ extern void init_global_data(void);
+ extern void init_startup_info( RTL_USER_PROCESS_PARAMETERS *params );
+ extern void init_locale( HMODULE module );
+ extern void init_console(void);
++extern void d2r_ods_init(void);  /* patch 0015, debug.c */
+ extern BOOL is_console_handle( HANDLE );
+ 
+ extern const WCHAR windows_dir[];
+diff --git a/dlls/kernelbase/main.c b/dlls/kernelbase/main.c
+index fb88cfc..a12127a 100644
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -50,6 +50,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+         init_locale( hinst );
+         init_startup_info( NtCurrentTeb()->Peb->ProcessParameters );
+         init_console();
++        d2r_ods_init();  /* patch 0015 */
+     }
+     return TRUE;
+ }
+diff --git a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
+index 3b524d0..8dc7e41 100644
+--- a/dlls/ntdll/exception.c
++++ b/dlls/ntdll/exception.c
+@@ -191,6 +191,30 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
+ }
+ 
+ 
++/*******************************************************************
++ *		__wine_d2r_exception_watchers
++ *
++ * d2r (fex-d2-reforged, patch 0015): who could see an exception the calling thread raises
++ * now, other than the frame handlers between the raiser and its own __EXCEPT:
++ * 1 a debugger (PEB BeingDebugged; without it no debug event is sent), 2 a vectored
++ * exception handler (they run before any frame handler), 4 on ARM64EC a patched
++ * KiUserExceptionDispatcher or a wow64 hook (x64 code then runs for every exception).
++ * 0 = nobody. kernelbase's OutputDebugString uses it to leave out the two exceptions only
++ * its own __EXCEPT would catch.
++ */
++ULONG CDECL __wine_d2r_exception_watchers(void)
++{
++    ULONG ret = 0;
++
++    if (NtCurrentTeb()->Peb->BeingDebugged) ret |= 1;
++    if (*(LIST_ENTRY * volatile *)&vectored_exception_handlers.Flink != &vectored_exception_handlers) ret |= 2;
++#ifdef __arm64ec__
++    if (d2r_x64_dispatcher_hooked()) ret |= 4;
++#endif
++    return ret;
++}
++
++
+ /*******************************************************************
+  *		dispatch_exception
+  */
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 950cada..2308aca 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1760,6 +1760,7 @@
+ @ extern -private __wine_d2r_server_calls
+ @ extern -private __wine_d2r_server_calls_ext
+ @ extern -private __wine_d2r_threads
++@ cdecl -private __wine_d2r_exception_watchers()
+ @ stdcall __wine_get_unix_env(ptr ptr long)
+ @ stdcall __wine_set_unix_env(ptr ptr)
+ @ stdcall wine_nt_to_unix_file_name(ptr ptr ptr long) compat_wine_nt_to_unix_file_name
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index cde0daa..2f0c9ae 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -58,7 +58,9 @@ extern BOOL d2r_wait_lock_spin;
+ extern BOOL d2r_wake_slow;
+ #ifdef __arm64ec__
+ extern BOOL d2r_continue_slow;
++extern BOOL d2r_x64_dispatcher_hooked(void);  /* patch 0015 */
+ #endif
++extern ULONG CDECL __wine_d2r_exception_watchers(void);  /* patch 0015 */
+ 
+ /* exceptions */
+ extern NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *context );
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index badada9..849394b 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -1339,6 +1339,13 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD
+     return NULL;
+ }
+ 
++/* d2r (patch 0015): exceptions go through x64 code first (see prepare_exception_arm64ec) */
++BOOL d2r_x64_dispatcher_hooked(void)
++{
++    return pWow64PrepareForException || memcmp( KiUserExceptionDispatcher_thunk, KiUserExceptionDispatcher_orig,
++                                                sizeof(KiUserExceptionDispatcher_orig) );
++}
++
+ /*******************************************************************
+  *		KiUserExceptionDispatcher (NTDLL.@)
+  */
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index 81aac10..e29ffae 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -861,7 +861,7 @@ DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls[1032];
+ 
+ /* d2r (patch 0009): latest caller per request type and completion port wait counters
+  * (struct d2r_server_calls_ext, D2R_SERVER_CALLS_EXT_U64), read by FEX */
+-DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls_ext[466];  /* 272 since patch 0010, 466 since 0012 */
++DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls_ext[545];  /* 272 since patch 0010, 466 since 0012, 545 since 0015 */
+ 
+ /* d2r (patch 0011): where the wineserver's thread table for this process is mapped
+  * (struct d2r_threads_info in unix/unix_private.h), read by FEX's helpers */
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 04e4a10..af14502 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -7318,6 +7318,75 @@ NTSTATUS WINAPI NtFlushBuffersFile( HANDLE handle, IO_STATUS_BLOCK *io )
+ }
+ 
+ 
++/* d2r (fex-d2-reforged, patch 0015): NtFlushBuffersFile(Ex) count and time per thread and the
++ * latest 8 calls in __wine_d2r_server_calls_ext for FEX. In b162 D2R's Battle.net SDK thread
++ * (BGS_Thread) was in FlushFileBuffers while the main thread waited in an SRW lock; these
++ * notes say how long its fsyncs take. On with the request counts (WINE_D2R_CALL_COUNTS). */
++static inline ULONG64 d2r_flush_now(void)
++{
++    struct timespec ts;
++
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return ts.tv_sec * (ULONG64)1000000000 + ts.tv_nsec;
++}
++
++static inline void d2r_flush_max( ULONG64 *max, ULONG64 ns )
++{
++    ULONG64 cur = __atomic_load_n( max, __ATOMIC_RELAXED );
++
++    while (ns > cur && !__atomic_compare_exchange_n( max, &cur, ns, TRUE, __ATOMIC_RELAXED, __ATOMIC_RELAXED )) ;
++}
++
++static void DECLSPEC_NOINLINE d2r_flush_note( ULONG64 start_ns, NTSTATUS status, ULONG kind )
++{
++    struct d2r_server_calls_ext *ext = d2r_server_calls_ext;
++    ULONG tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
++    ULONG64 end_ns = d2r_flush_now(), ns = end_ns - start_ns, n;
++    struct d2r_flush_note *note;
++    unsigned int i;
++    ULONG seq;
++
++    __atomic_fetch_add( &ext->flush_calls, 1, __ATOMIC_RELAXED );
++    __atomic_fetch_add( &ext->flush_ns, ns, __ATOMIC_RELAXED );
++    d2r_flush_max( &ext->flush_max_ns, ns );
++    for (i = 0; i < ARRAY_SIZE(ext->flush_tid); i++)
++    {
++        struct d2r_flush_tid *t = &ext->flush_tid[i];
++        ULONG cur = __atomic_load_n( &t->tid, __ATOMIC_ACQUIRE );
++
++        /* a free slot: take it for this thread, unless another thread just did */
++        if (!cur && __atomic_compare_exchange_n( &t->tid, &cur, tid, FALSE, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
++            cur = tid;
++        if (cur != tid) continue;
++        __atomic_fetch_add( &t->count, 1, __ATOMIC_RELAXED );
++        __atomic_fetch_add( &t->ns, ns, __ATOMIC_RELAXED );
++        d2r_flush_max( &t->max_ns, ns );
++        __atomic_store_n( &t->last_end_ns, end_ns, __ATOMIC_RELAXED );
++        break;
++    }
++    if (i == ARRAY_SIZE(ext->flush_tid))
++    {
++        __atomic_fetch_add( &ext->flush_other_calls, 1, __ATOMIC_RELAXED );
++        __atomic_fetch_add( &ext->flush_other_ns, ns, __ATOMIC_RELAXED );
++    }
++
++    n = __atomic_fetch_add( &ext->flush_next, 1, __ATOMIC_RELAXED );
++    note = &ext->flush[n % ARRAY_SIZE(ext->flush)];
++    seq = __atomic_load_n( &note->seq, __ATOMIC_RELAXED );
++    /* another thread writing this note: leave it to that one */
++    if ((seq & 1) || !__atomic_compare_exchange_n( &note->seq, &seq, seq + 1, FALSE,
++                                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
++        return;
++    __atomic_thread_fence( __ATOMIC_RELEASE );
++    note->tid      = tid;
++    note->status   = status;
++    note->kind     = kind;
++    note->start_ns = start_ns;
++    note->ns       = ns;
++    __atomic_store_n( &note->seq, seq + 2, __ATOMIC_RELEASE );
++}
++
++
+ /******************************************************************************
+  *              NtFlushBuffersFileEx   (NTDLL.@)
+  */
+@@ -7327,6 +7396,8 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params,
+     HANDLE wait_handle;
+     enum server_fd_type type;
+     int fd, needs_close;
++    ULONG64 d2r_start = d2r_server_calls_ext ? d2r_flush_now() : 0;  /* patch 0015 */
++    ULONG d2r_kind = 0;
+ 
+     TRACE( "(%p,0x%08x,%p,0x%08x,%p)\n", handle, flags, params, size, io );
+ 
+@@ -7341,20 +7412,26 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params,
+ 
+     if (!ret && (type == FD_TYPE_FILE || type == FD_TYPE_DIR || type == FD_TYPE_CHAR))
+     {
++        d2r_kind = 1;
+         if (fsync(fd)) ret = errno_to_status( errno );
+         io->Status      = ret;
+         io->Information = 0;
+     }
+     else if (!ret && type == FD_TYPE_SERIAL)
+     {
++        d2r_kind = 3;
+         ret = serial_FlushBuffersFile( fd );
+     }
+     else if (ret != STATUS_ACCESS_DENIED)
+     {
+         struct async_irp *async;
+ 
++        d2r_kind = 2;
+         if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion, handle )))
++        {
++            if (d2r_start) d2r_flush_note( d2r_start, STATUS_NO_MEMORY, d2r_kind );
+             return STATUS_NO_MEMORY;
++        }
+         async->buffer  = NULL;
+         async->size    = 0;
+ 
+@@ -7377,6 +7454,7 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params,
+     }
+ 
+     if (needs_close) close( fd );
++    if (d2r_start) d2r_flush_note( d2r_start, ret, d2r_kind );  /* patch 0015 */
+     return ret;
+ }
+ 
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index ef92b91..d3d9530 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -302,7 +302,16 @@ C_ASSERT( sizeof(struct d2r_reg_note) == 128 );  /* patch 0012 */
+ C_ASSERT( offsetof(struct d2r_server_calls_ext, reg_open_next) == 2176 );
+ C_ASSERT( offsetof(struct d2r_server_calls_ext, reg_open) == 2192 );
+ C_ASSERT( offsetof(struct d2r_server_calls_ext, reg_value) == 2192 + 8 * 128 );
+-C_ASSERT( sizeof(struct d2r_server_calls_ext) == 3728 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, ods_w_calls) == 3728 );  /* patch 0015, kernelbase's D2R_EXT_ODS */
++C_ASSERT( offsetof(struct d2r_server_calls_ext, ods_dbwin_skipped) == 3728 + 7 * sizeof(ULONG64) );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, ods_last_tid) == 3792 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, ods_watchers) == 3796 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, flush_calls) == 3800 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, flush_tid) == 3848 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, flush) == 4104 );
++C_ASSERT( sizeof(struct d2r_flush_tid) == 32 );
++C_ASSERT( sizeof(struct d2r_flush_note) == 32 );
++C_ASSERT( sizeof(struct d2r_server_calls_ext) == 4360 );
+ C_ASSERT( REQ_NB_REQUESTS <= D2R_MAX_REQUESTS );
+ C_ASSERT( offsetof(struct d2r_server_calls, ev_pool_full) == offsetof(struct d2r_server_calls, ev_kept) + 5 * sizeof(ULONG64) );
+ /* the number of request types in this build, so the build can check the name table it ships */
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 63ed86d..5bc9ea5 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -163,6 +163,26 @@ struct d2r_reg_note
+     char    name[96];         /* key path relative to parent / value name: ASCII, '?' for others, cut to 95 */
+ };
+ 
++/* patch 0015: NtFlushBuffersFile(Ex) per thread, and one call */
++struct d2r_flush_tid
++{
++    ULONG   tid;              /* Windows thread id, 0 = free slot (a slot is never given back) */
++    ULONG   count;            /* its flushes so far */
++    ULONG64 ns;               /* their time (CLOCK_MONOTONIC, whole call) */
++    ULONG64 max_ns;           /* the longest */
++    ULONG64 last_end_ns;      /* CLOCK_MONOTONIC when its latest flush returned */
++};
++
++struct d2r_flush_note
++{
++    ULONG   seq;              /* odd while being written, +2 per write (same rule as d2r_reg_note) */
++    ULONG   tid;              /* Windows thread id of the caller */
++    ULONG   status;           /* NTSTATUS of the call */
++    ULONG   kind;             /* 1 fsync of a file, directory or char device, 2 server flush, 3 serial, 0 none */
++    ULONG64 start_ns;         /* CLOCK_MONOTONIC at the call */
++    ULONG64 ns;               /* how long it took */
++};
++
+ struct d2r_server_calls_ext
+ {
+     ULONG   version;          /* 1 once the unix side writes here */
+@@ -191,10 +211,32 @@ struct d2r_server_calls_ext
+     ULONG64 reg_value_next;   /* value reads noted so far; the latest is reg_value[(reg_value_next - 1) % 4] */
+     struct d2r_reg_note reg_open[8];
+     struct d2r_reg_note reg_value[4];
++    /* patch 0015: OutputDebugString, written by kernelbase, at byte 3728. OutputDebugStringW
++     * calls OutputDebugStringA as in stock Wine, so ods_a_* include the A calls made by W and
++     * ods_w_ns includes their time. */
++    ULONG64 ods_w_calls;      /* OutputDebugStringW calls */
++    ULONG64 ods_w_ns;         /* their time (NtQueryPerformanceCounter, ns) */
++    ULONG64 ods_a_calls;      /* OutputDebugStringA calls */
++    ULONG64 ods_a_ns;         /* their time */
++    ULONG64 ods_max_ns;       /* the longest call of either */
++    ULONG64 ods_raised;       /* DBG_PRINTEXCEPTION(_WIDE)_C raised (stock: 2 per W call, 1 per A call) */
++    ULONG64 ods_dbwin_opens;  /* OpenFileMappingW("DBWIN_BUFFER") tries (no debug monitor: each fails, an open_mapping request) */
++    ULONG64 ods_dbwin_skipped;/* tries left out: the last one found no monitor less than 1 s ago */
++    ULONG   ods_last_tid;     /* Windows thread id of the latest caller */
++    ULONG   ods_watchers;     /* who could see an exception at the latest call: 1 debugger, 2 vectored handler, 4 x64 dispatcher hooked; ~0 switched off */
++    /* patch 0015: NtFlushBuffersFile(Ex), at byte 3800 */
++    ULONG64 flush_calls;      /* all flushes */
++    ULONG64 flush_ns;         /* their time */
++    ULONG64 flush_max_ns;     /* the longest */
++    ULONG64 flush_other_calls;/* flushes of threads after the first 8 (no slot in flush_tid) */
++    ULONG64 flush_other_ns;
++    ULONG64 flush_next;       /* flushes noted so far; the latest is flush[(flush_next - 1) % 8] */
++    struct d2r_flush_tid  flush_tid[8];   /* at byte 3848 */
++    struct d2r_flush_note flush[8];       /* at byte 4104 */
+ };
+ 
+ extern struct d2r_server_calls_ext *d2r_server_calls_ext;
+-#define D2R_SERVER_CALLS_EXT_U64 466  /* size of __wine_d2r_server_calls_ext in ULONG64 (272 in d2r9) */
++#define D2R_SERVER_CALLS_EXT_U64 545  /* size of __wine_d2r_server_calls_ext in ULONG64 (272 in d2r9, 466 in d2r10-d2r11) */
+ 
+ /* d2r (patch 0011): this process's thread table, written by the wineserver whenever a
+  * thread's id, Linux tid, TEB, priority, base priority, affinity or name changes (layout in

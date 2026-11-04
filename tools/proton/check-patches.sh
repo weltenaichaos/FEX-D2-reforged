@@ -208,8 +208,9 @@ check_0012() {
     n=$(calls_to "$NTSO" "$s" d2r_reg_note)
     if [ "${n:-0}" -ge 1 ]; then ok 0012 "$s notes its call for FEX"; else bad 0012 "$s never notes its call (stock)"; fi
   done
-  n=$($OBJDUMP -d --no-show-raw-insn "$NTSO" 2>/dev/null | grep -cE 'mov\s+w[0-9]+, #0xe90\b')
-  if [ "${n:-0}" -ge 1 ]; then ok 0012 "${NTSO#$LIB/} writes the export size 3,728"; else bad 0012 "${NTSO#$LIB/} never writes the export size 3,728"; fi
+  # 3,728 bytes in d2r10-d2r11; 4,360 since 0015 (check_0015 wants exactly that)
+  n=$($OBJDUMP -d --no-show-raw-insn "$NTSO" 2>/dev/null | grep -cE 'mov\s+w[0-9]+, #0x(e90|1108)\b')
+  if [ "${n:-0}" -ge 1 ]; then ok 0012 "${NTSO#$LIB/} writes an export size of at least 3,728"; else bad 0012 "${NTSO#$LIB/} never writes the export size 3,728 or later"; fi
 }
 
 # 0013: event reuse window 10 s: its switch, and the window is a variable in ntdll.so's data
@@ -229,6 +230,26 @@ check_0014() {
   for f in "$LIB/aarch64-windows/setupapi.dll" "$LIB/i386-windows/setupapi.dll"; do
     if ascii_in "$f" WINE_D2R_SETUPAPI_FAST; then ok 0014 "${f#$LIB/} reads WINE_D2R_SETUPAPI_FAST"; else bad 0014 "${f#$LIB/} lacks WINE_D2R_SETUPAPI_FAST"; fi
   done
+}
+
+# 0015: OutputDebugString raises only for a debugger, VEH or x64 hook and looks for DBWIN_BUFFER
+# once a second without a monitor (both kernelbase.dll builds read the switch and look up
+# ntdll's new function; stock has neither string), PE ntdll exports that function,
+# NtFlushBuffersFileEx notes its calls, and the export's size word says 4,360 bytes
+check_0015() {
+  local f s n
+  for f in "$NT" "$NT32"; do
+    if exports "$f" __wine_d2r_exception_watchers; then ok 0015 "${f#$LIB/} exports __wine_d2r_exception_watchers"; else bad 0015 "${f#$LIB/} lacks __wine_d2r_exception_watchers"; fi
+  done
+  for f in "$LIB/aarch64-windows/kernelbase.dll" "$LIB/i386-windows/kernelbase.dll"; do
+    for s in WINE_D2R_ODS_FAST __wine_d2r_exception_watchers __wine_d2r_server_calls_ext; do
+      if ascii_in "$f" "$s"; then ok 0015 "${f#$LIB/} has $s"; else bad 0015 "${f#$LIB/} lacks $s"; fi
+    done
+  done
+  n=$(calls_to "$NTSO" NtFlushBuffersFileEx 'd2r_flush_note[.a-z0-9]*')
+  if [ "${n:-0}" -ge 1 ]; then ok 0015 "NtFlushBuffersFileEx notes its calls for FEX"; else bad 0015 "NtFlushBuffersFileEx never notes its calls (stock)"; fi
+  n=$($OBJDUMP -d --no-show-raw-insn "$NTSO" 2>/dev/null | grep -cE 'mov\s+w[0-9]+, #0x1108\b')
+  if [ "${n:-0}" -ge 1 ]; then ok 0015 "${NTSO#$LIB/} writes the export size 4,360"; else bad 0015 "${NTSO#$LIB/} never writes the export size 4,360"; fi
 }
 
 for p in "$PATCHES"/*.patch; do
