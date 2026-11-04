@@ -58,9 +58,15 @@ class D2RWords(ctx: android.content.Context) {
     private val SMALL = setOf("to", "of", "per", "by", "on", "the", "and", "a", "in", "vs")
 
     /** One case style as in the game: "+110 To ATTACK" -> "+110 to Attack". */
-    fun gameCase(line: String): String = Regex("\\p{L}[\\p{L}']*").replace(line) { m ->
-        val w = m.value.lowercase(Locale.ROOT)
-        if (w in SMALL) w else w.replaceFirstChar { it.uppercase(Locale.ROOT) }
+    fun gameCase(line: String): String {
+        var t = Regex("\\p{L}[\\p{L}']*").replace(line) { m ->
+            val w = m.value.lowercase(Locale.ROOT)
+            if (w in SMALL) w else w.replaceFirstChar { it.uppercase(Locale.ROOT) }
+        }
+        t = Regex("%(?=\\p{L})").replace(t, "% ")          // "+86%Enhanced"
+        t = Regex("(?<=\\p{L})\\+(?=\\d)").replace(t, " +") // "Resist+15%"
+        t = Regex("(?<=\\d) - (?=\\d)").replace(t, "-")      // "23 - 54"
+        return t
     }
 
     private val NUMBER = Regex("(?<=^|[\\s+\\-:(])[|Il0-9]*[|0-9][|Il0-9]*(?=$|[\\s%:)\\-])")
@@ -167,6 +173,14 @@ class D2RWords(ctx: android.content.Context) {
     private fun fixWord(word: String): String {
         val lower = word.lowercase(Locale.ROOT)
         if (lower in SET) return word
+        // Two words read without the space between them ("HeLYFIRE" = Holy Fire).
+        if (lower.length >= 6) {
+            for (cut in 3..lower.length - 3) {
+                val a = closest(lower.substring(0, cut), 0.2f) ?: continue
+                val b = closest(lower.substring(cut), 0.2f) ?: continue
+                return matchCase(word.substring(0, cut), a) + " " + matchCase(word.substring(cut), b)
+            }
+        }
         val limit = when {
             word.length <= 2 -> 0.6f
             word.length == 3 -> 1.0f
@@ -182,6 +196,19 @@ class D2RWords(ctx: android.content.Context) {
         }
         val b = best ?: return word
         return matchCase(word, b)
+    }
+
+    /** A known word within the given misread cost, or null. */
+    private fun closest(w: String, limit: Float): String? {
+        if (w in SET) return w
+        var best: String? = null
+        var bestD = limit + 0.001f
+        for (k in WORDS) {
+            if (k.length < 3 || kotlin.math.abs(k.length - w.length) > 1) continue
+            val d = Fuzzy.dist(w, k, bestD)
+            if (d < bestD) { bestD = d; best = k }
+        }
+        return best
     }
 
     private fun matchCase(orig: String, w: String): String = when {
