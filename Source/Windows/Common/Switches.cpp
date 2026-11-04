@@ -278,6 +278,10 @@ namespace {
     // counted as a load: in the build 157 run they read 4,150 hits from disk in play, 0.76 ms each, against 0.16-0.27 ms
     // to unpack one, and 1.97 GB were read ahead, about half never used (see ARM64EC/NativeUnpackCache.cpp).
     {"FEX_UNPACK_CACHE_FRAMES", "1"},
+    // Build 164: and nothing is read ahead while frames come. In the build 163 run read-ahead in play was 2,038 MB, 65%
+    // never used, 45% of the storage reads in play, and up to 117 MB in a second when the game streamed in an area, while
+    // the main thread waited for the game's lock in frames of 50-91 ms (see ARM64EC/NativeUnpackCache.cpp).
+    {"FEX_UNPACK_CACHE_FRAMES_AHEAD", "0"},
     // Build 90: the streams the main thread looks up in frames of play are learned across sessions and read into the
     // file cache at the start and at every loading screen (budget in MB). The same 105 ms frame unpacked 7.6 MB of
     // stored streams itself (20.9 ms) because they weren't in memory.
@@ -610,6 +614,7 @@ namespace {
     "FEX_UNPACK_CACHE_AHEAD",
     "FEX_UNPACK_CACHE_MAIN_PLAY",
     "FEX_UNPACK_CACHE_FRAMES",
+    "FEX_UNPACK_CACHE_FRAMES_AHEAD",
     "FEX_UNPACK_CACHE_LEARN",
     "FEX_UNPACK_CACHE_FLUSH",
     "FEX_CODE_BUFFER_START",

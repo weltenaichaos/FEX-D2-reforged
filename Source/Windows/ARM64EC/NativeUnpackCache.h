@@ -60,6 +60,8 @@ struct FEXUnpackCacheCounters {
   uint64_t FlushWaitTicks;  // waiting for them
   uint64_t FlushDropTicks;  // dropping the batch afterwards
   uint64_t FlushFailures;
+  uint64_t FramesNoAheadRam;  // build 164: hits from read-ahead memory while frames came that asked for no read-ahead after them
+  uint64_t FramesNoAheadDisk; // ... and hits not in it that started none (FEX_UNPACK_CACHE_FRAMES_AHEAD=0)
 };
 extern struct FEXUnpackCacheCounters FEXUnpackCacheStats;
 

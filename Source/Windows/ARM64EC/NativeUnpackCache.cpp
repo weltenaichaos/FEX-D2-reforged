@@ -64,6 +64,17 @@ $end_info$
 // read-ahead goes PlayAheadChunks past a hit, as in play. Loading screens (no frames, or the loading screen detector's
 // light frames) keep the full cache.
 //
+// No read-ahead while frames come (FEX_UNPACK_CACHE_FRAMES_AHEAD, from build 164): with hits left to the game while frames
+// come (build 158), read-ahead during play only turned the game's own unpacking of a ~60 KB stream (~0.2 ms on a worker)
+// into a copy, and it read whole 1 MB chunks for that. In the build 163 run (multiplayer) it read 2,038 MB during play, 65%
+// never used, 45% of all storage reads in play. It came in bursts when the game streamed in an area: in the 20 play
+// seconds with 30 MB or more read ahead, storage read 71-154 MB a second (median), mostly this read-ahead, for ~13 MB a
+// second of hits it served, and frames of 40 ms or more came 18-43 times a minute, mostly with the main thread waiting for
+// the game's own lock (RtlAcquireSRWLockExclusive) while files were read, against once a minute in the 689 seconds without
+// read-ahead. At t=638 a 91 ms frame waited for that lock while storage read 177 MB, 117 MB of it read-ahead, 77 MB of that
+// never used. Now while frames are coming no hit, from memory or not, asks for read-ahead; chunks already in memory still
+// serve hits. Loading screens keep the full read-ahead. FEX_UNPACK_CACHE_FRAMES_AHEAD=1 reads ahead as build 163.
+//
 // Learned streams (FEX_UNPACK_CACHE_LEARN, from build 90): the same 105 ms frame also unpacked 7.6 MB itself (20.9 ms) for
 // streams that were stored but not in memory. The streams the main thread looks up in frames of play are much the same
 // every session (like its game file reads, see GameFiles.h build 89), so their places in data.bin (whole 64 KB blocks)
@@ -247,6 +258,8 @@ struct Cache {
   bool MainPlay {};
   // Build 158: no thread reads a hit from disk while frames are coming (FEX_UNPACK_CACHE_FRAMES).
   bool FramesPlay {};
+  // Build 164: read-ahead while frames are coming (FEX_UNPACK_CACHE_FRAMES_AHEAD; off for D2R).
+  bool FramesAhead {true};
   uint64_t WindowTicks {1};
   std::atomic<uint64_t> WindowStart {};
   std::atomic<uint32_t> WindowLookups {};
@@ -1207,8 +1220,11 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
     __atomic_fetch_add(&FEXUnpackCacheStats.PlayLookups, 1, __ATOMIC_RELAXED);
   }
   // Build 158: any thread while frames are coming, see FEX_UNPACK_CACHE_FRAMES above.
-  const bool Frames = C->FramesPlay && GameFiles::FramesComing();
-  const uint64_t Distance = Play || Frames ? PlayAheadChunks : AheadChunks;
+  const bool FramesNow = (C->FramesPlay || !C->FramesAhead) && GameFiles::FramesComing();
+  const bool Frames = C->FramesPlay && FramesNow;
+  // Build 164: nothing read ahead while frames are coming, see FEX_UNPACK_CACHE_FRAMES_AHEAD above.
+  const bool NoAhead = !C->FramesAhead && FramesNow;
+  const uint64_t Distance = NoAhead ? 0 : Play || Frames ? PlayAheadChunks : AheadChunks;
 
   Entry E;
   {
@@ -1241,6 +1257,9 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
   if (Ahead && CopyFromMemory(C, E, Out, Distance)) {
     const uint64_t Copied = ReadTicks();
     __atomic_fetch_add(&FEXUnpackCacheStats.RamHits, 1, __ATOMIC_RELAXED);
+    if (NoAhead) {
+      __atomic_fetch_add(&FEXUnpackCacheStats.FramesNoAheadRam, 1, __ATOMIC_RELAXED);
+    }
     __atomic_fetch_add(&FEXUnpackCacheStats.RamTicks, Copied - Now, __ATOMIC_RELAXED);
     Good = XXH3_64bits(Out, E.Produced) == E.OutputHash;
     Now = ReadTicks();
@@ -1275,7 +1294,9 @@ extern "C" int FEXUnpackCacheGet(const uint64_t Key[2], uint8_t* Out, uint32_t O
     }
   }
   if (!Good) {
-    if (Ahead) {
+    if (Ahead && NoAhead) {
+      __atomic_fetch_add(&FEXUnpackCacheStats.FramesNoAheadDisk, 1, __ATOMIC_RELAXED);
+    } else if (Ahead) {
       NoteDiskHit(C, E, Distance);
     }
     if (Play || (MainPlay && C->MainPlay) || Frames) {
@@ -1770,6 +1791,9 @@ bool Init(bool MD5Cache) {
   // Build 158, see the top of this file: the same for every thread.
   const char* FramesEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_FRAMES");
   C->FramesPlay = FramesEnv && FramesEnv[0] == '1' && GameFiles::Running();
+  // Build 164, see the top of this file: no read-ahead while frames come. Needs the frame clock like the rules above.
+  const char* FramesAheadEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_FRAMES_AHEAD");
+  C->FramesAhead = !(FramesAheadEnv && FramesAheadEnv[0] == '0' && GameFiles::Running());
   const char* LearnEnv = FEX::Windows::Switch("FEX_UNPACK_CACHE_LEARN");
   const uint64_t LearnMB = std::min<uint64_t>(LearnEnv && LearnEnv[0] ? strtoull(LearnEnv, nullptr, 10) : 0, 4096);
   fextl::string LearnNote;
@@ -1834,6 +1858,11 @@ bool Init(bool MD5Cache) {
                                                PlayAheadChunks * ChunkSize >> 20) :
                                              "unpack cache: other threads read hits from disk while frames come when lookups are many "
                                              "(FEX_UNPACK_CACHE_FRAMES=1 needs FEX_GAME_FILES_UNCACHED=1)");
+  FEX::Windows::StatsLogNote(!C->FramesAhead ? "unpack cache: build 164: nothing is read ahead while frames are coming (hits already in "
+                                               "read-ahead memory still come from there); loading screens keep the full read-ahead "
+                                               "(FEX_UNPACK_CACHE_FRAMES_AHEAD=1 reads ahead as build 163)" :
+                                               "unpack cache: read-ahead also while frames are coming, as build 163 (FEX_UNPACK_CACHE_FRAMES_AHEAD=0 "
+                                               "turns it off there; needs FEX_GAME_FILES_UNCACHED=1)");
   if (MD5Cache) {
     FEX::Windows::StatsLogNote(OpenMD5Cache(Dir, Reset));
   } else {
@@ -1913,11 +1942,12 @@ fextl::string StatsLine() {
                               fextl::string {},
                             MB(Waiting), D.Dropped, D.Failures, Size >> 20, WriterState.load(std::memory_order_relaxed),
                             TheCache->Full ? " full" : "", D.MD5Hits, D.MD5Lookups, MB(D.MD5HitBytes), Ms(D.MD5Ticks), D.MD5Stores);
-  if (D.MainPlaySkips || D.FramesSkips || D.LearnedHits || D.LearnedNotCached) {
+  if (D.MainPlaySkips || D.FramesSkips || D.LearnedHits || D.LearnedNotCached || D.FramesNoAheadRam || D.FramesNoAheadDisk) {
     Out += fextl::fmt::format("  ucache main thread in play: left to the game {}/{:.1f}MB | other threads while frames come (build 158): left to the "
-                              "game {}/{:.1f}MB | learned streams: from the file cache {}/{:.1f}ms, not there {}/{:.1f}ms\n",
+                              "game {}/{:.1f}MB | learned streams: from the file cache {}/{:.1f}ms, not there {}/{:.1f}ms | no read-ahead "
+                              "while frames come (build 164): hits from memory {}, not in memory {}\n",
                               D.MainPlaySkips, MB(D.MainPlaySkipBytes), D.FramesSkips, MB(D.FramesSkipBytes), D.LearnedHits, Ms(D.LearnedTicks),
-                              D.LearnedNotCached, Ms(D.LearnedNotCachedTicks));
+                              D.LearnedNotCached, Ms(D.LearnedNotCachedTicks), D.FramesNoAheadRam, D.FramesNoAheadDisk);
   }
   return Out + Learned::Line();
 }
