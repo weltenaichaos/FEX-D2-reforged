@@ -38,7 +38,7 @@ env:
   PROTON_REPO: GameNative/proton-wine
   PROTON_REF: f7c016668db739f563e3d4781c27ed085843d63a
   PROTON_VERSION: 11.0-1
-  D2R_TAG: d2r10
+  D2R_TAG: d2r11
   # Optimization of the unix side (ntdll.so, wineserver, win32u.so, winevulkan.so, ...).
   # GameNative's build script sets CFLAGS to warning flags only, so configure's default
   # "-g -O2" never applies and their stock packages run the whole unix side unoptimized
@@ -316,6 +316,8 @@ jobs:
             echo "- WINE_D2R_TIMER_REUSE=0: anonymous timers are closed and made new as in stock Wine (0010)"
             echo "- WINE_D2R_TIMER_LIFE_MS=<ms>: timer reuse window (default 10000; d2r9 had 100) (0012)"
             echo "- WINE_D2R_THREAD_TABLE=0: no wineserver thread table for FEX (0011)"
+            echo "- WINE_D2R_EVENT_LIFE_MS=<ms>: event reuse window (default 10000; d2r6-d2r10 had 10) (0013)"
+            echo "- WINE_D2R_SETUPAPI_FAST=0: device lists ask every device's installers on destroy and look up each class name, as in stock Wine (0014)"
             echo
             echo "Compiler warnings that point at undefined behaviour (list in share/wine/d2r-build-warnings.txt):"
             echo '```'

@@ -212,6 +212,25 @@ check_0012() {
   if [ "${n:-0}" -ge 1 ]; then ok 0012 "${NTSO#$LIB/} writes the export size 3,728"; else bad 0012 "${NTSO#$LIB/} never writes the export size 3,728"; fi
 }
 
+# 0013: event reuse window 10 s: its switch, and the window is a variable in ntdll.so's data
+# whose default is 10 s (d2r6-d2r10 had a 10 ms constant in the code and no such variable)
+check_0013() {
+  local v
+  if ascii_in "$NTSO" WINE_D2R_EVENT_LIFE_MS; then ok 0013 "${NTSO#$LIB/} reads WINE_D2R_EVENT_LIFE_MS"; else bad 0013 "${NTSO#$LIB/} lacks WINE_D2R_EVENT_LIFE_MS"; fi
+  v=$(python3 -I "$(dirname "$0")/elf-symbol-u64.py" "$NTSO" d2r_ev_life_ns 2>/dev/null)
+  if [ "$v" = 10000000000 ]; then ok 0013 "${NTSO#$LIB/} event reuse window defaults to 10 s"
+  else bad 0013 "${NTSO#$LIB/} event reuse window is '${v:-not a variable}' ns (want 10000000000)"; fi
+}
+
+# 0014: SetupAPI shortcuts for device lists (both PE builds of setupapi.dll read the switch;
+# stock has no such string)
+check_0014() {
+  local f
+  for f in "$LIB/aarch64-windows/setupapi.dll" "$LIB/i386-windows/setupapi.dll"; do
+    if ascii_in "$f" WINE_D2R_SETUPAPI_FAST; then ok 0014 "${f#$LIB/} reads WINE_D2R_SETUPAPI_FAST"; else bad 0014 "${f#$LIB/} lacks WINE_D2R_SETUPAPI_FAST"; fi
+  done
+}
+
 for p in "$PATCHES"/*.patch; do
   n=$(basename "$p"); n=${n%%-*}
   if declare -F "check_$n" >/dev/null; then "check_$n"; else bad "$n" "no check for $(basename "$p") in check-patches.sh"; fi

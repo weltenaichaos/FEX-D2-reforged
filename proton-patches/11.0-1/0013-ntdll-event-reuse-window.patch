@@ -1,0 +1,79 @@
+ntdll: event reuse window 10 s.
+
+Event reuse (0008) kept an anonymous event only when the thread that made it closed it
+within 10 ms. In b161 (Proton d2r10) D2R's AIO thread made about 970 events a second while
+the first area streamed in (t=44-45, with get_inproc_sync_fd ~955 and the close_handle of each
+event), and about 800 a second of them met every other rule but were closed later than 10 ms
+after they were made (ev_too_old). Those were the seconds with the run's last slow frames.
+
+As for timers in 0012, the window decides nothing about what is safe: the rules that do (made
+by NtCreateEvent with EVENT_ALL_ACCESS and plain attributes, closed by the thread that made
+it, never duplicated, given new handle flags, given to an I/O call, socket event select or
+change notification, never waited on by another thread) are the same at any age, and a reused
+event still gets its state from NtSetEvent / NtResetEvent in NtCreateEvent. The window only
+kept events that live long out of the pool. It is now 10 s, set with WINE_D2R_EVENT_LIFE_MS
+(1 to 3,600,000 ms; 10 gives d2r6-d2r10's behaviour). ev_too_old now counts events closed
+later than the window. Read once per process, with WINE_D2R_EVENT_REUSE.
+---
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index e7080f3..c7120aa 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -1121,7 +1121,7 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous
+  * protection thread: ~1,500 a second, never waited on), and every pair costs two
+  * wineserver round trips. An event that NtCreateEvent made without name, root directory,
+  * security descriptor or inherit flag, with EVENT_ALL_ACCESS, is noted as fresh. If the
+- * thread that made it closes it within D2R_EV_LIFE_NS, and nothing else can hold a
++ * thread that made it closes it within d2r_ev_life_ns, and nothing else can hold a
+  * reference to it (it was not duplicated, not given to an I/O call or socket event select,
+  * not waited on by another thread), NtClose keeps it open in a small pool instead. The next
+  * such NtCreateEvent of the same type takes it back and sets its state with NtSetEvent or
+@@ -1129,7 +1129,12 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous
+  * turns it off. */
+ #define D2R_EV_SLOTS   256                /* fresh events, by handle value */
+ #define D2R_EV_POOL    16                 /* kept events per type */
+-#define D2R_EV_LIFE_NS (10 * 1000000)
++/* patch 0013: 10 s instead of 10 ms (d2r6-d2r10). In b161, while the first area streamed in,
++ * D2R's AIO thread made ~970 events a second and ~800 of them met every other rule but were
++ * closed later than 10 ms after they were made (ev_too_old). As with timers (0012), the
++ * window decides nothing about what is safe; it only keeps events that live long out of the
++ * pool. WINE_D2R_EVENT_LIFE_MS (1 to 3,600,000) sets it; 10 gives the old behaviour. */
++static ULONG64 d2r_ev_life_ns = 10000 * (ULONG64)1000000;
+ 
+ struct d2r_ev_slot
+ {
+@@ -1190,6 +1195,12 @@ static BOOL d2r_ev_on(void)
+             on = 0;
+         }
+         else on = 1;
++        /* patch 0013: the reuse window */
++        if ((env = getenv( "WINE_D2R_EVENT_LIFE_MS" )))
++        {
++            unsigned long ms = strtoul( env, NULL, 10 );
++            if (ms >= 1 && ms <= 3600000) d2r_ev_life_ns = ms * (ULONG64)1000000;
++        }
+     }
+     return on;
+ }
+@@ -1603,7 +1614,7 @@ BOOL d2r_event_keep( HANDLE handle )
+     {
+         __atomic_store_n( &slot->handle, 0, __ATOMIC_RELAXED );
+         if (slot->tid != d2r_ev_tid()) counter = D2R_EV_OTHER_THREAD;
+-        else if (d2r_ev_now() - slot->born_ns >= D2R_EV_LIFE_NS) counter = D2R_EV_TOO_OLD;
++        else if (d2r_ev_now() - slot->born_ns >= d2r_ev_life_ns) counter = D2R_EV_TOO_OLD;
+         else if (d2r_ev_pooled[slot->manual] >= D2R_EV_POOL) counter = D2R_EV_POOL_FULL;
+         else
+         {
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 50f62ae..63ed86d 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -137,7 +137,7 @@ struct d2r_server_calls
+     ULONG64 ev_reused;        /* NtCreateEvent took a kept event back, no server call */
+     ULONG64 ev_shared;        /* fresh events left out: duplicated, given to I/O, waited on by another thread */
+     ULONG64 ev_other_thread;  /* closed by another thread than the one that made it */
+-    ULONG64 ev_too_old;       /* closed later than 10 ms after it was made */
++    ULONG64 ev_too_old;       /* closed later than the reuse window after it was made (10 ms until d2r10, 10 s since 0013) */
+     ULONG64 ev_pool_full;     /* closed while the pool for its type was full (ev_kept..ev_pool_full in this order) */
+     ULONG64 pad;
+     ULONG64 count[D2R_MAX_REQUESTS];    /* by enum request */

@@ -1,0 +1,173 @@
+setupapi: fewer registry round trips when device lists are made and destroyed.
+
+In b161 (Proton d2r10) one D2R thread (tid 764, unnamed, game code) made a list of the HID
+device interfaces with SetupDiGetClassDevs and destroyed it again twice a second for the whole
+run: exactly 70 key opens and 54 value reads a second, every second (FEX's registry notes).
+That is 35 opens and 27 value reads per list of 3 devices, which is what Wine's SetupAPI code
+does for 3 present interfaces: 2 opens for the interface class, 7 opens and 6 value reads per
+device to add it, and 4 opens and 3 value reads per device to destroy it. xinput's HID thread
+(wine_xinput_hid_update) does the same for its one device when no report came for 2 s: 13
+opens and 9 value reads (2 + 7 + 4, 6 + 3). By the code, each list of 3 also costs 16 key
+creates, 12 value writes and 48 closes: about 300 wineserver requests a second.
+
+Two parts of that are repeat work whose answer can't change:
+- Destroying a device asks its installers to free their private data (DIF_DESTROYPRIVATEDATA):
+  CoDeviceInstallers (not found), the driver key and its CoInstallers32 (not found), the class
+  key and its Installer32 (not found), for each device every time. An installer only has
+  private data for a device it was called for in this set, so the call is now made only for a
+  device that SetupDiCallClassInstaller ran for. An app that installs drivers calls the
+  installers first and still gets it.
+- Every device added looks up its class name (Control\Class, the class key, the Class value).
+  While one SetupDiGetClassDevs call fills a list it made itself, devices of the same class
+  share the first lookup. The name is kept only during that call, and only after a lookup
+  that worked.
+
+Per list of 3: 16 opens, 11 value reads, 3 creates and 16 closes fewer (46 of ~150
+requests, ~90 a second for D2R's thread). FEX's registry line should show 190 opens and 160 value
+reads per 5 s for tid 764 instead of 350 and 270. WINE_D2R_SETUPAPI_FAST=0 turns both off.
+
+Tests: model test (/home/claude/pw/satest, the patch's own function text with mocked
+registry lookups): 500 seeds x 200 lists with random classes, registry changes between lists
+and lists given back as deviceset, 0 differences in the class names written, lookups and
+destroy calls as expected; switch 0/1 read once; negative controls (cache kept after the call,
+installer call not noted) caught with 808 and 500 differences.
+---
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+index bd1f2c6..f567735 100644
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -89,6 +89,11 @@ struct DeviceInfoSet
+     GUID ClassGuid;
+     HWND hwndParent;
+     struct list devices;
++    /* patch 0014: class name lookups shared by the devices one SetupDiGetClassDevs call adds */
++    BOOL d2r_name_cache;    /* on while that call enumerates into a set it made */
++    BOOL d2r_name_valid;
++    GUID d2r_name_class;
++    WCHAR d2r_name[MAX_CLASS_NAME_LEN];
+ };
+ 
+ struct device
+@@ -106,8 +111,40 @@ struct device
+     struct driver        *drivers;
+     unsigned int          driver_count;
+     struct driver        *selected_driver;
++    BOOL                  d2r_installer_called; /* patch 0014: SetupDiCallClassInstaller ran for it */
+ };
+ 
++/* patch 0014: fewer registry round trips when device lists are made and destroyed.
++ *
++ * In b161 a D2R thread made a list of 3 HID device interfaces and destroyed it again twice a
++ * second for the whole run: 35 key opens and 27 value reads each time (FEX's registry notes)
++ * and, by the code, 16 key creates, 12 value writes and 48 closes, each a wineserver request
++ * (~300 a second). Two parts of that repeat work whose answer can't change:
++ * - Destroying the list asks every device's installers to free their private data
++ *   (DIF_DESTROYPRIVATEDATA): 4 key opens, 3 value reads, a key create and 4 closes per
++ *   device to find out that there are none. An installer only has private data for a device
++ *   it was called for in this set, so the call is now made only for a device that
++ *   SetupDiCallClassInstaller ran for (an app that installs drivers still gets it).
++ * - Every device added looks up its class name (2 key opens, a value read, 2 closes). While
++ *   one SetupDiGetClassDevs call fills a list it made, devices of the same class share the
++ *   first lookup. The name is used for nothing else and kept only for that call.
++ * WINE_D2R_SETUPAPI_FAST=0 turns both off. */
++static BOOL d2r_setupapi_fast(void)
++{
++    static LONG state; /* 0 not read yet, 1 on, 2 off */
++    LONG s = state;
++
++    if (!s)
++    {
++        char value[16];
++        DWORD len = GetEnvironmentVariableA("WINE_D2R_SETUPAPI_FAST", value, sizeof(value));
++
++        s = (len && len < sizeof(value) && value[0] == '0') ? 2 : 1;
++        state = s;
++    }
++    return s == 1;
++}
++
+ struct device_iface
+ {
+     WCHAR           *refstr;
+@@ -810,7 +847,9 @@ static void delete_device(struct device *device)
+ 
+     device_data.cbSize = sizeof(device_data);
+     copy_device_data(&device_data, device);
+-    SetupDiCallClassInstaller(DIF_DESTROYPRIVATEDATA, device->set, &device_data);
++    /* patch 0014: no installer ran for this device, so none has private data to free */
++    if (device->d2r_installer_called || !d2r_setupapi_fast())
++        SetupDiCallClassInstaller(DIF_DESTROYPRIVATEDATA, device->set, &device_data);
+ 
+     if (device->phantom)
+     {
+@@ -831,6 +870,24 @@ static void delete_device(struct device *device)
+     free(device);
+ }
+ 
++/* patch 0014: the class name, looked up once per class while SetupDiGetClassDevs fills a list */
++static BOOL d2r_class_name(struct DeviceInfoSet *set, const GUID *class, WCHAR *name, DWORD size)
++{
++    if (!set->d2r_name_cache || size != ARRAY_SIZE(set->d2r_name))
++        return SetupDiClassNameFromGuidW(class, name, size, NULL);
++    if (set->d2r_name_valid && IsEqualGUID(&set->d2r_name_class, class))
++    {
++        memcpy(name, set->d2r_name, sizeof(set->d2r_name));
++        return TRUE;
++    }
++    if (!SetupDiClassNameFromGuidW(class, name, size, NULL))
++        return FALSE;
++    set->d2r_name_class = *class;
++    memcpy(set->d2r_name, name, sizeof(set->d2r_name));
++    set->d2r_name_valid = TRUE;
++    return TRUE;
++}
++
+ /* Create a new device, or return a device already in the set. */
+ static struct device *create_device(struct DeviceInfoSet *set,
+     const GUID *class, const WCHAR *instanceid, BOOL phantom)
+@@ -884,7 +941,7 @@ static struct device *create_device(struct DeviceInfoSet *set,
+     SETUPDI_SetDeviceRegistryPropertyW(device, SPDRP_CLASSGUID,
+         (const BYTE *)guidstr, sizeof(guidstr));
+ 
+-    if (SetupDiClassNameFromGuidW(class, class_name, ARRAY_SIZE(class_name), NULL))
++    if (d2r_class_name(set, class, class_name, ARRAY_SIZE(class_name)))
+     {
+         size = (lstrlenW(class_name) + 1) * sizeof(WCHAR);
+         SETUPDI_SetDeviceRegistryPropertyW(device, SPDRP_CLASS, (const BYTE *)class_name, size);
+@@ -1523,6 +1580,8 @@ SetupDiCreateDeviceInfoListExW(const GUID *ClassGuid,
+ 
+     list->magic = SETUP_DEVICE_INFO_SET_MAGIC;
+     list->hwndParent = hwndParent;
++    list->d2r_name_cache = FALSE;
++    list->d2r_name_valid = FALSE;
+     memcpy(&list->ClassGuid,
+             ClassGuid ? ClassGuid : &GUID_NULL,
+             sizeof(list->ClassGuid));
+@@ -2742,6 +2801,9 @@ HDEVINFO WINAPI SetupDiGetClassDevsExW(const GUID *class, PCWSTR enumstr, HWND p
+         set = SetupDiCreateDeviceInfoListExW((flags & DIGCF_DEVICEINTERFACE) ? NULL : class, parent, machine, reserved);
+     if (set != INVALID_HANDLE_VALUE)
+     {
++        struct DeviceInfoSet *made = deviceset ? NULL : set; /* patch 0014 */
++
++        if (made) made->d2r_name_cache = d2r_setupapi_fast();
+         if (machine && *machine)
+             FIXME("%s: unimplemented for remote machines\n",
+                     debugstr_w(machine));
+@@ -2749,6 +2811,7 @@ HDEVINFO WINAPI SetupDiGetClassDevsExW(const GUID *class, PCWSTR enumstr, HWND p
+             SETUPDI_EnumerateInterfaces(set, class, enumstr, flags);
+         else
+             SETUPDI_EnumerateDevices(set, class, enumstr, flags);
++        if (made) made->d2r_name_cache = made->d2r_name_valid = FALSE;
+     }
+     return set;
+ }
+@@ -4304,6 +4367,9 @@ BOOL WINAPI SetupDiCallClassInstaller(DI_FUNCTION function, HDEVINFO devinfo, SP
+     if (!(device = get_device(devinfo, device_data)))
+         return FALSE;
+ 
++    /* patch 0014: from now on its installers may hold private data for it */
++    if (function != DIF_DESTROYPRIVATEDATA) device->d2r_installer_called = TRUE;
++
+     if (!RegOpenKeyExW(HKEY_LOCAL_MACHINE, class_coinst_pathW, 0, KEY_READ, &coinst_key))
+     {
+         SETUPDI_GuidToString(&device->class, guidstr);
