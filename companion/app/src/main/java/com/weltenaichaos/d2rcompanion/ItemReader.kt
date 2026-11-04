@@ -276,7 +276,8 @@ class ItemReader(ctx: android.content.Context) {
         val (q, share) = colorOf(bmp, box)
         val glyphs = D2RWords.fixGlyphs(text)
         // A line without numbers may be an item name: take the known name as is.
-        if (glyphs.none { it.isDigit() }) {
+        // (A digit inside a word is a misread letter, "PT1@N", not a number.)
+        if (!Regex("(?<!\\p{L})\\d+(?!\\p{L})").containsMatchIn(glyphs)) {
             val m = db.match(glyphs)
             if (m != null && m.wholeLine) return TextLine(m.entry.name, box, q, share, text, m)
             if (m != null) return TextLine(D2RWords.gameCase(words.fix(glyphs)), box, q, share, text, m)
