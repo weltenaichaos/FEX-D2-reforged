@@ -29,6 +29,32 @@
             android:layout_height="wrap_content" android:text="Save shot" />
     </LinearLayout>
 
+    <TextView
+        android:id="@+id/runStats"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:textColor="#FFE0C060"
+        android:textSize="16sp"
+        android:text="Run counter starts with Watch for drops" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button android:id="@+id/btnRunPlus" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="wrap_content" android:text="+1 run" />
+        <Button android:id="@+id/btnRunMinus" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="wrap_content" android:text="-1 run" />
+        <Button android:id="@+id/btnGap" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="wrap_content" android:text="Run gap 15 s" />
+        <Button android:id="@+id/btnUndo" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="wrap_content" android:text="Undo last drop" />
+        <Button android:id="@+id/btnHistory" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="wrap_content" android:text="Drop history" />
+    </LinearLayout>
+
     <Switch
         android:id="@+id/swAuto"
         android:layout_width="match_parent"

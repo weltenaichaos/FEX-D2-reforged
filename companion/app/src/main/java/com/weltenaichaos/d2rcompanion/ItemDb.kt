@@ -45,6 +45,17 @@ class ItemDb(ctx: Context) {
         baseByName = bases.associateBy { it.key }
     }
 
+    /**
+     * Misreads allowed for a whole-line name. Short names get far less room:
+     * one wrong letter in "Sling" is already 20% of it ("Sling" was logged
+     * from other text in build 13). O-lookalikes cost 0.2, so they still pass.
+     */
+    private fun wholeLimit(len: Int, maxScore: Float): Float = when {
+        len <= 5 -> 0.45f
+        len <= 8 -> minOf(0.9f, len * maxScore)
+        else -> len * maxScore
+    }
+
     /** The base item entry for a name ("Giant Sword"). */
     fun base(name: String): Entry? = baseByName[name.lowercase(Locale.ROOT)]
 
@@ -54,15 +65,18 @@ class ItemDb(ctx: Context) {
      * score = weighted misreads per letter, 0 = exact.
      */
     fun match(line: String, maxScore: Float = 0.22f): Match? {
-        val text = line.lowercase(Locale.ROOT).trim()
+        val text = line.lowercase(Locale.ROOT).trim().trimEnd(',', '.', ';', ':', '\'', '"').trim()
         if (text.length < 3 || text.count { it.isLetter() } < 3) return null
         var best: Match? = null
         for (e in entries) {
-            if (kotlin.math.abs(e.key.length - text.length) > e.key.length * maxScore + 2) continue
-            val limit = e.key.length * maxScore
+            // The crossed O often isn't read at all ("LNG Bw" = Long Bow): each O
+            // in the name may go missing on top of the limit.
+            val limit = wholeLimit(e.key.length, maxScore) + 0.5f * e.key.count { it == 'o' }
+            if (kotlin.math.abs(e.key.length - text.length) > limit + 1) continue
             val d = Fuzzy.dist(text, e.key, limit)
+            if (d > limit) continue
             val s = d / e.key.length
-            if (s <= maxScore && (best == null || s < best.score)) best = Match(e, s, true)
+            if (best == null || s < best.score) best = Match(e, s, true)
         }
         if (best != null) return best
 
