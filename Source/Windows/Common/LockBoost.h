@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include <FEXCore/fextl/string.h>
+#include <FEXCore/Utils/WritePriorityMutex.h>
 
 namespace FEX::Windows::LockBoost {
 // Build 156 (FEX_LOCK_BOOST=<ms>, D2R default 4, 0 = off): a thread that holds FEX's code lock or memory lock for this
@@ -20,7 +21,12 @@ constexpr uint32_t KindMemoryLock = 2; // FEX's memory/SMC lock (ThreadCreationM
 // take either lock; before the locks' SetBoostKind. Returns whether it is on.
 bool Init();
 
-// The stats log's note at the start, and its per-second line ("" when nothing was raised that second).
+// Build 165: the code lock's and the memory lock's owner slots (WritePriorityMutex / MemoryLock GetBoostSlot), so that
+// Line() also names an owner that has held its lock 1 s or more. After Init, in ProcessInit.
+void WatchOwners(const FEXCore::Utils::WritePriorityMutex::BoostSlot* CodeLock, const FEXCore::Utils::WritePriorityMutex::BoostSlot* MemoryLock);
+
+// The stats log's note at the start, and its per-second lines ("" when nothing was raised that second and no lock is
+// held 1 s or more).
 fextl::string Note();
 fextl::string Line();
 

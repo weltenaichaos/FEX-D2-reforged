@@ -472,6 +472,11 @@ public:
   void SetBoostKind(uint32_t Kind) {
     BoostKind = LockBoost ? Kind : 0;
   }
+
+  // Build 165: the exclusive owner and since when, for the stats log's held-too-long note (kept only with a BoostKind).
+  const BoostSlot& GetBoostSlot() const {
+    return Boost;
+  }
 #endif
 
 #if !defined(_WIN32)

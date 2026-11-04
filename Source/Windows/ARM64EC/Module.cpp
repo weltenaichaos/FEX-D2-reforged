@@ -274,6 +274,11 @@ public:
     Boosting = FEXCore::Utils::WritePriorityMutex::KernelFutex && FEXCore::Utils::WritePriorityMutex::LockBoost && Kind;
   }
 
+  // Build 165: the owner and since when, for the stats log's held-too-long note (kept only while Boosting).
+  const FEXCore::Utils::WritePriorityMutex::BoostSlot& GetBoostSlot() const {
+    return Boost;
+  }
+
 private:
   std::atomic<uint32_t> State {};
   std::atomic<uint32_t> Owner {};
@@ -1269,7 +1274,21 @@ public:
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
-    InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+    // Build 165: called from translated code (a self-checking block found its bytes changed) with Wine's memory
+    // callbacks still on and without the memory/SMC lock. The invalidation takes the code lock exclusively and then
+    // resets each affected thread's call-return stack with VirtualFree/VirtualAlloc; with the callbacks on, Wine calls
+    // NotifyMemoryFree for that, which takes the memory/SMC lock and then the code lock again, which this thread already
+    // holds, so it waited forever (b164 run, t=4817: the run's one self-check failure, then no frames). Turn the
+    // callbacks off as every other invalidation runs (Wine's own notifications, the fault handler), and take the
+    // memory/SMC lock first: the same order as those paths, and the thread list read below is guarded by it.
+    auto* CPUArea = GetCPUArea().Area;
+    const bool PrevCallback = CPUArea->InSyscallCallback;
+    CPUArea->InSyscallCallback = true;
+    {
+      std::scoped_lock Lock(ThreadCreationMutex);
+      InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+    }
+    CPUArea->InSyscallCallback = PrevCallback;
   }
 
   bool IsFullSMCRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
@@ -1410,6 +1429,8 @@ NTSTATUS ProcessInit() {
   if (FEX::Windows::LockBoost::Init()) {
     CTX->GetCodeInvalidationMutex().SetBoostKind(FEX::Windows::LockBoost::KindCodeLock);
     ThreadCreationMutex.SetBoostKind(FEX::Windows::LockBoost::KindMemoryLock);
+    // Build 165: a lock held 1 s or more is named in the stats log.
+    FEX::Windows::LockBoost::WatchOwners(&CTX->GetCodeInvalidationMutex().GetBoostSlot(), &ThreadCreationMutex.GetBoostSlot());
   }
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);

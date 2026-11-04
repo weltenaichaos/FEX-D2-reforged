@@ -101,6 +101,10 @@ namespace {
 
   Pending Pendings[Kinds];
   KindStats Stats[Kinds];
+  // Build 165: owner slots of the two locks, for the held-too-long line. In the b164 run a thread held the code lock
+  // from t=4817 to the end (it waited for that same lock again), and only a raise with no end showed it.
+  const FEXCore::Utils::WritePriorityMutex::BoostSlot* Watched[Kinds] {};
+  constexpr uint64_t HeldLongNs = 1'000'000'000;
   uint64_t AfterMs {};
   uint64_t ShownRaises[Kinds] {};
   uint64_t ShownFailures[Kinds] {};
@@ -177,6 +181,11 @@ bool Init() {
   return true;
 }
 
+void WatchOwners(const FEXCore::Utils::WritePriorityMutex::BoostSlot* CodeLock, const FEXCore::Utils::WritePriorityMutex::BoostSlot* MemoryLock) {
+  Watched[KindCodeLock] = CodeLock;
+  Watched[KindMemoryLock] = MemoryLock;
+}
+
 fextl::string Note() {
   if (!FEXCore::Utils::WritePriorityMutex::LockBoost) {
     return fextl::fmt::format("lock boost: off (FEX_LOCK_BOOST={}{})", AfterMs,
@@ -185,7 +194,8 @@ fextl::string Note() {
   return fextl::fmt::format("lock boost: a thread that holds FEX's code lock or memory lock {} ms or more while another thread "
                             "waits for it runs at nice {} until it lets go, then at its own nice again (build 156; "
                             "'lock boost' line in seconds with a raise: holder, how long it held the lock, and its state and CPU "
-                            "when raised, R = ready or running, S/D = blocked; FEX_LOCK_BOOST=0 turns it off)",
+                            "when raised, R = ready or running, S/D = blocked; FEX_LOCK_BOOST=0 turns it off); build 165: "
+                            "'locks held 1 s or more now' names an owner holding either lock that long, every second",
                             AfterMs, RaisedNice);
 }
 
@@ -239,6 +249,38 @@ fextl::string Line() {
       Out += fextl::fmt::format(", {} raises failed (error {})", NewFailures, -S.Error.load(std::memory_order_relaxed));
     }
   }
-  return Out.empty() ? Out : Out + "\n";
+  if (!Out.empty()) {
+    Out += "\n";
+  }
+
+  // Build 165: an owner that has held its lock 1 s or more now (every second while it does). Only raw Linux reads, so
+  // this line still comes while other threads wait for either lock.
+  fextl::string Held;
+  for (uint32_t K = 1; K < Kinds; ++K) {
+    const auto* Slot = Watched[K];
+    if (!Slot) {
+      continue;
+    }
+    const int Tid = Slot->OwnerTid.load(std::memory_order_seq_cst);
+    if (!Tid) {
+      continue;
+    }
+    const uint64_t Since = Slot->OwnerSince.load(std::memory_order_relaxed);
+    const uint64_t Now = FEXCore::Utils::SpinWaitLock::GetCycleCounter();
+    const uint64_t HeldNs = Now > Since ? FEXCore::Utils::WritePriorityMutex::BoostSlot::TicksToNs(Now - Since) : 0;
+    // A hold that ended while this read (owner changed or let go) is left out.
+    if (HeldNs < HeldLongNs || Slot->OwnerTid.load(std::memory_order_seq_cst) != Tid) {
+      continue;
+    }
+    char State;
+    int Cpu;
+    ReadTaskState(Tid, State, Cpu);
+    Held += fextl::fmt::format("{}{} held {:.1f} s by {} {} ({} on cpu {}, nice {})", Held.empty() ? "" : " | ", Names[K],
+                               static_cast<double>(HeldNs) / 1e9, Tid, ThreadName(Tid), State, Cpu, Linux::GetNice(Tid));
+  }
+  if (!Held.empty()) {
+    Out += fextl::fmt::format("  locks held 1 s or more now (build 165): {}\n", Held);
+  }
+  return Out;
 }
 } // namespace FEX::Windows::LockBoost
