@@ -6,6 +6,7 @@ import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.util.Locale
 
 /** D2R text colors, used to tell item quality from a line of text. */
 enum class Quality(val label: String, val r: Int, val g: Int, val b: Int, val argb: Int) {
@@ -28,6 +29,8 @@ data class TextLine(
     val raw: String = text,
     /** The known D2R item this line names, if any. */
     val item: ItemDb.Match? = null,
+    /** How the line was corrected beyond plain reading, for the log. */
+    val note: String = "",
 )
 
 class ItemReader(ctx: android.content.Context) {
@@ -67,7 +70,83 @@ class ItemReader(ctx: android.content.Context) {
         // found stays (build 5 dropped lines the 2x read missed).
         out.removeAll { o -> sharpLines.any { s -> overlapsMostly(o.box, s.box) } }
         out.addAll(sharpLines)
+
+        // Lines whose numbers came out broken get a second read on their own, 4x.
+        for (i in out.indices) {
+            val l = out[i]
+            if (!Rect.intersects(l.box, crop) || !numbersBroken(l.text)) continue
+            val again2 = rereadLine(bmp, l.box) ?: continue
+            val nl = makeLine(again2, bmp, l.box)
+            if (!numbersBroken(nl.text)) out[i] = nl.copy(raw = l.raw, note = "re-read 4x: $again2")
+        }
+        workOutDamage(out, crop)
         return out
+    }
+
+    private fun numbersBroken(t: String): Boolean {
+        val l = t.lowercase(Locale.ROOT)
+        if ('|' in t) return true
+        if ("damage:" in l && !Regex("damage: \\d+ to \\d+").containsMatchIn(l)) return true
+        if ("durability:" in l && !Regex("durability: \\d+ of \\d+").containsMatchIn(l)) return true
+        if ((l.startsWith("required") || l.startsWith("defense:")) && !Regex(": \\d+\\s*$").containsMatchIn(l)) return true
+        return false
+    }
+
+    private fun rereadLine(bmp: Bitmap, box: Rect): String? {
+        val pad = maxOf(4, box.height() / 3)
+        val r = Rect(box.left - pad * 2, box.top - pad, box.right + pad * 2, box.bottom + pad)
+        if (!r.intersect(0, 0, bmp.width, bmp.height)) return null
+        val part = Bitmap.createBitmap(bmp, r.left, r.top, r.width(), r.height())
+        val big = clean(Bitmap.createScaledBitmap(part, part.width * 4, part.height * 4, true))
+        val res = Tasks.await(recognizer.process(InputImage.fromBitmap(big, 0)))
+        val lines = res.textBlocks.flatMap { it.lines }.sortedBy { it.boundingBox?.left ?: 0 }
+        if (lines.isEmpty()) return null
+        return lines.joinToString(" ") { it.text }
+    }
+
+    /**
+     * Weapon damage follows from the base item and enhanced damage:
+     * Giant Sword 9-28 with +86% = 16 to 52. A line read with numbers missing
+     * gets them worked out; one that matches is confirmed.
+     */
+    private fun workOutDamage(lines: MutableList<TextLine>, tip: Rect) {
+        val tl = lines.filter { Rect.intersects(it.box, tip) }.sortedBy { it.box.top }
+        var base: ItemDb.Entry? = null
+        for (l in tl) {
+            val e = l.item?.entry ?: continue
+            val b = if (e.kind == ItemDb.Kind.BASE) e else db.base(e.base)
+            if (b != null && b.damage.isNotEmpty()) { base = b; break }
+        }
+        val b = base ?: return
+        val all = tl.joinToString("\n") { it.text.lowercase(Locale.ROOT) }
+        // Flat damage bonuses change the numbers in ways we don't model.
+        if (Regex("to (maximum|minimum) damage|adds \\d+-\\d+ damage|damage \\(based on").containsMatchIn(all)) return
+        val ed = Regex("\\+(\\d+)% enhanced damage").find(all)?.groupValues?.get(1)?.toInt() ?: 0
+        val eth = "ethereal" in all
+        for (i in lines.indices) {
+            val l = lines[i]
+            if (!Rect.intersects(l.box, tip)) continue
+            val lo = l.text.lowercase(Locale.ROOT)
+            val (tag, label) = when {
+                lo.startsWith("one-hand damage") -> "1h" to "One-Hand"
+                lo.startsWith("two-hand damage") -> "2h" to "Two-Hand"
+                lo.startsWith("throw damage") -> "th" to "Throw"
+                else -> continue
+            }
+            val r = b.damage[tag] ?: continue
+            fun calc(v: Int): Int { val x = if (eth) v * 3 / 2 else v; return x * (100 + ed) / 100 }
+            val mn = calc(r.first)
+            val mx = calc(r.last)
+            val m = Regex("damage: (\\d+) to (\\d+)").find(lo)
+            val a = m?.groupValues?.get(1)?.toIntOrNull()
+            val z = m?.groupValues?.get(2)?.toIntOrNull()
+            val how = "${b.name} ${r.first}-${r.last}" + (if (ed > 0) " +$ed%" else "") + (if (eth) " ethereal" else "")
+            when {
+                a == mn && z == mx -> lines[i] = l.copy(note = (l.note + " checked: $how").trim())
+                m == null || a == mn || z == mx ->
+                    lines[i] = l.copy(text = "$label Damage: $mn to $mx", note = (l.note + " worked out: $how").trim())
+            }
+        }
     }
 
     private fun overlapsMostly(a: Rect, b: Rect): Boolean {

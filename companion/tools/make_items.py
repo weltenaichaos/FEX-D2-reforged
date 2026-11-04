@@ -2,7 +2,8 @@
 """Builds app/src/main/assets/items.tsv and words.txt from blizzhackers/d2data (MIT).
 
 Usage: make_items.py <d2data json dir> <out.tsv> [<words.txt>]
-Lines: kind<TAB>display name<TAB>base name   (kind = base, unique, set)
+Lines: kind<TAB>display name<TAB>base name<TAB>damage   (kind = base, unique, set;
+damage for weapon bases: 1h:min-max,2h:min-max,th:min-max)
 """
 import json, sys, os
 
@@ -25,14 +26,18 @@ for f in ('weapons', 'armor', 'misc'):
         if not name or name.startswith('Not used') or name.lower() == 'unused':
             continue
         code_name[it['code']] = name
-        rows.add(('base', name, name))
+        dmg = []
+        for tag, lo, hi in (('1h', 'mindam', 'maxdam'), ('2h', '2handmindam', '2handmaxdam'), ('th', 'minmisdam', 'maxmisdam')):
+            if f == 'weapons' and it.get(lo) and it.get(hi):
+                dmg.append(f"{tag}:{it[lo]}-{it[hi]}")
+        rows.add(('base', name, name, ','.join(dmg)))
 for kind, f, base_key in (('unique', 'uniqueitems', 'code'), ('set', 'setitems', 'item')):
     for it in load(f):
         idx = it.get('index')
         if not idx or not it.get(base_key):
             continue
         base = code_name.get(it[base_key], it.get('*ItemName', ''))
-        rows.add((kind, text(idx), base))
+        rows.add((kind, text(idx), base, ''))
 with open(out, 'w') as o:
     o.write('# from github.com/blizzhackers/d2data (MIT license), made by companion/tools/make_items.py\n')
     for r in sorted(rows):

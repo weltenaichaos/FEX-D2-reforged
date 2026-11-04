@@ -10,7 +10,14 @@ import java.util.Locale
  */
 class ItemDb(ctx: Context) {
     enum class Kind { BASE, UNIQUE, SET }
-    data class Entry(val kind: Kind, val name: String, val base: String, val key: String)
+    data class Entry(
+        val kind: Kind,
+        val name: String,
+        val base: String,
+        val key: String,
+        /** Weapon base damage by kind: "1h", "2h", "th" (throw). */
+        val damage: Map<String, IntRange> = emptyMap(),
+    )
     data class Match(val entry: Entry, val score: Float, val wholeLine: Boolean)
 
     private val entries: List<Entry>
@@ -24,12 +31,23 @@ class ItemDb(ctx: Context) {
                 val p = l.split('\t')
                 if (p.size < 3) continue
                 val kind = when (p[0]) { "unique" -> Kind.UNIQUE; "set" -> Kind.SET; else -> Kind.BASE }
-                list.add(Entry(kind, p[1], p[2], p[1].lowercase(Locale.ROOT)))
+                val dmg = HashMap<String, IntRange>()
+                for (d in p.getOrNull(3).orEmpty().split(',')) {
+                    val m = Regex("(\\w+):(\\d+)-(\\d+)").matchEntire(d) ?: continue
+                    dmg[m.groupValues[1]] = m.groupValues[2].toInt()..m.groupValues[3].toInt()
+                }
+                list.add(Entry(kind, p[1], p[2], p[1].lowercase(Locale.ROOT), dmg))
             }
         }
         entries = list
         bases = list.filter { it.kind == Kind.BASE }
+        baseByName = bases.associateBy { it.key }
     }
+
+    private val baseByName: Map<String, Entry>
+
+    /** The base item entry for a name ("Giant Sword"). */
+    fun base(name: String): Entry? = baseByName[name.lowercase(Locale.ROOT)]
 
     /**
      * Best item for a line of text: the whole line as a known name, or else a

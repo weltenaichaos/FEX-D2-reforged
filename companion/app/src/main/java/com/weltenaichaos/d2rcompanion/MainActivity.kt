@@ -236,7 +236,7 @@ class MainActivity : Activity() {
         for (l in lines.sortedWith(compareBy({ it.box.top / 8 }, { it.box.left }))) {
             append("${l.text}", l.quality.argb)
             val item = l.item?.entry?.let { e -> " ITEM ${e.kind.name.lowercase()}: ${e.name}" + (if (e.base != e.name) " / ${e.base}" else "") } ?: ""
-            val note = item + (if (l.raw != l.text) " read as: ${l.raw}" else "")
+            val note = item + (if (l.raw != l.text) " read as: ${l.raw}" else "") + (if (l.note.isNotEmpty()) " (${l.note})" else "")
             append("  [${l.quality.label} ${l.share}%]$note\n", 0xFF777777.toInt())
         }
     }
@@ -263,7 +263,7 @@ class MainActivity : Activity() {
                 val name = "d2r-shot-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
                 write("$name.png", "image/png") { os -> bmp.compress(Bitmap.CompressFormat.PNG, 100, os) }
                 val txt = lines.joinToString("\n") {
-                    "${it.text}\t${it.quality.label}\t${it.share}%\t${it.box.flattenToString()}\traw=${it.raw}\titem=${it.item?.entry?.name ?: ""}"
+                    "${it.text}\t${it.quality.label}\t${it.share}%\t${it.box.flattenToString()}\traw=${it.raw}\titem=${it.item?.entry?.name ?: ""}\tnote=${it.note}"
                 }
                 write("$name.txt", "text/plain") { os -> os.write(txt.toByteArray()) }
                 main.post { status.text = "Saved Download/D2RCompanion/$name.png and .txt" }
