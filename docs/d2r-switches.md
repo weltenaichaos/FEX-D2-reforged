@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 162, VKD3D fex41, Turnip fex17, frame generation layer 14, our Proton d2r11 (build 13). The build numbers in the
+State: FEX build 162, VKD3D fex42, Turnip fex17, frame generation layer 14, our Proton d2r11 (build 13). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -16,7 +16,7 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
   those, `0` means "nice 0", not off.
 - The logging version lists every switch with its value in the `# switches:` line near the top of the log. Built-in
   values are marked `(default)`.
-- VKD3D switches need our VKD3D (fex41), Turnip switches our Turnip (fex17), frame generation switches our layer. A
+- VKD3D switches need our VKD3D (fex42), Turnip switches our Turnip (fex17), frame generation switches our layer. A
   VKD3D switch does nothing when its matching `VKD3D_FEX_*` variable is already set.
 - If you changed any switch, say so when you report a problem.
 
@@ -117,6 +117,7 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `VKD3D_FEX_START_HITCH_SKIP` | on | Set directly (no FEX switch). Frames that would have come late anyway (loading screens, area changes, hitches) no longer keep frame start pacing at 0 for 8.5 s, and from fex39 neither do the frames around them or the first 10 s after a loading screen, so the lag after loads drops back sooner (VKD3D fex38-39). `1` = fex38 only. | `0` |
 | `VKD3D_FEX_START_SLOW_SKIP` | on (fex41) | Set directly (no FEX switch). One slow game frame that came late or nearly late with the hold-back on no longer keeps frame start pacing low for 8.5 s (lag 58-67 ms instead of ~50 for 10-17 s after it); it lowers the hold-back for ~2 s, and only a second one within 8.5 s keeps it low as before (VKD3D fex40). From fex41 also a lone frame that would allow (nearly) no hold-back at all, whatever was held back. | `0` (`1` = fex40) |
 | `VKD3D_FEX_START_ROOMY_MS` | `10` | Set directly (no FEX switch). Frames with this much room (ms) or more don't limit frame start pacing outside GPU-bound scenes: the room measured tops out at ~15 ms, so they held the hold-back low in steps for 11-17 s after a late frame (VKD3D fex41). 4-30. | `0` |
+| `VKD3D_FEX_START_CAP_MS` | `4` | Set directly (no FEX switch). After a frame comes late or nearly late with 24 ms or more held back (outside GPU-bound scenes), frame start pacing stays at least this many ms below that hold-back (not under 20 ms); the ceiling rises 1 ms per 450 frames (~15 s) without another. Above ~28 ms frames came late 5 times as often, and the hold-back kept climbing back there (VKD3D fex42). 1-15. | `0` (= fex41) |
 
 ## Turnip (graphics driver)
 
