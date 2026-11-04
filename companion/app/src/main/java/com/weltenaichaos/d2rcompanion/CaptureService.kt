@@ -23,8 +23,10 @@ import android.view.Display
 
 /**
  * Mirrors the main display (the Thor's top screen, where the game runs) into an
- * ImageReader. Nothing is copied until grab() is called, so it costs next to
- * nothing while idle. It only sees pixels, like a screenshot.
+ * ImageReader, but only while grab() runs: between reads the virtual display has
+ * no surface, so the compositor does no extra work for it and the game's GPU and
+ * memory are left alone (build 1 mirrored all the time, and the game crashed in
+ * loading screens). It only sees pixels, like a screenshot.
  */
 class CaptureService : Service() {
 
@@ -40,7 +42,6 @@ class CaptureService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var reader: ImageReader? = null
     private var thread: HandlerThread? = null
-    private var last: Bitmap? = null
 
     var width = 0
         private set
@@ -88,35 +89,44 @@ class CaptureService : Service() {
         reader = r
         virtualDisplay = p.createVirtualDisplay(
             "d2r-companion", width, height, resources.displayMetrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, handler
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, null, null, handler
         )
         instance = this
         return START_NOT_STICKY
     }
 
-    /** Latest frame of the game screen, or the previous one if nothing changed. */
+    /** One fresh frame of the game screen, or null if none came in time. */
     @Synchronized
     fun grab(): Bitmap? {
         val r = reader ?: return null
-        val until = SystemClock.uptimeMillis() + 600
-        while (true) {
-            val image = try { r.acquireLatestImage() } catch (e: Exception) { null }
-            if (image != null) {
-                try {
-                    val plane = image.planes[0]
-                    val rowPixels = plane.rowStride / plane.pixelStride
-                    val full = Bitmap.createBitmap(rowPixels, image.height, Bitmap.Config.ARGB_8888)
-                    full.copyPixelsFromBuffer(plane.buffer)
-                    val bmp = if (rowPixels == image.width) full
-                    else Bitmap.createBitmap(full, 0, 0, image.width, image.height)
-                    last = bmp
-                    return bmp
-                } finally {
-                    image.close()
+        val vd = virtualDisplay ?: return null
+        // Drop a frame left over from the last read.
+        try { r.acquireLatestImage()?.close() } catch (e: Exception) {}
+        vd.surface = r.surface
+        try {
+            val until = SystemClock.uptimeMillis() + 1500
+            SystemClock.sleep(40)
+            while (true) {
+                val image = try { r.acquireLatestImage() } catch (e: Exception) { null }
+                if (image != null) {
+                    try {
+                        val plane = image.planes[0]
+                        val rowPixels = plane.rowStride / plane.pixelStride
+                        val full = Bitmap.createBitmap(rowPixels, image.height, Bitmap.Config.ARGB_8888)
+                        full.copyPixelsFromBuffer(plane.buffer)
+                        if (rowPixels == image.width) return full
+                        val bmp = Bitmap.createBitmap(full, 0, 0, image.width, image.height)
+                        full.recycle()
+                        return bmp
+                    } finally {
+                        image.close()
+                    }
                 }
+                if (SystemClock.uptimeMillis() > until) return null
+                SystemClock.sleep(30)
             }
-            if (SystemClock.uptimeMillis() > until) return last
-            SystemClock.sleep(30)
+        } finally {
+            vd.surface = null
         }
     }
 

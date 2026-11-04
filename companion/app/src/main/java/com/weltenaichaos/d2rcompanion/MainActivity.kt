@@ -84,7 +84,7 @@ class MainActivity : Activity() {
         swAuto.setOnCheckedChangeListener { _, on ->
             main.removeCallbacks(autoTick)
             if (on) {
-                append("Watching for drops (unique, set, runes)\n", null)
+                append("Watching for drops (magic, rare, set, unique, runes)\n", null)
                 main.post(autoTick)
             }
         }
@@ -146,7 +146,7 @@ class MainActivity : Activity() {
                     return@execute
                 }
                 val t1 = SystemClock.elapsedRealtime()
-                val lines = reader.read(bmp)
+                val lines = reader.read(bmp, sharp = !auto)
                 val t2 = SystemClock.elapsedRealtime()
                 main.post {
                     lastShot = bmp
@@ -163,9 +163,9 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Item labels worth logging: magic, rare, set, unique and orange (runes, crafted). */
     private fun isDrop(l: TextLine): Boolean = when (l.quality) {
-        Quality.UNIQUE, Quality.SET -> true
-        Quality.ORANGE -> l.text.contains("rune", ignoreCase = true)
+        Quality.MAGIC, Quality.RARE, Quality.UNIQUE, Quality.SET, Quality.ORANGE -> l.share >= 40
         else -> false
     }
 
@@ -187,7 +187,8 @@ class MainActivity : Activity() {
         // Top to bottom, then left to right, as a tooltip reads.
         for (l in lines.sortedWith(compareBy({ it.box.top / 8 }, { it.box.left }))) {
             append("${l.text}", l.quality.argb)
-            append("  [${l.quality.label} ${l.share}%]\n", 0xFF777777.toInt())
+            val note = if (l.raw != l.text) " read as: ${l.raw}" else ""
+            append("  [${l.quality.label} ${l.share}%]$note\n", 0xFF777777.toInt())
         }
     }
 
@@ -213,7 +214,7 @@ class MainActivity : Activity() {
                 val name = "d2r-shot-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
                 write("$name.png", "image/png") { os -> bmp.compress(Bitmap.CompressFormat.PNG, 100, os) }
                 val txt = lines.joinToString("\n") {
-                    "${it.text}\t${it.quality.label}\t${it.share}%\t${it.box.flattenToString()}"
+                    "${it.text}\t${it.quality.label}\t${it.share}%\t${it.box.flattenToString()}\traw=${it.raw}"
                 }
                 write("$name.txt", "text/plain") { os -> os.write(txt.toByteArray()) }
                 main.post { status.text = "Saved Download/D2RCompanion/$name.png and .txt" }

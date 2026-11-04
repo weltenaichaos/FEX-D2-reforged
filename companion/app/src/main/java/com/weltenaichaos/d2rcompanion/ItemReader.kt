@@ -19,21 +19,59 @@ enum class Quality(val label: String, val r: Int, val g: Int, val b: Int, val ar
     RED("red", 255, 77, 77, 0xFFFF4D4D.toInt());
 }
 
-data class TextLine(val text: String, val box: Rect, val quality: Quality, val share: Int)
+data class TextLine(
+    val text: String,
+    val box: Rect,
+    val quality: Quality,
+    val share: Int,
+    /** What text recognition saw, before the D2R word fixes. */
+    val raw: String = text,
+)
 
 class ItemReader {
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
-    /** Blocking; call from a worker thread. */
-    fun read(bmp: Bitmap): List<TextLine> {
+    /**
+     * Blocking; call from a worker thread. With sharp = true the largest text
+     * block (the item tooltip) is cut out, scaled up 2x and read again, which
+     * helps a lot with the game's lowered render resolution.
+     */
+    fun read(bmp: Bitmap, sharp: Boolean): List<TextLine> {
         val result = Tasks.await(recognizer.process(InputImage.fromBitmap(bmp, 0)))
         val out = ArrayList<TextLine>()
         for (block in result.textBlocks) for (line in block.lines) {
             val box = line.boundingBox ?: continue
-            val (q, share) = colorOf(bmp, box)
-            out.add(TextLine(line.text, box, q, share))
+            out.add(makeLine(line.text, bmp, box))
         }
+        if (!sharp) return out
+
+        val tip = result.textBlocks.maxByOrNull { it.lines.size }?.boundingBox ?: return out
+        if (tip.width() < 40 || tip.height() < 20) return out
+        val pad = 16
+        val crop = Rect(tip.left - pad, tip.top - pad, tip.right + pad, tip.bottom + pad)
+        if (!crop.intersect(0, 0, bmp.width, bmp.height)) return out
+        val part = Bitmap.createBitmap(bmp, crop.left, crop.top, crop.width(), crop.height())
+        val big = Bitmap.createScaledBitmap(part, part.width * 2, part.height * 2, true)
+        val again = Tasks.await(recognizer.process(InputImage.fromBitmap(big, 0)))
+        val sharpLines = ArrayList<TextLine>()
+        for (block in again.textBlocks) for (line in block.lines) {
+            val b = line.boundingBox ?: continue
+            val box = Rect(crop.left + b.left / 2, crop.top + b.top / 2, crop.left + b.right / 2, crop.top + b.bottom / 2)
+            sharpLines.add(makeLine(line.text, bmp, box))
+        }
+        if (sharpLines.isEmpty()) return out
+        // Lines from the 2x read replace the first read's lines inside the tooltip.
+        out.removeAll { Rect.intersects(it.box, crop) }
+        out.addAll(sharpLines)
         return out
+    }
+
+    private fun makeLine(text: String, bmp: Bitmap, box: Rect): TextLine {
+        val (q, share) = colorOf(bmp, box)
+        // Only property lines (with a number) get word fixes; names stay as read.
+        val glyphs = D2RWords.fixGlyphs(text)
+        val fixed = if (glyphs.any { it.isDigit() } && q != Quality.UNIQUE && q != Quality.SET) D2RWords.fix(glyphs) else glyphs
+        return TextLine(fixed, box, q, share, text)
     }
 
     /**

@@ -34,7 +34,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textColor="#FFDDDDDD"
-        android:text="Watch for drops (scan every 2 s)" />
+        android:text="Watch for drops: blue, yellow, set, unique, runes (every 2 s)" />
 
     <ImageView
         android:id="@+id/shot"
