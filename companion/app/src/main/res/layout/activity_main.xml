@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="#FFC7B377"
+        android:textSize="15sp"
+        android:text="Not capturing" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="8dp">
+
+        <Button android:id="@+id/btnCapture" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="wrap_content" android:text="Start capture" />
+        <Button android:id="@+id/btnRead" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="wrap_content" android:text="Read now" />
+        <Button android:id="@+id/btnReadDelay" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="wrap_content" android:text="Read in 3 s" />
+        <Button android:id="@+id/btnSave" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="wrap_content" android:text="Save shot" />
+    </LinearLayout>
+
+    <Switch
+        android:id="@+id/swAuto"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="#FFDDDDDD"
+        android:text="Watch for drops (scan every 2 s)" />
+
+    <ImageView
+        android:id="@+id/shot"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:adjustViewBounds="true"
+        android:scaleType="fitCenter" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+        <TextView
+            android:id="@+id/log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#FFDDDDDD"
+            android:textSize="14sp"
+            android:fontFamily="monospace" />
+    </ScrollView>
+</LinearLayout>

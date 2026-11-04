@@ -1,0 +1,54 @@
+name: Build D2R Companion APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [d2r/clean, 'claude/**']
+    paths:
+      - companion/**
+      - .github/workflows/build-companion-apk.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+
+      - name: Build APK
+        working-directory: companion
+        env:
+          COMPANION_BUILD: ${{ github.run_number }}
+        run: gradle --no-daemon assembleRelease
+
+      - name: Package
+        run: |
+          mkdir out
+          cp companion/app/build/outputs/apk/release/app-release.apk "out/d2r-companion-${{ github.run_number }}.apk"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d2r-companion
+          path: out/*.apk
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="d2r-companion-${{ github.run_number }}"
+          gh release create "$TAG" out/*.apk \
+            --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "$TAG" --prerelease \
+            --notes "D2R Companion test app: captures the game screen (top screen) and reads item text with on-device text recognition. Pixels only: no game memory, no network traffic of the game."
