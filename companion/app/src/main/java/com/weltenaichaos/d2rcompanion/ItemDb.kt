@@ -49,6 +49,8 @@ class ItemDb(ctx: Context) {
         }
         if (best != null) return best
 
+        // Tooltip lines like "Spear Class - Very Slow Attack Speed" aren't names.
+        if (':' in text || " - " in text) return null
         val words = text.split(' ').filter { it.isNotEmpty() }
         for (e in bases) {
             val n = e.key.count { it == ' ' } + 1

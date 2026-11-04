@@ -87,12 +87,27 @@ class D2RWords(ctx: android.content.Context) {
             }
             if (o != null) sb.setCharAt(i, o)
         }
-        // "+||0" is "+110": bars and I/l inside a number are ones.
-        return NUMBER.replace(sb) { m ->
-            if (m.value.any { it.isDigit() } || m.range.first > 0 && sb[m.range.first - 1] == '+')
+        // "1" or "|" between letters is an I ("REQU1RED").
+        var t = Regex("(?<=\\p{L})[1|](?=\\p{L})").replace(sb) { m ->
+            if (sb[m.range.first - 1].isUpperCase()) "I" else "i"
+        }
+        // An O right after a digit is a zero ("6O" = 60).
+        t = Regex("(?<=\\d)[Oo@](?!\\p{L})").replace(t, "0")
+        // "Two- Hand" -> "Two-Hand"
+        t = Regex("(?<=\\p{L})-\\s+(?=\\p{L})").replace(t, "-")
+        // "+ 86%" -> "+86%"
+        t = Regex("\\+\\s+(?=[\\d|Il])").replace(t, "+")
+        // Bars and I/l before or in a number are ones, also when text
+        // recognition put spaces between them: "+ | |0" = +110, "T I 20" = to 120.
+        t = Regex("(?<=^|[\\s+\\-:(])([|Il](?:\\s?[|Il])*)\\s?(?=\\d)").replace(t) { m ->
+            "1".repeat(m.groupValues[1].count { it != ' ' })
+        }
+        return NUMBER.replace(t) { m ->
+            if (m.value.any { it.isDigit() } || m.range.first > 0 && t[m.range.first - 1] == '+')
                 m.value.replace('|', '1').replace('I', '1').replace('l', '1')
             else m.value
         }
+    }
     }
     }
 
@@ -105,7 +120,7 @@ class D2RWords(ctx: android.content.Context) {
             sb.append(line, last, m.range.first)
             val prevDigit = m.range.first > 0 && line[m.range.first - 1].isDigit()
             val w = fixWord(m.value)
-            if (prevDigit && w != m.value) sb.append(' ')
+            if (prevDigit && (w != m.value || w.length >= 2 && w.lowercase(Locale.ROOT) in SET)) sb.append(' ')
             sb.append(w)
             last = m.range.last + 1
         }
@@ -119,17 +134,25 @@ class D2RWords(ctx: android.content.Context) {
      */
     private fun joinSplitWords(line: String): String {
         val parts = line.split(' ').toMutableList()
+        fun letters(w: String) = w.trimEnd(':', ',', '.', ')', '%')
+        fun isWord(w: String) = w.isNotEmpty() && w.all { it.isLetter() }
+        fun knownJoin(a: String, b: String): Boolean {
+            val joined = (a + b).lowercase(Locale.ROOT)
+            return joined in SET || WORDS.any {
+                it.length >= 4 && kotlin.math.abs(it.length - joined.length) <= 1 && Fuzzy.dist(joined, it, 0.5f) <= 0.4f
+            }
+        }
         var i = 0
         while (i < parts.size - 1) {
             val a = parts[i]
-            val b = parts[i + 1]
-            if (a.isNotEmpty() && b.isNotEmpty() && a.all { it.isLetter() } && b.all { it.isLetter() }) {
-                val joined = (a + b).lowercase(Locale.ROOT)
-                val known = joined in SET || WORDS.any {
-                    it.length >= 4 && kotlin.math.abs(it.length - joined.length) <= 1 && Fuzzy.dist(joined, it, 0.5f) <= 0.4f
-                }
-                if (known && !(a.lowercase(Locale.ROOT) in SET && b.lowercase(Locale.ROOT) in SET)) {
-                    parts[i] = a + b
+            val b = letters(parts[i + 1])
+            if (isWord(a) && isWord(b)) {
+                val bothKnown = a.lowercase(Locale.ROOT) in SET && b.lowercase(Locale.ROOT) in SET
+                // A lone letter belongs to the word after it ("ATTACK S PEED" = Attack Speed).
+                val bToNext = b.length == 1 && i + 2 < parts.size &&
+                    isWord(letters(parts[i + 2])) && knownJoin(b, letters(parts[i + 2]))
+                if (!bothKnown && !bToNext && knownJoin(a, b)) {
+                    parts[i] = a + parts[i + 1]
                     parts.removeAt(i + 1)
                     continue
                 }
