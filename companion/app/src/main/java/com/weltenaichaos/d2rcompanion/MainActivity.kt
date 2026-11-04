@@ -262,6 +262,14 @@ class MainActivity : Activity() {
             try {
                 val name = "d2r-shot-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
                 write("$name.png", "image/png") { os -> bmp.compress(Bitmap.CompressFormat.PNG, 100, os) }
+                // Same shot with the text boxes the app found, in magenta.
+                val marked = bmp.copy(Bitmap.Config.ARGB_8888, true)
+                val c = android.graphics.Canvas(marked)
+                val p = android.graphics.Paint().apply {
+                    style = android.graphics.Paint.Style.STROKE; strokeWidth = 2f; color = 0xFFFF00FF.toInt()
+                }
+                for (r in reader.lastBoxes) c.drawRect(r, p)
+                write("$name-boxes.png", "image/png") { os -> marked.compress(Bitmap.CompressFormat.PNG, 100, os) }
                 val txt = lines.joinToString("\n") {
                     "${it.text}\t${it.quality.label}\t${it.share}%\t${it.box.flattenToString()}\traw=${it.raw}\titem=${it.item?.entry?.name ?: ""}\tnote=${it.note}"
                 }

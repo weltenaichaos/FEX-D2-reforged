@@ -38,39 +38,68 @@ class ItemReader(ctx: android.content.Context) {
     private val words = D2RWords(ctx)
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
+    /** Text boxes the last read found on the screen (for the saved shot). */
+    @Volatile var lastBoxes: List<Rect> = emptyList()
+        private set
+
     /**
-     * Blocking; call from a worker thread. With sharp = true the largest text
-     * block (the item tooltip) is cut out, scaled up 2x and read again, which
-     * helps a lot with the game's lowered render resolution.
+     * Blocking; call from a worker thread. First finds D2R's text boxes from
+     * the pixels (TextFinder). sharp = true (Read now): the item tooltip is cut
+     * out, enlarged 2x and read; without a tooltip the whole screen is read as
+     * before. sharp = false (watch): only the label boxes are read, enlarged and
+     * put together into one picture, so one cheap read covers all of them.
      */
     fun read(bmp: Bitmap, sharp: Boolean): List<TextLine> {
+        val found = TextFinder.find(bmp)
+        lastBoxes = found
+        val tip = TextFinder.tooltip(found)
+        if (!sharp) return readLabels(bmp, found.filter { tip == null || !Rect.intersects(it, tip) })
+        if (tip != null) {
+            val pad = maxOf(12, bmp.height / 90)
+            val crop = Rect(tip.left - pad, tip.top - pad, tip.right + pad, tip.bottom + pad)
+            if (crop.intersect(0, 0, bmp.width, bmp.height)) {
+                val out = readRegion(bmp, crop)
+                if (out.isNotEmpty()) return finishTooltip(bmp, out, crop)
+            }
+        }
+        return readFull(bmp)
+    }
+
+    /** Text in one part of the screen, enlarged 2x with the backdrop blacked out. */
+    private fun readRegion(bmp: Bitmap, crop: Rect): MutableList<TextLine> {
+        val part = Bitmap.createBitmap(bmp, crop.left, crop.top, crop.width(), crop.height())
+        val big = clean(Bitmap.createScaledBitmap(part, part.width * 2, part.height * 2, true))
+        val res = Tasks.await(recognizer.process(InputImage.fromBitmap(big, 0)))
+        val out = ArrayList<TextLine>()
+        for (block in res.textBlocks) for (line in block.lines) {
+            val b = line.boundingBox ?: continue
+            val box = Rect(crop.left + b.left / 2, crop.top + b.top / 2, crop.left + b.right / 2, crop.top + b.bottom / 2)
+            out.add(makeLine(line.text, bmp, box))
+        }
+        return out
+    }
+
+    /** Build 8's way: the whole screen, then the tooltip again at 2x. */
+    private fun readFull(bmp: Bitmap): List<TextLine> {
         val result = Tasks.await(recognizer.process(InputImage.fromBitmap(bmp, 0)))
         val out = ArrayList<TextLine>()
         for (block in result.textBlocks) for (line in block.lines) {
             val box = line.boundingBox ?: continue
             out.add(makeLine(line.text, bmp, box))
         }
-        if (!sharp) return out
-
         val tip = tooltipBox(out) ?: return out
         val pad = 16
         val crop = Rect(tip.left - pad, tip.top - pad, tip.right + pad, tip.bottom + pad)
         if (!crop.intersect(0, 0, bmp.width, bmp.height)) return out
-        val part = Bitmap.createBitmap(bmp, crop.left, crop.top, crop.width(), crop.height())
-        val big = clean(Bitmap.createScaledBitmap(part, part.width * 2, part.height * 2, true))
-        val again = Tasks.await(recognizer.process(InputImage.fromBitmap(big, 0)))
-        val sharpLines = ArrayList<TextLine>()
-        for (block in again.textBlocks) for (line in block.lines) {
-            val b = line.boundingBox ?: continue
-            val box = Rect(crop.left + b.left / 2, crop.top + b.top / 2, crop.left + b.right / 2, crop.top + b.bottom / 2)
-            sharpLines.add(makeLine(line.text, bmp, box))
-        }
+        val sharpLines = readRegion(bmp, crop)
         if (sharpLines.isEmpty()) return out
-        // The 2x read wins where both found a line; a line only the first read
-        // found stays (build 5 dropped lines the 2x read missed).
+        // The 2x read wins where both found a line; a line only the first read found stays.
         out.removeAll { o -> sharpLines.any { s -> overlapsMostly(o.box, s.box) } }
         out.addAll(sharpLines)
+        return finishTooltip(bmp, out, crop)
+    }
 
+    private fun finishTooltip(bmp: Bitmap, out: MutableList<TextLine>, crop: Rect): List<TextLine> {
         // Lines whose numbers came out broken get a second read on their own, 4x.
         for (i in out.indices) {
             val l = out[i]
@@ -80,6 +109,43 @@ class ItemReader(ctx: android.content.Context) {
             if (!numbersBroken(nl.text)) out[i] = nl.copy(raw = l.raw, note = "re-read 4x: $again2")
         }
         workOutDamage(out, crop)
+        return out
+    }
+
+    /** All label boxes in one picture, each enlarged 2x, read in one go. */
+    private fun readLabels(bmp: Bitmap, boxes: List<Rect>): List<TextLine> {
+        val crops = ArrayList<Rect>()
+        for (b in boxes) {
+            val p = maxOf(3, b.height() / 3)
+            val r = Rect(b.left - p, b.top - p, b.right + p, b.bottom + p)
+            if (r.intersect(0, 0, bmp.width, bmp.height)) crops.add(r)
+            if (crops.size >= 60) break
+        }
+        if (crops.isEmpty()) return emptyList()
+        val gap = 16
+        val mw = crops.maxOf { it.width() } * 2
+        val tops = IntArray(crops.size)
+        var mh = 0
+        for ((i, c) in crops.withIndex()) { tops[i] = mh; mh += c.height() * 2 + gap }
+        val mosaic = Bitmap.createBitmap(mw, mh, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(mosaic)
+        canvas.drawColor(android.graphics.Color.BLACK)
+        val paint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+        for ((i, c) in crops.withIndex()) {
+            canvas.drawBitmap(bmp, c, Rect(0, tops[i], c.width() * 2, tops[i] + c.height() * 2), paint)
+        }
+        val res = Tasks.await(recognizer.process(InputImage.fromBitmap(clean(mosaic), 0)))
+        val out = ArrayList<TextLine>()
+        for (block in res.textBlocks) for (line in block.lines) {
+            val b = line.boundingBox ?: continue
+            val cy = b.centerY()
+            var i = tops.indexOfLast { it <= cy }
+            if (i < 0) i = 0
+            val c = crops[i]
+            val box = Rect(c.left + b.left / 2, c.top + (b.top - tops[i]) / 2, c.left + b.right / 2, c.top + (b.bottom - tops[i]) / 2)
+            box.intersect(c)
+            out.add(makeLine(line.text, bmp, box))
+        }
         return out
     }
 
