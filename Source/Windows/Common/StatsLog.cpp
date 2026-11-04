@@ -2218,7 +2218,15 @@ namespace {
           SchedState::CallCount Calls[SchedState::FrameCallSlots];
           memcpy(Calls, F.Calls, sizeof(Calls));
           std::sort(std::begin(Calls), std::end(Calls), [](const auto& a, const auto& b) { return a.N > b.N; });
-          FrameText += fextl::fmt::format(" | {}/{} ({}):", FrameComms[f], F.Tid, F.Samples);
+          // Build 160: its CPU time and CPU wait this second, and its nice (FEX_PRESENT_THREADS).
+          fextl::string RunText;
+          for (const auto& R : Rows) {
+            if (R.Tid == F.Tid) {
+              RunText = fextl::fmt::format(" run+wait {:.1f}+{:.1f} ms nice {}", R.RunMs, R.WaitMs, R.Nice);
+              break;
+            }
+          }
+          FrameText += fextl::fmt::format(" | {}/{} ({}){}:", FrameComms[f], F.Tid, F.Samples, RunText);
           for (const auto& C : Calls) {
             if (C.N) {
               FrameText += fextl::fmt::format(" {} {}%", QueueCallName(C.Key), (C.N * 100 + F.Samples / 2) / F.Samples);

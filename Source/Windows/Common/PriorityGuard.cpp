@@ -1000,8 +1000,18 @@ namespace {
   // nice or better (never lowered: the layer's present thread runs at -20) and off the main thread's core while it is open.
   // Found by their Linux names (Wine passes VKD3D's thread names on, cut to 15 characters) every 2 s.
   constexpr size_t MaxFrameThreads = 16;
+  // Build 160: also Mesa's X11 present queue thread in GameNative's Vulkan wrapper ("WSI swapchain queue"), which sends
+  // every presented image on.
   constexpr const char* FrameThreadNames[] = {"vkd3d_queue",     "vkd3d_fence",     "vkd3d-fex-prese", "vkd3d-fex-start",
-                                              "vkd3d-fex-done",  "vkd3d-swapchain", "lsfg-present"};
+                                              "vkd3d-fex-done",  "vkd3d-swapchain", "lsfg-present",    "WSI swapchain q"};
+  // Build 160, FEX_PRESENT_THREADS: the threads that must run at a present's moment. With frame generation the layer lets
+  // the game's present go at the generated frame's slot: it sleeps until that slot on VKD3D's present thread
+  // (vkd3d-fex-present), and the generated frame is late by however long that thread then waits for a CPU. In the
+  // build 159 run it (nice -10) waited ~39 ms a second for a CPU while running ~9 ms, and in 39 of 169 calm seconds 5 or
+  // more generated frames came 1-6 ms late; the layer's own present thread (lsfg-present, nice -20, the same kind of
+  // wake-ups) waited ~3 ms a second. Kept at FEX_PRESENT_THREADS's nice or better like the frame threads (which keep
+  // them off the main thread's core too); the layer sets its own thread to -20 already.
+  constexpr const char* PresentThreadNames[] = {"vkd3d-fex-prese", "WSI swapchain q"};
   // Build 137, FEX_INPUT_THREADS: Wine's controller thread (xinput's wine_xinput_hid_update). The game's XInputGetState
   // takes a controller's lock, which that thread holds while it reads the controller's next report (ReadFile, a wineserver
   // call). At nice 0 on the game's cores, behind the main thread and the job workers, it waited for a CPU with the lock
@@ -1041,6 +1051,7 @@ namespace {
   FrameThreadKeeper* FrameThreads {};
   FrameThreadKeeper* InputThreads {};
   FrameThreadKeeper* SteamThreads {};
+  FrameThreadKeeper* PresentThreads {};
 
   // A frame thread to keep off the main thread's core (any thread, under the escape lock).
   bool KeptOffSharedCore(int Tid) {
@@ -2817,6 +2828,16 @@ namespace {
                                                            fextl::string {}));
         }
       }
+      if (PresentThreads) {
+        FindFrameThreads(*PresentThreads, Escape);
+        if (Round % 30 == 0) {
+          const auto& K = *PresentThreads;
+          StatsLogNote(fextl::fmt::format("present threads: s={} {} kept, nice set {} times{}", Round * 2,
+                                          K.Count.load(std::memory_order_relaxed), K.NiceSets,
+                                          K.NiceFailures ? fextl::fmt::format(" ({} failed, errno {})", K.NiceFailures, -K.NiceError) :
+                                                           fextl::string {}));
+        }
+      }
       if (FrameThreads) {
         FindFrameThreads(*FrameThreads, Escape);
         // Once a minute: what keeping them took.
@@ -2888,6 +2909,9 @@ namespace {
         }
         if (Workers) {
           KeepWorkers(*Workers, *C, C->Loader != LoaderMode::Off ? &Finder : nullptr);
+        }
+        if (PresentThreads) {
+          KeepFrameThreads(*PresentThreads);
         }
         if (FrameThreads) {
           KeepFrameThreads(*FrameThreads);
@@ -3002,6 +3026,11 @@ void StartPriorityGuard(std::string_view AppName) {
   if (const char* F = Switch("FEX_STEAM_THREADS"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
     SteamNice = std::clamp(atoi(F), -20, 19);
   }
+  // Build 160: VKD3D's present thread and the window system's present queue thread.
+  int PresentNice = NiceUnchanged;
+  if (const char* F = Switch("FEX_PRESENT_THREADS"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
+    PresentNice = std::clamp(atoi(F), -20, 19);
+  }
   const bool FrameOffCore = FrameCoreSwitch && (FrameCoreSwitch[0] == '1' || (FrameCoreSwitch[0] == 'o' && FrameCoreSwitch[1] == 'n'));
 
   StatsLogNote(C->Prio == PrioMode::Keep ? fextl::fmt::format("prio: off, Windows thread priorities pass through to Linux nice "
@@ -3101,7 +3130,8 @@ void StartPriorityGuard(std::string_view AppName) {
 
   StatsLogNote(FrameNice != NiceUnchanged || FrameOffCore ?
                  fextl::fmt::format("frame threads: build 126: VKD3D's frame threads (vkd3d_queue, vkd3d_fence, its present, frame start, "
-                                    "frame done and swapchain sync threads) and the frame gen layer's present thread {}{}{}, found by "
+                                    "frame done and swapchain sync threads), the frame gen layer's present thread and (build 160) the "
+                                    "window system's present queue thread {}{}{}, found by "
                                     "name every 2 s; in the build 125 run vkd3d_queue (nice 0) waited 163 ms for a CPU on the main "
                                     "thread's shared core (a 161 ms frame). FEX_FRAME_THREADS=off leaves their nice, "
                                     "FEX_FRAME_THREADS_OFFCORE=0 lets them on that core",
@@ -3111,6 +3141,16 @@ void StartPriorityGuard(std::string_view AppName) {
                                     FrameOffCore ? "kept off the main thread's core while it is open to the game's threads (build 123)" : "") :
                  fextl::string("frame threads: left alone (FEX_FRAME_THREADS=-10 keeps VKD3D's frame threads at nice -10, "
                                "FEX_FRAME_THREADS_OFFCORE=1 keeps them off the main thread's core while it is open)"));
+  StatsLogNote(PresentNice != NiceUnchanged ?
+                 fextl::fmt::format("present threads: build 160: VKD3D's present thread (vkd3d-fex-present) and the window system's "
+                                    "present queue thread (WSI swapchain queue) kept at nice {} or better, found by name every 2 s and "
+                                    "checked every 250 ms; with frame generation the generated frame goes out when VKD3D's present "
+                                    "thread wakes at its slot (build 159 run: at nice -10 it waited ~39 ms a second for a CPU, the "
+                                    "frame gen layer's present thread at -20 ~3 ms). FEX_PRESENT_THREADS=off leaves them at "
+                                    "FEX_FRAME_THREADS's nice",
+                                    PresentNice) :
+                 fextl::string("present threads: left at FEX_FRAME_THREADS's nice (FEX_PRESENT_THREADS=-20 keeps VKD3D's present "
+                               "thread and the window system's present queue thread at nice -20)"));
   StatsLogNote(InputNice != NiceUnchanged ?
                  fextl::fmt::format("input threads: build 137: Wine's controller thread (wine_xinput_hid_update) kept at nice {} or better, "
                                     "found by name every 2 s and checked every 250 ms; it holds a controller's lock while it reads the "
@@ -3153,7 +3193,7 @@ void StartPriorityGuard(std::string_view AppName) {
 
   if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && !C->MainNiceOn &&
       C->Loader == LoaderMode::Off && WorkerNiceMode == WorkerMode::Off && FrameNice == NiceUnchanged && !FrameOffCore &&
-      InputNice == NiceUnchanged && SteamNice == NiceUnchanged) {
+      InputNice == NiceUnchanged && SteamNice == NiceUnchanged && PresentNice == NiceUnchanged) {
     delete C;
     return;
   }
@@ -3164,6 +3204,14 @@ void StartPriorityGuard(std::string_view AppName) {
     FrameThreads->Want = FrameThreadNames;
     FrameThreads->WantCount = std::size(FrameThreadNames);
     FrameThreads->Label = "frame threads";
+  }
+  if (PresentNice != NiceUnchanged) {
+    PresentThreads = new FrameThreadKeeper {};
+    PresentThreads->Nice = PresentNice;
+    PresentThreads->OffCore = false; // the frame threads' keeper does that
+    PresentThreads->Want = PresentThreadNames;
+    PresentThreads->WantCount = std::size(PresentThreadNames);
+    PresentThreads->Label = "present threads";
   }
   if (InputNice != NiceUnchanged) {
     InputThreads = new FrameThreadKeeper {};

@@ -237,6 +237,12 @@ namespace {
     // waited up to 340 ms a second for a CPU while other apps restarted on all cores, and the main thread waited up to
     // 194 ms a second on Steam. It is kept at this nice or better (it runs ~20-30 ms a second). "off" leaves it.
     {"FEX_STEAM_THREADS", "-10"},
+    // Build 160: with frame generation the layer lets the game's present go at the generated frame's slot, on VKD3D's
+    // present thread, so the generated frame is late by that thread's wait for a CPU when it wakes. In the build 159 run
+    // it (nice -10) waited ~39 ms a second for a CPU, and generated frames came 1-6 ms late in 39 of 169 calm seconds;
+    // the layer's own present thread (nice -20) waited ~3 ms a second. VKD3D's present thread and Mesa's X11 present
+    // queue thread are kept at this nice or better (they run ~10 ms a second). "off" leaves them at FEX_FRAME_THREADS's.
+    {"FEX_PRESENT_THREADS", "-20"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -284,6 +290,10 @@ namespace {
     {"FEX_CODE_BUFFER_START", "max"},
     {"FEX_CODE_BUFFER_RENEW", "50"},
     {"FEX_CODE_BUFFER_RENEW_EARLY", "10"},
+    // Build 160: a loading screen within this many seconds of the last renewal renews only at FEX_CODE_BUFFER_RENEW's mark,
+    // not the early one: in the build 159 run entering the game counted as two loading screens 2.2 s apart, and the second
+    // renewal dropped the 13,084 blocks just loaded for the new area. 0 turns it off.
+    {"FEX_CODE_BUFFER_RENEW_GAP", "10"},
     // Build 94: frames with fewer than 64 push descriptor updates each (FEX's Turnip build counts them) for 500 ms are a
     // loading screen too. D2R draws most of a loading screen at full speed (~7-9 updates a frame, play 190 or more): in
     // the build 93 run a 5 s loading screen at 40 FPS went unseen and the code buffer filled in play 2 minutes later
@@ -599,6 +609,7 @@ namespace {
     "FEX_CODE_BUFFER_START",
     "FEX_CODE_BUFFER_RENEW",
     "FEX_CODE_BUFFER_RENEW_EARLY",
+    "FEX_CODE_BUFFER_RENEW_GAP",
     "FEX_CODE_BUFFER_LOAD_MS",
     "FEX_LOAD_LIGHT",
     "FEX_LOAD_LIGHT_MS",
@@ -683,6 +694,7 @@ namespace {
     "FEX_FRAME_THREADS_OFFCORE",
     "FEX_INPUT_THREADS",
     "FEX_STEAM_THREADS",
+    "FEX_PRESENT_THREADS",
     "FEX_CRASH_NOTE",
     "FEX_START_WATCH",
     "FEX_START_WATCH_S",

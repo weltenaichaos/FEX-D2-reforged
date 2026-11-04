@@ -4,7 +4,7 @@ Every fix in this fork has a switch. **For `D2R.exe` all fixes are on by default
 these.** They are there to turn one fix off for a comparison, or when you suspect a fix causes a problem. For every
 other program FEX behaves like upstream FEX unless a switch is set.
 
-State: FEX build 159, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r9 (build 11). The build numbers in the
+State: FEX build 160, VKD3D fex41, Turnip fex17, frame generation layer 13, our Proton d2r9 (build 11). The build numbers in the
 tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md) has the background.
 
 ## How to set a switch
@@ -54,6 +54,7 @@ tables say where each fix came from; [d2r-thor-findings.md](d2r-thor-findings.md
 | `FEX_CODE_BUFFER_START` | `max` | FEX's buffer for translated code starts at its full 128 MB (build 84). | `grow` |
 | `FEX_CODE_BUFFER_RENEW` | `50` | The code buffer is renewed at a loading screen once it is this % full, instead of filling up and dropping all code during play (build 84). | `off` |
 | `FEX_CODE_BUFFER_RENEW_EARLY` | `10` | The same, in % for the first three loading screens. | |
+| `FEX_CODE_BUFFER_RENEW_GAP` | `10` | A loading screen within this many seconds of the last renewal renews only at `FEX_CODE_BUFFER_RENEW`'s mark, not the early one. In the b159 run entering the game counted as two loading screens 2.2 s apart, and the second renewal dropped the 13,084 blocks of code just loaded for the new area (build 160). | `0` |
 | `FEX_CODE_REUSE` | `1` | Code from the disk cache that comes back unchanged is reused from the buffer instead of placed again (build 85). | `0` |
 | `FEX_JIT_REUSE` | `1` | The same for freshly translated code. The game's protection rewrites its code every minute or two (build 95). | `0` |
 | `FEX_SMC_HOTPAGE` | `16` | A memory page that its own code writes to this often within 100 ms stops being write-protected; its code checks itself instead. This fixed the protection's regular freezes (build 54). | `0` |
@@ -84,8 +85,9 @@ FEX finds the fastest core and the little cores by their top clock speeds. On th
 | `FEX_HELPER_PRIO` | `normal` | FEX's helper threads at normal priority instead of idle (build 48). | `idle` |
 | `FEX_SERVER_NICE` | `-10` | The wineserver's priority (build 49). | `off` |
 | `FEX_WORKER_NICE` | `-10` | The game's job worker threads' priority (builds 87-88). | `off` |
-| `FEX_FRAME_THREADS` | `-10` | VKD3D's frame threads and the frame generation layer's present thread run at this priority or better (build 126). | `off` |
+| `FEX_FRAME_THREADS` | `-10` | VKD3D's frame threads, the frame generation layer's present thread and (from build 160) the window system's present queue thread run at this priority or better (build 126). | `off` |
 | `FEX_FRAME_THREADS_OFFCORE` | `1` | Those threads stay off the main thread's core while it is shared (build 126). | `0` |
+| `FEX_PRESENT_THREADS` | `-20` | VKD3D's present thread and the window system's present queue thread run at this priority or better. With frame generation the generated frame goes out when VKD3D's present thread wakes at its slot; in the b159 run that thread (at -10) waited ~39 ms a second for a CPU, and generated frames came 1-6 ms late in 39 of 169 calm seconds (build 160). | `off` |
 | `FEX_INPUT_THREADS` | `-10` | Wine's controller thread runs at this priority or better, so the game's controller reads don't wait for it while it holds the controller's lock (build 137). | `off` |
 | `FEX_STEAM_THREADS` | `-10` | steam.exe's thread that answers the game's Steam calls every frame runs at this priority or better, so the game doesn't wait on Steam while the cores are crowded (build 147; in the build 146 run it waited up to 340 ms a second for a CPU). | `off` |
 
