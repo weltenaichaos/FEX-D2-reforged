@@ -29,7 +29,27 @@ jobs:
           git clone https://github.com/GameNative/lsfg-vk-android.git lsfg
           cd lsfg
           git checkout "$LSFG_COMMIT"
-          git submodule update --init --recursive
+          # thirdparty/dxbc's repository (github.com/PancakeTAS/dxbc) is gone since 2026-11-04 (the clone asks for a
+          # login). The commit lsfg pins (78ab59a, PancakeTAS, 2025-07-25) then comes from a copy that has it, and
+          # failing that from tools/lsfg/dxbc-78ab59a.tar.gz (git archive of that commit), checked against its tree.
+          export GIT_TERMINAL_PROMPT=0
+          git submodule init
+          if ! git submodule update --recursive thirdparty/dxbc; then
+            rm -rf .git/modules/thirdparty/dxbc && rm -rf thirdparty/dxbc && mkdir thirdparty/dxbc
+            git config submodule.thirdparty/dxbc.url https://github.com/manuelgzz/dxbc.git
+            if ! git submodule update --recursive thirdparty/dxbc; then
+              rm -rf thirdparty/dxbc .git/modules/thirdparty/dxbc
+              mkdir -p thirdparty/dxbc
+              tar -xzf ../fex/tools/lsfg/dxbc-78ab59a.tar.gz -C thirdparty/dxbc
+              TREE="$(cd thirdparty/dxbc && git init -q && git add -A && git write-tree)"
+              rm -rf thirdparty/dxbc/.git
+              test "$TREE" = f19b5a7a5c0e509f62c5d3518490e2f4a9367fdd
+            fi
+          fi
+          if [ -d thirdparty/dxbc/.git ] || [ -f thirdparty/dxbc/.git ]; then
+            test "$(git -C thirdparty/dxbc rev-parse HEAD)" = 78ab59a8aaeb43cd1b0a5e91ba86722433a10b78
+          fi
+          git submodule update --recursive thirdparty/pe-parse thirdparty/toml11 thirdparty/volk
           git apply --verbose ../fex/tools/lsfg/d2r.patch
 
       - name: Install Android build tools
