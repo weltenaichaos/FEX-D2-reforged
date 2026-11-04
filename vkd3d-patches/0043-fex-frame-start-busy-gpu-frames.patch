@@ -1,0 +1,157 @@
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index 01b788b..847d486 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -49,6 +49,9 @@ uint32_t vkd3d_fex_frame_start_roomy_ms = 10;
+  * stays at least this much (ms) below what that frame was held back by (not below 20 ms); the ceiling rises 1 ms per 450
+  * frames without another such frame (VKD3D_FEX_START_CAP_MS: 0 = off as fex41, 1-15). */
+ uint32_t vkd3d_fex_frame_start_cap_ms = 4;
++/* VKD3D fex43: frames whose spare time came from a busy GPU hold their place in the 256-frame memory without limiting the
++ * hold-back; they still count among the last 64 frames (VKD3D_FEX_START_BUSY_SKIP: 0 = off as fex42, else on). */
++uint32_t vkd3d_fex_frame_start_busy_skip = 1;
+ uint32_t vkd3d_fex_frame_start_margin_ms = 6;
+ 
+ struct fex_timeline_stat
+@@ -91,6 +94,7 @@ static struct
+     uint32_t pacing_cap_lowered; /* frames that set or lowered it */
+     uint32_t pacing_cap_raised; /* 1 ms raises */
+     uint32_t pacing_cap_limited; /* frames whose hold-back it kept lower than the rest allowed */
++    uint32_t pacing_busy_kept;  /* frames with spare time from a busy GPU kept from limiting the long memory (VKD3D fex43) */
+     uint32_t pacing_gpu_bound;  /* frames paced as GPU-bound (VKD3D fex10) */
+     /* GPU time of frames the GPU went to straight from the frame before, by whether they had pass meter timers */
+     struct fex_timeline_stat gpu_frame[3];
+@@ -216,6 +220,8 @@ void vkd3d_fex_timeline_init(void)
+         if (ms <= 15)
+             vkd3d_fex_frame_start_cap_ms = ms;
+     }
++    if (vkd3d_get_env_var("VKD3D_FEX_START_BUSY_SKIP", env, sizeof(env)))
++        vkd3d_fex_frame_start_busy_skip = strcmp(env, "0") ? 1 : 0;
+     /* Smallest margin outside GPU-bound pacing in ms (VKD3D fex18: 6 unless set; 1-20 taken, 3 = fex9 to fex17). */
+     if (vkd3d_get_env_var("VKD3D_FEX_START_MARGIN_MS", env, sizeof(env)))
+     {
+@@ -445,6 +451,15 @@ void vkd3d_fex_timeline_pacing_cap(int64_t cap_ns, bool lowered, bool raised, bo
+     spinlock_release(&fex_timeline.lock);
+ }
+ 
++void vkd3d_fex_timeline_pacing_busy_kept(void)
++{
++    if (!vkd3d_fex_timeline_on)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    fex_timeline.pacing_busy_kept++;
++    spinlock_release(&fex_timeline.lock);
++}
++
+ void vkd3d_fex_timeline_pacing_hitch_skipped(uint32_t hitches, uint32_t around, uint32_t loads, uint32_t lone,
+         uint32_t repeats, uint32_t roomy)
+ {
+@@ -535,6 +550,7 @@ static void fex_timeline_publish(double seconds)
+     int64_t pacing_spare_min_ns, pacing_aim_ns;
+     uint32_t pacing_ceiling, pacing_gpu_bound, pacing_memory, pacing_hitch_skipped, pacing_around_skipped, pacing_loads;
+     uint32_t pacing_lone, pacing_repeats, pacing_roomy, pacing_cap_lowered, pacing_cap_raised, pacing_cap_limited;
++    uint32_t pacing_busy_kept;
+     int64_t pacing_memory_less_ns, pacing_cap_ns;
+     char cap_text[16];
+     struct fex_timeline_stat gpu_frame[3];
+@@ -598,6 +614,8 @@ static void fex_timeline_publish(double seconds)
+     fex_timeline.pacing_cap_raised = 0;
+     pacing_cap_limited = fex_timeline.pacing_cap_limited;
+     fex_timeline.pacing_cap_limited = 0;
++    pacing_busy_kept = fex_timeline.pacing_busy_kept;
++    fex_timeline.pacing_busy_kept = 0;
+     pacing_memory_less_ns = fex_timeline.pacing_memory_less_ns;
+     fex_timeline.pacing_memory_less_ns = 0;
+     memcpy(gpu_frame, fex_timeline.gpu_frame, sizeof(gpu_frame));
+@@ -667,7 +685,8 @@ static void fex_timeline_publish(double seconds)
+                 " | late without a hold-back, left out of that memory %u, around those or after a loading screen %u,"
+                 " loading screens that emptied it %u (%s) | late or nearly late with the hold-back on: alone in that memory, left"
+                 " out of it %u, after another kept in %u (%s) | %u ms+ spare, not limiting it %u (%s)"
+-                " | learned ceiling: %s, set or lowered %u, raised %u, frames it held back less %u (%s)\n",
++                " | learned ceiling: %s, set or lowered %u, raised %u, frames it held back less %u (%s)"
++                " | busy GPU, not limiting it %u (%s)\n",
+                 pacing_frames, pacing_delay_ns / 1e6, pacing_margin_ns / 1e6, pacing_frames ? pacing_spare_min_ns / 1e6 : 0.0,
+                 pacing_late, pacing_caused, pacing_busy, pacing_unseen, pacing_aim_ns / 1e6, vkd3d_fex_frame_start_max_ms,
+                 pacing_ceiling,
+@@ -678,7 +697,8 @@ static void fex_timeline_publish(double seconds)
+                 pacing_lone, pacing_repeats, vkd3d_fex_frame_start_slow_skip >= 2 ? "VKD3D fex41" :
+                 vkd3d_fex_frame_start_slow_skip ? "VKD3D fex40" : "off", vkd3d_fex_frame_start_roomy_ms, pacing_roomy,
+                 vkd3d_fex_frame_start_roomy_ms ? "VKD3D fex41" : "off", cap_text, pacing_cap_lowered, pacing_cap_raised,
+-                pacing_cap_limited, vkd3d_fex_frame_start_cap_ms ? "VKD3D fex42" : "off");
++                pacing_cap_limited, vkd3d_fex_frame_start_cap_ms ? "VKD3D fex42" : "off", pacing_busy_kept,
++                vkd3d_fex_frame_start_busy_skip ? "VKD3D fex43" : "off");
+     if (gpu_frame[0].count || gpu_frame[1].count || gpu_frame[2].count)
+     {
+         len = vkd3d_fex_report_append(text, sizeof(text), len,
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 45cf660..ddc3ad9 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -2349,16 +2349,18 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+ {
+     uint64_t target_interval_ns = chain->frame_rate_limit.target_interval_ns;
+     struct vkd3d_queue_family_info *const *families = chain->queue->device->queue_families;
+-    char text[2300], pacing[1000], cap_text[100];
++    char text[2400], pacing[1100], cap_text[160];
+ 
+     if (!vkd3d_fex_timeline_on)
+         return;
+ 
+     if (vkd3d_fex_frame_start_cap_ms)
+-        snprintf(cap_text, sizeof(cap_text), "%u ms under a frame late with 24+ ms held back: VKD3D fex42",
+-                vkd3d_fex_frame_start_cap_ms);
++        snprintf(cap_text, sizeof(cap_text), "%u ms under a frame late with 24+ ms held back: VKD3D fex42, %s",
++                vkd3d_fex_frame_start_cap_ms, vkd3d_fex_frame_start_busy_skip ?
++                "busy GPU frames not limiting them: VKD3D fex43" : "busy GPU frames limiting them");
+     else
+-        snprintf(cap_text, sizeof(cap_text), "no learned ceiling");
++        snprintf(cap_text, sizeof(cap_text), "no learned ceiling, %s", vkd3d_fex_frame_start_busy_skip ?
++                "busy GPU frames not limiting them: VKD3D fex43" : "busy GPU frames limiting them");
+ 
+     if (!chain->fex_start.enable)
+         snprintf(pacing, sizeof(pacing), "%s", vkd3d_fex_frame_start_on ? "off (no game latency handle)" : "off");
+@@ -4477,6 +4479,18 @@ static void *dxgi_vk_swap_chain_fex_done_worker(void *chain_)
+ #define FEX_START_CAP_FROM_NS 24000000ll
+ #define FEX_START_CAP_FLOOR_NS 20000000ll
+ #define FEX_START_CAP_UP_FRAMES 450u      /* ~15 s at the cap's 30 FPS */
++/* VKD3D fex43: a frame whose spare time came from a busy GPU (the GPU was still on the frame before when the game called
++ * Present(), so the frame had only as much room as the GPU left it) holds its place in the 256-frame memory without
++ * limiting it, like a roomy one (fex41). While the GPU is full such frames allow (nearly) no hold-back, and that is right:
++ * they still count among the last 64 frames (~2 s), and GPU-bound pacing (48 of 64 busy) doesn't use the long memory.
++ * But up to fex42 they also went into the long memory, so after a heavy fight, when the GPU had room again, they kept the
++ * hold-back at 0-3 ms for up to 8.5 s while every new frame had ~15 ms of room. In the FEX build 163 multiplayer log
++ * (GPU 90% busy or more in 241 of 773 s of play) that was 70 s at 66 ms from frame start to screen (median) against ~47 ms:
++ * at t=775-782 the last 64 frames alone allowed 50 ms and the memory, holding the busy frames of t=773-774, 0.6 ms; at
++ * t=455-459, right after GPU-bound pacing, 0 ms. In build 162 (lighter scenes) it was 6 s. Frames late or nearly late with
++ * the hold-back on keep their own rules (fex40), so a busy frame after another such one still goes in.
++ * VKD3D_FEX_START_BUSY_SKIP (0 = off, as fex42). */
++#define FEX_START_BUSY_SKIP (vkd3d_fex_frame_start_busy_skip != 0)
+ #define FEX_START_HITCH_BEFORE 30u        /* VKD3D fex39: frames before a hitch taken out of the long memory */
+ #define FEX_START_HITCH_AFTER 60u         /* ... and frames after it kept out */
+ #define FEX_START_LOAD_AFTER 300u         /* frames after a loading screen kept out of it */
+@@ -4700,6 +4714,12 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+                 natural_kept = INT64_MAX;
+                 vkd3d_fex_timeline_pacing_hitch_skipped(0, 0, 0, 0, 0, 1);
+             }
++            /* VKD3D fex43: so does one whose spare time came from a busy GPU, see FEX_START_BUSY_SKIP. */
++            else if (FEX_START_BUSY_SKIP && busy && !repeat)
++            {
++                natural_kept = INT64_MAX;
++                vkd3d_fex_timeline_pacing_busy_kept();
++            }
+             chain->fex_start.long_spare_ns[chain->fex_start.long_pos] = natural_kept;
+             chain->fex_start.long_pos = (chain->fex_start.long_pos + 1) % ARRAY_SIZE(chain->fex_start.long_spare_ns);
+             if (chain->fex_start.long_count < ARRAY_SIZE(chain->fex_start.long_spare_ns))
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index aad7fd9..34c59d4 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3218,6 +3218,9 @@ extern uint32_t vkd3d_fex_frame_start_hitch_skip;
+ extern uint32_t vkd3d_fex_frame_start_slow_skip;
+ extern uint32_t vkd3d_fex_frame_start_roomy_ms;
+ extern uint32_t vkd3d_fex_frame_start_cap_ms;
++extern uint32_t vkd3d_fex_frame_start_busy_skip;
++/* VKD3D fex43: a frame whose spare time came from a busy GPU was kept from limiting the 256-frame memory. */
++void vkd3d_fex_timeline_pacing_busy_kept(void);
+ /* VKD3D fex42: the learned ceiling after a frame (-1 = none), whether that frame set or lowered it, raised it, and whether
+  * it held the hold-back lower than the rest allowed. */
+ void vkd3d_fex_timeline_pacing_cap(int64_t cap_ns, bool lowered, bool raised, bool limited);
