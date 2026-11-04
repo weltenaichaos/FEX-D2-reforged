@@ -444,6 +444,112 @@ namespace {
     }
     return false;
   }
+  // Build 163: our Proton d2r12 (patch 0015) appends OutputDebugString and file flush counters (Size 4,360). In the b162
+  // run's character select screen the main thread had a 70-115 ms frame every 10 s while BGS_Thread wrote ~600 debug lines
+  // a second (two exceptions and a failing DBWIN_BUFFER lookup, an open_mapping request, each) and flushed its log file.
+  struct ServerCallsOdsInfo {
+    uint64_t WCalls;       // OutputDebugStringW calls
+    uint64_t WNs;          // their time (includes the A call each W makes)
+    uint64_t ACalls;       // OutputDebugStringA calls, including the one inside every W call
+    uint64_t ANs;          // their time
+    uint64_t MaxNs;        // longest call of either kind
+    uint64_t Raised;       // exceptions raised (stock: 2 per W call; 0 when nothing could see them)
+    uint64_t DbwinOpens;   // DBWIN_BUFFER looks (one open_mapping request each)
+    uint64_t DbwinSkipped; // looks left out (no debug monitor less than 1 s ago)
+    uint32_t LastTid;      // latest caller
+    uint32_t Watchers;     // at the latest call: bit 0 debugger, 1 vectored handler, 2 x64 dispatcher hooked; ~0u switched off
+  };
+  struct FlushTidInfo {
+    uint32_t Tid; // 0 = free slot; the first 8 threads that flush keep theirs
+    uint32_t Count;
+    uint64_t Ns;
+    uint64_t MaxNs;
+    uint64_t LastEndNs; // CLOCK_MONOTONIC
+  };
+  struct FlushNote {
+    uint32_t Seq; // odd while written
+    uint32_t Tid;
+    uint32_t Status;
+    uint32_t Kind;    // 1 fsync, 2 server flush, 3 serial, 0 nothing done
+    uint64_t StartNs; // CLOCK_MONOTONIC at the call
+    uint64_t Ns;
+  };
+  struct ServerCallsFlushInfo {
+    uint64_t Calls;
+    uint64_t Ns;
+    uint64_t MaxNs;
+    uint64_t OtherCalls; // threads without a slot
+    uint64_t OtherNs;
+    uint64_t Next; // flushes noted so far; the latest is Notes[(Next - 1) % 8]
+    FlushTidInfo Tid[8];
+    FlushNote Notes[8];
+  };
+  constexpr size_t OdsOffset = 3728;
+  constexpr size_t FlushOffset = 3800;
+  constexpr size_t D2r12ExtSize = 4360;
+  static_assert(sizeof(ServerCallsOdsInfo) == 72 && OdsOffset + sizeof(ServerCallsOdsInfo) == FlushOffset &&
+                OdsOffset + offsetof(ServerCallsOdsInfo, LastTid) == 3792 && OdsOffset + offsetof(ServerCallsOdsInfo, Watchers) == 3796);
+  static_assert(sizeof(FlushTidInfo) == 32 && sizeof(FlushNote) == 32 && FlushOffset + offsetof(ServerCallsFlushInfo, Tid) == 3848 &&
+                FlushOffset + offsetof(ServerCallsFlushInfo, Notes) == 4104 && FlushOffset + sizeof(ServerCallsFlushInfo) == D2r12ExtSize);
+  // Both blocks are read only when Wine says it writes all of d2r12's export.
+  bool ServerCallsHasD2r12(const ServerCallsExtInfo* Ext) {
+    return __atomic_load_n(&Ext->Size, __ATOMIC_RELAXED) >= D2r12ExtSize;
+  }
+  const ServerCallsOdsInfo* ServerCallsOds(const ServerCallsExtInfo* Ext) {
+    return reinterpret_cast<const ServerCallsOdsInfo*>(reinterpret_cast<const uint8_t*>(Ext) + OdsOffset);
+  }
+  const ServerCallsFlushInfo* ServerCallsFlush(const ServerCallsExtInfo* Ext) {
+    return reinterpret_cast<const ServerCallsFlushInfo*>(reinterpret_cast<const uint8_t*>(Ext) + FlushOffset);
+  }
+  // One flush note read whole (the registry notes' sequence rule); false while Wine keeps writing it or it was never written.
+  bool ReadFlushNote(const FlushNote& N, FlushNote& Out) {
+    uint64_t Words[sizeof(FlushNote) / sizeof(uint64_t)];
+    const auto* Src = reinterpret_cast<const uint64_t*>(&N);
+    for (int Try = 0; Try < 64; ++Try) {
+      const uint32_t S0 = __atomic_load_n(&N.Seq, __ATOMIC_ACQUIRE);
+      if (S0 & 1) {
+        continue;
+      }
+      for (size_t w = 0; w < std::size(Words); ++w) {
+        Words[w] = __atomic_load_n(&Src[w], __ATOMIC_RELAXED);
+      }
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(&N.Seq, __ATOMIC_RELAXED) == S0) {
+        memcpy(&Out, Words, sizeof(Out));
+        return S0 != 0;
+      }
+    }
+    return false;
+  }
+  const char* FlushKindName(uint32_t Kind) {
+    switch (Kind) {
+    case 1: return "fsync";
+    case 2: return "server";
+    case 3: return "serial";
+    default: return "none";
+    }
+  }
+  fextl::string OdsWatchersText(uint32_t Watchers) {
+    if (Watchers == ~0u) {
+      return "fast path off (WINE_D2R_ODS_FAST=0)";
+    }
+    if (!Watchers) {
+      return "nobody";
+    }
+    fextl::string Out;
+    const char* Names[] = {"debugger", "vectored handler", "x64 dispatcher hooked"};
+    for (uint32_t i = 0; i < 3; ++i) {
+      if (Watchers & (1u << i)) {
+        Out += Out.empty() ? "" : " + ";
+        Out += Names[i];
+      }
+    }
+    if (Watchers & ~7u) {
+      Out += fextl::fmt::format("{}bits {:#x}", Out.empty() ? "" : " + ", Watchers & ~7u);
+    }
+    return Out;
+  }
+
   // Requests whose callers the Proton side asked for: shown with their latest caller even outside the busiest ten.
   constexpr const char* ServerCallsWatched[] = {"create_timer", "set_timer", "cancel_timer", "close_handle", "get_next_thread",
                                                 "get_thread_info"};
@@ -2476,6 +2582,15 @@ namespace {
     uint64_t RegPrevOpen, RegPrevValue; // build 161: registry notes counts at the last registry line
     uint32_t RegRounds;
     bool RegHave;
+    // Build 163: our Proton d2r12's debug output and file flush counters at the last line.
+    uint64_t OdsPrev[8];
+    uint64_t OdsPrevMax;
+    uint64_t FlushPrev[4]; // calls, ns, other calls, other ns
+    uint64_t FlushPrevMax;
+    uint64_t FlushPrevNext;
+    uint32_t FlushTidPrevCount[8];
+    uint64_t FlushTidPrevNs[8];
+    bool D2r12Have;
     bool ServerHave;
 
     // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
@@ -3782,7 +3897,8 @@ namespace {
   // reply), and Wine's anonymous event reuse. A first line notes where the names came from. Build 157, with our Proton
   // d2r8's second export: each shown type's latest caller (@tid), the watched types outside the busiest ten, the
   // callers' names, and what the completion port waits in the process did.
-  fextl::string ServerCallsLine(LogState* State) {
+  fextl::string D2r12Lines(LogState* State, uint64_t Seconds, const ServerCallsExtInfo* Ext);
+  fextl::string ServerCallsLine(LogState* State, uint64_t Seconds) {
     auto* Info = ServerCalls.load(std::memory_order_relaxed);
     if (!Info || __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) != 1) {
       return {};
@@ -3971,6 +4087,108 @@ namespace {
                                 Opens, Values, std::min<uint64_t>(8, OpenNow), Group(Reg->Open, 8, OpenNow),
                                 std::min<uint64_t>(4, ValueNow), Group(Reg->Value, 4, ValueNow));
     }
+    // Build 163: our Proton d2r12's debug output and file flush counters, a line each in seconds that had any.
+    if (Ext && ServerCallsHasD2r12(Ext)) {
+      Out += D2r12Lines(State, Seconds, Ext);
+    }
+    return Out;
+  }
+
+  fextl::string D2r12Lines(LogState* State, uint64_t Seconds, const ServerCallsExtInfo* Ext) {
+    const auto* Ods = ServerCallsOds(Ext);
+    const auto* Fl = ServerCallsFlush(Ext);
+    const uint64_t* OdsFields[7] = {&Ods->WCalls, &Ods->WNs, &Ods->ACalls, &Ods->ANs, &Ods->Raised, &Ods->DbwinOpens, &Ods->DbwinSkipped};
+    uint64_t O[7];
+    for (size_t i = 0; i < 7; ++i) {
+      O[i] = __atomic_load_n(OdsFields[i], __ATOMIC_RELAXED);
+    }
+    const uint64_t OdsMax = __atomic_load_n(&Ods->MaxNs, __ATOMIC_RELAXED);
+    const uint64_t* FlushFields[4] = {&Fl->Calls, &Fl->Ns, &Fl->OtherCalls, &Fl->OtherNs};
+    uint64_t F[4];
+    for (size_t i = 0; i < 4; ++i) {
+      F[i] = __atomic_load_n(FlushFields[i], __ATOMIC_RELAXED);
+    }
+    const uint64_t FlushMax = __atomic_load_n(&Fl->MaxNs, __ATOMIC_RELAXED);
+    const uint64_t FlushNext = __atomic_load_n(&Fl->Next, __ATOMIC_ACQUIRE);
+    if (!State->D2r12Have) {
+      State->D2r12Have = true;
+      memcpy(State->OdsPrev, O, sizeof(O));
+      State->OdsPrevMax = OdsMax;
+      memcpy(State->FlushPrev, F, sizeof(F));
+      State->FlushPrevMax = FlushMax;
+      State->FlushPrevNext = FlushNext;
+      for (size_t i = 0; i < 8; ++i) {
+        State->FlushTidPrevCount[i] = __atomic_load_n(&Fl->Tid[i].Count, __ATOMIC_RELAXED);
+        State->FlushTidPrevNs[i] = __atomic_load_n(&Fl->Tid[i].Ns, __ATOMIC_RELAXED);
+      }
+      return fextl::fmt::format("# debug output and file flushes (our Proton d2r12) at the first read: {} OutputDebugStringW and {} A calls, {} "
+                                "exceptions raised, {} DBWIN_BUFFER looks, {} left out | {} file flushes in {:.1f} ms\n",
+                                O[0], O[2], O[4], O[5], O[6], F[0], F[1] / 1e6);
+    }
+    uint64_t DO[7], DF[4];
+    for (size_t i = 0; i < 7; ++i) {
+      DO[i] = O[i] >= State->OdsPrev[i] ? O[i] - State->OdsPrev[i] : 0;
+      State->OdsPrev[i] = O[i];
+    }
+    for (size_t i = 0; i < 4; ++i) {
+      DF[i] = F[i] >= State->FlushPrev[i] ? F[i] - State->FlushPrev[i] : 0;
+      State->FlushPrev[i] = F[i];
+    }
+    fextl::string Out;
+    if (DO[0] || DO[2]) {
+      const uint32_t Tid = __atomic_load_n(&Ods->LastTid, __ATOMIC_RELAXED);
+      const uint32_t Watchers = __atomic_load_n(&Ods->Watchers, __ATOMIC_RELAXED);
+      const fextl::string Name = Tid ? QueryThreadName(Tid) : fextl::string {};
+      Out += fextl::fmt::format("  debug output (our Proton d2r12): OutputDebugStringW {} in {:.1f} ms, A {} in {:.1f} ms (counts the one inside "
+                                "each W) | longest {:.2f} ms{} | exceptions raised {} | DBWIN_BUFFER looks {}, left out {} | latest caller {} {} "
+                                "| could see the exceptions: {}\n",
+                                DO[0], DO[1] / 1e6, DO[2], DO[3] / 1e6, OdsMax / 1e6, OdsMax > State->OdsPrevMax ? " (new)" : " (so far)",
+                                DO[4], DO[5], DO[6], Tid, Name.empty() ? "-" : Name, OdsWatchersText(Watchers));
+    }
+    State->OdsPrevMax = OdsMax;
+    const uint64_t NewNotes = FlushNext - std::min(FlushNext, State->FlushPrevNext);
+    State->FlushPrevNext = FlushNext;
+    fextl::string Threads;
+    for (size_t i = 0; i < 8; ++i) {
+      const uint32_t Tid = __atomic_load_n(&Fl->Tid[i].Tid, __ATOMIC_RELAXED);
+      const uint32_t Count = __atomic_load_n(&Fl->Tid[i].Count, __ATOMIC_RELAXED);
+      const uint64_t Ns = __atomic_load_n(&Fl->Tid[i].Ns, __ATOMIC_RELAXED);
+      const uint32_t DCount = Count - std::min(Count, State->FlushTidPrevCount[i]);
+      const uint64_t DNs = Ns - std::min(Ns, State->FlushTidPrevNs[i]);
+      State->FlushTidPrevCount[i] = Count;
+      State->FlushTidPrevNs[i] = Ns;
+      if (!Tid || !DCount) {
+        continue;
+      }
+      const fextl::string Name = QueryThreadName(Tid);
+      Threads += fextl::fmt::format("{} {} {} {} in {:.1f} ms (longest {:.1f})", Threads.empty() ? "" : ",", Tid, Name.empty() ? "-" : Name,
+                                    DCount, DNs / 1e6, __atomic_load_n(&Fl->Tid[i].MaxNs, __ATOMIC_RELAXED) / 1e6);
+    }
+    if (DF[2]) {
+      Threads += fextl::fmt::format("{} threads without a slot {} in {:.1f} ms", Threads.empty() ? "" : ",", DF[2], DF[3] / 1e6);
+    }
+    if (DF[0]) {
+      // The calls noted since the last line, oldest first, at their start time on the log's clock.
+      fextl::string Notes;
+      const uint64_t Shown = std::min<uint64_t>(NewNotes, 8);
+      const uint64_t NowCounter = GetCounter();
+      const int64_t NowMono = Linux::MonotonicNs();
+      const double NowT = static_cast<double>(Seconds) +
+                          (static_cast<double>(NowCounter) - static_cast<double>(State->SecondStart)) / static_cast<double>(State->CounterFreq);
+      for (uint64_t n = FlushNext - Shown; n != FlushNext; ++n) {
+        FlushNote Copy;
+        if (!ReadFlushNote(Fl->Notes[n % 8], Copy)) {
+          continue;
+        }
+        const double AgoS = NowMono > 0 && static_cast<uint64_t>(NowMono) > Copy.StartNs ? (static_cast<uint64_t>(NowMono) - Copy.StartNs) / 1e9 : 0.0;
+        Notes += fextl::fmt::format(" t={:.2f} {:.1f} ms {} tid={}{};", NowT - AgoS, Copy.Ns / 1e6, FlushKindName(Copy.Kind), Copy.Tid,
+                                    Copy.Status ? fextl::fmt::format(" status {:#x}", Copy.Status) : fextl::string {});
+      }
+      Out += fextl::fmt::format("  file flushes (our Proton d2r12): {} in {:.1f} ms, longest {:.1f} ms{} | by thread:{} | latest {} of {}:{}\n",
+                                DF[0], DF[1] / 1e6, FlushMax / 1e6, FlushMax > State->FlushPrevMax ? " (new)" : " (so far)",
+                                Threads.empty() ? fextl::string(" -") : Threads, Shown, NewNotes, Notes.empty() ? fextl::string(" -") : Notes);
+    }
+    State->FlushPrevMax = FlushMax;
     return Out;
   }
 
@@ -4872,7 +5090,7 @@ namespace {
       Line += ProbeLine(State, MsPerTick);
       Line += LockWaitLines(State, Seconds);
       Line += VmLockHoldLines(State, Seconds);
-      Line += ServerCallsLine(State);
+      Line += ServerCallsLine(State, Seconds);
       Line += FrameLines(State, Seconds);
       if (State->Profile) {
         Line += MainHitches(State, Seconds);
@@ -5306,6 +5524,15 @@ void StatsLogSetServerCallsExt(const void* Info) {
                    "'too old' = closed more than 10 s after it was made): every 5 s a 'registry' line names the keys and values the "
                    "latest 8 key opens and 4 value reads asked for, with their callers (build 161)" :
                    "server calls: no registry notes (our Proton older than d2r10)");
+    StatsLogNote(ServerCallsHasD2r12(Ext) ?
+                   "server calls: Wine's debug output and file flush counts found (our Proton d2r12 and later, build 163): a 'debug "
+                   "output' line in seconds with OutputDebugString calls (A counts the one inside every W call; exceptions raised = 0 "
+                   "when nothing could see them, since d2r12 leaves them out then; DBWIN_BUFFER looks = open_mapping requests, left out = "
+                   "looks d2r12 skipped because no debug monitor was there less than 1 s ago; 'could see the exceptions' names a "
+                   "debugger, vectored handler or hooked x64 dispatcher, which keep the exceptions as in stock; WINE_D2R_ODS_FAST=0 "
+                   "turns both off), and a 'file flushes' line in seconds with FlushFileBuffers calls: per thread, and each call since "
+                   "the last line with its start t=, time and kind (fsync, server = a pipe or other wineserver flush, serial)" :
+                   "server calls: no debug output or file flush counts (our Proton older than d2r12)");
   }
 }
 
