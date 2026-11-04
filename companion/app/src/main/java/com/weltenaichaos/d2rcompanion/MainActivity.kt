@@ -258,9 +258,12 @@ class MainActivity : Activity() {
     private fun saveShot() {
         val bmp = lastShot ?: run { status.text = "Nothing read yet"; return }
         val lines = lastLines
+        val logCopy = logText.toString()
         worker.execute {
             try {
                 val name = "d2r-shot-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
+                // The whole log on screen too (drops from Watch for drops).
+                write("$name-log.txt", "text/plain") { os -> os.write(logCopy.toByteArray()) }
                 write("$name.png", "image/png") { os -> bmp.compress(Bitmap.CompressFormat.PNG, 100, os) }
                 // Same shot with the text boxes the app found, in magenta.
                 val marked = bmp.copy(Bitmap.Config.ARGB_8888, true)
