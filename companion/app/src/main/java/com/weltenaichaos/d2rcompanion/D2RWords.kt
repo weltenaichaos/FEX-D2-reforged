@@ -12,7 +12,8 @@ class D2RWords(ctx: android.content.Context) {
         to of all and the per by on in a two damage
         stash inventory personal shared difficulty normal nightmare night mare hell gold max pick up drop
         compare hold sort close menu very slow fast class encampment act
-        party quest log character skill tree options potions holy skills skill level levels resist resistance resistances
+        party quest log character skill tree options potions holy
+        materials gems runes shared stolen move fire cold skills skill level levels resist resistance resistances
         increased enhanced faster cast rate hit recovery attack speed run walk run/walk life mana
         defense rating chance strike attacker takes cold fire lightning poison magic physical
         reduced reduces maximum minimum adds absorb absorbs light radius find gold gold items
@@ -54,6 +55,14 @@ class D2RWords(ctx: android.content.Context) {
     fun fixGlyphs(line: String): String = Companion.fixGlyphs(line)
 
     companion object {
+    private val SMALL = setOf("to", "of", "per", "by", "on", "the", "and", "a", "in", "vs")
+
+    /** One case style as in the game: "+110 To ATTACK" -> "+110 to Attack". */
+    fun gameCase(line: String): String = Regex("\\p{L}[\\p{L}']*").replace(line) { m ->
+        val w = m.value.lowercase(Locale.ROOT)
+        if (w in SMALL) w else w.replaceFirstChar { it.uppercase(Locale.ROOT) }
+    }
+
     private val NUMBER = Regex("(?<=^|[\\s+\\-:(])[|Il0-9]*[|0-9][|Il0-9]*(?=$|[\\s%:)\\-])")
 
     fun fixGlyphs(line: String): String {
@@ -66,7 +75,13 @@ class D2RWords(ctx: android.content.Context) {
                 'ø', 'θ', 'ο', 'о' -> 'o'
                 'Ø', '⊕', '⊗', 'Θ', 'Φ', 'φ', 'Ο', 'О' -> 'O'
                 // Digits and @ only when a letter is on both sides, so "40%" stays.
-                '0', '@' -> if (prevLetter && nextLetter) (if (sb[i - 1].isUpperCase()) 'O' else 'o') else null
+                '0', '@', '9' -> {
+                    val nextDigit = i + 1 < sb.length && sb[i + 1].isDigit()
+                    val prevDigit = i > 0 && sb[i - 1].isDigit()
+                    // Inside a word, or ending one ("T9" = "to"), never in a number.
+                    if (prevLetter && !nextDigit && !prevDigit) (if (sb[i - 1].isUpperCase()) 'O' else 'o') else null
+                }
+                '}' -> if (sb.lastIndexOf("(", i) >= 0) ')' else null
                 'Q' -> if (prevLetter && nextLetter && sb[i - 1].isLowerCase()) 'o' else null
                 else -> null
             }
@@ -130,7 +145,8 @@ class D2RWords(ctx: android.content.Context) {
         val lower = word.lowercase(Locale.ROOT)
         if (lower in SET) return word
         val limit = when {
-            word.length <= 3 -> 0.6f
+            word.length <= 2 -> 0.6f
+            word.length == 3 -> 1.0f
             word.length <= 6 -> 1.0f
             else -> 1.6f
         }

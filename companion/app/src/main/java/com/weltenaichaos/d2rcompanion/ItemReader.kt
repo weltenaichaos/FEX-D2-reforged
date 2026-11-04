@@ -49,13 +49,12 @@ class ItemReader(ctx: android.content.Context) {
         }
         if (!sharp) return out
 
-        val tip = result.textBlocks.maxByOrNull { it.lines.size }?.boundingBox ?: return out
-        if (tip.width() < 40 || tip.height() < 20) return out
+        val tip = tooltipBox(out) ?: return out
         val pad = 16
         val crop = Rect(tip.left - pad, tip.top - pad, tip.right + pad, tip.bottom + pad)
         if (!crop.intersect(0, 0, bmp.width, bmp.height)) return out
         val part = Bitmap.createBitmap(bmp, crop.left, crop.top, crop.width(), crop.height())
-        val big = Bitmap.createScaledBitmap(part, part.width * 2, part.height * 2, true)
+        val big = clean(Bitmap.createScaledBitmap(part, part.width * 2, part.height * 2, true))
         val again = Tasks.await(recognizer.process(InputImage.fromBitmap(big, 0)))
         val sharpLines = ArrayList<TextLine>()
         for (block in again.textBlocks) for (line in block.lines) {
@@ -64,9 +63,67 @@ class ItemReader(ctx: android.content.Context) {
             sharpLines.add(makeLine(line.text, bmp, box))
         }
         if (sharpLines.isEmpty()) return out
-        // Lines from the 2x read replace the first read's lines inside the tooltip.
-        out.removeAll { Rect.intersects(it.box, crop) }
+        // The 2x read wins where both found a line; a line only the first read
+        // found stays (build 5 dropped lines the 2x read missed).
+        out.removeAll { o -> sharpLines.any { s -> overlapsMostly(o.box, s.box) } }
         out.addAll(sharpLines)
+        return out
+    }
+
+    private fun overlapsMostly(a: Rect, b: Rect): Boolean {
+        val r = Rect()
+        if (!r.setIntersect(a, b)) return false
+        val inter = r.height().toLong()
+        return inter * 2 >= minOf(a.height(), b.height())
+    }
+
+    /**
+     * The item tooltip: the biggest stack of centered lines. Starts at the line
+     * group with the most lines and grows by lines that are centered under it
+     * and close above or below.
+     */
+    private fun tooltipBox(lines: List<TextLine>): Rect? {
+        if (lines.isEmpty()) return null
+        var bestBox: Rect? = null
+        var bestCount = 0
+        for (seed in lines) {
+            val box = Rect(seed.box)
+            var count = 1
+            val used = HashSet<TextLine>()
+            used.add(seed)
+            var grew = true
+            while (grew) {
+                grew = false
+                for (l in lines) {
+                    if (l in used) continue
+                    val h = maxOf(l.box.height(), 8)
+                    val cx = l.box.centerX()
+                    val centered = kotlin.math.abs(cx - box.centerX()) < maxOf(box.width(), l.box.width()) / 4 + h
+                    val near = l.box.top <= box.bottom + h * 3 && l.box.bottom >= box.top - h * 3
+                    if (centered && near) {
+                        box.union(l.box); used.add(l); count++; grew = true
+                    }
+                }
+            }
+            if (count > bestCount) { bestCount = count; bestBox = box }
+        }
+        val b = bestBox ?: return null
+        return if (bestCount >= 2 && b.width() >= 40) b else null
+    }
+
+    /** Dark background to black, so only the bright tooltip text is left. */
+    private fun clean(bmp: Bitmap): Bitmap {
+        val w = bmp.width
+        val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        for (i in px.indices) {
+            val c = px[i]
+            val mx = maxOf((c shr 16) and 0xFF, (c shr 8) and 0xFF, c and 0xFF)
+            if (mx < 85) px[i] = 0xFF000000.toInt()
+        }
+        val out = bmp.copy(Bitmap.Config.ARGB_8888, true)
+        out.setPixels(px, 0, w, 0, 0, w, h)
         return out
     }
 
@@ -77,9 +134,9 @@ class ItemReader(ctx: android.content.Context) {
         if (glyphs.none { it.isDigit() }) {
             val m = db.match(glyphs)
             if (m != null && m.wholeLine) return TextLine(m.entry.name, box, q, share, text, m)
-            if (m != null) return TextLine(words.fix(glyphs), box, q, share, text, m)
+            if (m != null) return TextLine(D2RWords.gameCase(words.fix(glyphs)), box, q, share, text, m)
         }
-        return TextLine(words.fix(glyphs), box, q, share, text)
+        return TextLine(D2RWords.gameCase(words.fix(glyphs)), box, q, share, text)
     }
 
     /**
