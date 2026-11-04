@@ -28,6 +28,10 @@ import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
 
+    companion object {
+        var updateMessage: ((String) -> Unit)? = null
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { r ->
         Thread({
@@ -89,7 +93,47 @@ class MainActivity : Activity() {
             }
         }
         CaptureService.onStopped = { main.post { updateStatus() } }
+        updateMessage = { msg -> main.post { status.text = msg } }
         updateStatus()
+        checkForUpdate()
+    }
+
+    /** Looks for a newer test build on GitHub and offers to install it. */
+    private fun checkForUpdate() {
+        val mine = packageManager.getPackageInfo(packageName, 0).longVersionCode.toInt()
+        Thread {
+            val rel = try { Updater.latest() } catch (e: Exception) { null }
+            if (rel == null || rel.build <= mine) return@Thread
+            main.post {
+                if (isFinishing) return@post
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("Test build ${rel.build} is out")
+                    .setMessage("You have build $mine. Install build ${rel.build} now?")
+                    .setPositiveButton("Install") { _, _ -> installUpdate(rel) }
+                    .setNegativeButton("Later", null)
+                    .show()
+            }
+        }.start()
+    }
+
+    private fun installUpdate(rel: Updater.Release) {
+        if (!packageManager.canRequestPackageInstalls()) {
+            status.text = "Allow D2R Companion to install apps, then reopen it"
+            startActivity(
+                Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    android.net.Uri.parse("package:$packageName"))
+            )
+            return
+        }
+        status.text = "Downloading build ${rel.build}..."
+        Thread {
+            try {
+                Updater.install(this, rel) { pct -> main.post { status.text = "Downloading build ${rel.build}: $pct%" } }
+                main.post { status.text = "Installing build ${rel.build}..." }
+            } catch (e: Exception) {
+                main.post { status.text = "Update failed: ${e.message}" }
+            }
+        }.start()
     }
 
     private fun askForCapture() {
@@ -238,6 +282,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         main.removeCallbacks(autoTick)
         CaptureService.onStopped = null
+        updateMessage = null
         super.onDestroy()
     }
 }
