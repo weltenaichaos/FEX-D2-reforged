@@ -47,6 +47,8 @@ class CaptureService : Service() {
         private set
     var height = 0
         private set
+    var displays = ""
+        private set
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -79,11 +81,22 @@ class CaptureService : Service() {
             override fun onStop() = stopCapture()
         }, handler)
 
-        val display = getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
-        val size = Point()
-        @Suppress("DEPRECATION") display.getRealSize(size)
-        width = size.x
-        height = size.y
+        // Capture at the game screen's own size. Build 3 used the size of the
+        // screen the app runs on (Thor bottom screen 1240x1080), which shrank the
+        // game picture to 65% and made the text hard to read.
+        var size = Point()
+        val dm = getSystemService(DisplayManager::class.java)
+        val sizes = StringBuilder()
+        for (d in dm.displays) {
+            val p = Point()
+            @Suppress("DEPRECATION") d.getRealSize(p)
+            sizes.append("${d.displayId}:${p.x}x${p.y} ")
+            if (p.x.toLong() * p.y > size.x.toLong() * size.y) size = p
+        }
+        displays = sizes.toString().trim()
+        // Landscape game: the long side is the width.
+        width = maxOf(size.x, size.y)
+        height = minOf(size.x, size.y)
 
         val r = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         reader = r

@@ -26,9 +26,13 @@ data class TextLine(
     val share: Int,
     /** What text recognition saw, before the D2R word fixes. */
     val raw: String = text,
+    /** The known D2R item this line names, if any. */
+    val item: ItemDb.Match? = null,
 )
 
-class ItemReader {
+class ItemReader(ctx: android.content.Context) {
+    private val db = ItemDb(ctx)
+    private val words = D2RWords(ctx)
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
     /**
@@ -68,10 +72,14 @@ class ItemReader {
 
     private fun makeLine(text: String, bmp: Bitmap, box: Rect): TextLine {
         val (q, share) = colorOf(bmp, box)
-        // Only property lines (with a number) get word fixes; names stay as read.
         val glyphs = D2RWords.fixGlyphs(text)
-        val fixed = if (glyphs.any { it.isDigit() } && q != Quality.UNIQUE && q != Quality.SET) D2RWords.fix(glyphs) else glyphs
-        return TextLine(fixed, box, q, share, text)
+        // A line without numbers may be an item name: take the known name as is.
+        if (glyphs.none { it.isDigit() }) {
+            val m = db.match(glyphs)
+            if (m != null && m.wholeLine) return TextLine(m.entry.name, box, q, share, text, m)
+            if (m != null) return TextLine(words.fix(glyphs), box, q, share, text, m)
+        }
+        return TextLine(words.fix(glyphs), box, q, share, text)
     }
 
     /**

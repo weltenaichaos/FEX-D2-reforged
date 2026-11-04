@@ -1,0 +1,1246 @@
+# from github.com/blizzhackers/d2data (MIT license), made by companion/tools/make_items.py
+base	A Jade Figurine	A Jade Figurine
+base	Aegis	Aegis
+base	Aerin Shield	Aerin Shield
+base	Akaran Rondache	Akaran Rondache
+base	Akaran Targe	Akaran Targe
+base	Alpha Helm	Alpha Helm
+base	Amethyst	Amethyst
+base	Amn Rune	Amn Rune
+base	Amulet	Amulet
+base	Ancient Armor	Ancient Armor
+base	Ancient Axe	Ancient Axe
+base	Ancient Shield	Ancient Shield
+base	Ancient Sword	Ancient Sword
+base	Antidote Potion	Antidote Potion
+base	Antlers	Antlers
+base	Arbalest	Arbalest
+base	Archon Plate	Archon Plate
+base	Archon Staff	Archon Staff
+base	Armet	Armet
+base	Arrows	Arrows
+base	Ashwood Bow	Ashwood Bow
+base	Assault Helmet	Assault Helmet
+base	Ataghan	Ataghan
+base	Avenger Guard	Avenger Guard
+base	Axe	Axe
+base	Baal's Eye	Baal's Eye
+base	Balanced Axe	Balanced Axe
+base	Balanced Knife	Balanced Knife
+base	Ballista	Ballista
+base	Balrog Blade	Balrog Blade
+base	Balrog Skin	Balrog Skin
+base	Balrog Spear	Balrog Spear
+base	Barbed Club	Barbed Club
+base	Barbed Shield	Barbed Shield
+base	Bardiche	Bardiche
+base	Basinet	Basinet
+base	Bastard Sword	Bastard Sword
+base	Battle Axe	Battle Axe
+base	Battle Belt	Battle Belt
+base	Battle Boots	Battle Boots
+base	Battle Cestus	Battle Cestus
+base	Battle Dart	Battle Dart
+base	Battle Gauntlets	Battle Gauntlets
+base	Battle Hammer	Battle Hammer
+base	Battle Scythe	Battle Scythe
+base	Battle Staff	Battle Staff
+base	Battle Sword	Battle Sword
+base	Bearded Axe	Bearded Axe
+base	Bec-de-Corbin	Bec-de-Corbin
+base	Belt	Belt
+base	Ber Rune	Ber Rune
+base	Berserker Axe	Berserker Axe
+base	Bill	Bill
+base	Blade	Blade
+base	Blade Barrier	Blade Barrier
+base	Blade Bow	Blade Bow
+base	Blade Talons	Blade Talons
+base	Blasphemous Compendium	Blasphemous Compendium
+base	Blasphemous Grimoire	Blasphemous Grimoire
+base	Blood Spirit	Blood Spirit
+base	Bloodlord Skull	Bloodlord Skull
+base	Bolts	Bolts
+base	Bone Helm	Bone Helm
+base	Bone Knife	Bone Knife
+base	Bone Shield	Bone Shield
+base	Bone Visage	Bone Visage
+base	Bone Wand	Bone Wand
+base	Boneweave	Boneweave
+base	Boneweave Boots	Boneweave Boots
+base	Book of Skill	Book of Skill
+base	Boots	Boots
+base	Brain	Brain
+base	Bramble Mitts	Bramble Mitts
+base	Brandistock	Brandistock
+base	Breast Plate	Breast Plate
+base	Broad Axe	Broad Axe
+base	Broad Sword	Broad Sword
+base	Buckler	Buckler
+base	Bul-Kathos' Nightmare	Bul-Kathos' Nightmare
+base	Burning Essence of Terror	Burning Essence of Terror
+base	Burnt Text	Burnt Text
+base	Burnt Wand	Burnt Wand
+base	Caduceus	Caduceus
+base	Cantor Trophy	Cantor Trophy
+base	Cap	Cap
+base	Carnage Helm	Carnage Helm
+base	Casque	Casque
+base	Cedar Bow	Cedar Bow
+base	Cedar Staff	Cedar Staff
+base	Ceremonial Bow	Ceremonial Bow
+base	Ceremonial Javelin	Ceremonial Javelin
+base	Ceremonial Pike	Ceremonial Pike
+base	Ceremonial Spear	Ceremonial Spear
+base	Cestus	Cestus
+base	Chain Boots	Chain Boots
+base	Chain Gloves	Chain Gloves
+base	Chain Mail	Chain Mail
+base	Cham Rune	Cham Rune
+base	Champion Axe	Champion Axe
+base	Champion Sword	Champion Sword
+base	Chaos Armor	Chaos Armor
+base	Charged Essence of Hatred	Charged Essence of Hatred
+base	Chipped Amethyst	Chipped Amethyst
+base	Chipped Diamond	Chipped Diamond
+base	Chipped Emerald	Chipped Emerald
+base	Chipped Ruby	Chipped Ruby
+base	Chipped Sapphire	Chipped Sapphire
+base	Chipped Skull	Chipped Skull
+base	Chipped Topaz	Chipped Topaz
+base	Choking Gas Potion	Choking Gas Potion
+base	Chu-Ko-Nu	Chu-Ko-Nu
+base	Cinquedeas	Cinquedeas
+base	Circlet	Circlet
+base	Clasped Orb	Clasped Orb
+base	Claws	Claws
+base	Claymore	Claymore
+base	Cleaver	Cleaver
+base	Cloudy Sphere	Cloudy Sphere
+base	Club	Club
+base	Codex	Codex
+base	Colossus Blade	Colossus Blade
+base	Colossus Crossbow	Colossus Crossbow
+base	Colossus Girdle	Colossus Girdle
+base	Colossus Sword	Colossus Sword
+base	Colossus Voulge	Colossus Voulge
+base	Compendium	Compendium
+base	Composite Bow	Composite Bow
+base	Conqueror Crown	Conqueror Crown
+base	Conquest Sword	Conquest Sword
+base	Corona	Corona
+base	Coronet	Coronet
+base	Crossbow	Crossbow
+base	Crowbill	Crowbill
+base	Crown	Crown
+base	Crown Shield	Crown Shield
+base	Crusader Bow	Crusader Bow
+base	Crusader Gauntlets	Crusader Gauntlets
+base	Cryptic Axe	Cryptic Axe
+base	Cryptic Sword	Cryptic Sword
+base	Crystal Sword	Crystal Sword
+base	Crystalline Globe	Crystalline Globe
+base	Cudgel	Cudgel
+base	Cuirass	Cuirass
+base	Cutlass	Cutlass
+base	Dacian Falx	Dacian Falx
+base	Dagger	Dagger
+base	Dark Codex	Dark Codex
+base	Dark Tome	Dark Tome
+base	Death Mask	Death Mask
+base	Decapitator	Decapitator
+base	Decoy Gidbinn	Decoy Gidbinn
+base	Deep Worldstone Shard	Deep Worldstone Shard
+base	Defender	Defender
+base	Defender's Bile	Defender's Bile
+base	Defender's Fire	Defender's Fire
+base	Demon Crossbow	Demon Crossbow
+base	Demon Head	Demon Head
+base	Demon Heart	Demon Heart
+base	Demonhead	Demonhead
+base	Demonhide Armor	Demonhide Armor
+base	Demonhide Boots	Demonhide Boots
+base	Demonhide Gloves	Demonhide Gloves
+base	Demonhide Sash	Demonhide Sash
+base	Destroyer Helm	Destroyer Helm
+base	Devil Star	Devil Star
+base	Diablo's Horn	Diablo's Horn
+base	Diadem	Diadem
+base	Diamond	Diamond
+base	Diamond Bow	Diamond Bow
+base	Diamond Mail	Diamond Mail
+base	Dimensional Blade	Dimensional Blade
+base	Dimensional Shard	Dimensional Shard
+base	Dirk	Dirk
+base	Divine Scepter	Divine Scepter
+base	Dol Rune	Dol Rune
+base	Double Axe	Double Axe
+base	Double Bow	Double Bow
+base	Dragon Shield	Dragon Shield
+base	Dream Spirit	Dream Spirit
+base	Dusk Shroud	Dusk Shroud
+base	Eagle Orb	Eagle Orb
+base	Ear	Ear
+base	Earth Spirit	Earth Spirit
+base	Eastern Worldstone Shard	Eastern Worldstone Shard
+base	Edge Bow	Edge Bow
+base	El Rune	El Rune
+base	Eld Rune	Eld Rune
+base	Elder Staff	Elder Staff
+base	Eldritch Orb	Eldritch Orb
+base	Elegant Blade	Elegant Blade
+base	Elixir	Elixir
+base	Embossed Plate	Embossed Plate
+base	Emerald	Emerald
+base	Espandon	Espandon
+base	Eth Rune	Eth Rune
+base	Ettin Axe	Ettin Axe
+base	Executioner Sword	Executioner Sword
+base	Exploding Potion	Exploding Potion
+base	Eye	Eye
+base	Fal Rune	Fal Rune
+base	Falcata	Falcata
+base	Falchion	Falchion
+base	Falcon Mask	Falcon Mask
+base	Fang	Fang
+base	Fanged Helm	Fanged Helm
+base	Fanged Knife	Fanged Knife
+base	Fascia	Fascia
+base	Feral Axe	Feral Axe
+base	Feral Claws	Feral Claws
+base	Festering Essence of Destruction	Festering Essence of Destruction
+base	Fetish Trophy	Fetish Trophy
+base	Field Plate	Field Plate
+base	Flag	Flag
+base	Flail	Flail
+base	Flamberge	Flamberge
+base	Flanged Mace	Flanged Mace
+base	Flawed Amethyst	Flawed Amethyst
+base	Flawed Diamond	Flawed Diamond
+base	Flawed Emerald	Flawed Emerald
+base	Flawed Ruby	Flawed Ruby
+base	Flawed Sapphire	Flawed Sapphire
+base	Flawed Skull	Flawed Skull
+base	Flawed Topaz	Flawed Topaz
+base	Flawless Amethyst	Flawless Amethyst
+base	Flawless Diamond	Flawless Diamond
+base	Flawless Emerald	Flawless Emerald
+base	Flawless Ruby	Flawless Ruby
+base	Flawless Sapphire	Flawless Sapphire
+base	Flawless Skull	Flawless Skull
+base	Flawless Topaz	Flawless Topaz
+base	Flying Axe	Flying Axe
+base	Flying Knife	Flying Knife
+base	Forgotten Volume	Forgotten Volume
+base	Francisca	Francisca
+base	Full Healing Potion	Full Healing Potion
+base	Full Helm	Full Helm
+base	Full Mana Potion	Full Mana Potion
+base	Full Plate Mail	Full Plate Mail
+base	Full Rejuvenation Potion	Full Rejuvenation Potion
+base	Fulminating Potion	Fulminating Potion
+base	Fury Visor	Fury Visor
+base	Fuscina	Fuscina
+base	Gargoyle Head	Gargoyle Head
+base	Gauntlets	Gauntlets
+base	Ghost Armor	Ghost Armor
+base	Ghost Glaive	Ghost Glaive
+base	Ghost Spear	Ghost Spear
+base	Ghost Wand	Ghost Wand
+base	Giant Axe	Giant Axe
+base	Giant Conch	Giant Conch
+base	Giant Sword	Giant Sword
+base	Giant Thresher	Giant Thresher
+base	Gilded Shield	Gilded Shield
+base	Gladius	Gladius
+base	Glaive	Glaive
+base	Glorious Axe	Glorious Axe
+base	Glowing Orb	Glowing Orb
+base	Gnarled Staff	Gnarled Staff
+base	Gold	Gold
+base	Gorgon Crossbow	Gorgon Crossbow
+base	Gothic Axe	Gothic Axe
+base	Gothic Bow	Gothic Bow
+base	Gothic Plate	Gothic Plate
+base	Gothic Shield	Gothic Shield
+base	Gothic Staff	Gothic Staff
+base	Gothic Sword	Gothic Sword
+base	Grand Charm	Grand Charm
+base	Grand Crown	Grand Crown
+base	Grand Matron Bow	Grand Matron Bow
+base	Grand Scepter	Grand Scepter
+base	Grave Wand	Grave Wand
+base	Great Axe	Great Axe
+base	Great Bow	Great Bow
+base	Great Hauberk	Great Hauberk
+base	Great Helm	Great Helm
+base	Great Maul	Great Maul
+base	Great Pilum	Great Pilum
+base	Great Poleaxe	Great Poleaxe
+base	Great Sword	Great Sword
+base	Greater Claws	Greater Claws
+base	Greater Healing Potion	Greater Healing Potion
+base	Greater Mana Potion	Greater Mana Potion
+base	Greater Talons	Greater Talons
+base	Greaves	Greaves
+base	Griffon Headdress	Griffon Headdress
+base	Grim Helm	Grim Helm
+base	Grim Scythe	Grim Scythe
+base	Grim Shield	Grim Shield
+base	Grim Wand	Grim Wand
+base	Grimoire	Grimoire
+base	Guardian Crown	Guardian Crown
+base	Guardian's Light	Guardian's Light
+base	Guardian's Thunder	Guardian's Thunder
+base	Gul Rune	Gul Rune
+base	Halberd	Halberd
+base	Hand Axe	Hand Axe
+base	Hand Scythe	Hand Scythe
+base	Hard Leather Armor	Hard Leather Armor
+base	Harpoon	Harpoon
+base	Hatchet	Hatchet
+base	Hatchet Hands	Hatchet Hands
+base	Hawk Helm	Hawk Helm
+base	Healing Potion	Healing Potion
+base	Heart	Heart
+base	Heater	Heater
+base	Heavenly Stone	Heavenly Stone
+base	Heavy Belt	Heavy Belt
+base	Heavy Boots	Heavy Boots
+base	Heavy Bracers	Heavy Bracers
+base	Heavy Crossbow	Heavy Crossbow
+base	Heavy Gloves	Heavy Gloves
+base	Hel Rune	Hel Rune
+base	Hell Forge Hammer	Hell Forge Hammer
+base	Hellforge Plate	Hellforge Plate
+base	Hellspawn Skull	Hellspawn Skull
+base	Helm	Helm
+base	Heraldic Shield	Heraldic Shield
+base	Herb	Herb
+base	Hierophant Trophy	Hierophant Trophy
+base	Highland Blade	Highland Blade
+base	Holy Water Sprinkler	Holy Water Sprinkler
+base	Horadric Cube	Horadric Cube
+base	Horadric Malus	Horadric Malus
+base	Horadric Scroll	Horadric Scroll
+base	Horadric Staff	Horadric Staff
+base	Horn	Horn
+base	Horned Helm	Horned Helm
+base	Hunter's Bow	Hunter's Bow
+base	Hunter's Guise	Hunter's Guise
+base	Hurlbat	Hurlbat
+base	Hydra Bow	Hydra Bow
+base	Hydra Edge	Hydra Edge
+base	Hydraskull	Hydraskull
+base	Hyperion	Hyperion
+base	Hyperion Javelin	Hyperion Javelin
+base	Hyperion Spear	Hyperion Spear
+base	Io Rune	Io Rune
+base	Ist Rune	Ist Rune
+base	Ith Rune	Ith Rune
+base	Jagged Star	Jagged Star
+base	Jah Rune	Jah Rune
+base	Jared's Stone	Jared's Stone
+base	Javelin	Javelin
+base	Jawbone	Jawbone
+base	Jawbone Cap	Jawbone Cap
+base	Jawbone Visor	Jawbone Visor
+base	Jewel	Jewel
+base	Jo Staff	Jo Staff
+base	Katar	Katar
+base	Key	Key
+base	Key of Destruction	Key of Destruction
+base	Key of Hate	Key of Hate
+base	Key of Terror	Key of Terror
+base	Key to the Cairn Stones	Key to the Cairn Stones
+base	Khalim's Brain	Khalim's Brain
+base	Khalim's Eye	Khalim's Eye
+base	Khalim's Flail	Khalim's Flail
+base	Khalim's Heart	Khalim's Heart
+base	Khalim's Will	Khalim's Will
+base	Kite Shield	Kite Shield
+base	Knout	Knout
+base	Ko Rune	Ko Rune
+base	Korlic's Pain	Korlic's Pain
+base	Kraken Shell	Kraken Shell
+base	Kris	Kris
+base	Kurast Shield	Kurast Shield
+base	Lacquered Plate	Lacquered Plate
+base	Lam Esen's Tome	Lam Esen's Tome
+base	Lance	Lance
+base	Large Axe	Large Axe
+base	Large Blue Potion	Large Blue Potion
+base	Large Charm	Large Charm
+base	Large Red Potion	Large Red Potion
+base	Large Shield	Large Shield
+base	Large Siege Bow	Large Siege Bow
+base	Leather Armor	Leather Armor
+base	Leather Gloves	Leather Gloves
+base	Legend Spike	Legend Spike
+base	Legend Sword	Legend Sword
+base	Legendary Mallet	Legendary Mallet
+base	Lem Rune	Lem Rune
+base	Lich Wand	Lich Wand
+base	Light Belt	Light Belt
+base	Light Crossbow	Light Crossbow
+base	Light Gauntlets	Light Gauntlets
+base	Light Healing Potion	Light Healing Potion
+base	Light Mana Potion	Light Mana Potion
+base	Light Plate	Light Plate
+base	Light Plated Boots	Light Plated Boots
+base	Linked Mail	Linked Mail
+base	Lion Helm	Lion Helm
+base	Lo Rune	Lo Rune
+base	Lochaber Axe	Lochaber Axe
+base	Long Battle Bow	Long Battle Bow
+base	Long Bow	Long Bow
+base	Long Staff	Long Staff
+base	Long Sword	Long Sword
+base	Long War Bow	Long War Bow
+base	Loricated Mail	Loricated Mail
+base	Lum Rune	Lum Rune
+base	Luna	Luna
+base	Mace	Mace
+base	Madawc's Ire	Madawc's Ire
+base	Mage Plate	Mage Plate
+base	Maiden Javelin	Maiden Javelin
+base	Maiden Pike	Maiden Pike
+base	Maiden Spear	Maiden Spear
+base	Mal Rune	Mal Rune
+base	Malah's Potion	Malah's Potion
+base	Mana Potion	Mana Potion
+base	Mancatcher	Mancatcher
+base	Martel de Fer	Martel de Fer
+base	Mask	Mask
+base	Matriarchal Bow	Matriarchal Bow
+base	Matriarchal Javelin	Matriarchal Javelin
+base	Matriarchal Pike	Matriarchal Pike
+base	Matriarchal Spear	Matriarchal Spear
+base	Maul	Maul
+base	Mephisto's Brain	Mephisto's Brain
+base	Mephisto's Soulstone	Mephisto's Soulstone
+base	Mesh Armor	Mesh Armor
+base	Mesh Belt	Mesh Belt
+base	Mesh Boots	Mesh Boots
+base	Mighty Scepter	Mighty Scepter
+base	Military Axe	Military Axe
+base	Military Pick	Military Pick
+base	Minion Skull	Minion Skull
+base	Minor Healing Potion	Minor Healing Potion
+base	Minor Mana Potion	Minor Mana Potion
+base	Mirrored Boots	Mirrored Boots
+base	Mithril Coil	Mithril Coil
+base	Mithril Point	Mithril Point
+base	Monarch	Monarch
+base	Morning Star	Morning Star
+base	Mummified Trophy	Mummified Trophy
+base	Myrmidon Greaves	Myrmidon Greaves
+base	Mythical Sword	Mythical Sword
+base	Naga	Naga
+base	Nef Rune	Nef Rune
+base	Northern Worldstone Shard	Northern Worldstone Shard
+base	Occult Codex	Occult Codex
+base	Occult Tome	Occult Tome
+base	Ogre Axe	Ogre Axe
+base	Ogre Gauntlets	Ogre Gauntlets
+base	Ogre Maul	Ogre Maul
+base	Ohm Rune	Ohm Rune
+base	Oil Potion	Oil Potion
+base	Old Book	Old Book
+base	Ornate Plate	Ornate Plate
+base	Ort Rune	Ort Rune
+base	Overseer Skull	Overseer Skull
+base	Partizan	Partizan
+base	Pavise	Pavise
+base	Pellet Bow	Pellet Bow
+base	Perfect Amethyst	Perfect Amethyst
+base	Perfect Diamond	Perfect Diamond
+base	Perfect Emerald	Perfect Emerald
+base	Perfect Ruby	Perfect Ruby
+base	Perfect Sapphire	Perfect Sapphire
+base	Perfect Skull	Perfect Skull
+base	Perfect Topaz	Perfect Topaz
+base	Petrified Wand	Petrified Wand
+base	Phase Blade	Phase Blade
+base	Pike	Pike
+base	Pilum	Pilum
+base	Plate Mail	Plate Mail
+base	Plated Belt	Plated Belt
+base	Poignard	Poignard
+base	Poleaxe	Poleaxe
+base	Polished Wand	Polished Wand
+base	Possessed Compendium	Possessed Compendium
+base	Possessed Grimoire	Possessed Grimoire
+base	Potion of Life	Potion of Life
+base	Preserved Head	Preserved Head
+base	Protector Shield	Protector Shield
+base	Protector's Frost	Protector's Frost
+base	Protector's Stone	Protector's Stone
+base	Pul Rune	Pul Rune
+base	Quarterstaff	Quarterstaff
+base	Quhab	Quhab
+base	Quill	Quill
+base	Quilted Armor	Quilted Armor
+base	Rage Mask	Rage Mask
+base	Ral Rune	Ral Rune
+base	Rancid Gas Potion	Rancid Gas Potion
+base	Razor Bow	Razor Bow
+base	Reflex Bow	Reflex Bow
+base	Reinforced Mace	Reinforced Mace
+base	Rejuvenation Potion	Rejuvenation Potion
+base	Repeating Crossbow	Repeating Crossbow
+base	Ring	Ring
+base	Ring Mail	Ring Mail
+base	Rondache	Rondache
+base	Rondel	Rondel
+base	Round Shield	Round Shield
+base	Royal Shield	Royal Shield
+base	Ruby	Ruby
+base	Rune Bow	Rune Bow
+base	Rune Scepter	Rune Scepter
+base	Rune Staff	Rune Staff
+base	Rune Sword	Rune Sword
+base	Runic Talons	Runic Talons
+base	Russet Armor	Russet Armor
+base	Sabre	Sabre
+base	Sacred Armor	Sacred Armor
+base	Sacred Feathers	Sacred Feathers
+base	Sacred Globe	Sacred Globe
+base	Sacred Rondache	Sacred Rondache
+base	Sacred Targe	Sacred Targe
+base	Sallet	Sallet
+base	Sapphire	Sapphire
+base	Sash	Sash
+base	Savage Helmet	Savage Helmet
+base	Scale Mail	Scale Mail
+base	Scalp	Scalp
+base	Scarab Husk	Scarab Husk
+base	Scarabshell Boots	Scarabshell Boots
+base	Scepter	Scepter
+base	Scimitar	Scimitar
+base	Scissors Katar	Scissors Katar
+base	Scissors Quhab	Scissors Quhab
+base	Scissors Suwayyah	Scissors Suwayyah
+base	Scourge	Scourge
+base	Scroll of Identify	Scroll of Identify
+base	Scroll of Inifuss	Scroll of Inifuss
+base	Scroll of Knowledge	Scroll of Knowledge
+base	Scroll of Resistance	Scroll of Resistance
+base	Scroll of Town Portal	Scroll of Town Portal
+base	Scutum	Scutum
+base	Scythe	Scythe
+base	Seraph Rod	Seraph Rod
+base	Serpentskin Armor	Serpentskin Armor
+base	Sexton Trophy	Sexton Trophy
+base	Shadow Bow	Shadow Bow
+base	Shadow Plate	Shadow Plate
+base	Shael Rune	Shael Rune
+base	Shaft of the Horadric Staff	Shaft of the Horadric Staff
+base	Shako	Shako
+base	Shamshir	Shamshir
+base	Sharkskin Belt	Sharkskin Belt
+base	Sharkskin Boots	Sharkskin Boots
+base	Sharkskin Gloves	Sharkskin Gloves
+base	Sharktooth Armor	Sharktooth Armor
+base	Shillelagh	Shillelagh
+base	Short Battle Bow	Short Battle Bow
+base	Short Bow	Short Bow
+base	Short Siege Bow	Short Siege Bow
+base	Short Spear	Short Spear
+base	Short Staff	Short Staff
+base	Short Sword	Short Sword
+base	Short War Bow	Short War Bow
+base	Siege Crossbow	Siege Crossbow
+base	Silver-edged Axe	Silver-edged Axe
+base	Simbilan	Simbilan
+base	Skull	Skull
+base	Skull Cap	Skull Cap
+base	Sky Spirit	Sky Spirit
+base	Slayer Guard	Slayer Guard
+base	Small Blue Potion	Small Blue Potion
+base	Small Charm	Small Charm
+base	Small Crescent	Small Crescent
+base	Small Red Potion	Small Red Potion
+base	Small Shield	Small Shield
+base	Smoked Sphere	Smoked Sphere
+base	Sol Rune	Sol Rune
+base	Soul	Soul
+base	Southern Worldstone Shard	Southern Worldstone Shard
+base	Sparkling Ball	Sparkling Ball
+base	Spear	Spear
+base	Spetum	Spetum
+base	Spiculum	Spiculum
+base	Spider Bow	Spider Bow
+base	Spiderweb Sash	Spiderweb Sash
+base	Spiked Club	Spiked Club
+base	Spiked Shield	Spiked Shield
+base	Spired Helm	Spired Helm
+base	Spirit Mask	Spirit Mask
+base	Spleen	Spleen
+base	Splint Mail	Splint Mail
+base	Stag Bow	Stag Bow
+base	Stalagmite	Stalagmite
+base	Stamina Potion	Stamina Potion
+base	Standard of Heroes	Standard of Heroes
+base	Stiletto	Stiletto
+base	Strangling Gas Potion	Strangling Gas Potion
+base	Studded Leather	Studded Leather
+base	Stygian Pike	Stygian Pike
+base	Stygian Pilum	Stygian Pilum
+base	Succubus Skull	Succubus Skull
+base	Sun Spirit	Sun Spirit
+base	Super Healing Potion	Super Healing Potion
+base	Super Mana Potion	Super Mana Potion
+base	Sur Rune	Sur Rune
+base	Suwayyah	Suwayyah
+base	Swirling Crystal	Swirling Crystal
+base	Tabar	Tabar
+base	Tail	Tail
+base	Tal Rune	Tal Rune
+base	Talic's Anguish	Talic's Anguish
+base	Targe	Targe
+base	Templar Coat	Templar Coat
+base	Thawing Potion	Thawing Potion
+base	The Black Tower Key	The Black Tower Key
+base	The Gidbinn	The Gidbinn
+base	The Golden Bird	The Golden Bird
+base	Thresher	Thresher
+base	Throwing Axe	Throwing Axe
+base	Throwing Knife	Throwing Knife
+base	Throwing Spear	Throwing Spear
+base	Thul Rune	Thul Rune
+base	Thunder Maul	Thunder Maul
+base	Tiara	Tiara
+base	Tigulated Mail	Tigulated Mail
+base	Tir Rune	Tir Rune
+base	Token of Absolution	Token of Absolution
+base	Tomahawk	Tomahawk
+base	Tomb Wand	Tomb Wand
+base	Tome	Tome
+base	Tome of Identify	Tome of Identify
+base	Tome of Town Portal	Tome of Town Portal
+base	Top of the Horadric Staff	Top of the Horadric Staff
+base	Topaz	Topaz
+base	Torch	Torch
+base	Totemic Mask	Totemic Mask
+base	Tower Shield	Tower Shield
+base	Trellised Armor	Trellised Armor
+base	Trident	Trident
+base	Troll Belt	Troll Belt
+base	Troll Nest	Troll Nest
+base	Truncheon	Truncheon
+base	Tulwar	Tulwar
+base	Tusk Sword	Tusk Sword
+base	Twin Axe	Twin Axe
+base	Twisted Essence of Suffering	Twisted Essence of Suffering
+base	Two-Handed Sword	Two-Handed Sword
+base	Tyrant Club	Tyrant Club
+base	Um Rune	Um Rune
+base	Unearthed Wand	Unearthed Wand
+base	Unraveller Head	Unraveller Head
+base	Vambraces	Vambraces
+base	Vampirebone Gloves	Vampirebone Gloves
+base	Vampirefang Belt	Vampirefang Belt
+base	Vex Rune	Vex Rune
+base	Vortex Orb	Vortex Orb
+base	Vortex Shield	Vortex Shield
+base	Voulge	Voulge
+base	Walking Stick	Walking Stick
+base	Wand	Wand
+base	War Axe	War Axe
+base	War Belt	War Belt
+base	War Boots	War Boots
+base	War Club	War Club
+base	War Dart	War Dart
+base	War Fist	War Fist
+base	War Fork	War Fork
+base	War Gauntlets	War Gauntlets
+base	War Hammer	War Hammer
+base	War Hat	War Hat
+base	War Javelin	War Javelin
+base	War Pike	War Pike
+base	War Scepter	War Scepter
+base	War Scythe	War Scythe
+base	War Spear	War Spear
+base	War Spike	War Spike
+base	War Staff	War Staff
+base	War Sword	War Sword
+base	Ward	Ward
+base	Ward Bow	Ward Bow
+base	Western Worldstone Shard	Western Worldstone Shard
+base	Winged Axe	Winged Axe
+base	Winged Harpoon	Winged Harpoon
+base	Winged Helm	Winged Helm
+base	Winged Knife	Winged Knife
+base	Wire Fleece	Wire Fleece
+base	Wirt's Leg	Wirt's Leg
+base	Wolf Head	Wolf Head
+base	Worusk's End	Worusk's End
+base	Wrist Blade	Wrist Blade
+base	Wrist Spike	Wrist Spike
+base	Wrist Sword	Wrist Sword
+base	Wyrmhide	Wyrmhide
+base	Wyrmhide Boots	Wyrmhide Boots
+base	Yari	Yari
+base	Yew Wand	Yew Wand
+base	Zakarum Shield	Zakarum Shield
+base	Zod Rune	Zod Rune
+base	Zombie Head	Zombie Head
+base	Zweihander	Zweihander
+set	Aldur's Advance	Battle Boots
+set	Aldur's Deception	Shadow Plate
+set	Aldur's Rhythm	Jagged Star
+set	Aldur's Stony Gaze	Hunter's Guise
+set	Angelic Halo	Ring
+set	Angelic Mantle	Ring Mail
+set	Angelic Sickle	Sabre
+set	Angelic Wings	Amulet
+set	Arcanna's Deathwand	War Staff
+set	Arcanna's Flesh	Light Plate
+set	Arcanna's Head	Skull Cap
+set	Arcanna's Sign	Amulet
+set	Arctic Binding	Light Belt
+set	Arctic Furs	Quilted Armor
+set	Arctic Horn	Short War Bow
+set	Arctic Mitts	Light Gauntlets
+set	Bane's Authority	Light Belt
+set	Bane's Oathmaker	Kris
+set	Bane's Wraithskin	Hard Leather Armor
+set	Berserker's Hatchet	Double Axe
+set	Berserker's Hauberk	Splint Mail
+set	Berserker's Headgear	Helm
+set	Bul-Kathos' Sacred Charge	Colossus Blade
+set	Bul-Kathos' Tribal Guardian	Mythical Sword
+set	Cathan's Mesh	Chain Mail
+set	Cathan's Rule	Battle Staff
+set	Cathan's Seal	Ring
+set	Cathan's Sigil	Amulet
+set	Cathan's Visage	Mask
+set	Civerb's Cudgel	Grand Scepter
+set	Civerb's Icon	Amulet
+set	Civerb's Ward	Large Shield
+set	Cleglaw's Claw	Small Shield
+set	Cleglaw's Pincers	Chain Gloves
+set	Cleglaw's Tooth	Long Sword
+set	Cow King's Hide	Studded Leather
+set	Cow King's Hooves	Heavy Boots
+set	Cow King's Horns	War Hat
+set	Credendum	Mithril Coil
+set	Dangoon's Teaching	Reinforced Mace
+set	Dark Adherent	Dusk Shroud
+set	Death's Guard	Sash
+set	Death's Hand	Leather Gloves
+set	Death's Touch	War Sword
+set	Griswold's Heart	Ornate Plate
+set	Griswold's Honor	Vortex Shield
+set	Griswold's Redemption	Caduceus
+set	Griswold's Valor	Corona
+set	Guillaume's Face	Winged Helm
+set	Haemosu's Adamant	Cuirass
+set	Horazon's Countenance	Demonhead
+set	Horazon's Dominion	Russet Armor
+set	Horazon's Hold	Demonhide Gloves
+set	Horazon's Legacy	Mirrored Boots
+set	Horazon's Secrets	Occult Codex
+set	Hsarus' Iron Fist	Buckler
+set	Hsarus' Iron Heel	Chain Boots
+set	Hsarus' Iron Stay	Belt
+set	Hwanin's Blessing	Belt
+set	Hwanin's Justice	Bill
+set	Hwanin's Refuge	Tigulated Mail
+set	Hwanin's Splendor	Grand Crown
+set	Immortal King's Detail	War Belt
+set	Immortal King's Forge	War Gauntlets
+set	Immortal King's Pillar	War Boots
+set	Immortal King's Soul Cage	Sacred Armor
+set	Immortal King's Stone Crusher	Ogre Maul
+set	Immortal King's Will	Avenger Guard
+set	Infernal Cranium	Cap
+set	Infernal Sign	Heavy Belt
+set	Infernal Torch	Grim Wand
+set	Iratha's Coil	Crown
+set	Iratha's Collar	Amulet
+set	Iratha's Cord	Heavy Belt
+set	Iratha's Cuff	Light Gauntlets
+set	Isenhart's Case	Breast Plate
+set	Isenhart's Horns	Full Helm
+set	Isenhart's Lightbrand	Broad Sword
+set	Isenhart's Parry	Gothic Shield
+set	Laying of Hands	Bramble Mitts
+set	M'avina's Caster	Grand Matron Bow
+set	M'avina's Embrace	Kraken Shell
+set	M'avina's Icy Clutch	Battle Gauntlets
+set	M'avina's Tenet	Sharkskin Belt
+set	M'avina's True Sight	Diadem
+set	Magnus' Skin	Sharkskin Gloves
+set	Milabrega's Diadem	Crown
+set	Milabrega's Orb	Kite Shield
+set	Milabrega's Robe	Ancient Armor
+set	Milabrega's Rod	War Scepter
+set	Naj's Circlet	Circlet
+set	Naj's Light Plate	Hellforge Plate
+set	Naj's Puzzler	Elder Staff
+set	Natalya's Mark	Scissors Suwayyah
+set	Natalya's Shadow	Loricated Mail
+set	Natalya's Soul	Mesh Boots
+set	Natalya's Totem	Grim Helm
+set	Ondal's Almighty	Spired Helm
+set	Rite of Passage	Demonhide Boots
+set	Sander's Paragon	Cap
+set	Sander's Riprap	Heavy Boots
+set	Sander's Superstition	Bone Wand
+set	Sander's Taboo	Heavy Gloves
+set	Sazabi's Cobalt Redeemer	Cryptic Sword
+set	Sazabi's Ghost Liberator	Balrog Skin
+set	Sazabi's Mental Sheath	Basinet
+set	Sigon's Gage	Gauntlets
+set	Sigon's Guard	Tower Shield
+set	Sigon's Sabot	Greaves
+set	Sigon's Shelter	Gothic Plate
+set	Sigon's Visor	Great Helm
+set	Sigon's Wrap	Plated Belt
+set	Taebaek's Glory	Ward
+set	Tal Rasha's Adjudication	Amulet
+set	Tal Rasha's Fine-Spun Cloth	Mesh Belt
+set	Tal Rasha's Guardianship	Lacquered Plate
+set	Tal Rasha's Horadric Crest	Death Mask
+set	Tal Rasha's Lidless Eye	Swirling Crystal
+set	Tancred's Crowbill	Military Pick
+set	Tancred's Hobnails	Boots
+set	Tancred's Skull	Bone Helm
+set	Tancred's Spine	Full Plate Mail
+set	Tancred's Weird	Amulet
+set	Telling of Beads	Amulet
+set	Trang-Oul's Claws	Heavy Bracers
+set	Trang-Oul's Girth	Troll Belt
+set	Trang-Oul's Guise	Bone Visage
+set	Trang-Oul's Scales	Chaos Armor
+set	Trang-Oul's Wing	Cantor Trophy
+set	Vidala's Ambush	Leather Armor
+set	Vidala's Barb	Long Battle Bow
+set	Vidala's Fetlock	Light Plated Boots
+set	Vidala's Snare	Amulet
+set	Warlord's Authority	Plated Belt
+set	Warlord's Conquest	Gauntlets
+set	Warlord's Crushers	Greaves
+set	Warlord's Lust	Great Helm
+set	Warlord's Mantle	Full Plate Mail
+set	Whitstan's Guard	Round Shield
+set	Wilhelm's Pride	Battle Belt
+unique	Alma Negra	Sacred Rondache
+unique	Amulet of the Viper	Top of the Horadric Staff
+unique	Andariel's Visage	Demonhead
+unique	Annihilus	Small Charm
+unique	Arachnid Mesh	Spiderweb Sash
+unique	Arioc's Needle	Hyperion Spear
+unique	Arkaine's Valor	Balrog Skin
+unique	Arm of King Leoric	Tomb Wand
+unique	Arreat's Face	Slayer Guard
+unique	Ars Al'Diabolos	Blasphemous Grimoire
+unique	Ars Dul'Mephistos	Occult Tome
+unique	Ars Tor'Baalos	Blasphemous Compendium
+unique	Astreon's Iron Ward	Caduceus
+unique	Athena's Wrath	Battle Scythe
+unique	Atma's Scarab	Amulet
+unique	Atma's Wail	Embossed Plate
+unique	Axe of Fechmar	Large Axe
+unique	Azurewrath	Crystal Sword
+unique	Azurewrath	Phase Blade
+unique	Baezil's Vortex	Knout
+unique	Bane Ash	Short Staff
+unique	Baranar's Star	Devil Star
+unique	Bartuc's Cut-Throat	Greater Talons
+unique	Biggin's Bonnet	Cap
+unique	Bing Sz Wang	Dacian Falx
+unique	Black Cleft	Grand Charm
+unique	Black Hades	Chaos Armor
+unique	Blackbog's Sharp	Cinquedeas
+unique	Blackhand Key	Grave Wand
+unique	Blackhorn's Face	Death Mask
+unique	Blackleach Blade	Bill
+unique	Blackoak Shield	Luna
+unique	Blacktongue	Bastard Sword
+unique	Blade of Ali Baba	Tulwar
+unique	Bladebone	Double Axe
+unique	Bladebuckle	Plated Belt
+unique	Blastbark	Long War Bow
+unique	Blinkbat's Form	Leather Armor
+unique	Blood Crescent	Scimitar
+unique	Blood Raven's Charge	Matriarchal Bow
+unique	Bloodfist	Heavy Gloves
+unique	Bloodletter	Gladius
+unique	Bloodmoon	Elegant Blade
+unique	Bloodpact Shard	Mithril Point
+unique	Bloodrise	Morning Star
+unique	Bloodthief	Brandistock
+unique	Bloodtree Stump	War Club
+unique	Bone Break	Grand Charm
+unique	Boneflame	Succubus Skull
+unique	Boneflesh	Plate Mail
+unique	Bonehew	Ogre Axe
+unique	Boneshade	Lich Wand
+unique	Boneslayer Blade	Gothic Axe
+unique	Bonesnap	Maul
+unique	Brainhew	Great Axe
+unique	Bul-Kathos' Wedding Band	Ring
+unique	Buriza-Do Kyanon	Ballista
+unique	Butcher's Pupil	Cleaver
+unique	Bverrit Keep	Tower Shield
+unique	Carin Shard	Petrified Wand
+unique	Carrion Wind	Ring
+unique	Cerebus' Bite	Blood Spirit
+unique	Chance Guards	Chain Gloves
+unique	Chromatic Ire	Cedar Staff
+unique	Cliffkiller	Large Siege Bow
+unique	Cloudcrack	Gothic Sword
+unique	Coif of Glory	Helm
+unique	Cold Rupture	Grand Charm
+unique	Coldkill	Hatchet
+unique	Coldsteel Eye	Cutlass
+unique	Constricting Ring	Ring
+unique	Corpsemourn	Ornate Plate
+unique	Crack of the Heavens	Grand Charm
+unique	Crainte Vomir	Espandon
+unique	Cranebeak	War Spike
+unique	Crescent Moon	Amulet
+unique	Crow Caw	Tigulated Mail
+unique	Crown of Ages	Corona
+unique	Crown of Thieves	Grand Crown
+unique	Crushflange	Mace
+unique	Culwen's Point	War Sword
+unique	Dark Clan Crusher	Cudgel
+unique	Darkfear	Armet
+unique	Darkforce Spawn	Bloodlord Skull
+unique	Darkglow	Ring Mail
+unique	Darksight Helm	Basinet
+unique	Death Cleaver	Berserker Axe
+unique	Death's Fathom	Dimensional Shard
+unique	Death's Web	Unearthed Wand
+unique	Deathbit	Battle Dart
+unique	Deathspade	Axe
+unique	Defender's Bile	Jewel
+unique	Defender's Fire	Jewel
+unique	Demon Limb	Tyrant Club
+unique	Demon Machine	Chu-Ko-Nu
+unique	Demon's Arch	Balrog Spear
+unique	Demonhorn's Edge	Destroyer Helm
+unique	Dimoak's Hew	Bardiche
+unique	Djinn Slayer	Ataghan
+unique	Doombringer	Champion Sword
+unique	Doomslinger	Repeating Crossbow
+unique	Dracul's Grasp	Vampirebone Gloves
+unique	Dragonscale	Zakarum Shield
+unique	Dreadfang	Legend Sword
+unique	Duriel's Shell	Cuirass
+unique	Duskdeep	Full Helm
+unique	Dwarf Star	Ring
+unique	Eaglehorn	Crusader Bow
+unique	Earth Shifter	Thunder Maul
+unique	Earthshaker	Battle Hammer
+unique	Endlesshail	Double Bow
+unique	Entropy Locket	Amulet
+unique	Eschuta's Temper	Eldritch Orb
+unique	Ethereal Edge	Silver-edged Axe
+unique	Executioner's Justice	Glorious Axe
+unique	Felloak	Club
+unique	Firelizard's Talons	Feral Claws
+unique	Flame Rift	Grand Charm
+unique	Flamebellow	Balrog Blade
+unique	Fleshrender	Barbed Club
+unique	Fleshripper	Fanged Knife
+unique	Frostburn	Gauntlets
+unique	Frostwind	Cryptic Sword
+unique	Gargoyle's Bite	Winged Harpoon
+unique	Gerke's Sanctuary	Pavise
+unique	Gheed's Fortune	Grand Charm
+unique	Gheed's Wager	Troll Belt
+unique	Ghostflame	Legend Spike
+unique	Ghoulhide	Heavy Bracers
+unique	Giant Skull	Bone Visage
+unique	Gimmershred	Flying Axe
+unique	Ginther's Rift	Dimensional Blade
+unique	Gleamscythe	Falchion
+unique	Gloom's Trap	Mesh Belt
+unique	Goblin Toe	Light Plated Boots
+unique	Goldskin	Full Plate Mail
+unique	Goldstrike Arch	Gothic Bow
+unique	Goldwrap	Heavy Belt
+unique	Gore Rider	War Boots
+unique	Gorefoot	Heavy Boots
+unique	Goreshovel	Broad Axe
+unique	Gravenspine	Bone Wand
+unique	Gravepalm	Sharkskin Gloves
+unique	Greyform	Quilted Armor
+unique	Griffon's Eye	Diadem
+unique	Grim's Burning Dead	Grim Scythe
+unique	Griswold's Edge	Broad Sword
+unique	Guardian Angel	Templar Coat
+unique	Guardian Naga	Naga
+unique	Guardian's Light	Jewel
+unique	Guardian's Thunder	Jewel
+unique	Gull	Dagger
+unique	Gut Siphon	Demon Crossbow
+unique	Halaberd's Reign	Conqueror Crown
+unique	Hand of Blessed Light	Divine Scepter
+unique	Harlequin Crest	Shako
+unique	Hawkmail	Scale Mail
+unique	Head Hunter's Glory	Troll Nest
+unique	Headstriker	Battle Sword
+unique	Heart Carver	Rondel
+unique	Heaven's Light	Mighty Scepter
+unique	Heavenly Garb	Light Plate
+unique	Hell Forge Hammer	Hell Forge Hammer
+unique	Hellcast	Heavy Crossbow
+unique	Hellclap	Short War Bow
+unique	Hellfire Torch	Large Charm
+unique	Hellmouth	War Gauntlets
+unique	Hellplague	Long Sword
+unique	Hellrack	Colossus Crossbow
+unique	Hellslayer	Decapitator
+unique	Hellwarden's Will	Death Mask
+unique	Herald of Zakarum	Gilded Shield
+unique	Hexfire	Shamshir
+unique	Highlord's Wrath	Amulet
+unique	Homunculus	Hierophant Trophy
+unique	Hone Sundan	Yari
+unique	Horadric Staff	Horadric Staff
+unique	Horizon's Tornado	Scourge
+unique	Hotspur	Boots
+unique	Howltusk	Great Helm
+unique	Humongous	Giant Axe
+unique	Husoldal Evo	Bec-de-Corbin
+unique	Iceblink	Splint Mail
+unique	Ichorsting	Crossbow
+unique	Infernostride	Demonhide Boots
+unique	Iron Pelt	Trellised Armor
+unique	Ironstone	War Hammer
+unique	Islestrike	Twin Axe
+unique	Jade Talon	Wrist Sword
+unique	Jalal's Mane	Totemic Mask
+unique	Kelpie Snare	Fuscina
+unique	Khalim's Flail	Khalim's Flail
+unique	Khalim's Will	Khalim's Will
+unique	Kinemil's Awl	Giant Sword
+unique	Kira's Guardian	Tiara
+unique	Knell Striker	Scepter
+unique	Kuko Shakaku	Cedar Bow
+unique	Lacerator	Winged Axe
+unique	Lance Guard	Barbed Shield
+unique	Lance of Yaggai	Spetum
+unique	Langer Briser	Arbalest
+unique	Latent Black Cleft	Grand Charm
+unique	Latent Bone Break	Grand Charm
+unique	Latent Cold Rupture	Grand Charm
+unique	Latent Crack of the Heavens	Grand Charm
+unique	Latent Flame Rift	Grand Charm
+unique	Latent Rotting Fissure	Grand Charm
+unique	Lava Gout	Battle Gauntlets
+unique	Leadcrow	Light Crossbow
+unique	Lenymo	Sash
+unique	Leviathan	Kraken Shell
+unique	Lidless Wall	Grim Shield
+unique	Lightsabre	Phase Blade
+unique	Lycander's Aim	Ceremonial Bow
+unique	Lycander's Flank	Ceremonial Pike
+unique	Maelstrom	Yew Wand
+unique	Magefist	Light Gauntlets
+unique	Magewrath	Rune Bow
+unique	Manald Heal	Ring
+unique	Mang Song's Lesson	Archon Staff
+unique	Mara's Kaleidoscope	Amulet
+unique	Marrowwalk	Boneweave Boots
+unique	Measured Wrath	Burnt Text
+unique	Medusa's Gaze	Aegis
+unique	Messerschmidt's Reaver	Champion Axe
+unique	Metalgrid	Amulet
+unique	Moonfall	Jagged Star
+unique	Moser's Blessed Circle	Round Shield
+unique	Nagelring	Ring
+unique	Nature's Peace	Ring
+unique	Nightsmoke	Belt
+unique	Nightwing's Veil	Spired Helm
+unique	Nokozan Relic	Amulet
+unique	Nord's Tenderizer	Truncheon
+unique	Nosferatu's Coil	Vampirefang Belt
+unique	Ondal's Wisdom	Elder Staff
+unique	Opalvein	Ring
+unique	Ormus' Robes	Dusk Shroud
+unique	Peasant Crown	War Hat
+unique	Pelta Lunata	Buckler
+unique	Pierre Tombale Couant	Partizan
+unique	Plague Bearer	Rune Sword
+unique	Pluckeye	Short Bow
+unique	Pompeii's Wrath	Crowbill
+unique	Protector's Frost	Jewel
+unique	Protector's Stone	Jewel
+unique	Pus Spitter	Siege Crossbow
+unique	Que-Hegan's Wisdom	Mage Plate
+unique	Radament's Sphere	Ancient Shield
+unique	Rainbow Facet	Jewel
+unique	Rakescar	War Axe
+unique	Rattlecage	Gothic Plate
+unique	Raven Claw	Long Bow
+unique	Raven Frost	Ring
+unique	Ravenlore	Sky Spirit
+unique	Razor's Edge	Tomahawk
+unique	Razorswitch	Jo Staff
+unique	Razortail	Sharkskin Belt
+unique	Razortine	Trident
+unique	Renewed Black Cleft	Grand Charm
+unique	Renewed Bone Break	Grand Charm
+unique	Renewed Cold Rupture	Grand Charm
+unique	Renewed Crack of the Heavens	Grand Charm
+unique	Renewed Flame Rift	Grand Charm
+unique	Renewed Rotting Fissure	Grand Charm
+unique	Ribcracker	Quarterstaff
+unique	Riphook	Razor Bow
+unique	Ripsaw	Flamberge
+unique	Rixot's Keen	Short Sword
+unique	Rockfleece	Field Plate
+unique	Rockstopper	Sallet
+unique	Rogue's Bow	Composite Bow
+unique	Rotting Fissure	Grand Charm
+unique	Rune Master	Ettin Axe
+unique	Rusthandle	Grand Scepter
+unique	Sandstorm Trek	Scarabshell Boots
+unique	Saracen's Chance	Amulet
+unique	Schaefer's Hammer	Legendary Mallet
+unique	Seraph's Hymn	Amulet
+unique	Serpent Lord	Long Staff
+unique	Shadow Dancer	Myrmidon Greaves
+unique	Shadow Killer	Battle Cestus
+unique	Shadowfang	Two-Handed Sword
+unique	Shaftstop	Mesh Armor
+unique	Silks of the Victor	Ancient Armor
+unique	Silkweave	Mesh Boots
+unique	Skewer of Krintiz	Sabre
+unique	Skin of the Flayed One	Demonhide Armor
+unique	Skin of the Vipermagi	Serpentskin Armor
+unique	Skull Collector	Rune Staff
+unique	Skull Splitter	Military Pick
+unique	Skullder's Ire	Russet Armor
+unique	Skystrike	Edge Bow
+unique	Sling	Ring
+unique	Snakecord	Light Belt
+unique	Snowclash	Battle Belt
+unique	Soul Drainer	Vambraces
+unique	Soul Harvest	Scythe
+unique	Soulfeast Tine	War Fork
+unique	Soulflay	Claymore
+unique	Sparking Mail	Chain Mail
+unique	Spectral Shard	Blade
+unique	Spellsteel	Bearded Axe
+unique	Spike Thorn	Blade Barrier
+unique	Spineripper	Poignard
+unique	Spire of Honor	Lance
+unique	Spire of Lazarus	Gnarled Staff
+unique	Spirit Forge	Linked Mail
+unique	Spirit Keeper	Earth Spirit
+unique	Spirit Ward	Ward
+unique	Staff of Kings	Shaft of the Horadric Staff
+unique	Stealskull	Casque
+unique	Steel Carapace	Shadow Plate
+unique	Steel Pillar	War Pike
+unique	Steel Shade	Armet
+unique	Steelclash	Kite Shield
+unique	Steeldriver	Great Maul
+unique	Steelgoad	Voulge
+unique	Steelrend	Ogre Gauntlets
+unique	Stone Crusher	Legendary Mallet
+unique	Stoneraven	Matriarchal Spear
+unique	Stormchaser	Scutum
+unique	Stormeye	War Scepter
+unique	Stormguild	Large Shield
+unique	Stormlash	Scourge
+unique	Stormrider	Tabar
+unique	Stormshield	Monarch
+unique	Stormspike	Stiletto
+unique	Stormspire	Giant Thresher
+unique	Stormstrike	Short Battle Bow
+unique	Stoutnail	Spiked Club
+unique	String of Ears	Demonhide Sash
+unique	Suicide Branch	Burnt Wand
+unique	Sureshrill Frost	Flanged Mace
+unique	Swordback Hold	Spiked Shield
+unique	Swordguard	Executioner Sword
+unique	Tarnhelm	Skull Cap
+unique	Tearhaunch	Greaves
+unique	Templar's Might	Sacred Armor
+unique	The Atlantean	Ancient Sword
+unique	The Battlebranch	Poleaxe
+unique	The Cat's Eye	Amulet
+unique	The Centurion	Hard Leather Armor
+unique	The Chieftain	Battle Axe
+unique	The Cranium Basher	Thunder Maul
+unique	The Diggler	Dirk
+unique	The Dragon Chang	Spear
+unique	The Eye of Etlich	Amulet
+unique	The Face of Horror	Mask
+unique	The Fetid Sprinkler	Holy Water Sprinkler
+unique	The Gavel of Pain	Martel de Fer
+unique	The General's Tan Do Li Ga	Flail
+unique	The Gladiator's Bane	Wire Fleece
+unique	The Gnasher	Hand Axe
+unique	The Grandfather	Colossus Blade
+unique	The Grim Reaper	War Scythe
+unique	The Hand of Broc	Leather Gloves
+unique	The Impaler	War Spear
+unique	The Iron Jang Bong	War Staff
+unique	The Jade Tan Do	Kris
+unique	The Mahim-Oak Curio	Amulet
+unique	The Meat Scraper	Lochaber Axe
+unique	The Minotaur	Ancient Axe
+unique	The Oculus	Swirling Crystal
+unique	The Patriarch	Great Sword
+unique	The Reaper's Toll	Thresher
+unique	The Redeemer	Mighty Scepter
+unique	The Rising Sun	Amulet
+unique	The Salamander	Battle Staff
+unique	The Scalper	Francisca
+unique	The Spirit Shroud	Ghost Armor
+unique	The Stone of Jordan	Ring
+unique	The Tannr Gorerod	Pike
+unique	The Vile Husk	Tusk Sword
+unique	The Ward	Gothic Shield
+unique	Thundergod's Vigor	War Belt
+unique	Thunderstroke	Matriarchal Javelin
+unique	Tiamat's Rebuke	Dragon Shield
+unique	Titan's Revenge	Ceremonial Javelin
+unique	Todesfaelle Flamme	Zweihander
+unique	Tomb Reaver	Cryptic Axe
+unique	Toothrow	Sharktooth Armor
+unique	Torch of Iro	Wand
+unique	Treads of Cthon	Chain Boots
+unique	Twitchthroe	Studded Leather
+unique	Tyrael's Might	Sacred Armor
+unique	Umbral Disk	Small Shield
+unique	Ume's Lament	Grim Wand
+unique	Undead Crown	Crown
+unique	Valkyrie Wing	Winged Helm
+unique	Vampire Gaze	Grim Helm
+unique	Veil of Steel	Spired Helm
+unique	Venom Grip	Demonhide Gloves
+unique	Venom Ward	Breast Plate
+unique	Verdungo's Hearty Cord	Mithril Coil
+unique	Viperfork	Mancatcher
+unique	Visceratuant	Defender
+unique	Wall of the Eyeless	Bone Shield
+unique	War Traveler	Battle Boots
+unique	Warlord's Trust	Military Axe
+unique	Warpspear	Gothic Staff
+unique	Warshrike	Winged Knife
+unique	Waterwalk	Sharkskin Boots
+unique	Widowmaker	Ward Bow
+unique	Windforce	Hydra Bow
+unique	Windhammer	Ogre Maul
+unique	Wisp Projector	Ring
+unique	Witchwild String	Short Siege Bow
+unique	Witherstring	Hunter's Bow
+unique	Wizardspike	Bone Knife
+unique	Wizendraw	Long Battle Bow
+unique	Woestave	Halberd
+unique	Wolfhowl	Fury Visor
+unique	Wormskull	Bone Helm
+unique	Wraith Flight	Ghost Glaive
+unique	Wraithstep	Mirrored Boots
+unique	Zakarum's Hand	Rune Scepter

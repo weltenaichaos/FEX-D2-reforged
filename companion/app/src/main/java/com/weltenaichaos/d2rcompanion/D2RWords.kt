@@ -7,9 +7,11 @@ import java.util.Locale
  * appear on items (properties, item types, quality words). Most common first,
  * so a tie goes to the more likely word ("T" -> "to").
  */
-object D2RWords {
-    private val WORDS = """
-        to of all and the per by on in a damage skills skill level levels resist resistance resistances
+class D2RWords(ctx: android.content.Context) {
+    private val HAND = """
+        to of all and the per by on in a two damage
+        stash inventory personal shared difficulty normal nightmare night mare hell gold max pick up drop
+        compare hold sort close menu very slow fast class encampment act skills skill level levels resist resistance resistances
         increased enhanced faster cast rate hit recovery attack speed run walk run/walk life mana
         defense rating chance strike attacker takes cold fire lightning poison magic physical
         reduced reduces maximum minimum adds absorb absorbs light radius find gold gold items
@@ -36,7 +38,11 @@ object D2RWords {
         shadow disciplines martial arts elemental shape shifting summoning offensive defensive auras
         bone necromancy curses javelin spear passive magic skills cold fire lightning spells
         target defense vs versus missiles hits ranged attacks sec seconds second
-    """.trimIndent().split(Regex("\\s+")).filter { it.isNotEmpty() }.distinct()
+    """.trimIndent().split(Regex("\\s+")).filter { it.isNotEmpty() }
+
+    /** Hand list first (most common words), then every word from D2R's item texts. */
+    private val WORDS: List<String> = (HAND + ctx.assets.open("words.txt").bufferedReader()
+        .readLines().filter { it.isNotEmpty() && !it.startsWith("#") }).distinct()
 
     private val SET = WORDS.toHashSet()
 
@@ -44,6 +50,9 @@ object D2RWords {
      * D2R's font draws O with a cross inside, which text recognition often reads
      * as a different sign (ø, ⊕, θ, Q, 0, @). Inside a word these become O again.
      */
+    fun fixGlyphs(line: String): String = Companion.fixGlyphs(line)
+
+    companion object {
     fun fixGlyphs(line: String): String {
         val sb = StringBuilder(line)
         for (i in sb.indices) {
@@ -62,54 +71,48 @@ object D2RWords {
         }
         return sb.toString()
     }
+    }
 
     /** Corrects each word of a line that isn't a known word but is close to one. */
     fun fix(line: String): String {
-        val parts = line.split(" ")
-        return parts.joinToString(" ") { fixToken(it) }
+        val sb = StringBuilder()
+        var last = 0
+        for (m in TOKEN.findAll(line)) {
+            sb.append(line, last, m.range.first)
+            val prevDigit = m.range.first > 0 && line[m.range.first - 1].isDigit()
+            val w = fixWord(m.value)
+            if (prevDigit && w != m.value) sb.append(' ')
+            sb.append(w)
+            last = m.range.last + 1
+        }
+        sb.append(line, last, line.length)
+        return sb.toString()
     }
 
-    private fun fixToken(token: String): String {
-        // Keep numbers, ranges, percents and punctuation as they are.
-        val m = Regex("^([^A-Za-z']*)([A-Za-z']+)([^A-Za-z']*)$").find(token) ?: return token
-        val (pre, word, post) = m.destructured
+    private val TOKEN = Regex("[A-Za-z'@#θøØ]+")
+
+    private fun fixWord(word: String): String {
         val lower = word.lowercase(Locale.ROOT)
-        if (lower in SET) return token
-        // Long unknown words are names (unique, set, monster): leave them alone.
-        val maxDist = if (word.length <= 5) 1 else 2
-        var best: String? = null
-        var bestD = maxDist + 1
-        for (w in WORDS) {
-            if (kotlin.math.abs(w.length - lower.length) > maxDist) continue
-            val d = dist(lower, w, bestD)
-            if (d < bestD) { bestD = d; best = w; if (d == 0) break }
+        if (lower in SET) return word
+        val limit = when {
+            word.length <= 3 -> 0.6f
+            word.length <= 6 -> 1.0f
+            else -> 1.6f
         }
-        val b = best ?: return token
-        if (word.length == 1 && b.length > 2) return token
-        return pre + matchCase(word, b) + post
+        var best: String? = null
+        var bestD = limit + 0.001f
+        for (w in WORDS) {
+            if (kotlin.math.abs(w.length - lower.length) > 2) continue
+            val d = Fuzzy.dist(lower, w, bestD)
+            if (d < bestD) { bestD = d; best = w; if (d == 0f) break }
+        }
+        val b = best ?: return word
+        return matchCase(word, b)
     }
 
     private fun matchCase(orig: String, w: String): String = when {
         orig.length > 1 && orig.all { it.isUpperCase() } -> w.uppercase(Locale.ROOT)
         orig.first().isUpperCase() && orig.length > 1 -> w.replaceFirstChar { it.uppercase(Locale.ROOT) }
         else -> w
-    }
-
-    /** Levenshtein distance, giving up once it is >= limit. */
-    private fun dist(a: String, b: String, limit: Int): Int {
-        var prev = IntArray(b.length + 1) { it }
-        var cur = IntArray(b.length + 1)
-        for (i in 1..a.length) {
-            cur[0] = i
-            var rowMin = cur[0]
-            for (j in 1..b.length) {
-                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
-                cur[j] = minOf(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
-                if (cur[j] < rowMin) rowMin = cur[j]
-            }
-            if (rowMin >= limit) return limit
-            val t = prev; prev = cur; cur = t
-        }
-        return prev[b.length]
     }
 }

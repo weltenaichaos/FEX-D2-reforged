@@ -40,7 +40,7 @@ class MainActivity : Activity() {
             r.run()
         }, "ocr")
     }
-    private val reader = ItemReader()
+    private val reader by lazy { ItemReader(applicationContext) }
 
     private lateinit var status: TextView
     private lateinit var log: TextView
@@ -165,7 +165,7 @@ class MainActivity : Activity() {
     private fun updateStatus() {
         val svc = CaptureService.instance
         if (svc != null) {
-            status.text = "Capturing game screen ${svc.width}x${svc.height}"
+            status.text = "Capturing game screen ${svc.width}x${svc.height} (screens ${svc.displays})"
             btnCapture.text = "Stop capture"
         } else {
             status.text = "Not capturing. Press Start capture and choose the whole screen."
@@ -207,8 +207,11 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Item labels worth logging: magic, rare, set, unique and orange (runes, crafted). */
-    private fun isDrop(l: TextLine): Boolean = when (l.quality) {
+    /**
+     * Item labels worth logging: the text must name a known D2R item (so gold
+     * monster and area names don't count) in magic, rare, set, unique or orange.
+     */
+    private fun isDrop(l: TextLine): Boolean = l.item != null && when (l.quality) {
         Quality.MAGIC, Quality.RARE, Quality.UNIQUE, Quality.SET, Quality.ORANGE -> l.share >= 40
         else -> false
     }
@@ -222,7 +225,8 @@ class MainActivity : Activity() {
             if (seen.containsKey(key)) { seen[key] = now; continue }
             seen[key] = now
             append("${time()} DROP ", null)
-            append("${l.text}  [${l.quality.label}]\n", l.quality.argb)
+            val base = l.item?.entry?.let { if (it.name != l.text) "  (${it.name})" else "" } ?: ""
+            append("${l.text}$base  [${l.quality.label}]\n", l.quality.argb)
         }
     }
 
@@ -231,7 +235,8 @@ class MainActivity : Activity() {
         // Top to bottom, then left to right, as a tooltip reads.
         for (l in lines.sortedWith(compareBy({ it.box.top / 8 }, { it.box.left }))) {
             append("${l.text}", l.quality.argb)
-            val note = if (l.raw != l.text) " read as: ${l.raw}" else ""
+            val item = l.item?.entry?.let { e -> " ITEM ${e.kind.name.lowercase()}: ${e.name}" + (if (e.base != e.name) " / ${e.base}" else "") } ?: ""
+            val note = item + (if (l.raw != l.text) " read as: ${l.raw}" else "")
             append("  [${l.quality.label} ${l.share}%]$note\n", 0xFF777777.toInt())
         }
     }
@@ -258,7 +263,7 @@ class MainActivity : Activity() {
                 val name = "d2r-shot-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
                 write("$name.png", "image/png") { os -> bmp.compress(Bitmap.CompressFormat.PNG, 100, os) }
                 val txt = lines.joinToString("\n") {
-                    "${it.text}\t${it.quality.label}\t${it.share}%\t${it.box.flattenToString()}\traw=${it.raw}"
+                    "${it.text}\t${it.quality.label}\t${it.share}%\t${it.box.flattenToString()}\traw=${it.raw}\titem=${it.item?.entry?.name ?: ""}"
                 }
                 write("$name.txt", "text/plain") { os -> os.write(txt.toByteArray()) }
                 main.post { status.text = "Saved Download/D2RCompanion/$name.png and .txt" }
