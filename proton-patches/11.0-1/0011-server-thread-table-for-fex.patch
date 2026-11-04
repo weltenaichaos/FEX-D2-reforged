@@ -1,0 +1,690 @@
+server, ntdll: the wineserver keeps a thread table for FEX's helpers.
+
+In b159 (FEX 159, Proton d2r9) FEX's own helper threads asked the wineserver about every
+thread of D2R's process, round after round: the priority guard and thread placer walk the
+threads with NtGetNextThread (get_next_thread 66/s) and NtQueryInformationThread
+(ThreadBasicInformation, ThreadNameInformation: get_thread_info ~160/s), the stats log reads
+ThreadTimes for every thread every second (get_thread_times) and closes the handles again
+(close_handle). About 300 of the ~2,100 requests a second in play came from these helpers.
+
+The wineserver owns all of these values, so it now writes them itself into a table that the
+process maps read-only, at the moment one of them changes:
+  thread created (create_thread), started (init_first_thread, init_thread, init_process_done:
+  Linux tid and TEB), priority (set_thread_priority, so also base priority, priority class and
+  process base priority changes), affinity (set_thread_affinity, so also process affinity
+  changes), priority boost (set_thread_disable_boost, also through the process), name and
+  debugger hiding (set_thread_info), killed (kill_thread: entry freed, and the next thread
+  rewritten because it may be the process's first thread now, whose Priority has +1),
+  destroyed (destroy_thread, a last check).
+Each entry holds what get_thread_info and get_thread_times return for the thread at that
+moment, so FEX gets exactly what NtQueryInformationThread would give it, FEX's own threads
+included: thread id, Linux tid, TEB, Priority (get_effective_thread_priority), BasePriority,
+the server's affinity (ThreadBasicInformation.AffinityMask = this & the system affinity mask,
+which ntdll exports next to the table), creation time and the name. Nothing else changes for
+the server or for the process; no request goes away by itself, FEX has to read the table.
+
+The table (64 KB memfd, made on the process's first d2r_get_thread_table request, sealed
+against shrinking and growing and against new writable mappings; the server keeps its own
+copy of everything it needs and never reads the shared memory, so nothing the process does
+to it can change what the server does):
+  header, 128 bytes: version 1, header_size 128, entry_size 128, max_entries 511, used
+  (entries [0, used) can be in use), count (threads listed now), changes (+1 after every
+  entry write), not_listed (threads left out because the table is full; one gets the next
+  free entry), pid, serial (serials handed out so far), reserved.
+  entry, 128 bytes at 128 + 128 * i: seq (u32, odd while being written, +2 per write), tid
+  (u32, 0 = free), unix_tid (s32, -1 until the thread runs), priority (s32), base_priority
+  (s32), flags (u32: 1 first thread of the process, 2 priority boost disabled, 4 hidden from
+  the debugger, 8 name cut or a character replaced), teb (u64), affinity (u64), serial (u32,
+  the thread's number in the table, never reused, so a reused tid shows as a new thread),
+  name_len (u32, whole name in characters), creation_time (s64), name (72 bytes, ASCII,
+  '?' for other characters, NUL terminated, cut to 71).
+Reading an entry: s0 = seq (acquire load); if odd, try again; copy the entry; acquire fence;
+s1 = seq; keep the copy only when s0 == s1. A free entry (tid 0) means the thread is gone.
+
+ntdll asks once at start (load_ntdll_functions, under fd_cache_mutex as other fd receives
+do), maps the table read-only and writes into the new export __wine_d2r_threads (8 x ULONG64,
+PE ntdll): version (u32, 1 once mapped, written last), size (u32), table (u64 address),
+system_affinity (u64, get_system_affinity_mask()), status (u32, why there is no table when
+version stays 0: NTSTATUS, or 0xe0000000 | errno of the mmap), pad, reserved[4].
+
+The new request is appended after the last one, so every other request keeps its number;
+SERVER_PROTOCOL_VERSION goes up by one (wineserver and ntdll are built together).
+
+Model test: the server block, compiled unchanged from thread.c, runs in a wineserver model
+whose thread and process functions copy thread.c and process.c with the hooks in place:
+three processes made and ended over and over, up to 700 threads (more than the table
+holds), tid reuse, creates, starts, kills, destroys, priority, base priority, priority
+class, boost, thread and process affinity (also failing sched_setaffinity), names (empty,
+71 and 90 characters, non-ASCII), debugger hiding, changes to killed threads through a
+kept handle, the table asked for at any point of a process's start or later. After every
+step every table is read through a read-only mapping and compared with what get_thread_info
+and get_thread_times would return for each live thread: 200 programs of 3,000 steps, 0
+differences; with any one hook taken out (affinity, boost, name, first thread after a kill)
+37 to 38 of 40 programs fail, so the test sees each of them. A writable mapping and a shrink
+of the client's fd are refused. Seqlock test: the server code rewrites entries as fast as it
+can (31 million writes in 8 s) while three reader threads use the read rule above: 0 torn
+copies kept; with the odd mark taken out, 10,438.
+
+WINE_D2R_THREAD_TABLE=0: ntdll does not ask for the table (the export stays version 0) and
+the server never makes one. Read once per process.
+---
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 85e9fa6..950cada 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1759,6 +1759,7 @@
+ @ extern -private __wine_d2r_vm_lock
+ @ extern -private __wine_d2r_server_calls
+ @ extern -private __wine_d2r_server_calls_ext
++@ extern -private __wine_d2r_threads
+ @ stdcall __wine_get_unix_env(ptr ptr long)
+ @ stdcall __wine_set_unix_env(ptr ptr)
+ @ stdcall wine_nt_to_unix_file_name(ptr ptr ptr long) compat_wine_nt_to_unix_file_name
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index baff5b9..f33d9b3 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -863,6 +863,10 @@ DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls[1032];
+  * (struct d2r_server_calls_ext, D2R_SERVER_CALLS_EXT_U64), read by FEX */
+ DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls_ext[272];  /* 272 since patch 0010 */
+ 
++/* d2r (patch 0011): where the wineserver's thread table for this process is mapped
++ * (struct d2r_threads_info in unix/unix_private.h), read by FEX's helpers */
++DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_threads[8];
++
+ /* WINE_D2R_WAIT_LOCK=0 (read in loader_init): spin until free, as stock Wine does */
+ BOOL d2r_wait_lock_spin = FALSE;
+ 
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 93f27a7..a4a2d84 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2033,6 +2033,13 @@ static void load_ntdll_functions( HMODULE module )
+             WriteRelease( (LONG *)&d2r_server_calls_ext->version, 1 );
+         }
+     }
++    /* d2r: the wineserver's thread table for FEX's helpers (patch 0011), off with
++     * WINE_D2R_THREAD_TABLE=0 */
++    if (!(getenv( "WINE_D2R_THREAD_TABLE" ) && getenv( "WINE_D2R_THREAD_TABLE" )[0] == '0'))
++    {
++        struct d2r_threads_info *info = (void *)find_named_export( module, exports, "__wine_d2r_threads" );
++        if (info) d2r_threads_init( info );
++    }
+ #undef GET_FUNC
+ }
+ 
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 9efdac6..4ef4d19 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1080,6 +1080,61 @@ int wine_server_receive_fd( obj_handle_t *handle )
+ }
+ 
+ 
++/***********************************************************************
++ *           d2r_threads_init
++ *
++ * d2r (patch 0011): map this process's thread table, kept up to date by the wineserver,
++ * for FEX. Called once from load_ntdll_functions, while the process has one thread.
++ */
++C_ASSERT( sizeof(struct d2r_threads_info) == 8 * sizeof(ULONG64) );  /* fits __wine_d2r_threads */
++
++void d2r_threads_init( struct d2r_threads_info *info )
++{
++    obj_handle_t token = 0, expected = 0;
++    unsigned int size = 0, status;
++    sigset_t sigset;
++    void *ptr;
++    int fd = -1;
++
++    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
++    SERVER_START_REQ( d2r_get_thread_table )
++    {
++        if (!(status = server_call_unlocked( req )))
++        {
++            expected = reply->handle;
++            size = reply->size;
++            fd = wine_server_receive_fd( &token );
++        }
++    }
++    SERVER_END_REQ;
++    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++
++    if (status) goto failed;
++    if (fd == -1 || token != expected || !size)
++    {
++        status = STATUS_INVALID_HANDLE;
++        goto failed;
++    }
++    ptr = mmap( NULL, size, PROT_READ, MAP_SHARED, fd, 0 );
++    if (ptr == MAP_FAILED)
++    {
++        status = 0xe0000000 | errno;
++        goto failed;
++    }
++    close( fd );
++    info->size = size;
++    info->table = (ULONG_PTR)ptr;
++    info->system_affinity = get_system_affinity_mask();
++    info->status = 0;
++    WriteRelease( (LONG *)&info->version, 1 );
++    return;
++
++failed:
++    if (fd != -1) close( fd );
++    info->status = status;
++}
++
++
+ /***********************************************************************/
+ /* fd cache support */
+ 
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 3e5f030..9823330 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -177,6 +177,23 @@ struct d2r_server_calls_ext
+ 
+ extern struct d2r_server_calls_ext *d2r_server_calls_ext;
+ #define D2R_SERVER_CALLS_EXT_U64 272  /* size of __wine_d2r_server_calls_ext in ULONG64 */
++
++/* d2r (patch 0011): this process's thread table, written by the wineserver whenever a
++ * thread's id, Linux tid, TEB, priority, base priority, affinity or name changes (layout in
++ * server/thread.c, struct d2r_thread_table, version 1), mapped read-only. Where it is goes
++ * into PE ntdll's export __wine_d2r_threads (8 ULONG64) for FEX's helpers, so they don't
++ * have to ask the server about every thread. Off with WINE_D2R_THREAD_TABLE=0. */
++struct d2r_threads_info
++{
++    ULONG   version;          /* 1 once table is mapped (written last) */
++    ULONG   size;             /* bytes mapped at table */
++    ULONG64 table;            /* address of the read-only table */
++    ULONG64 system_affinity;  /* get_system_affinity_mask(): AffinityMask = entry affinity & this */
++    ULONG   status;           /* why there is no table (version 0): NTSTATUS or errno | 0xe0000000 */
++    ULONG   pad;
++    ULONG64 reserved[4];
++};
++extern void d2r_threads_init( struct d2r_threads_info *info );
+ extern void d2r_event_shared( HANDLE handle, BOOL wait );
+ extern BOOL d2r_event_keep( HANDLE handle );
+ 
+diff --git a/server/process.c b/server/process.c
+index 287718a..79a03ac 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -682,6 +682,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     process->priority        = PROCESS_PRIOCLASS_NORMAL;
+     process->base_priority   = 8;
+     process->disable_boost   = 0;
++    process->d2r_threads     = NULL;  /* d2r (patch 0011) */
+     process->suspend         = 0;
+     process->is_system       = 0;
+     process->debug_children  = 1;
+@@ -821,6 +822,7 @@ static void process_destroy( struct object *obj )
+     if (process->id) free_ptid( process->id );
+     if (process->token) release_object( process->token );
+     if (process->sync) release_object( process->sync );
++    d2r_process_threads_free( process );  /* d2r (patch 0011) */
+     if (do_fsync()) fsync_cleanup_process_shm_indices( process->id );
+     list_remove( &process->rawinput_entry );
+     free( process->rawinput_devices );
+@@ -1495,6 +1497,7 @@ DECL_HANDLER(init_process_done)
+ 
+     current->teb = req->teb;
+     process->peb = req->peb;
++    d2r_thread_update( current );  /* d2r (patch 0011): the first thread's TEB */
+ 
+     process->start_time = current_time;
+ 
+diff --git a/server/process.h b/server/process.h
+index 5d157d6..6aaf8e0 100644
+--- a/server/process.h
++++ b/server/process.h
+@@ -90,6 +90,7 @@ struct process
+     struct pe_image_info image_info;      /* main exe image info */
+     struct cpu_topology_override cpu_override; /* Overridden CPUs to host CPUs mapping. */
+     unsigned char   wine_cpu_id_from_host[64]; /* Host to overridden CPU mapping. */
++    struct d2r_threads  *d2r_threads;     /* d2r (patch 0011): thread table shared with the process, or NULL */
+ };
+ 
+ /* process functions */
+diff --git a/server/protocol.def b/server/protocol.def
+index 03565fe..9be44fe 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4352,3 +4352,11 @@ enum fsync_type
+     unsigned int shm_idx;
+ @REPLY
+ @END
++
++/* d2r (fex-d2-reforged, patch 0011): this process's thread table for FEX, made on the first
++ * request; the server keeps it up to date (see d2r_thread_update in server/thread.c) */
++@REQ(d2r_get_thread_table)
++@REPLY
++    obj_handle_t handle;        /* the table's fd is sent with this token */
++    unsigned int size;          /* bytes to map */
++@END
+diff --git a/server/thread.c b/server/thread.c
+index 7caf39b..a90d71f 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -32,6 +32,10 @@
+ #include <unistd.h>
+ #include <time.h>
+ #include <poll.h>
++#include <sys/mman.h>  /* d2r (patch 0011) */
++#ifdef __linux__
++#include <sys/syscall.h>
++#endif
+ #ifdef HAVE_SCHED_H
+ /* FreeBSD needs this for cpu_set_t instead of its cpuset_t */
+ #define _WITH_CPU_SET_T
+@@ -433,6 +437,7 @@ static inline void init_thread_structure( struct thread *thread )
+     thread->creation_time = current_time;
+     thread->exit_time     = 0;
+     thread->completion_wait = NULL;
++    thread->d2r_slot      = 0;  /* d2r (patch 0011) */
+ 
+     list_init( &thread->mutex_list );
+     list_init( &thread->d3dkmt_mutexes );
+@@ -579,6 +584,7 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
+ 
+     set_fd_events( thread->request_fd, POLLIN );  /* start listening to events */
+     add_process_thread( thread->process, thread );
++    d2r_thread_update( thread );  /* d2r (patch 0011) */
+     return thread;
+ 
+ error:
+@@ -605,6 +611,315 @@ static struct list *thread_get_kernel_obj_list( struct object *obj )
+     return &thread->kernel_object;
+ }
+ 
++/* d2r (fex-d2-reforged, patch 0011): thread table for FEX.
++ *
++ * FEX's helpers (priority guard, thread placer, stats log, stall probe) asked the server
++ * about every thread of the process each round: get_next_thread, get_thread_info,
++ * get_thread_times and close_handle, about 300 requests a second in b159.  The server now
++ * writes what NtQueryInformationThread would return for each thread of a process into a
++ * table that the process maps read-only, every time one of those values changes.  The
++ * table is made on the process's first d2r_get_thread_table request; until then, and in
++ * processes that never ask, nothing changes.
++ *
++ * Each entry is written under a sequence lock: seq is odd while the entry changes and
++ * goes up by 2 with every write.  A reader copies the entry and keeps the copy only when
++ * seq was even and the same before and after.  The server only writes to the shared
++ * memory and keeps its own copy of everything it needs, so nothing the process writes
++ * there can change what the server does. */
++
++#ifndef MFD_CLOEXEC
++#define MFD_CLOEXEC 0x0001U
++#endif
++#ifndef MFD_ALLOW_SEALING
++#define MFD_ALLOW_SEALING 0x0002U
++#endif
++#ifndef F_ADD_SEALS
++#define F_ADD_SEALS (1024 + 9)
++#endif
++#ifndef F_SEAL_SHRINK
++#define F_SEAL_SHRINK 0x0002
++#endif
++#ifndef F_SEAL_GROW
++#define F_SEAL_GROW 0x0004
++#endif
++#ifndef F_SEAL_FUTURE_WRITE
++#define F_SEAL_FUTURE_WRITE 0x0010
++#endif
++
++#define D2R_THREADS_VERSION   1
++#define D2R_THREADS_SIZE      65536
++#define D2R_THREADS_ENTRIES   511
++#define D2R_THREAD_NAME       72
++
++/* entry flags */
++#define D2R_THREAD_FIRST          0x01  /* first thread of the process (Priority includes its +1) */
++#define D2R_THREAD_DISABLE_BOOST  0x02  /* priority boost disabled */
++#define D2R_THREAD_DBG_HIDDEN     0x04  /* hidden from the debugger */
++#define D2R_THREAD_NAME_INEXACT   0x08  /* name cut or a character replaced by '?' */
++
++struct d2r_thread_entry               /* 128 bytes */
++{
++    unsigned int   seq;               /* odd while being written, +2 per write */
++    unsigned int   tid;               /* thread id (ClientId.UniqueThread), 0 = free entry */
++    int            unix_tid;          /* Linux tid, -1 until the thread runs */
++    int            priority;          /* ThreadBasicInformation.Priority */
++    int            base_priority;     /* ThreadBasicInformation.BasePriority */
++    unsigned int   flags;             /* D2R_THREAD_* */
++    client_ptr_t   teb;               /* ThreadBasicInformation.TebBaseAddress */
++    affinity_t     affinity;          /* the server's affinity; AffinityMask = this & system mask */
++    unsigned int   serial;            /* number of this thread in the table, never reused */
++    unsigned int   name_len;          /* length of the whole name in characters */
++    timeout_t      creation_time;     /* ThreadTimes.CreateTime */
++    char           name[D2R_THREAD_NAME]; /* ThreadNameInformation as ASCII, NUL terminated */
++};
++
++struct d2r_thread_table               /* the shared memory, D2R_THREADS_SIZE bytes */
++{
++    unsigned int   version;           /* D2R_THREADS_VERSION */
++    unsigned int   header_size;       /* 128 */
++    unsigned int   entry_size;        /* 128 */
++    unsigned int   max_entries;       /* D2R_THREADS_ENTRIES */
++    unsigned int   used;              /* entries [0, used) can be in use */
++    unsigned int   count;             /* threads listed now */
++    unsigned int   changes;           /* +1 after every entry write */
++    unsigned int   not_listed;        /* threads not listed now because the table is full */
++    unsigned int   pid;               /* process id */
++    unsigned int   serial;            /* serials handed out so far */
++    unsigned int   reserved[22];
++    struct d2r_thread_entry entry[D2R_THREADS_ENTRIES];
++};
++
++C_ASSERT( sizeof(struct d2r_thread_entry) == 128 );
++C_ASSERT( offsetof(struct d2r_thread_table, entry) == 128 );
++C_ASSERT( sizeof(struct d2r_thread_table) == D2R_THREADS_SIZE );
++
++struct d2r_threads                    /* the server's own state, never read from the shared memory */
++{
++    struct d2r_thread_table *map;
++    int            fd;
++    unsigned int   used;
++    unsigned int   count;
++    unsigned int   changes;
++    unsigned int   not_listed;
++    unsigned int   serial;
++    unsigned int   seq[D2R_THREADS_ENTRIES];
++    unsigned char  taken[D2R_THREADS_ENTRIES];
++};
++
++static void d2r_header_store( unsigned int *field, unsigned int value )
++{
++    __atomic_store_n( field, value, __ATOMIC_RELEASE );
++}
++
++/* write one entry under its sequence lock; thread NULL frees it */
++static void d2r_entry_write( struct d2r_threads *t, unsigned int i, struct thread *thread, unsigned int serial )
++{
++    struct d2r_thread_entry *e = &t->map->entry[i];
++    unsigned int seq = t->seq[i];
++
++    __atomic_store_n( &e->seq, seq + 1, __ATOMIC_RELAXED );
++    __atomic_thread_fence( __ATOMIC_RELEASE );
++    if (thread)
++    {
++        data_size_t j, len = thread->desc_len / sizeof(WCHAR);
++        unsigned int flags = 0;
++
++        if (get_process_first_thread( thread->process ) == thread) flags |= D2R_THREAD_FIRST;
++        if (thread->disable_boost) flags |= D2R_THREAD_DISABLE_BOOST;
++        if (thread->dbg_hidden) flags |= D2R_THREAD_DBG_HIDDEN;
++        if (len > D2R_THREAD_NAME - 1) flags |= D2R_THREAD_NAME_INEXACT;
++        for (j = 0; j < len && j < D2R_THREAD_NAME - 1; j++)
++        {
++            WCHAR c = thread->desc[j];
++            if (c < 0x20 || c > 0x7e)
++            {
++                c = '?';
++                flags |= D2R_THREAD_NAME_INEXACT;
++            }
++            e->name[j] = (char)c;
++        }
++        memset( e->name + j, 0, D2R_THREAD_NAME - j );
++        e->tid           = get_thread_id( thread );
++        e->unix_tid      = thread->unix_tid;
++        e->priority      = get_effective_thread_priority( thread );
++        e->base_priority = thread->base_priority;
++        e->flags         = flags;
++        e->teb           = thread->teb;
++        e->affinity      = thread->affinity;
++        if (serial) e->serial = serial;
++        e->name_len      = len;
++        e->creation_time = thread->creation_time;
++    }
++    else
++    {
++        e->tid           = 0;
++        e->unix_tid      = 0;
++        e->priority      = 0;
++        e->base_priority = 0;
++        e->flags         = 0;
++        e->teb           = 0;
++        e->affinity      = 0;
++        e->serial        = 0;
++        e->name_len      = 0;
++        e->creation_time = 0;
++        memset( e->name, 0, sizeof(e->name) );
++    }
++    t->seq[i] = seq + 2;
++    __atomic_store_n( &e->seq, seq + 2, __ATOMIC_RELEASE );
++    d2r_header_store( &t->map->changes, ++t->changes );
++}
++
++/* the thread is gone from the process: free its entry */
++static void d2r_thread_gone( struct thread *thread )
++{
++    struct d2r_threads *t = thread->process->d2r_threads;
++
++    if (t && thread->d2r_slot > 0)
++    {
++        unsigned int i = thread->d2r_slot - 1;
++        struct thread *other;
++
++        d2r_entry_write( t, i, NULL, 0 );
++        t->taken[i] = 0;
++        d2r_header_store( &t->map->count, --t->count );
++        thread->d2r_slot = 0;
++        /* a thread left out while the table was full gets the free entry */
++        if (t->not_listed)
++            LIST_FOR_EACH_ENTRY( other, &thread->process->thread_list, struct thread, proc_entry )
++                if (other != thread && other->d2r_slot < 0)
++                {
++                    d2r_thread_update( other );
++                    break;
++                }
++    }
++    else if (t && thread->d2r_slot < 0)
++        d2r_header_store( &t->map->not_listed, --t->not_listed );
++    thread->d2r_slot = 0;
++}
++
++/* write the thread's entry again after one of its values changed */
++void d2r_thread_update( struct thread *thread )
++{
++    struct d2r_threads *t = thread->process->d2r_threads;
++    unsigned int i, serial = 0;
++
++    if (!t) return;
++    if (thread->state == TERMINATED || !thread->id)
++    {
++        d2r_thread_gone( thread );
++        return;
++    }
++    if (thread->d2r_slot <= 0)
++    {
++        for (i = 0; i < t->used; i++) if (!t->taken[i]) break;
++        if (i == D2R_THREADS_ENTRIES)
++        {
++            if (!thread->d2r_slot)
++            {
++                thread->d2r_slot = -1;
++                d2r_header_store( &t->map->not_listed, ++t->not_listed );
++            }
++            return;
++        }
++        if (thread->d2r_slot < 0) d2r_header_store( &t->map->not_listed, --t->not_listed );
++        t->taken[i] = 1;
++        thread->d2r_slot = i + 1;
++        serial = ++t->serial;
++        d2r_header_store( &t->map->serial, t->serial );
++        d2r_entry_write( t, i, thread, serial );
++        d2r_header_store( &t->map->count, ++t->count );
++        if (i == t->used) d2r_header_store( &t->map->used, ++t->used );
++        return;
++    }
++    d2r_entry_write( t, thread->d2r_slot - 1, thread, 0 );
++}
++
++/* the thread was removed from its process's thread list */
++static void d2r_thread_removed( struct thread *thread, struct process *process )
++{
++    struct thread *first;
++
++    if (!process->d2r_threads) return;
++    d2r_thread_gone( thread );
++    /* the next thread may be the first one now, which changes its Priority */
++    if ((first = get_process_first_thread( process ))) d2r_thread_update( first );
++}
++
++void d2r_process_threads_free( struct process *process )
++{
++    struct d2r_threads *t = process->d2r_threads;
++
++    if (!t) return;
++    munmap( t->map, D2R_THREADS_SIZE );
++    close( t->fd );
++    free( t );
++    process->d2r_threads = NULL;
++}
++
++static int d2r_memfd(void)
++{
++#if defined(__linux__) && defined(__NR_memfd_create)
++    return syscall( __NR_memfd_create, "wine-d2r-threads", MFD_CLOEXEC | MFD_ALLOW_SEALING );
++#else
++    errno = ENOSYS;
++    return -1;
++#endif
++}
++
++static struct d2r_threads *d2r_threads_create( struct process *process )
++{
++    struct d2r_threads *t;
++    struct thread *thread;
++    void *ptr;
++    int fd;
++
++    if ((fd = d2r_memfd()) == -1)
++    {
++        set_error( STATUS_NOT_SUPPORTED );
++        return NULL;
++    }
++    if (ftruncate( fd, D2R_THREADS_SIZE ) == -1 ||
++        (ptr = mmap( NULL, D2R_THREADS_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
++    {
++        file_set_error();
++        close( fd );
++        return NULL;
++    }
++    /* the process gets a read-only view and must not change the size under the server */
++    fcntl( fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW );
++    fcntl( fd, F_ADD_SEALS, F_SEAL_FUTURE_WRITE );
++    if (!(t = mem_alloc( sizeof(*t) )))
++    {
++        munmap( ptr, D2R_THREADS_SIZE );
++        close( fd );
++        return NULL;
++    }
++    memset( t, 0, sizeof(*t) );
++    t->map = ptr;
++    t->fd = fd;
++    t->map->header_size = offsetof(struct d2r_thread_table, entry);
++    t->map->entry_size  = sizeof(struct d2r_thread_entry);
++    t->map->max_entries = D2R_THREADS_ENTRIES;
++    t->map->pid         = get_process_id( process );
++    process->d2r_threads = t;
++    LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
++        d2r_thread_update( thread );
++    d2r_header_store( &t->map->version, D2R_THREADS_VERSION );
++    return t;
++}
++
++/* d2r (patch 0011): hand the process its thread table, made on the first request */
++DECL_HANDLER(d2r_get_thread_table)
++{
++    struct process *process = current->process;
++    struct d2r_threads *t = process->d2r_threads;
++
++    if (!t && !(t = d2r_threads_create( process ))) return;
++    reply->handle = get_thread_id( current ) | 1;  /* arbitrary token */
++    reply->size   = D2R_THREADS_SIZE;
++    send_client_fd( process, t->fd, reply->handle );
++}
++
+ /* cleanup everything that is no longer needed by a dead thread */
+ /* used by destroy_thread and kill_thread */
+ static void cleanup_thread( struct thread *thread )
+@@ -657,6 +972,7 @@ static void destroy_thread( struct object *obj )
+ 
+     list_remove( &thread->entry );
+     cleanup_thread( thread );
++    if (thread->d2r_slot) d2r_thread_gone( thread );  /* d2r (patch 0011) */
+     release_object( thread->process );
+     if (thread->id) free_ptid( thread->id );
+     if (thread->token) release_object( thread->token );
+@@ -817,6 +1133,7 @@ int set_thread_affinity( struct thread *thread, affinity_t affinity )
+     }
+ #endif
+     if (!ret) thread->affinity = affinity;
++    d2r_thread_update( thread );  /* d2r (patch 0011) */
+     return ret;
+ }
+ 
+@@ -872,6 +1189,7 @@ unsigned int set_thread_priority( struct thread *thread, int priority )
+     if (priority_class != PROCESS_PRIOCLASS_REALTIME && priority >= LOW_REALTIME_PRIORITY) return STATUS_PRIVILEGE_NOT_HELD;
+ 
+     thread->priority = priority;
++    d2r_thread_update( thread );  /* d2r (patch 0011) */
+ 
+     /* if thread is gone or hasn't started yet, this will be called again from init_thread with a unix_tid */
+     if (thread->state == RUNNING && thread->unix_tid != -1) apply_thread_priority( thread );
+@@ -918,6 +1236,7 @@ unsigned int set_thread_base_priority( struct thread *thread, int base_priority
+ void set_thread_disable_boost( struct thread *thread, int disable_boost )
+ {
+     thread->disable_boost = disable_boost;
++    d2r_thread_update( thread );  /* d2r (patch 0011) */
+     apply_thread_priority( thread );
+ }
+ 
+@@ -974,6 +1293,8 @@ static void set_thread_info( struct thread *thread,
+             thread->desc_len = 0;
+         }
+     }
++    if (req->mask & (SET_THREAD_INFO_DESCRIPTION | SET_THREAD_INFO_DBG_HIDDEN))
++        d2r_thread_update( thread );  /* d2r (patch 0011) */
+ }
+ 
+ /* stop a thread (at the Unix level) */
+@@ -1652,6 +1973,7 @@ void kill_thread( struct thread *thread, int violent_death )
+     if (violent_death) send_thread_signal( thread, SIGQUIT );
+     cleanup_thread( thread );
+     remove_process_thread( thread->process, thread );
++    d2r_thread_removed( thread, thread->process );  /* d2r (patch 0011) */
+     release_object( thread );
+ }
+ 
+@@ -1811,6 +2133,7 @@ DECL_HANDLER(init_first_thread)
+         set_thread_affinity( current, current->affinity );
+ 
+     set_thread_base_priority( current, current->base_priority );
++    d2r_thread_update( current );  /* d2r (patch 0011) */
+ 
+     debug_level = max( debug_level, req->debug_level );
+ 
+diff --git a/server/thread.h b/server/thread.h
+index 77ea355..d52b3b4 100644
+--- a/server/thread.h
++++ b/server/thread.h
+@@ -99,6 +99,7 @@ struct thread
+     data_size_t            desc_len;      /* thread description length in bytes */
+     WCHAR                 *desc;          /* thread description string */
+     struct completion_wait *completion_wait; /* completion port wait object the thread is associated with */
++    int                    d2r_slot;      /* d2r (patch 0011): entry in the process's thread table + 1, 0 = none */
+ };
+ 
+ extern struct thread *current;
+@@ -133,6 +134,8 @@ extern unsigned int set_thread_priority( struct thread *thread, int priority );
+ extern unsigned int set_thread_base_priority( struct thread *thread, int base_priority );
+ extern void set_thread_disable_boost( struct thread *thread, int disable_boost );
+ extern int set_thread_affinity( struct thread *thread, affinity_t affinity );
++extern void d2r_thread_update( struct thread *thread );
++extern void d2r_process_threads_free( struct process *process );
+ extern int suspend_thread( struct thread *thread );
+ extern int resume_thread( struct thread *thread );
+ 

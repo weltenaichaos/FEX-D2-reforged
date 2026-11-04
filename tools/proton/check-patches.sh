@@ -176,6 +176,42 @@ check_0010() {
   if marker_in "$WS" req_set_timer,d2r_timer_fresh; then ok 0010 "wineserver's set_timer knows the fresh-timer marker"; else bad 0010 "wineserver's set_timer has no fresh-timer marker (stock)"; fi
 }
 
+# 0011: the wineserver keeps a thread table (request handler, memfd, and the places that change
+# a thread's values write its entry: stock has none of these); ntdll asks for it, maps it and
+# fills PE ntdll's __wine_d2r_threads; off switch
+check_0011() {
+  local f s n
+  for f in "$NT" "$NT32"; do
+    if exports "$f" __wine_d2r_threads; then ok 0011 "${f#$LIB/} exports __wine_d2r_threads"; else bad 0011 "${f#$LIB/} lacks __wine_d2r_threads"; fi
+  done
+  if ascii_in "$NTSO" WINE_D2R_THREAD_TABLE; then ok 0011 "${NTSO#$LIB/} reads WINE_D2R_THREAD_TABLE"; else bad 0011 "${NTSO#$LIB/} lacks WINE_D2R_THREAD_TABLE"; fi
+  if ascii_in "$NTSO" __wine_d2r_threads; then ok 0011 "${NTSO#$LIB/} looks up __wine_d2r_threads"; else bad 0011 "${NTSO#$LIB/} never looks up __wine_d2r_threads"; fi
+  n=$(calls_to "$NTSO" d2r_threads_init 'mmap|mmap64|wine_server_receive_fd')
+  if [ "${n:-0}" -ge 2 ]; then ok 0011 "${NTSO#$LIB/} receives and maps the table"; else bad 0011 "${NTSO#$LIB/} d2r_threads_init receives/maps '${n:-0}' times (want 2)"; fi
+  if ascii_in "$WS" wine-d2r-threads; then ok 0011 "wineserver makes the table's memfd"; else bad 0011 "wineserver has no table memfd (stock)"; fi
+  n=$(calls_to "$WS" req_d2r_get_thread_table 'd2r_thread_update|d2r_threads_create|send_client_fd')
+  if [ "${n:-0}" -ge 1 ]; then ok 0011 "wineserver handles d2r_get_thread_table"; else bad 0011 "wineserver has no d2r_get_thread_table handler"; fi
+  for s in create_thread set_thread_priority set_thread_affinity set_thread_disable_boost kill_thread; do
+    n=$(calls_to "$WS" "$s" 'd2r_thread_update|d2r_thread_gone|d2r_thread_removed')
+    if [ "${n:-0}" -ge 1 ]; then ok 0011 "wineserver's $s writes the thread's entry"; else bad 0011 "wineserver's $s never writes the thread's entry"; fi
+  done
+}
+
+# 0012: timer reuse window 10 s (its switch, and the default in the data), registry key and value
+# notes from NtOpenKeyEx and NtQueryValueKey, and the export's size word says 3,728 bytes
+check_0012() {
+  local s n
+  if ascii_in "$NTSO" WINE_D2R_TIMER_LIFE_MS; then ok 0012 "${NTSO#$LIB/} reads WINE_D2R_TIMER_LIFE_MS"; else bad 0012 "${NTSO#$LIB/} lacks WINE_D2R_TIMER_LIFE_MS"; fi
+  if python3 -I -c 'import sys; sys.exit(0 if open(sys.argv[1],"rb").read().count(bytes.fromhex("00e40b5402000000")) else 1)' "$NTSO"; then
+    ok 0012 "${NTSO#$LIB/} holds the 10 s timer window"; else bad 0012 "${NTSO#$LIB/} has no 10 s timer window"; fi
+  for s in NtOpenKeyEx NtQueryValueKey; do
+    n=$(calls_to "$NTSO" "$s" d2r_reg_note)
+    if [ "${n:-0}" -ge 1 ]; then ok 0012 "$s notes its call for FEX"; else bad 0012 "$s never notes its call (stock)"; fi
+  done
+  n=$($OBJDUMP -d --no-show-raw-insn "$NTSO" 2>/dev/null | grep -cE 'mov\s+w[0-9]+, #0xe90\b')
+  if [ "${n:-0}" -ge 1 ]; then ok 0012 "${NTSO#$LIB/} writes the export size 3,728"; else bad 0012 "${NTSO#$LIB/} never writes the export size 3,728"; fi
+}
+
 for p in "$PATCHES"/*.patch; do
   n=$(basename "$p"); n=${n%%-*}
   if declare -F "check_$n" >/dev/null; then "check_$n"; else bad "$n" "no check for $(basename "$p") in check-patches.sh"; fi

@@ -1,0 +1,224 @@
+ntdll: timer reuse window 10 s; registry key and value notes for FEX.
+
+Timer reuse (0010) kept a timer only when the thread that made it closed it within 100 ms.
+In b159 (d2r9) 78 timers a second were reused, and about 10 a second met every other rule
+but were closed later than that (tm_too_old). The window decides nothing about what is safe:
+the rules that do (same thread, every setting seen to fire, no APC or period, never
+cancelled, duplicated or used by another thread) are the same at any age; the window only
+keeps handles that live long out of the pool. It is now 10 s, set with
+WINE_D2R_TIMER_LIFE_MS (1 to 3,600,000 ms; 100 gives d2r9's behaviour). tm_too_old now
+counts timers closed later than the window.
+
+In b159 one unnamed thread of D2R's process (tid 784, ~1% CPU, started before t=15) sent
+open_key ~80 and get_key_value ~60 times a second; nothing says which key. NtOpenKeyEx and
+NtQueryValueKey now note each call for FEX, appended to __wine_d2r_server_calls_ext at byte
+2176: reg_open_next and reg_value_next (u64: calls noted so far; the latest is entry
+(next - 1) % 8 resp. % 4), then reg_open[8] and reg_value[4] at byte 2192, 128 bytes each:
+seq (u32, odd while being written, +2 per write; a reader takes seq, copies, and keeps the
+copy when seq was even and the same after an acquire fence), tid (u32, caller), status
+(u32, NTSTATUS), name_len (u32, characters), parent (u64: root directory handle, or the key
+handle for a value read), result (u64: the key handle opened, 0 for value reads), name (96
+bytes: key path relative to parent or value name, ASCII with '?' for other characters, NUL
+terminated, cut to 95). A thread finding the note it would write already being written
+leaves it to that one. The export grows from 2,176 to 3,728 bytes (466 ULONG64); size (byte
+48) says 3,728. Version stays 1. On with the request counts (WINE_D2R_CALL_COUNTS).
+
+Tests: the 0010 model test with this sync.c (200 seeds x 3: default window, tiny pools, and
+a 1 ms window), every result compared with WINE_D2R_TIMER_REUSE=0: 600 runs, 0 differences;
+kept timers 159,377 with the 10 s window, 45,190 with 1 ms. The note writer, compiled from
+registry.c, with four threads writing as fast as they can and a reader using the rule above:
+17 million notes each, 0 torn copies kept; names longer than 95 characters are cut, non-ASCII
+characters become '?'.
+---
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index f33d9b3..81aac10 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -861,7 +861,7 @@ DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls[1032];
+ 
+ /* d2r (patch 0009): latest caller per request type and completion port wait counters
+  * (struct d2r_server_calls_ext, D2R_SERVER_CALLS_EXT_U64), read by FEX */
+-DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls_ext[272];  /* 272 since patch 0010 */
++DECLSPEC_ALIGN(64) ULONG64 __wine_d2r_server_calls_ext[466];  /* 272 since patch 0010, 466 since 0012 */
+ 
+ /* d2r (patch 0011): where the wineserver's thread table for this process is mapped
+  * (struct d2r_threads_info in unix/unix_private.h), read by FEX's helpers */
+diff --git a/dlls/ntdll/unix/registry.c b/dlls/ntdll/unix/registry.c
+index d1df93f..678e743 100644
+--- a/dlls/ntdll/unix/registry.c
++++ b/dlls/ntdll/unix/registry.c
+@@ -375,6 +375,51 @@ NTSTATUS WINAPI NtCreateKeyTransacted( HANDLE *key, ACCESS_MASK access, const OB
+ }
+ 
+ 
++/* d2r (fex-d2-reforged, patch 0012): note the latest registry keys opened and values read in
++ * __wine_d2r_server_calls_ext for FEX. In b159 one unnamed thread (tid 784) did open_key ~80
++ * and get_key_value ~60 times a second; these notes say which key and value. On with the
++ * request counts (WINE_D2R_CALL_COUNTS). */
++static void DECLSPEC_NOINLINE d2r_reg_note( BOOL value, HANDLE parent, const UNICODE_STRING *name, HANDLE result,
++                                            NTSTATUS status )
++{
++    struct d2r_server_calls_ext *ext = d2r_server_calls_ext;
++    struct d2r_reg_note *note;
++    ULONG seq, i, len;
++    ULONG64 n;
++
++    if (!ext) return;
++    if (value)
++    {
++        n = __atomic_fetch_add( &ext->reg_value_next, 1, __ATOMIC_RELAXED );
++        note = &ext->reg_value[n % ARRAY_SIZE(ext->reg_value)];
++    }
++    else
++    {
++        n = __atomic_fetch_add( &ext->reg_open_next, 1, __ATOMIC_RELAXED );
++        note = &ext->reg_open[n % ARRAY_SIZE(ext->reg_open)];
++    }
++    seq = __atomic_load_n( &note->seq, __ATOMIC_RELAXED );
++    /* another thread writing this note: leave it to that one */
++    if ((seq & 1) || !__atomic_compare_exchange_n( &note->seq, &seq, seq + 1, FALSE,
++                                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
++        return;
++    __atomic_thread_fence( __ATOMIC_RELEASE );
++    len = name ? name->Length / sizeof(WCHAR) : 0;
++    for (i = 0; i < len && i < sizeof(note->name) - 1; i++)
++    {
++        WCHAR c = name->Buffer[i];
++        note->name[i] = (c >= 0x20 && c <= 0x7e) ? (char)c : '?';
++    }
++    memset( note->name + i, 0, sizeof(note->name) - i );
++    note->tid      = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
++    note->status   = status;
++    note->name_len = len;
++    note->parent   = (ULONG_PTR)parent;
++    note->result   = (ULONG_PTR)result;
++    __atomic_store_n( &note->seq, seq + 2, __ATOMIC_RELEASE );
++}
++
++
+ /******************************************************************************
+  *              NtOpenKeyEx  (NTDLL.@)
+  */
+@@ -403,6 +448,7 @@ NTSTATUS WINAPI NtOpenKeyEx( HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRI
+         *key = wine_server_ptr_handle( reply->hkey );
+     }
+     SERVER_END_REQ;
++    d2r_reg_note( FALSE, attr->RootDirectory, attr->ObjectName, *key, ret );  /* d2r (patch 0012) */
+     TRACE("<- %p\n", *key);
+     return ret;
+ }
+@@ -801,6 +847,7 @@ NTSTATUS WINAPI NtQueryValueKey( HANDLE handle, const UNICODE_STRING *name,
+         }
+     }
+     SERVER_END_REQ;
++    d2r_reg_note( TRUE, handle, name, 0, ret );  /* d2r (patch 0012) */
+     return ret;
+ }
+ 
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 4ef4d19..ef92b91 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -298,6 +298,11 @@ C_ASSERT( offsetof(struct d2r_server_calls_ext, last_tid) == 64 );
+ C_ASSERT( offsetof(struct d2r_server_calls_ext, size) == 48 );  /* patch 0010 */
+ C_ASSERT( offsetof(struct d2r_server_calls_ext, tm_kept) == 2112 );
+ C_ASSERT( offsetof(struct d2r_server_calls_ext, tm_pool_full) == offsetof(struct d2r_server_calls_ext, tm_kept) + 7 * sizeof(ULONG64) );
++C_ASSERT( sizeof(struct d2r_reg_note) == 128 );  /* patch 0012 */
++C_ASSERT( offsetof(struct d2r_server_calls_ext, reg_open_next) == 2176 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, reg_open) == 2192 );
++C_ASSERT( offsetof(struct d2r_server_calls_ext, reg_value) == 2192 + 8 * 128 );
++C_ASSERT( sizeof(struct d2r_server_calls_ext) == 3728 );
+ C_ASSERT( REQ_NB_REQUESTS <= D2R_MAX_REQUESTS );
+ C_ASSERT( offsetof(struct d2r_server_calls, ev_pool_full) == offsetof(struct d2r_server_calls, ev_kept) + 5 * sizeof(ULONG64) );
+ /* the number of request types in this build, so the build can check the name table it ships */
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index a355e39..e7080f3 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -1237,7 +1237,7 @@ static HANDLE d2r_ev_take( BOOL manual )
+  * close_handle every time. A timer that NtCreateTimer made with an access that can set and
+  * wait (TIMER_MODIFY_STATE and SYNCHRONIZE) and the plain attributes of d2r_ev_plain is noted
+  * in the table of fresh events. NtClose keeps it open in a small pool only when nothing can
+- * still happen to it: closed by the thread that made it within D2R_TM_LIFE_NS; never set with
++ * still happen to it: closed by the thread that made it within d2r_tm_life_ns; never set with
+  * an APC or a period, never set again before its last setting was seen to fire, and every
+  * setting seen to fire by a wait of that thread; never duplicated, given new handle flags,
+  * cancelled, or set, waited on or queried by another thread. Then no timeout or APC is pending
+@@ -1251,7 +1251,10 @@ static HANDLE d2r_ev_take( BOOL manual )
+  * first. The server acts on the first marker of each reuse only. WINE_D2R_TIMER_REUSE=0 turns
+  * it off. */
+ #define D2R_TM_POOL    16                 /* kept timers per type */
+-#define D2R_TM_LIFE_NS (100 * (ULONG64)1000000)
++/* patch 0012: 10 s instead of 100 ms (d2r9). In b159 ~10 timers a second that met every
++ * other rule were closed later than 100 ms after they were made (tm_too_old); the window
++ * only keeps handles that live long out of the pool, the other rules decide what is safe */
++static ULONG64 d2r_tm_life_ns = 10000 * (ULONG64)1000000;
+ #define D2R_TM_UNSET   32                 /* reused timers the program hasn't set yet */
+ /* set_timer marker: the high half of the argument of a request without APC (an argument the
+  * server never uses then; the same value is in server/timer.c); bits 1-31 hold the reuse number,
+@@ -1304,6 +1307,12 @@ static BOOL d2r_tm_on(void)
+             on = 0;
+         }
+         else on = 1;
++        /* patch 0012: the reuse window, WINE_D2R_TIMER_LIFE_MS (1 to 3,600,000; d2r9 had 100) */
++        if ((env = getenv( "WINE_D2R_TIMER_LIFE_MS" )))
++        {
++            unsigned long ms = strtoul( env, NULL, 10 );
++            if (ms >= 1 && ms <= 3600000) d2r_tm_life_ns = ms * (ULONG64)1000000;
++        }
+     }
+     return on;
+ }
+@@ -1551,7 +1560,7 @@ static BOOL d2r_tm_keep( HANDLE handle, struct d2r_ev_slot *slot )
+     }
+     if (slot->tid != d2r_ev_tid()) counter = D2R_TM_OTHER_THREAD;
+     else if (slot->armed) counter = D2R_TM_ARMED;
+-    else if (d2r_ev_now() - slot->born_ns >= D2R_TM_LIFE_NS) counter = D2R_TM_TOO_OLD;
++    else if (d2r_ev_now() - slot->born_ns >= d2r_tm_life_ns) counter = D2R_TM_TOO_OLD;
+     else if (d2r_tm_pooled[slot->manual] >= D2R_TM_POOL) counter = D2R_TM_POOL_FULL;
+     else
+     {
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 9823330..50f62ae 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -151,6 +151,18 @@ extern struct d2r_server_calls *d2r_server_calls;
+  * each request type and what the completion port waits in the process did. On with the
+  * request counts (WINE_D2R_CALL_COUNTS). Version 1 layout; later patches only append, and
+  * size says how much this build writes (0 in patch 0009's build: 2,112 bytes). */
++/* patch 0012: one registry call; a reader takes seq (even), copies, and checks seq again */
++struct d2r_reg_note
++{
++    ULONG   seq;              /* odd while being written, +2 per write */
++    ULONG   tid;              /* Windows thread id of the caller */
++    ULONG   status;           /* NTSTATUS of the call */
++    ULONG   name_len;         /* length of the whole name in characters */
++    ULONG64 parent;           /* NtOpenKeyEx: root directory handle; NtQueryValueKey: key handle */
++    ULONG64 result;           /* NtOpenKeyEx: the key handle it returned; 0 for value reads */
++    char    name[96];         /* key path relative to parent / value name: ASCII, '?' for others, cut to 95 */
++};
++
+ struct d2r_server_calls_ext
+ {
+     ULONG   version;          /* 1 once the unix side writes here */
+@@ -171,12 +183,18 @@ struct d2r_server_calls_ext
+     ULONG64 tm_armed;         /* closed while a setting wasn't seen to fire (maybe pending): really closed */
+     ULONG64 tm_shared;        /* left out: APC or period, set again before it fired, cancelled, duplicated, other thread */
+     ULONG64 tm_other_thread;  /* closed by another thread than the one that made it */
+-    ULONG64 tm_too_old;       /* closed later than 100 ms after it was made */
++    ULONG64 tm_too_old;       /* closed later than the reuse window after it was made (100 ms in d2r9, 10 s since 0012) */
+     ULONG64 tm_pool_full;     /* closed while the pool for its type was full (tm_kept..tm_pool_full in this order) */
++    /* patch 0012: the latest registry keys opened (NtOpenKeyEx) and values read
++     * (NtQueryValueKey), at byte 2176 */
++    ULONG64 reg_open_next;    /* opens noted so far; the latest is reg_open[(reg_open_next - 1) % 8] */
++    ULONG64 reg_value_next;   /* value reads noted so far; the latest is reg_value[(reg_value_next - 1) % 4] */
++    struct d2r_reg_note reg_open[8];
++    struct d2r_reg_note reg_value[4];
+ };
+ 
+ extern struct d2r_server_calls_ext *d2r_server_calls_ext;
+-#define D2R_SERVER_CALLS_EXT_U64 272  /* size of __wine_d2r_server_calls_ext in ULONG64 */
++#define D2R_SERVER_CALLS_EXT_U64 466  /* size of __wine_d2r_server_calls_ext in ULONG64 (272 in d2r9) */
+ 
+ /* d2r (patch 0011): this process's thread table, written by the wineserver whenever a
+  * thread's id, Linux tid, TEB, priority, base priority, affinity or name changes (layout in
