@@ -94,6 +94,8 @@ namespace {
     NtDelayExecution(FALSE, &Interval);
   }
 
+  bool LeftToProton {};
+
   // Finds xinput's XInputSetState and arms ExitFunctionEC. D2R imports it from xinput9_1_0.dll, which Wine forwards to
   // xinput1_4.dll; a forwarded export has no code of its own and is skipped.
   bool Arm() {
@@ -108,6 +110,16 @@ namespace {
       const size_t N = FrameLatency::FindExportEntries(Base, "XInputSetState", Entries);
       if (!N) {
         continue;
+      }
+      // Our own Proton (d2r3 and later) sends rumble off the game's threads itself and says so with a data export: then
+      // xinput is left to Proton (its own A/B switch is WINE_D2R_XINPUT=0).
+      uint64_t Marker[3] {};
+      if (FrameLatency::FindExportEntries(Base, "__wine_d2r_xinput", Marker) && *reinterpret_cast<const uint32_t*>(Marker[0]) >= 1) {
+        FEX::Windows::StatsLogNote(fextl::fmt::format("rumble: {} is our Proton's (__wine_d2r_xinput={}), which sends rumble off the game's "
+                                                      "threads itself; rumble left to Proton",
+                                                      Names[i], *reinterpret_cast<const uint32_t*>(Marker[0])));
+        LeftToProton = true;
+        return true;
       }
       // [0] last: it switches the check on.
       __atomic_store_n(&FEXRumbleTargets[2], Entries[N > 2 ? 2 : 0], __ATOMIC_RELAXED);
@@ -131,6 +143,9 @@ namespace {
         return nullptr;
       }
       Sleep100ns(10'000'000); // 1s
+    }
+    if (LeftToProton) {
+      return nullptr;
     }
 
     for (;;) {

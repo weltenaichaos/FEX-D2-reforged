@@ -3,6 +3,7 @@
 #include "Windows/Common/LinuxSys.h"
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/Switches.h"
+#include "Windows/Common/ThreadTable.h"
 
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
@@ -25,6 +26,7 @@
 
 // Exported by ntdll (Defs/ntdll.def) but not declared by the bundled headers.
 extern "C" NTSTATUS WINAPI NtGetNextThread(HANDLE Process, HANDLE Thread, ACCESS_MASK Access, ULONG Attributes, ULONG Flags, HANDLE* Next);
+extern "C" NTSTATUS WINAPI NtOpenThread(HANDLE* Handle, ACCESS_MASK Access, const OBJECT_ATTRIBUTES* Attr, const CLIENT_ID* Id);
 
 namespace FEX::Windows {
 namespace {
@@ -295,6 +297,7 @@ namespace {
     uint32_t CoreFixes;
     uint32_t SeenAt;
     bool Main;
+    uint32_t Serial; // build 161: its serial in Wine's thread table, 0 = not from the table
     // Loader thread detection, see FEX_LOADER_CORES.
     int LinuxTid; // 0 = not an emulated thread, or not registered yet
     uint64_t Teb;
@@ -1000,11 +1003,42 @@ namespace {
   // nice or better (never lowered: the layer's present thread runs at -20) and off the main thread's core while it is open.
   // Found by their Linux names (Wine passes VKD3D's thread names on, cut to 15 characters) every 2 s.
   constexpr size_t MaxFrameThreads = 16;
+  // Build 160: also Mesa's X11 present queue thread in GameNative's Vulkan wrapper ("WSI swapchain queue"), which sends
+  // every presented image on.
   constexpr const char* FrameThreadNames[] = {"vkd3d_queue",     "vkd3d_fence",     "vkd3d-fex-prese", "vkd3d-fex-start",
-                                              "vkd3d-fex-done",  "vkd3d-swapchain", "lsfg-present"};
+                                              "vkd3d-fex-done",  "vkd3d-swapchain", "lsfg-present",    "WSI swapchain q"};
+  // Build 160, FEX_PRESENT_THREADS: the threads that must run at a present's moment. With frame generation the layer lets
+  // the game's present go at the generated frame's slot: it sleeps until that slot on VKD3D's present thread
+  // (vkd3d-fex-present), and the generated frame is late by however long that thread then waits for a CPU. In the
+  // build 159 run it (nice -10) waited ~39 ms a second for a CPU while running ~9 ms, and in 39 of 169 calm seconds 5 or
+  // more generated frames came 1-6 ms late; the layer's own present thread (lsfg-present, nice -20, the same kind of
+  // wake-ups) waited ~3 ms a second. Kept at FEX_PRESENT_THREADS's nice or better like the frame threads (which keep
+  // them off the main thread's core too); the layer sets its own thread to -20 already.
+  constexpr const char* PresentThreadNames[] = {"vkd3d-fex-prese", "WSI swapchain q"};
+  // Build 137, FEX_INPUT_THREADS: Wine's controller thread (xinput's wine_xinput_hid_update). The game's XInputGetState
+  // takes a controller's lock, which that thread holds while it reads the controller's next report (ReadFile, a wineserver
+  // call). At nice 0 on the game's cores, behind the main thread and the job workers, it waited for a CPU with the lock
+  // held: in the build 133 run the main thread sat 14 ms in XInputGetState in a 48 ms frame at t=194.8. It runs a few ms a
+  // second. Kept at FEX_INPUT_THREADS's nice or better the same way as the frame threads (not kept off any core).
+  constexpr const char* InputThreadNames[] = {"wine_xinput_hid"};
+  // Build 147, FEX_STEAM_THREADS: steam.exe's thread that answers the game's Steam calls (Steam's "IPC:CSteamEngine",
+  // cut to 15 characters). The game asks Steam the same two questions every frame over a pipe and waits for the answer
+  // (build 146 pipe watch: ~1 ms a frame in calm play). In the build 146 run, while other apps restarted on all 8 cores
+  // after the first area load, that thread (nice 0) waited up to 340 ms a second for a CPU, the main thread waited up to
+  // 194 ms a second on Steam, and one reply took 68.6 ms. It runs ~20-30 ms a second. Kept at FEX_STEAM_THREADS's nice
+  // or better like the input threads, found by name among steam.exe's threads (another Linux process of this app).
+  constexpr const char* SteamThreadNames[] = {"IPC:CSteamEngin"};
+  constexpr const char* SteamProcessName = "steam.exe";
   struct FrameThreadKeeper {
     int Nice;     // NiceUnchanged = left alone
     bool OffCore; // kept off the main thread's core while it is open to others
+    const char* const* Want; // the Linux names it keeps
+    size_t WantCount;
+    const char* Label;       // "frame threads" or "input threads" in the log
+    // Build 147: the Linux process (by name, Linux::FindProcess) whose threads it keeps; nullptr = this one. Guard thread only:
+    // its pid, 0 while not found.
+    const char* Process;
+    int Pid;
     // Written by the guard (under the escape lock when there is one), read by the share sweeps.
     std::atomic<uint32_t> Count;
     std::atomic<int> Tids[MaxFrameThreads];
@@ -1018,6 +1052,9 @@ namespace {
     std::atomic<int> CoreError;
   };
   FrameThreadKeeper* FrameThreads {};
+  FrameThreadKeeper* InputThreads {};
+  FrameThreadKeeper* SteamThreads {};
+  FrameThreadKeeper* PresentThreads {};
 
   // A frame thread to keep off the main thread's core (any thread, under the escape lock).
   bool KeptOffSharedCore(int Tid) {
@@ -1035,6 +1072,9 @@ namespace {
   }
 
   struct FrameScan {
+    const char* const* Want;
+    size_t WantCount;
+    char Dir[40]; // the task folder: /proc/self/task, or /proc/<pid>/task for another process (build 147)
     int Tids[MaxFrameThreads];
     char Names[MaxFrameThreads][16];
     uint32_t Count;
@@ -1047,7 +1087,7 @@ namespace {
       return;
     }
     char Path[64];
-    snprintf(Path, sizeof(Path), "/proc/self/task/%d/comm", Tid);
+    snprintf(Path, sizeof(Path), "%s/%d/comm", S->Dir, Tid);
     char Comm[32];
     int64_t Len = Linux::ReadSmallFile(Path, Comm, sizeof(Comm));
     if (Len <= 0) {
@@ -1056,8 +1096,8 @@ namespace {
     if (Comm[Len - 1] == '\n') {
       Comm[--Len] = 0;
     }
-    for (const char* Want : FrameThreadNames) {
-      if (strcmp(Comm, Want) == 0) {
+    for (size_t w = 0; w < S->WantCount; ++w) {
+      if (strcmp(Comm, S->Want[w]) == 0) {
         S->Tids[S->Count] = Tid;
         snprintf(S->Names[S->Count], sizeof(S->Names[0]), "%s", Comm);
         ++S->Count;
@@ -1085,7 +1125,29 @@ namespace {
   // Every 2 s on the guard's thread: finds the frame threads by name; notes the list when it changed.
   void FindFrameThreads(FrameThreadKeeper& K, EscapeState* E) {
     FrameScan S {};
-    Linux::ForEachEntry("/proc/self/task", FrameScanTask, &S);
+    S.Want = K.Want;
+    S.WantCount = K.WantCount;
+    if (!K.Process) {
+      snprintf(S.Dir, sizeof(S.Dir), "/proc/self/task");
+      Linux::ForEachEntry(S.Dir, FrameScanTask, &S);
+    } else {
+      // Build 147: another of this app's processes, looked up again once it's gone (or until it's there).
+      if (K.Pid > 0) {
+        char Path[40];
+        char Comm[32];
+        snprintf(Path, sizeof(Path), "/proc/%d/comm", K.Pid);
+        if (Linux::ReadSmallFile(Path, Comm, sizeof(Comm)) <= 0) {
+          K.Pid = 0;
+        }
+      }
+      if (K.Pid <= 0) {
+        K.Pid = Linux::FindProcess(K.Process);
+      }
+      if (K.Pid > 0) {
+        snprintf(S.Dir, sizeof(S.Dir), "/proc/%d/task", K.Pid);
+        Linux::ForEachEntry(S.Dir, FrameScanTask, &S);
+      }
+    }
     const uint32_t Old = K.Count.load(std::memory_order_relaxed);
     bool Same = Old == S.Count;
     for (uint32_t i = 0; i < S.Count && Same; ++i) {
@@ -1115,7 +1177,11 @@ namespace {
     ++K.Lists;
     if (K.Notes < 12) {
       ++K.Notes;
-      StatsLogNote(fextl::fmt::format("frame threads: {} found (list #{}):{}{}", S.Count, K.Lists, S.Count ? Text : fextl::string(" none"),
+      StatsLogNote(fextl::fmt::format("{}: {} found (list #{}){}:{}{}", K.Label, S.Count, K.Lists,
+                                      K.Process ? (K.Pid > 0 ? fextl::fmt::format(" in {} (Linux pid {})", K.Process, K.Pid) :
+                                                               fextl::fmt::format(" ({} not running)", K.Process)) :
+                                                  fextl::string {},
+                                      S.Count ? Text : fextl::string(" none"),
                                       K.OffCore ? "; kept off the main thread's core while it is open to the game's threads" : ""));
     }
   }
@@ -2436,6 +2502,115 @@ namespace {
     return Out;
   }
 
+  // FEX's own threads that may leave the game's cores for the slowest ones (FEX_HELPER_CORES=little): the stats log (its
+  // 2ms sampler and per-second work), this guard, the rumble sender, the file cache dropper and the escape watcher. The
+  // stall probe measures what game threads see, and the disk cache writer, prefetcher and unpack cache threads hold locks
+  // or feed loads the game waits on, so they stay.
+  bool MovableHelper(std::string_view Name) {
+    return Name == "FEXStatsLog" || Name == "FEXPrioGuard" || Name == "FEXThreadPin" || Name == "FEXFrameLatency" || Name == "FEXRumble" ||
+           Name == "FEXFileCache" || Name == "FEXMainWatch";
+  }
+
+  // Build 156: the movable helpers on the slowest cores at the Linux level where Wine refuses them. GameNative gives the
+  // game cores 3-7 (process mask 0xf8 from about t=3), Wine then keeps every thread's cores inside that, so in every run
+  // up to b154 the stats log, this guard, the escape watcher and the file cache dropper ran on the big cores next to the
+  // game ("# cores: tid=N FEXStatsLog affinity 0xf8 -> 0x78"), and on the main thread's core while it was shared. The
+  // loader thread is moved the same way (LoaderRound). Found by their Linux names in /proc/self/task (Wine names a
+  // thread's Linux task after its Windows name); their cores are read every round, as Wine puts them back on the game's
+  // cores when the process's cores change.
+  struct HelperThread {
+    int LinuxTid;
+    fextl::string Name;
+    uint32_t Sets;
+    uint32_t Failures;
+  };
+  struct HelperKeeper {
+    fextl::vector<HelperThread> Threads;
+    uint32_t ScannedAt; // round of the last /proc scan, 0 = scan at the next round
+    uint32_t Expected;  // movable helpers Wine listed at that scan
+    bool Noted;
+  };
+
+  void ScanHelpers(HelperKeeper& K) {
+    struct Args {
+      fextl::vector<HelperThread> Found;
+      const fextl::vector<HelperThread>* Old;
+    } A {.Old = &K.Threads};
+    Linux::ForEachEntry(
+      "/proc/self/task",
+      [](const char* Name, void* Arg) {
+        auto& A = *static_cast<Args*>(Arg);
+        const int Tid = atoi(Name);
+        if (Tid <= 0) {
+          return;
+        }
+        char Path[64];
+        snprintf(Path, sizeof(Path), "/proc/self/task/%d/comm", Tid);
+        char Comm[32];
+        if (Linux::ReadSmallFile(Path, Comm, sizeof(Comm)) <= 0) {
+          return;
+        }
+        if (char* End = strchr(Comm, '\n')) {
+          *End = 0;
+        }
+        if (!MovableHelper(Comm)) {
+          return;
+        }
+        HelperThread H {.LinuxTid = Tid, .Name = Comm};
+        for (const auto& O : *A.Old) {
+          if (O.LinuxTid == Tid && O.Name == H.Name) {
+            H.Sets = O.Sets;
+            H.Failures = O.Failures;
+          }
+        }
+        A.Found.push_back(std::move(H));
+      },
+      &A);
+    K.Threads = std::move(A.Found);
+  }
+
+  void KeepHelpersLittle(HelperKeeper& K, const Config& C, uint32_t Round, uint32_t Movable, uint64_t ProcessMask) {
+    // Again when Wine lists another number of them (one started or ended, at most every 10 s) and once a minute.
+    if (!K.ScannedAt || Round - K.ScannedAt >= 30 || (Movable != K.Expected && Round - K.ScannedAt >= 5)) {
+      ScanHelpers(K);
+      K.ScannedAt = Round;
+      K.Expected = Movable;
+      if (!K.Noted) {
+        K.Noted = true;
+        fextl::string Names;
+        for (const auto& H : K.Threads) {
+          Names += fextl::fmt::format(" {}/{}", H.Name, H.LinuxTid);
+        }
+        StatsLogNote(fextl::fmt::format("cores: Wine keeps FEX's helpers on the game's cores {:#x}; {} of the {} it lists found by their "
+                                        "Linux names and moved to the slowest cores {:#x} directly (build 156; FEX_HELPER_CORES=off "
+                                        "leaves them):{}",
+                                        ProcessMask, K.Threads.size(), Movable, C.LittleMask, Names.empty() ? fextl::string(" none") : Names));
+      }
+    }
+    for (auto& H : K.Threads) {
+      const uint64_t Now = Linux::GetAffinity(H.LinuxTid);
+      if (!Now) {
+        K.ScannedAt = 0; // ended
+        continue;
+      }
+      // Only the slowest cores (GetAffinity leaves out cores the kernel has paused).
+      if (!(Now & ~C.LittleMask)) {
+        continue;
+      }
+      const int Result = Linux::SetAffinity(H.LinuxTid, C.LittleMask);
+      if (Result == 0) {
+        ++H.Sets;
+      } else {
+        ++H.Failures;
+      }
+      const uint32_t N = H.Sets + H.Failures;
+      if (N <= 3 || N % 50 == 0) {
+        StatsLogNote(fextl::fmt::format("cores: FEX helper {} (Linux {}) Linux cores {:#x} -> {:#x}, result {}, set #{}", H.Name, H.LinuxTid,
+                                        Now, C.LittleMask, Result, N));
+      }
+    }
+  }
+
   void* GuardThread(void* Arg) {
     const auto* C = static_cast<Config*>(Arg);
     const uint32_t SelfTID = GetCurrentThreadId();
@@ -2453,6 +2628,8 @@ namespace {
     fextl::unordered_map<uint32_t, Tracked> Threads;
     fextl::vector<HANDLE> Handles;
     fextl::vector<Entry> Entries;
+    fextl::vector<ThreadTable::Entry> Listed; // build 161: Wine's thread table this round
+    uint32_t Opens {};                        // handles opened to change a thread listed there
     uint32_t Round {};
     bool ReportedWalkFailure {};
     uint64_t ReportedGameMask {};
@@ -2463,6 +2640,7 @@ namespace {
     Keeper.StatusPath = fextl::fmt::format("/proc/self/task/{}/status", Keeper.Tid);
     uint64_t KeepFast {}, KeepWide {};
     LoaderFinder Finder {.C = C};
+    HelperKeeper Helpers {};
     OthersKeeper Others {};
     Others.SelfPid = Linux::GetPid();
     Others.Uid = Linux::GetUid();
@@ -2498,22 +2676,20 @@ namespace {
       HANDLE Next {};
       NTSTATUS WalkStatus;
       uint32_t Count {}, Fixed {}, CoreFixed {};
-      while ((WalkStatus = NtGetNextThread(NtCurrentProcess(), Handles.empty() ? nullptr : Handles.back(),
-                                           THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION, 0, 0, &Next)) ==
-             STATUS_SUCCESS) {
-        Handles.push_back(Next);
-        ThreadBasicInfo Basic {};
-        if (NtQueryInformationThread(Next, ThreadBasicInformation, &Basic, sizeof(Basic), nullptr) != STATUS_SUCCESS ||
-            Basic.ExitStatus != STATUS_PENDING) {
-          continue;
-        }
+      // One thread as Wine reports it; Next is its handle from the walk, nullptr when it came from the thread table.
+      const auto Note = [&](HANDLE Next, const ThreadBasicInfo& Basic, const ThreadTable::Entry* Listed) {
         const auto TID = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Basic.ClientId.UniqueThread));
         if (TID == SelfTID) {
-          continue;
+          return;
         }
         ++Count;
         auto [It, New] = Threads.try_emplace(TID);
         auto& T = It->second;
+        // Build 161: a tid Wine gave to a new thread (the table's serial changed) starts over.
+        if (!New && Listed && T.Serial && T.Serial != Listed->Serial) {
+          T = Tracked {};
+          New = true;
+        }
         T.SeenAt = Round;
         T.Teb = reinterpret_cast<uintptr_t>(Basic.TebBaseAddress);
         if (New) {
@@ -2524,18 +2700,49 @@ namespace {
         if (New || Basic.AffinityMask != T.SetTo) {
           T.Orig = Basic.AffinityMask;
         }
-        if (!T.Named || (T.Name.empty() && Round % 5 == 0)) {
+        if (Listed) {
+          T.Serial = Listed->Serial;
+          fextl::string Name = ThreadTable::HelperName(*Listed);
+          if (!T.Named || Name != T.Name) {
+            T.Name = std::move(Name);
+            T.Named = true;
+            T.FEX = T.Name.size() >= 3 && T.Name.compare(0, 3, "FEX") == 0;
+            T.KeepCores = !MovableHelper(T.Name);
+          }
+        } else if (!T.Named || (T.Name.empty() && Round % 5 == 0)) {
           T.Name = QueryName(Next);
           T.Named = true;
           T.FEX = T.Name.size() >= 3 && T.Name.compare(0, 3, "FEX") == 0;
-          // Only the stats log (its 2ms sampler and per-second work), this guard, the rumble sender and the file cache dropper move: the stall
-          // probe measures what game threads see, and the disk cache writer, prefetcher and unpack cache threads hold locks
-          // or feed loads the game waits on.
-          T.KeepCores = !(T.Name == "FEXStatsLog" || T.Name == "FEXPrioGuard" || T.Name == "FEXThreadPin" || T.Name == "FEXFrameLatency" ||
-                          T.Name == "FEXRumble" || T.Name == "FEXFileCache" || T.Name == "FEXMainWatch");
+          T.KeepCores = !MovableHelper(T.Name);
         }
         T.Main = TID == C->MainTID || T.Name == "Main";
         Entries.push_back({Next, TID, Basic, &T, T.Main});
+      };
+      if (ThreadTable::ReadAll(Listed)) {
+        // Build 161: our Proton d2r10's thread table, no wineserver requests. A handle is opened only to change a thread.
+        WalkStatus = STATUS_SUCCESS;
+        for (const auto& L : Listed) {
+          ThreadBasicInfo Basic {};
+          Basic.ExitStatus = STATUS_PENDING;
+          Basic.TebBaseAddress = reinterpret_cast<void*>(static_cast<uintptr_t>(L.Teb));
+          Basic.ClientId.UniqueThread = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(L.Tid));
+          Basic.AffinityMask = static_cast<KAFFINITY>(L.Affinity);
+          Basic.Priority = L.Priority;
+          Basic.BasePriority = L.BasePriority;
+          Note(nullptr, Basic, &L);
+        }
+      } else {
+        while ((WalkStatus = NtGetNextThread(NtCurrentProcess(), Handles.empty() ? nullptr : Handles.back(),
+                                             THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION, 0, 0,
+                                             &Next)) == STATUS_SUCCESS) {
+          Handles.push_back(Next);
+          ThreadBasicInfo Basic {};
+          if (NtQueryInformationThread(Next, ThreadBasicInformation, &Basic, sizeof(Basic), nullptr) != STATUS_SUCCESS ||
+              Basic.ExitStatus != STATUS_PENDING) {
+            continue;
+          }
+          Note(Next, Basic, nullptr);
+        }
       }
 
       // The cores the game gave its own threads: the most common affinity among threads other than FEX's and the main
@@ -2580,6 +2787,23 @@ namespace {
           C->Cores == CoreMode::Fast && FastUsable ? fextl::fmt::format("lose {:#x}", C->FastMask) : fextl::string("unchanged")));
       }
 
+      // Build 161: threads from the thread table get a handle only when one of them is changed (closed with the walk's).
+      const auto SetHandle = [&](Entry& E) -> HANDLE {
+        if (!E.Handle) {
+          CLIENT_ID ClientId {
+            .UniqueProcess = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())),
+            .UniqueThread = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(E.TID)),
+          };
+          OBJECT_ATTRIBUTES Attr {.Length = sizeof(Attr)};
+          HANDLE Opened {};
+          if (NtOpenThread(&Opened, THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION, &Attr, &ClientId) == STATUS_SUCCESS) {
+            E.Handle = Opened;
+            Handles.push_back(Opened);
+            ++Opens;
+          }
+        }
+        return E.Handle;
+      };
       for (auto& E : Entries) {
         auto& T = *E.T;
         const auto& Basic = E.Basic;
@@ -2591,7 +2815,7 @@ namespace {
           const bool PriorityOff = Basic.Priority < Expected || Basic.Priority > std::min<LONG>(Expected + 1, 15);
           if (Basic.BasePriority != Want || PriorityOff) {
             LONG Value = Want;
-            const NTSTATUS Status = NtSetInformationThread(E.Handle, ThreadBasePriority, &Value, sizeof(Value));
+            const NTSTATUS Status = NtSetInformationThread(SetHandle(E), ThreadBasePriority, &Value, sizeof(Value));
             ++T.Fixes;
             ++Fixed;
             // The first three fixes of a thread, then every 50th: a game that sets priorities every frame shows as a count.
@@ -2609,7 +2833,7 @@ namespace {
         const uint64_t Want = WantedAffinity(*C, T, E.IsMain, Current, GameMask, FastUsable, ProcessMask);
         if (Want && Want != Current) {
           KAFFINITY Value = Want;
-          const NTSTATUS Status = NtSetInformationThread(E.Handle, ThreadAffinityMaskClass, &Value, sizeof(Value));
+          const NTSTATUS Status = NtSetInformationThread(SetHandle(E), ThreadAffinityMaskClass, &Value, sizeof(Value));
           if (Status == STATUS_SUCCESS) {
             T.SetTo = Want;
           }
@@ -2627,8 +2851,47 @@ namespace {
         NtClose(H);
       }
 
+      // Build 156: where Wine refuses the slowest cores, FEX's movable helpers go there at the Linux level.
+      if (C->HelpersLittle && C->LittleMask && ProcessMask && (C->LittleMask & ProcessMask) != C->LittleMask) {
+        uint32_t Movable = 1; // this guard, left out of Entries
+        for (const auto& E : Entries) {
+          Movable += E.T->FEX && !E.T->KeepCores;
+        }
+        KeepHelpersLittle(Helpers, *C, Round, Movable, ProcessMask);
+      }
+
       if (C->Loader != LoaderMode::Off) {
         LoaderRound(Finder, Threads, Round);
+      }
+      if (InputThreads) {
+        FindFrameThreads(*InputThreads, Escape);
+        if (Round % 30 == 0) {
+          const auto& K = *InputThreads;
+          StatsLogNote(fextl::fmt::format("input threads: s={} {} kept, nice set {} times{}", Round * 2, K.Count.load(std::memory_order_relaxed),
+                                          K.NiceSets,
+                                          K.NiceFailures ? fextl::fmt::format(" ({} failed, errno {})", K.NiceFailures, -K.NiceError) :
+                                                           fextl::string {}));
+        }
+      }
+      if (SteamThreads) {
+        FindFrameThreads(*SteamThreads, Escape);
+        if (Round % 30 == 0) {
+          const auto& K = *SteamThreads;
+          StatsLogNote(fextl::fmt::format("steam threads: s={} {} kept, nice set {} times{}", Round * 2, K.Count.load(std::memory_order_relaxed),
+                                          K.NiceSets,
+                                          K.NiceFailures ? fextl::fmt::format(" ({} failed, errno {})", K.NiceFailures, -K.NiceError) :
+                                                           fextl::string {}));
+        }
+      }
+      if (PresentThreads) {
+        FindFrameThreads(*PresentThreads, Escape);
+        if (Round % 30 == 0) {
+          const auto& K = *PresentThreads;
+          StatsLogNote(fextl::fmt::format("present threads: s={} {} kept, nice set {} times{}", Round * 2,
+                                          K.Count.load(std::memory_order_relaxed), K.NiceSets,
+                                          K.NiceFailures ? fextl::fmt::format(" ({} failed, errno {})", K.NiceFailures, -K.NiceError) :
+                                                           fextl::string {}));
+        }
       }
       if (FrameThreads) {
         FindFrameThreads(*FrameThreads, Escape);
@@ -2648,7 +2911,7 @@ namespace {
         }
       }
 
-      if (Handles.empty() && !ReportedWalkFailure) {
+      if (Handles.empty() && Listed.empty() && !ReportedWalkFailure) {
         ReportedWalkFailure = true;
         StatsLogNote(fextl::fmt::format("prio: can't list the process's threads, NtGetNextThread status={:#x}", static_cast<uint32_t>(WalkStatus)));
       }
@@ -2673,8 +2936,15 @@ namespace {
           NowText += fextl::fmt::format(" {:#x}x{}", Mask, N);
         }
         StatsLogNote(fextl::fmt::format("prio: s={} threads={} fixed={} cores fixed={} | affinity at start{} | now{} | not normal at start "
-                                        "(tid:name:base/prio x fixes):{}",
-                                        Round * 2, Count, Fixed, CoreFixed, MaskText, NowText, Odd.empty() ? " none" : Odd));
+                                        "(tid:name:base/prio x fixes):{}{}",
+                                        Round * 2, Count, Fixed, CoreFixed, MaskText, NowText, Odd.empty() ? " none" : Odd,
+                                        ThreadTable::Available() ?
+                                          fextl::fmt::format(" | threads from Wine's thread table (build 161), {} handles opened to "
+                                                             "change one so far; table entries read {} (by every FEX helper), read "
+                                                             "again because Wine was writing them {}, skipped {}",
+                                                             Opens, ThreadTable::GetCounts().Reads, ThreadTable::GetCounts().Retries,
+                                                             ThreadTable::GetCounts().GaveUp) :
+                                          fextl::string {}));
       }
 
       for (auto It = Threads.begin(); It != Threads.end();) {
@@ -2702,8 +2972,17 @@ namespace {
         if (Workers) {
           KeepWorkers(*Workers, *C, C->Loader != LoaderMode::Off ? &Finder : nullptr);
         }
+        if (PresentThreads) {
+          KeepFrameThreads(*PresentThreads);
+        }
         if (FrameThreads) {
           KeepFrameThreads(*FrameThreads);
+        }
+        if (InputThreads) {
+          KeepFrameThreads(*InputThreads);
+        }
+        if (SteamThreads) {
+          KeepFrameThreads(*SteamThreads);
         }
       }
     }
@@ -2799,6 +3078,21 @@ void StartPriorityGuard(std::string_view AppName) {
     FrameNice = std::clamp(atoi(F), -20, 19);
   }
   const char* FrameCoreSwitch = Switch("FEX_FRAME_THREADS_OFFCORE");
+  // Build 137: Wine's controller thread.
+  int InputNice = NiceUnchanged;
+  if (const char* F = Switch("FEX_INPUT_THREADS"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
+    InputNice = std::clamp(atoi(F), -20, 19);
+  }
+  // Build 147: steam.exe's thread that answers the game's Steam calls.
+  int SteamNice = NiceUnchanged;
+  if (const char* F = Switch("FEX_STEAM_THREADS"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
+    SteamNice = std::clamp(atoi(F), -20, 19);
+  }
+  // Build 160: VKD3D's present thread and the window system's present queue thread.
+  int PresentNice = NiceUnchanged;
+  if (const char* F = Switch("FEX_PRESENT_THREADS"); F && (F[0] == '-' || (F[0] >= '0' && F[0] <= '9'))) {
+    PresentNice = std::clamp(atoi(F), -20, 19);
+  }
   const bool FrameOffCore = FrameCoreSwitch && (FrameCoreSwitch[0] == '1' || (FrameCoreSwitch[0] == 'o' && FrameCoreSwitch[1] == 'n'));
 
   StatsLogNote(C->Prio == PrioMode::Keep ? fextl::fmt::format("prio: off, Windows thread priorities pass through to Linux nice "
@@ -2898,7 +3192,8 @@ void StartPriorityGuard(std::string_view AppName) {
 
   StatsLogNote(FrameNice != NiceUnchanged || FrameOffCore ?
                  fextl::fmt::format("frame threads: build 126: VKD3D's frame threads (vkd3d_queue, vkd3d_fence, its present, frame start, "
-                                    "frame done and swapchain sync threads) and the frame gen layer's present thread {}{}{}, found by "
+                                    "frame done and swapchain sync threads), the frame gen layer's present thread and (build 160) the "
+                                    "window system's present queue thread {}{}{}, found by "
                                     "name every 2 s; in the build 125 run vkd3d_queue (nice 0) waited 163 ms for a CPU on the main "
                                     "thread's shared core (a 161 ms frame). FEX_FRAME_THREADS=off leaves their nice, "
                                     "FEX_FRAME_THREADS_OFFCORE=0 lets them on that core",
@@ -2908,6 +3203,31 @@ void StartPriorityGuard(std::string_view AppName) {
                                     FrameOffCore ? "kept off the main thread's core while it is open to the game's threads (build 123)" : "") :
                  fextl::string("frame threads: left alone (FEX_FRAME_THREADS=-10 keeps VKD3D's frame threads at nice -10, "
                                "FEX_FRAME_THREADS_OFFCORE=1 keeps them off the main thread's core while it is open)"));
+  StatsLogNote(PresentNice != NiceUnchanged ?
+                 fextl::fmt::format("present threads: build 160: VKD3D's present thread (vkd3d-fex-present) and the window system's "
+                                    "present queue thread (WSI swapchain queue) kept at nice {} or better, found by name every 2 s and "
+                                    "checked every 250 ms; with frame generation the generated frame goes out when VKD3D's present "
+                                    "thread wakes at its slot (build 159 run: at nice -10 it waited ~39 ms a second for a CPU, the "
+                                    "frame gen layer's present thread at -20 ~3 ms). FEX_PRESENT_THREADS=off leaves them at "
+                                    "FEX_FRAME_THREADS's nice",
+                                    PresentNice) :
+                 fextl::string("present threads: left at FEX_FRAME_THREADS's nice (FEX_PRESENT_THREADS=-20 keeps VKD3D's present "
+                               "thread and the window system's present queue thread at nice -20)"));
+  StatsLogNote(InputNice != NiceUnchanged ?
+                 fextl::fmt::format("input threads: build 137: Wine's controller thread (wine_xinput_hid_update) kept at nice {} or better, "
+                                    "found by name every 2 s and checked every 250 ms; it holds a controller's lock while it reads the "
+                                    "next report, and the game's XInputGetState waits for that lock (build 133 run: main thread 14 ms "
+                                    "in XInputGetState in a 48 ms frame). FEX_INPUT_THREADS=off leaves its nice",
+                                    InputNice) :
+                 fextl::string("input threads: left alone (FEX_INPUT_THREADS=-10 keeps Wine's controller thread at nice -10)"));
+  StatsLogNote(SteamNice != NiceUnchanged ?
+                 fextl::fmt::format("steam threads: build 147: steam.exe's thread that answers the game's Steam calls (IPC:CSteamEngin) "
+                                    "kept at nice {} or better, found by name every 2 s and checked every 250 ms; the game waits for "
+                                    "its answer every frame (build 146 run: at nice 0 it waited up to 340 ms a second for a CPU while "
+                                    "other apps restarted on all cores, the main thread waited up to 194 ms a second on Steam). "
+                                    "FEX_STEAM_THREADS=off leaves its nice",
+                                    SteamNice) :
+                 fextl::string("steam threads: left alone (FEX_STEAM_THREADS=-10 keeps steam.exe's answering thread at nice -10)"));
 
   const fextl::string Exe = fextl::fmt::format("main exe {:X}-{:X}", C->ExeBase, C->ExeEnd);
   StatsLogNote(C->Loader == LoaderMode::Little ?
@@ -2934,7 +3254,8 @@ void StartPriorityGuard(std::string_view AppName) {
   }
 
   if (C->Prio == PrioMode::Keep && C->Cores == CoreMode::Off && !C->HelpersLittle && !C->ServerNiceOn && !C->MainNiceOn &&
-      C->Loader == LoaderMode::Off && WorkerNiceMode == WorkerMode::Off && FrameNice == NiceUnchanged && !FrameOffCore) {
+      C->Loader == LoaderMode::Off && WorkerNiceMode == WorkerMode::Off && FrameNice == NiceUnchanged && !FrameOffCore &&
+      InputNice == NiceUnchanged && SteamNice == NiceUnchanged && PresentNice == NiceUnchanged) {
     delete C;
     return;
   }
@@ -2942,6 +3263,34 @@ void StartPriorityGuard(std::string_view AppName) {
     FrameThreads = new FrameThreadKeeper {};
     FrameThreads->Nice = FrameNice;
     FrameThreads->OffCore = FrameOffCore;
+    FrameThreads->Want = FrameThreadNames;
+    FrameThreads->WantCount = std::size(FrameThreadNames);
+    FrameThreads->Label = "frame threads";
+  }
+  if (PresentNice != NiceUnchanged) {
+    PresentThreads = new FrameThreadKeeper {};
+    PresentThreads->Nice = PresentNice;
+    PresentThreads->OffCore = false; // the frame threads' keeper does that
+    PresentThreads->Want = PresentThreadNames;
+    PresentThreads->WantCount = std::size(PresentThreadNames);
+    PresentThreads->Label = "present threads";
+  }
+  if (InputNice != NiceUnchanged) {
+    InputThreads = new FrameThreadKeeper {};
+    InputThreads->Nice = InputNice;
+    InputThreads->OffCore = false;
+    InputThreads->Want = InputThreadNames;
+    InputThreads->WantCount = std::size(InputThreadNames);
+    InputThreads->Label = "input threads";
+  }
+  if (SteamNice != NiceUnchanged) {
+    SteamThreads = new FrameThreadKeeper {};
+    SteamThreads->Nice = SteamNice;
+    SteamThreads->OffCore = false;
+    SteamThreads->Want = SteamThreadNames;
+    SteamThreads->WantCount = std::size(SteamThreadNames);
+    SteamThreads->Label = "steam threads";
+    SteamThreads->Process = SteamProcessName;
   }
   if (WorkerNiceMode != WorkerMode::Off) {
     Workers = new WorkerKeeper {};

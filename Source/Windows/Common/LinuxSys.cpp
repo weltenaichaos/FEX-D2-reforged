@@ -26,6 +26,8 @@ namespace {
   constexpr int64_t NR_getuid = 174;
   constexpr int64_t NR_gettid = 178;
   constexpr int64_t NR_getrusage = 165;
+  constexpr int64_t NR_prctl = 167;
+  constexpr int64_t PR_SET_NAME = 15;
   constexpr int64_t NR_nanosleep = 101;
   constexpr int64_t NR_clock_gettime = 113;
   constexpr int64_t RUSAGE_THREAD = 1;
@@ -236,6 +238,14 @@ int GetTid() {
   return static_cast<int>(Syscall(NR_gettid));
 }
 
+int SetOwnName(const char* Name) {
+  char Comm[16] {};
+  for (size_t i = 0; i + 1 < sizeof(Comm) && Name[i]; ++i) {
+    Comm[i] = Name[i];
+  }
+  return static_cast<int>(Syscall(NR_prctl, PR_SET_NAME, reinterpret_cast<intptr_t>(Comm)));
+}
+
 bool ReadOwnMemory(uint64_t Address, void* Out, size_t Size) {
   // Opened once; -2 = not tried yet. Two threads opening it at once only leaks one descriptor.
   static std::atomic<int> Fd {-2};
@@ -270,6 +280,15 @@ int64_t ThreadCpuNs(int Tid) {
     int64_t Nanoseconds;
   } Time {};
   const int64_t Result = Syscall(NR_clock_gettime, Clock, reinterpret_cast<intptr_t>(&Time));
+  return Result < 0 ? Result : Time.Seconds * 1'000'000'000 + Time.Nanoseconds;
+}
+
+int64_t MonotonicNs() {
+  struct {
+    int64_t Seconds;
+    int64_t Nanoseconds;
+  } Time {};
+  const int64_t Result = Syscall(NR_clock_gettime, 1 /* CLOCK_MONOTONIC */, reinterpret_cast<intptr_t>(&Time));
   return Result < 0 ? Result : Time.Seconds * 1'000'000'000 + Time.Nanoseconds;
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Threads.h"
 #include "CRT/CRT.h"
+#include "LinuxSys.h"
 #include "Switches.h"
 
 #include <FEXCore/Utils/LogManager.h>
@@ -19,6 +20,11 @@ namespace WinThreadImpl {
       , UserArg {Arg}
       , Flags {Flags} {
       // hide everything from guest, don't initialize anything, we'll do that manually in RunThread()
+      if (ThreadName) {
+        for (size_t i = 0; i + 1 < sizeof(LinuxName) && ThreadName[i]; ++i) {
+          LinuxName[i] = ThreadName[i];
+        }
+      }
       ULONG CreateFlags = THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH | THREAD_CREATE_FLAGS_SKIP_LOADER_INIT | THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE;
       if (Flags.Internal) {
         CreateFlags |= THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER;
@@ -88,6 +94,13 @@ namespace WinThreadImpl {
 
     static void RunThread(Thread* This) {
       This->TID = GetCurrentThreadId();
+      // Build 158: the thread gives itself its Linux name. The name set below in the constructor only reaches Linux when
+      // Wine already knows the new thread's Linux tid, which it learns once the thread has started; in the build 157 run
+      // FEXStatsLog, FEXStartWatch and the disk cache writer kept the name "D2R.exe", so FEX's search for its helpers
+      // by name (PriorityGuard.cpp, build 156) missed the stats log and it stayed on the game's cores.
+      if (This->LinuxName[0]) {
+        FEX::Windows::Linux::SetOwnName(This->LinuxName);
+      }
       // Upstream runs low priority helpers (disk cache writer, cache prefetch) at IDLE. Wine on Linux turns that into nice
       // 19, about 1.5% of a core next to busy game threads, while the writer holds locks every compile needs.
       // FEX_HELPER_PRIO=normal (the D2R default) runs them at normal priority instead.
@@ -108,6 +121,7 @@ namespace WinThreadImpl {
     HANDLE Handle {};
     DWORD TID {};
     void* ReturnValue {};
+    char LinuxName[16] {}; // the first 15 characters of the thread's name
   };
 
   fextl::unique_ptr<FEXCore::Threads::Thread>

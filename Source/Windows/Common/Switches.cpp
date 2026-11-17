@@ -34,6 +34,10 @@ namespace {
     // last exceptions FEX passed on), nothing otherwise. "0" turns it off.
     {"FEX_CRASH_NOTE", "D:\\"},
 #endif
+    // Build 128: a small file D:\fexstart-D2R.exe-b<N>-<time>-<pid>.txt for every start (both builds): process starts and
+    // ends of this Linux user to the millisecond for 120 s and the end of Steam's logs, to find out what ends a start
+    // that shows a black screen and leaves neither D2R nor Steam running (see StartWatch.h). "0" turns it off.
+    {"FEX_START_WATCH", "D:\\"},
     {"FEX_NATIVE_ZLIB", "1"},
     {"FEX_NATIVE_MD5", "1"},
     {"FEX_UNPACK_CACHE", "1"},
@@ -187,12 +191,40 @@ namespace {
     // frame generation). Labels move with the world, the map stays or scrolls, the HUD stays; UI it can't match stays
     // as before. The number is the largest move searched per real frame, in pixels (at most 32).
     {"FEX_LSFG_UI_MOTION", "24"},
+    // Build 162 (layer 14): in the build 161 run 8% of the generated frames went out 1 ms or more after their slot (the
+    // real frames 0.4%). A frame that started early (FEX_LSFG_EARLY) gave its generated frame to the layer's present
+    // thread only once the game's present had slept until that frame's slot, on VKD3D's present thread, which waited up
+    // to 27 ms a second for a CPU in busy stretches (t=277-293, 335-348). The layer now hands it over before that sleep,
+    // and its present thread (nice -20, awake 1 ms early) waits for the slot itself, as it does for the real frame.
+    {"FEX_LSFG_GEN_AHEAD", "1"},
+    // Build 150: from the 2026-11-01 runs on, the frame generation layer's presents took 1-12 ms (median per run, the
+    // generated one 4-12 ms, 18-26 ms in b148's heavy scenes) where every run up to 2026-10-30 had 0.1 ms. Those runs
+    // started with MESA_VK_WSI_DEBUG=sw (GameNative sets it when the container's "Use DRI3" is off). Then GameNative's
+    // Vulkan wrapper (Mesa's window system code over Turnip) gives the swapchain CPU images: each present copies the
+    // picture on the GPU into a CPU buffer, on the one KGSL queue behind the game's queued work, waits on the presenting
+    // thread until that copy is done, and the X server copies it again. Without "sw" the wrapper hands the X server the
+    // picture's own buffer (AHardwareBuffer, no copy, no wait), as up to 2026-10-30. 0 leaves MESA_VK_WSI_DEBUG as it is.
+    {"FEX_WSI_DIRECT", "1"},
     // Build 125: the one hitch of the layer 13 run (144 ms at 1:25) was FEX's code lock: a game thread queuing for it on a
     // crowded core was pushed off its CPU inside Wine's wait-list spin lock (Wine keeps waiters in 256 shared lists, each
     // guarded by a spin lock in user code), and three job workers plus the protection thread (holding FEX's memory lock)
     // spun on that spin lock for ~120 ms, which kept the stuck thread off a CPU longer still. FEX's code lock and memory
     // lock now sleep and wake in the Linux kernel (futex), whose wait lists can't be held by a thread that isn't running.
     {"FEX_KERNEL_FUTEX", "1"},
+    // Build 156: in the b154 run FEX's code lock was held 56, 59 and 111 ms in calm play while the main thread and the job
+    // workers waited to compile (frames of 76, 53 and 131 ms), and in each of those seconds a normal priority thread
+    // waited 79-172 ms for a CPU on the crowded big cores. A thread that holds FEX's code lock or memory lock this many ms
+    // while another waits for it runs at the main thread's priority (nice -20) until it lets go (LockBoost.h). 0 = off.
+    {"FEX_LOCK_BOOST", "4"},
+    // Build 142: the build 118 and 139 freezes (no frames, main thread stuck in RtlWakeConditionVariable at 95% CPU, job
+    // workers spinning in SleepConditionVariableSRW) were a race in Proton 11.0's ntdll wait lists that upstream Wine has
+    // fixed: a waker marked a waiter woken before unlinking it, a waiter coming back on its own left at once, and the list
+    // ended up pointing into reused stack. FEX runs ntdll's RtlWaitOnAddress/RtlWakeAddress* with the fixed code
+    // (WineWaitFix.h); 2 = the same with Wine's spin lock, 0 = Wine's own code.
+    {"FEX_WINE_WAIT_FIX", "1"},
+    // Build 146 (measurement, logging build only): the main thread's pipe reads and writes, the process at the other end
+    // and its threads' CPU time (ARM64EC/PipeWatch.h). Build 143: the main thread waited ~0.84 ms a frame on Steam.
+    {"FEX_PIPE_WATCH", Measuring ? "1" : "0"},
     // Build 126: the longest hitch of the build 125 run (161 ms at 3:50) was VKD3D's queue thread, which hands every frame's
     // GPU work to the driver: at nice 0 it waited 163 ms for a CPU on the main thread's core (open to the game's threads
     // while the main thread is away) while the kernel reclaimed memory there. VKD3D's frame threads (vkd3d_queue,
@@ -201,6 +233,22 @@ namespace {
     // thread's core while it is open to others. "off" leaves their nice; FEX_FRAME_THREADS_OFFCORE=0 lets them on it.
     {"FEX_FRAME_THREADS", "-10"},
     {"FEX_FRAME_THREADS_OFFCORE", "1"},
+    // Build 137: in the build 133 run the main thread sat 14 ms in XInputGetState in a 48 ms frame: the game's controller
+    // reads take a controller's lock that Wine's controller thread (wine_xinput_hid_update) holds while it reads the next
+    // report, and at nice 0 that thread waited for a CPU behind the main thread and the job workers. It is kept at this
+    // nice or better (it runs a few ms a second). "off" leaves it.
+    {"FEX_INPUT_THREADS", "-10"},
+    // Build 147: steam.exe's thread that answers the game's Steam calls (IPC:CSteamEngin). The game asks Steam the same two
+    // questions every frame and waits for the answer (build 146 pipe watch); in the build 146 run that thread (nice 0)
+    // waited up to 340 ms a second for a CPU while other apps restarted on all cores, and the main thread waited up to
+    // 194 ms a second on Steam. It is kept at this nice or better (it runs ~20-30 ms a second). "off" leaves it.
+    {"FEX_STEAM_THREADS", "-10"},
+    // Build 160: with frame generation the layer lets the game's present go at the generated frame's slot, on VKD3D's
+    // present thread, so the generated frame is late by that thread's wait for a CPU when it wakes. In the build 159 run
+    // it (nice -10) waited ~39 ms a second for a CPU, and generated frames came 1-6 ms late in 39 of 169 calm seconds;
+    // the layer's own present thread (nice -20) waited ~3 ms a second. VKD3D's present thread and Mesa's X11 present
+    // queue thread are kept at this nice or better (they run ~10 ms a second). "off" leaves them at FEX_FRAME_THREADS's.
+    {"FEX_PRESENT_THREADS", "-20"},
     // Build 62: in the fex10 run (FEX build 61) a thread running the game's protection/loader code (outside any module)
     // was busy in 36% of the play time on the game's big cores, and those phases had 3-7 times as many frames of 40 ms or
     // more. Such threads go to the slowest cores, and their event calls are counted (see PriorityGuard.h, ARM64EC/LoaderWatch.h).
@@ -226,6 +274,14 @@ namespace {
     // storage was at its low clock during play and the main thread's 11 disk hits at an area entry took 36.9 ms (3.4 ms
     // each, against ~0.2 ms to unpack one), in a 105 ms frame (see ARM64EC/NativeUnpackCache.cpp).
     {"FEX_UNPACK_CACHE_MAIN_PLAY", "1"},
+    // Build 158: the same for every thread. When the game streamed in a new area during play, its workers' many lookups
+    // counted as a load: in the build 157 run they read 4,150 hits from disk in play, 0.76 ms each, against 0.16-0.27 ms
+    // to unpack one, and 1.97 GB were read ahead, about half never used (see ARM64EC/NativeUnpackCache.cpp).
+    {"FEX_UNPACK_CACHE_FRAMES", "1"},
+    // Build 164: and nothing is read ahead while frames come. In the build 163 run read-ahead in play was 2,038 MB, 65%
+    // never used, 45% of the storage reads in play, and up to 117 MB in a second when the game streamed in an area, while
+    // the main thread waited for the game's lock in frames of 50-91 ms (see ARM64EC/NativeUnpackCache.cpp).
+    {"FEX_UNPACK_CACHE_FRAMES_AHEAD", "0"},
     // Build 90: the streams the main thread looks up in frames of play are learned across sessions and read into the
     // file cache at the start and at every loading screen (budget in MB). The same 105 ms frame unpacked 7.6 MB of
     // stored streams itself (20.9 ms) because they weren't in memory.
@@ -244,6 +300,10 @@ namespace {
     {"FEX_CODE_BUFFER_START", "max"},
     {"FEX_CODE_BUFFER_RENEW", "50"},
     {"FEX_CODE_BUFFER_RENEW_EARLY", "10"},
+    // Build 160: a loading screen within this many seconds of the last renewal renews only at FEX_CODE_BUFFER_RENEW's mark,
+    // not the early one: in the build 159 run entering the game counted as two loading screens 2.2 s apart, and the second
+    // renewal dropped the 13,084 blocks just loaded for the new area. 0 turns it off.
+    {"FEX_CODE_BUFFER_RENEW_GAP", "10"},
     // Build 94: frames with fewer than 64 push descriptor updates each (FEX's Turnip build counts them) for 500 ms are a
     // loading screen too. D2R draws most of a loading screen at full speed (~7-9 updates a frame, play 190 or more): in
     // the build 93 run a 5 s loading screen at 40 FPS went unseen and the code buffer filled in play 2 minutes later
@@ -272,6 +332,45 @@ namespace {
     // bursts, too short for Android to raise the clock, so a 3968 KB read took 20-21 ms (~200 MB/s, against ~950 MB/s in
     // loading screens), and an area entry had a 124 ms frame. The same reads come back in every session.
     {"FEX_GAME_FILES_LEARN", "256"},
+    // Build 129: in the b126 run of 2026-11-01 Android's memory reclaim (kswapd) threw part of the learned data out of the
+    // file cache in play (40.9 of 52.8 MB had to be read again at the next loading screen), and the main thread read
+    // 5.9 MB of it from storage in one frame (111 ms). The learned ranges are asked of storage every 500 ms in play too:
+    // what is still cached costs only the look-up, what was thrown out is read back in the background.
+    {"FEX_GAME_FILES_REFILL", "1"},
+    // Build 129: that reclaim runs when memory nothing holds (MemFree) reaches the kernel's watermark; in that run it was
+    // 200-450 MB all session, so each few hundred MB the game added in play (new area GPU data) woke it. In a loading
+    // screen FEX now takes memory until MemFree is this many MB and gives it back, so the reclaim runs in the load and
+    // play starts with room (see ARM64EC/GameFiles.cpp). 0 = off.
+    // Build 131: off by default. In the build 130 run it pushed Android's memory killer (lmkd) to close background apps
+    // at three loading screens (t=60, 198, 553: 2-9 ended a second), which restarted at once and kept all 8 cores near
+    // 100% busy for 15-25 s of play (2-3 cores of other apps), the run's worst stutter.
+    {"FEX_MEM_HEADROOM_MB", "0"},
+    // Build 138: in the build 137 run the first area load started with 330 MB of unused memory and took ~650 MB in 2 s;
+    // Android's memory killer closed 9 apps, which restarted for 28 s on all 8 cores (70 frames of 50 ms or more). In a
+    // loading screen with less unused memory than this, FEX's drops keep only readahead and learned game data, so FEX's
+    // own ~600-850 MB of kept data makes the room instead of other apps (see ARM64EC/GameFiles.cpp). 0 = off.
+    {"FEX_GAME_FILES_LOAD_FREE_MB", "1024"},
+    // Build 139: the same in play below this much unused memory. In the build 138 run the game streamed new areas while
+    // frames kept coming (t=46, t=189: 661 and 817 MB read in a second) with 147-185 MB unused, and Android closed 12 and
+    // 5 apps while FEX kept 750-870 MB of game data. 0 = off.
+    // Build 148: 384 -> 1024. In the build 147 run unused memory sat at 384-512 MB in most of play, where FEX kept 80-250 MB
+    // more game data than in the room, and Android closed 13 and 12 apps when the game streamed new areas (t=48, t=283).
+    {"FEX_GAME_FILES_PLAY_FREE_MB", "1024"},
+    // Build 148: in the play room a pass also starts once the game has read this many MB since the last one (at least
+    // 100 ms after it began). In the build 147 run the game read 191 MB in a second at t=282 and the reads stayed in the
+    // file cache up to 500 ms until the next pass. 0 = off (passes every 500 ms only).
+    {"FEX_GAME_FILES_BURST_MB", "32"},
+    // Build 148: FEXFileCache's nice. In the build 147 run it waited 457 ms for a CPU at t=283 while all cores were busy,
+    // and its one pass that second took 189 ms, when Android closed 12 apps. It runs 1-18 ms a pass. "off" leaves it.
+    {"FEX_GAME_FILES_NICE", "-10"},
+    // Build 147: in the build 146 run the first area load's room passes kept 171-385 MB as readahead, mostly pieces read
+    // 32-128 MB before (a read had ended in the piece before them), and Android's memory killer closed 18 apps at t=36-37,
+    // which restarted every second for 30 s on all 8 cores. A piece read since its readahead mark now counts by that read
+    // in the rooms, so they keep only the last 32 MB read as meant. 0 = as build 146.
+    {"FEX_GAME_FILES_ROOM_AHEAD_READ", "1"},
+    // Build 147: learned pieces (1 MB) were kept whole: ~195 MB for 54 MB of learned ranges in the build 146 run. A piece
+    // kept only because it is learned now keeps only its learned ranges. 0 = whole pieces as before.
+    {"FEX_GAME_FILES_LEARN_RANGES", "1"},
     // Build 64: the build 63 log had ~1 s of 50-55 ms frames after each area load, with 14-35 ms a frame of GPU work
     // outside the game's render passes or command lists. vkd3d zero-fills every new small buffer and texture it places
     // in its own memory blocks on the GPU, and the game's queues wait for it; FEX's vkd3d-proton build (fex11) skips the
@@ -514,11 +613,14 @@ namespace {
     "FEX_UNPACK_CACHE_PLAY",
     "FEX_UNPACK_CACHE_AHEAD",
     "FEX_UNPACK_CACHE_MAIN_PLAY",
+    "FEX_UNPACK_CACHE_FRAMES",
+    "FEX_UNPACK_CACHE_FRAMES_AHEAD",
     "FEX_UNPACK_CACHE_LEARN",
     "FEX_UNPACK_CACHE_FLUSH",
     "FEX_CODE_BUFFER_START",
     "FEX_CODE_BUFFER_RENEW",
     "FEX_CODE_BUFFER_RENEW_EARLY",
+    "FEX_CODE_BUFFER_RENEW_GAP",
     "FEX_CODE_BUFFER_LOAD_MS",
     "FEX_LOAD_LIGHT",
     "FEX_LOAD_LIGHT_MS",
@@ -531,8 +633,18 @@ namespace {
     "FEX_GAME_FILES_READ_WATCH",
     "FEX_GAME_FILES_AHEAD",
     "FEX_GAME_FILES_LEARN",
+    "FEX_GAME_FILES_REFILL",
+    "FEX_GAME_FILES_LOAD_FREE_MB",
+    "FEX_GAME_FILES_PLAY_FREE_MB",
+    "FEX_GAME_FILES_ROOM_AHEAD_READ",
+    "FEX_GAME_FILES_LEARN_RANGES",
+    "FEX_GAME_FILES_BURST_MB",
+    "FEX_GAME_FILES_NICE",
+    "FEX_MEM_HEADROOM_MB",
+    "FEX_MEM_HEADROOM_GUARD_MB",
     "FEX_UNPACK_CACHE_SKIP_ADLER",
     "FEX_NATIVE_ADLER_NEON",
+    "FEX_INFLATE_FAST",
     "FEX_NATIVE_MD5_CACHE",
     "FEX_JOBWAIT",
     "FEX_JOBWAIT_BACKOFF",
@@ -543,6 +655,7 @@ namespace {
     "FEX_PRIO",
     "FEX_HELPER_PRIO",
     "FEX_STALLPROBE",
+    "FEX_PROBE_VQ_NOTES",
     "FEX_MAINCORE",
     "FEX_MAINCORE_WAIT",
     "FEX_MAINCORE_ESCAPE",
@@ -583,10 +696,21 @@ namespace {
     "FEX_LSFG_UI",
     "FEX_LSFG_UI_TOL",
     "FEX_LSFG_UI_MOTION",
+    "FEX_LSFG_GEN_AHEAD",
+    "FEX_WSI_DIRECT",
     "FEX_KERNEL_FUTEX",
+    "FEX_LOCK_BOOST",
+    "FEX_WINE_WAIT_FIX",
+    "FEX_PIPE_WATCH",
     "FEX_FRAME_THREADS",
     "FEX_FRAME_THREADS_OFFCORE",
+    "FEX_INPUT_THREADS",
+    "FEX_STEAM_THREADS",
+    "FEX_PRESENT_THREADS",
     "FEX_CRASH_NOTE",
+    "FEX_START_WATCH",
+    "FEX_START_WATCH_S",
+    "FEX_SYSDLL_REDIRECT",
     "FEX_VKD3D_SKIP_FRESH_CLEARS",
     "FEX_VKD3D_PRESENT_DRAWN",
     "FEX_VKD3D_SHADER_COPY",

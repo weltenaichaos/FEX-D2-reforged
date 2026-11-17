@@ -48,6 +48,8 @@ struct FEXUnpackCacheCounters {
   uint64_t PlaySkipBytes;
   uint64_t MainPlaySkips;     // build 90: of the skips, the main thread's while frames came that the lookup rate alone wouldn't have made
   uint64_t MainPlaySkipBytes;
+  uint64_t FramesSkips;       // build 158: of the skips, other threads' while frames came that the lookup rate alone wouldn't have made
+  uint64_t FramesSkipBytes;
   uint64_t LearnedHits;       // build 90: learned streams taken from the kernel's file cache
   uint64_t LearnedTicks;
   uint64_t LearnedNotCached;  // learned streams that weren't there (then handled like any other hit)
@@ -58,6 +60,8 @@ struct FEXUnpackCacheCounters {
   uint64_t FlushWaitTicks;  // waiting for them
   uint64_t FlushDropTicks;  // dropping the batch afterwards
   uint64_t FlushFailures;
+  uint64_t FramesNoAheadRam;  // build 164: hits from read-ahead memory while frames came that asked for no read-ahead after them
+  uint64_t FramesNoAheadDisk; // ... and hits not in it that started none (FEX_UNPACK_CACHE_FRAMES_AHEAD=0)
 };
 extern struct FEXUnpackCacheCounters FEXUnpackCacheStats;
 

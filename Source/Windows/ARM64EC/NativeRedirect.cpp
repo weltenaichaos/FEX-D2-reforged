@@ -932,6 +932,7 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
   };
   FEXNativeSkipHitAdler = DefaultOn("FEX_UNPACK_CACHE_SKIP_ADLER");
   FEXNativeAdlerNeon = DefaultOn("FEX_NATIVE_ADLER_NEON");
+  FEXNativeInflateChunk = DefaultOn("FEX_INFLATE_FAST");
 
   FEX::Windows::StatsLogNote(fextl::fmt::format("native zlib: {}", ZlibEnabled ? "on (FEX_NATIVE_ZLIB=1)" : "off"));
   if (ZlibEnabled) {
@@ -939,6 +940,10 @@ void Init(uint64_t MainImageBase, bool StatsLog, void (*Invalidate)(uint64_t Add
                                                   FEXNativeAdlerNeon ? "NEON" : "zlib C code (FEX_NATIVE_ADLER_NEON=0)",
                                                   FEXNativeSkipHitAdler ? "answered from the stream's trailer" :
                                                                           "computed (FEX_UNPACK_CACHE_SKIP_ADLER=0)"));
+    FEX::Windows::StatsLogNote(FEXNativeInflateChunk ?
+                                 "native zlib: inflate_fast is FEX's own (build 158): input 8 bytes at a time, matches copied 8-16 bytes "
+                                 "at a time, up to 3 literals per input read; FEX_INFLATE_FAST=0 runs zlib's own" :
+                                 "native zlib: inflate_fast is zlib's own (FEX_INFLATE_FAST=0)");
   }
   FEX::Windows::StatsLogNote(fextl::fmt::format("native md5: {}", MD5Enabled ? "on (FEX_NATIVE_MD5=1)" : "off"));
   if (StatsLog) {

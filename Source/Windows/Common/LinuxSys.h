@@ -53,6 +53,8 @@ int GetPid();
 uint32_t GetUid();
 // The calling thread's Linux tid.
 int GetTid();
+// Sets the calling thread's Linux name (its comm, prctl PR_SET_NAME; the first 15 characters). 0 or a negative errno.
+int SetOwnName(const char* Name);
 // Reads Size bytes of this process's memory at Address through /proc/self/mem. False where any of it isn't mapped
 // (it never faults), and no wineserver round trip, unlike NtReadVirtualMemory.
 bool ReadOwnMemory(uint64_t Address, void* Out, size_t Size);
@@ -65,6 +67,8 @@ int SetNice(int Tid, int Nice);
 void SleepNs(uint64_t Ns);
 // The run time of a thread of this process in ns, exact even while it runs (its thread CPU clock), or a negative errno.
 int64_t ThreadCpuNs(int Tid);
+// CLOCK_MONOTONIC in nanoseconds (Wine's own notes use it), or a negative errno.
+int64_t MonotonicNs();
 // The state letter of a thread's stat file kept open ("/proc/self/task/<tid>/stat": 'R' = running or ready to run, 'S'
 // sleeping, 'D' waiting for storage ...), or 0 when it can't be read.
 char PreadTaskState(int Fd);

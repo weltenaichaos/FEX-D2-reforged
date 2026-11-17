@@ -1,0 +1,63 @@
+# Copies ntdll.dll out of GameNative's stock Proton 11.0-1 ARM64EC package into a release of this repo, so FEX's
+# FEX_WINE_WAIT_FIX checks (build 141) can be tried against the real file and its stock code pinned.
+name: Fetch stock Proton ntdll
+
+on:
+  push:
+    branches: [ 'claude/**' ]
+    paths: [ .github/workflows/fetch-stock-ntdll.yml ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  STOCK_REPO: GameNative/proton-wine
+  STOCK_TAG: build-p11-20260502-1-sdk28
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download the stock package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$STOCK_TAG" -R "$STOCK_REPO" --json assets --jq '.assets[] | "\(.name) \(.size)"' | tee assets.txt
+          mkdir dl
+          # the ARM64EC package(s) only
+          grep -iE 'arm64ec' assets.txt | cut -d' ' -f1 | while read -r Name; do
+            gh release download "$STOCK_TAG" -R "$STOCK_REPO" -p "$Name" -D dl
+          done
+          ls -la dl
+      - name: Pull out ntdll.dll
+        run: |
+          sudo apt-get install -y zstd xz-utils >/dev/null
+          mkdir out
+          cp assets.txt out/stock-assets.txt
+          for F in dl/*; do
+            mkdir -p x
+            case "$F" in
+              *.zip) unzip -q -o "$F" -d x ;;
+              *) tar -xf "$F" -C x 2>/dev/null || tar --zstd -xf "$F" -C x || tar -xJf "$F" -C x ;;
+            esac
+          done
+          find x -iname 'ntdll*' -o -iname 'kernelbase.dll' -o -iname 'profile.json' -o -iname '*.json' | tee out/found.txt
+          find x -iname ntdll.dll | while read -r P; do
+            D=$(basename "$(dirname "$P")")
+            cp "$P" "out/${D}_ntdll.dll"
+          done
+          find x -iname 'ntdll.so' | while read -r P; do
+            D=$(basename "$(dirname "$P")")
+            cp "$P" "out/${D}_ntdll.so"
+          done
+          (cd out && sha256sum * | tee sha256.txt)
+          ls -la out
+      - name: Publish
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: stock-proton-11.0-1-ntdll-${{ github.run_number }}
+          name: Stock Proton 11.0-1 ntdll (reference copy ${{ github.run_number }})
+          prerelease: true
+          body: ntdll.dll from GameNative's stock Proton 11.0-1 ARM64EC package (${{ env.STOCK_TAG }}), for checking FEX_WINE_WAIT_FIX.
+          files: out/*

@@ -130,6 +130,10 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   uint64_t CompileEntryRIP {};
   uint64_t CompileFaultPage {};
   FEXCore::UncheckedLongJump::JumpBuf CompileRestartJump;
+  // The Windows frontend's stale NoExec fault retries (RetryStaleNoExecFault): the last RIP retried and how often in a
+  // row. Kept here, not in thread_local variables: the Windows DLLs have no TLS directory, so those land in TLS slot 0.
+  uint64_t NoExecRetryRip {};
+  uint32_t NoExecRetries {};
 
   // BaseFrameState should always be at the end, directly before the interrupt fault page
   FEXCore::Core::CpuStateFrame BaseFrameState {};

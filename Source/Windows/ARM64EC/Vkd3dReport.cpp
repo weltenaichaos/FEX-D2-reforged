@@ -415,6 +415,8 @@ namespace {
   // Layer 12 (build 124) adds how the UI moved: tiles of 16 x 16 pixels with UI per counted frame and their share that
   // moved (with the mean move, |dx| + |dy| per real frame), stayed, matched nothing or had no frame before; the share of
   // pixels placed along a move, placed still or left as in the real frame; and the GPU time of the UI bits and motion.
+  // Layer 14 (build 162) adds the generated frames handed to the present thread before the game's present slept until
+  // their slot, how long before it, and the early frames that went the layer 13 way.
   struct FramegenState {
     fextl::string Path; // empty: not known yet
     char Last[4096];
@@ -472,7 +474,7 @@ namespace {
     struct Field {
       std::string_view Key, Value;
     };
-    Field Fields[96];
+    Field Fields[128];
     size_t Count = 0;
     std::string_view All {Text};
     while (!All.empty() && Count < std::size(Fields)) {
@@ -551,6 +553,14 @@ namespace {
                                      Num("ui_px_moved_pct"), Num("ui_px_still_pct"), Num("ui_px_left_pct"), Get("ui_noprev_frames"),
                                      Num("gpu_ui_motion_ms"));
       }
+    }
+
+    // Layer 14 (build 162): generated frames that started early, handed to the present thread before the game's present
+    // slept until their slot
+    if (!Get("gen_ahead").empty()) {
+      Timing += fextl::fmt::format("; generated frames to the present thread before the game's slot sleep {}: {} frames, {:.2f} ms "
+                                   "before their slot, {} the layer 13 way",
+                                   Get("gen_ahead"), Get("gen_ahead_frames"), Num("gen_ahead_lead_ms"), Get("gen_ahead_not"));
     }
 
     if (Get("layer").empty()) {

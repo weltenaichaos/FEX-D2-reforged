@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "Windows/Common/StatsLog.h"
+#include "Windows/Common/ThreadTable.h"
 #include "Windows/Common/LinuxSys.h"
+#include "Windows/Common/LockBoost.h"
 #include "Windows/Common/SHMStats.h"
 #include "Windows/Common/Switches.h"
 
@@ -16,9 +18,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <ntstatus.h>
 #include <windef.h>
 #include <winternl.h>
@@ -297,7 +301,9 @@ namespace {
   enum ProbeKind : uint8_t { ProbeSleep, ProbeVQ, ProbeFault, ProbeLock, ProbeServer, ProbeKinds };
   constexpr const char* ProbeNames[ProbeKinds] = {"sleep", "vq", "fault", "fexlock", "server"};
   constexpr int64_t ProbeSleep100ns = 40'000; // 4ms between rounds
-  constexpr uint64_t ProbeServerEvery = 4;    // wineserver round trip every 4th round
+  // Wineserver round trip every 8th round (32 ms; build 161, every 4th before: our Proton's request counts time every
+  // request now, and this probe alone was 62 get_thread_info requests a second).
+  constexpr uint64_t ProbeServerEvery = 8;
   constexpr size_t ProbeFaultPages = 4096;    // 16MB, one fresh page per round, then decommitted and committed again
   constexpr double ProbeKeepMs = 2.0;         // events at least this long are kept for "# frame" lines
   constexpr size_t ProbeRingSize = 4096;
@@ -306,6 +312,285 @@ namespace {
     uint64_t Ticks; // how long it took; for sleep, how much later than asked the thread woke up
     uint8_t Kind;
   };
+  // Memory lock waits (build 133): in the build 131 runs the main thread waited 44-109 ms for Wine's process-wide memory
+  // lock (virtual_mutex) a few times per run ('vq' in '# frame' stalls), and the log could not say which thread held it.
+  // While the probe's own VirtualQuery has waited LockSnapFirstMs, and again at LockSnapSecondMs, a watch thread writes
+  // down every thread of the process that is not asleep in a wait (Linux /proc/self/task/<tid>/syscall and stat): the
+  // holder is among them, in a memory call (mmap, munmap, mprotect, madvise) or running. The log thread prints them on a
+  // '# memory lock wait' line with what the sampled threads were doing during the wait.
+  constexpr double LockWaitMinMs = 15.0;
+  constexpr uint64_t LockSnapFirstMs = 15;
+  constexpr uint64_t LockSnapSecondMs = 45;
+  constexpr size_t LockSnapSlots = 16;
+  constexpr size_t LockSnapTextSize = 1536;
+  constexpr size_t MaxLockWaitLines = 300;
+  // Wine's memory lock holder notes (build 150): our Proton d2r4 and later keep, in PE ntdll's export __wine_d2r_vm_lock,
+  // who holds the unix side's memory lock (virtual_mutex) now, where in dlls/ntdll/unix/virtual.c it took it and since
+  // when (CLOCK_MONOTONIC), plus its holds of 4 ms or more in a 16 slot ring. Layout version 1 = struct d2r_vm_lock_info
+  // of proton-patches/11.0-1/0006-ntdll-memory-lock-notes-its-holder.patch. Only the holder writes; a reader takes tid,
+  // line and since_ns and checks tid again.
+  struct VmLockHold {
+    uint32_t Line;
+    uint32_t Tid; // Windows thread id
+    uint32_t HeldUs;
+    uint32_t Pad;
+    uint64_t EndNs; // CLOCK_MONOTONIC when it was let go
+  };
+  struct VmLockInfo {
+    uint32_t Version;   // 1 once Wine writes here (0: WINE_D2R_VM_NOTES=0)
+    uint32_t Tid;       // holder now, 0 when free
+    uint32_t Line;      // where the holder now took it
+    uint32_t LongHolds; // holds of 4 ms or more so far; the next goes to Holds[LongHolds % 16]
+    uint64_t SinceNs;   // CLOCK_MONOTONIC when the holder now took it
+    uint64_t HoldsTotal;
+    VmLockHold Holds[16];
+  };
+  static_assert(sizeof(VmLockInfo) == 416);
+  std::atomic<VmLockInfo*> VmLock {};
+  constexpr size_t MaxVmHoldLines = 900;
+
+  // Wineserver request counts (build 154): our Proton d2r6 and later count every wine_server_call of this process in PE
+  // ntdll's export __wine_d2r_server_calls: per request number how many and the time from send to reply (for a select
+  // only its request: the wait for its objects comes after the reply), and what its anonymous event reuse did. Layout version 1 = struct d2r_server_calls of
+  // proton-patches/11.0-1 (d2r6). Request names come from share/wine/d2r-server-requests.txt ("number name" per row).
+  struct ServerCallsInfo {
+    uint32_t Version;    // 1 once Wine counts (0: WINE_D2R_CALL_COUNTS=0)
+    uint32_t NbRequests; // request types in this build
+    uint64_t EvKept;        // anonymous events kept at their close for reuse
+    uint64_t EvReused;      // event creations served from kept events
+    uint64_t EvShared;      // closes not kept: the event was shared (duplicated, used for I/O)
+    uint64_t EvOtherThread; // ... closed by another thread than the one that made it
+    uint64_t EvTooOld;      // ... lived too long
+    uint64_t EvPoolFull;    // ... no room left
+    uint64_t Pad;
+    uint64_t Count[512];
+    uint64_t TimeNs[512];
+  };
+  static_assert(sizeof(ServerCallsInfo) == 8256);
+  std::atomic<ServerCallsInfo*> ServerCalls {};
+  constexpr size_t ServerCallsShown = 10;
+
+  // Build 157: our Proton d2r8's second export __wine_d2r_server_calls_ext (struct d2r_server_calls_ext of
+  // proton-patches/11.0-1/0009, version 1): what its completion port waits in the process did, and the Windows tid of
+  // the latest caller of each request type. Build 159: d2r9 (patch 0010) appends its timer reuse counters and says in
+  // Size how many bytes it writes (0 in d2r8, whose export ends at LastTid: Tm is read only when Size covers it).
+  struct ServerCallsExtInfo {
+    uint32_t Version;    // 1 once Wine writes it
+    uint32_t NbRequests; // last_tid entries in use
+    uint64_t Cp[5];      // woken, timed out, lost race, fallback, Ex batches without a last empty remove
+    uint32_t Size;       // bytes Wine writes (d2r9 and later; 0 before)
+    uint32_t Pad32;
+    uint64_t Pad;
+    uint32_t LastTid[512];
+    // d2r9: kept at close, reused at create, reset in a request of its own, not kept: closed still set, shared (APC,
+    // period, set again, cancelled, duplicated, another thread), closed by another thread, too old, pool full.
+    uint64_t Tm[8];
+  };
+  static_assert(sizeof(ServerCallsExtInfo) == 2176);
+  static_assert(offsetof(ServerCallsExtInfo, Cp) == 8 && offsetof(ServerCallsExtInfo, Size) == 48 &&
+                offsetof(ServerCallsExtInfo, LastTid) == 64 && offsetof(ServerCallsExtInfo, Tm) == 2112);
+  // Whether the export has d2r9's timer counters (read after Version, which Wine sets last).
+  bool ServerCallsExtHasTimers(const ServerCallsExtInfo* Ext) {
+    return __atomic_load_n(&Ext->Size, __ATOMIC_RELAXED) >= sizeof(ServerCallsExtInfo);
+  }
+  std::atomic<ServerCallsExtInfo*> ServerCallsExt {};
+
+  // Build 161: our Proton d2r10 (patch 0012) appends registry notes to the export (Size 3,728): the latest 8 key opens and
+  // the latest 4 value reads, each with its caller. In the b159 run one unnamed thread (tid 784) opened a key ~83 and
+  // read a value ~63 times a second (open_key, get_key_value and close_handle requests); these name the key.
+  struct RegistryNote {
+    uint32_t Seq; // odd while written
+    uint32_t Tid;
+    uint32_t Status;
+    uint32_t NameLen;
+    uint64_t Parent; // root directory handle (open) or key handle (value read)
+    uint64_t Result; // the key handle opened, 0 for value reads
+    char Name[96];   // path relative to Parent, or the value name; ASCII, cut to 95
+  };
+  static_assert(sizeof(RegistryNote) == 128);
+  struct ServerCallsRegistryInfo {
+    uint64_t OpenNext;  // key opens noted so far; the latest is Open[(OpenNext - 1) % 8]
+    uint64_t ValueNext; // value reads noted so far
+    RegistryNote Open[8];
+    RegistryNote Value[4];
+  };
+  constexpr size_t RegistryOffset = 2176;
+  static_assert(RegistryOffset + sizeof(ServerCallsRegistryInfo) == 3728 && RegistryOffset + offsetof(ServerCallsRegistryInfo, Open) == 2192 &&
+                RegistryOffset + offsetof(ServerCallsRegistryInfo, Value) == 3216);
+  const ServerCallsRegistryInfo* ServerCallsRegistry(const ServerCallsExtInfo* Ext) {
+    if (__atomic_load_n(&Ext->Size, __ATOMIC_RELAXED) < RegistryOffset + sizeof(ServerCallsRegistryInfo)) {
+      return nullptr;
+    }
+    return reinterpret_cast<const ServerCallsRegistryInfo*>(reinterpret_cast<const uint8_t*>(Ext) + RegistryOffset);
+  }
+  // One note read whole (the same sequence rule as Wine's thread table); false while Wine keeps writing it.
+  bool ReadRegistryNote(const RegistryNote& N, RegistryNote& Out) {
+    uint64_t Words[sizeof(RegistryNote) / sizeof(uint64_t)];
+    const auto* Src = reinterpret_cast<const uint64_t*>(&N);
+    for (int Try = 0; Try < 64; ++Try) {
+      const uint32_t S0 = __atomic_load_n(&N.Seq, __ATOMIC_ACQUIRE);
+      if (S0 & 1) {
+        continue;
+      }
+      for (size_t w = 0; w < std::size(Words); ++w) {
+        Words[w] = __atomic_load_n(&Src[w], __ATOMIC_RELAXED);
+      }
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(&N.Seq, __ATOMIC_RELAXED) == S0) {
+        memcpy(&Out, Words, sizeof(Out));
+        Out.Name[sizeof(Out.Name) - 1] = 0;
+        return S0 != 0;
+      }
+    }
+    return false;
+  }
+  // Build 163: our Proton d2r12 (patch 0015) appends OutputDebugString and file flush counters (Size 4,360). In the b162
+  // run's character select screen the main thread had a 70-115 ms frame every 10 s while BGS_Thread wrote ~600 debug lines
+  // a second (two exceptions and a failing DBWIN_BUFFER lookup, an open_mapping request, each) and flushed its log file.
+  struct ServerCallsOdsInfo {
+    uint64_t WCalls;       // OutputDebugStringW calls
+    uint64_t WNs;          // their time (includes the A call each W makes)
+    uint64_t ACalls;       // OutputDebugStringA calls, including the one inside every W call
+    uint64_t ANs;          // their time
+    uint64_t MaxNs;        // longest call of either kind
+    uint64_t Raised;       // exceptions raised (stock: 2 per W call; 0 when nothing could see them)
+    uint64_t DbwinOpens;   // DBWIN_BUFFER looks (one open_mapping request each)
+    uint64_t DbwinSkipped; // looks left out (no debug monitor less than 1 s ago)
+    uint32_t LastTid;      // latest caller
+    uint32_t Watchers;     // at the latest call: bit 0 debugger, 1 vectored handler, 2 x64 dispatcher hooked; ~0u switched off
+  };
+  struct FlushTidInfo {
+    uint32_t Tid; // 0 = free slot; the first 8 threads that flush keep theirs
+    uint32_t Count;
+    uint64_t Ns;
+    uint64_t MaxNs;
+    uint64_t LastEndNs; // CLOCK_MONOTONIC
+  };
+  struct FlushNote {
+    uint32_t Seq; // odd while written
+    uint32_t Tid;
+    uint32_t Status;
+    uint32_t Kind;    // 1 fsync, 2 server flush, 3 serial, 0 nothing done
+    uint64_t StartNs; // CLOCK_MONOTONIC at the call
+    uint64_t Ns;
+  };
+  struct ServerCallsFlushInfo {
+    uint64_t Calls;
+    uint64_t Ns;
+    uint64_t MaxNs;
+    uint64_t OtherCalls; // threads without a slot
+    uint64_t OtherNs;
+    uint64_t Next; // flushes noted so far; the latest is Notes[(Next - 1) % 8]
+    FlushTidInfo Tid[8];
+    FlushNote Notes[8];
+  };
+  constexpr size_t OdsOffset = 3728;
+  constexpr size_t FlushOffset = 3800;
+  constexpr size_t D2r12ExtSize = 4360;
+  static_assert(sizeof(ServerCallsOdsInfo) == 72 && OdsOffset + sizeof(ServerCallsOdsInfo) == FlushOffset &&
+                OdsOffset + offsetof(ServerCallsOdsInfo, LastTid) == 3792 && OdsOffset + offsetof(ServerCallsOdsInfo, Watchers) == 3796);
+  static_assert(sizeof(FlushTidInfo) == 32 && sizeof(FlushNote) == 32 && FlushOffset + offsetof(ServerCallsFlushInfo, Tid) == 3848 &&
+                FlushOffset + offsetof(ServerCallsFlushInfo, Notes) == 4104 && FlushOffset + sizeof(ServerCallsFlushInfo) == D2r12ExtSize);
+  // Both blocks are read only when Wine says it writes all of d2r12's export.
+  bool ServerCallsHasD2r12(const ServerCallsExtInfo* Ext) {
+    return __atomic_load_n(&Ext->Size, __ATOMIC_RELAXED) >= D2r12ExtSize;
+  }
+  const ServerCallsOdsInfo* ServerCallsOds(const ServerCallsExtInfo* Ext) {
+    return reinterpret_cast<const ServerCallsOdsInfo*>(reinterpret_cast<const uint8_t*>(Ext) + OdsOffset);
+  }
+  const ServerCallsFlushInfo* ServerCallsFlush(const ServerCallsExtInfo* Ext) {
+    return reinterpret_cast<const ServerCallsFlushInfo*>(reinterpret_cast<const uint8_t*>(Ext) + FlushOffset);
+  }
+  // One flush note read whole (the registry notes' sequence rule); false while Wine keeps writing it or it was never written.
+  bool ReadFlushNote(const FlushNote& N, FlushNote& Out) {
+    uint64_t Words[sizeof(FlushNote) / sizeof(uint64_t)];
+    const auto* Src = reinterpret_cast<const uint64_t*>(&N);
+    for (int Try = 0; Try < 64; ++Try) {
+      const uint32_t S0 = __atomic_load_n(&N.Seq, __ATOMIC_ACQUIRE);
+      if (S0 & 1) {
+        continue;
+      }
+      for (size_t w = 0; w < std::size(Words); ++w) {
+        Words[w] = __atomic_load_n(&Src[w], __ATOMIC_RELAXED);
+      }
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(&N.Seq, __ATOMIC_RELAXED) == S0) {
+        memcpy(&Out, Words, sizeof(Out));
+        return S0 != 0;
+      }
+    }
+    return false;
+  }
+  const char* FlushKindName(uint32_t Kind) {
+    switch (Kind) {
+    case 1: return "fsync";
+    case 2: return "server";
+    case 3: return "serial";
+    default: return "none";
+    }
+  }
+  fextl::string OdsWatchersText(uint32_t Watchers) {
+    if (Watchers == ~0u) {
+      return "fast path off (WINE_D2R_ODS_FAST=0)";
+    }
+    if (!Watchers) {
+      return "nobody";
+    }
+    fextl::string Out;
+    const char* Names[] = {"debugger", "vectored handler", "x64 dispatcher hooked"};
+    for (uint32_t i = 0; i < 3; ++i) {
+      if (Watchers & (1u << i)) {
+        Out += Out.empty() ? "" : " + ";
+        Out += Names[i];
+      }
+    }
+    if (Watchers & ~7u) {
+      Out += fextl::fmt::format("{}bits {:#x}", Out.empty() ? "" : " + ", Watchers & ~7u);
+    }
+    return Out;
+  }
+
+  // Requests whose callers the Proton side asked for: shown with their latest caller even outside the busiest ten.
+  constexpr const char* ServerCallsWatched[] = {"create_timer", "set_timer", "cancel_timer", "close_handle", "get_next_thread",
+                                                "get_thread_info"};
+
+  // The holder as Wine noted it: State 0 = no notes, 1 = free, 2 = held, 3 = it changed while being read.
+  struct VmHolder {
+    uint32_t State;
+    uint32_t Tid;
+    uint32_t Line;
+    uint32_t HeldUs;
+    uint64_t SinceNs; // CLOCK_MONOTONIC when the holder took it (State 2)
+  };
+  VmHolder ReadVmHolder() {
+    auto* Info = VmLock.load(std::memory_order_relaxed);
+    if (!Info || __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) != 1) {
+      return {};
+    }
+    for (int Try = 0; Try < 3; ++Try) {
+      const uint32_t Tid = __atomic_load_n(&Info->Tid, __ATOMIC_ACQUIRE);
+      if (!Tid) {
+        return {.State = 1};
+      }
+      const uint32_t Line = __atomic_load_n(&Info->Line, __ATOMIC_RELAXED);
+      const uint64_t Since = __atomic_load_n(&Info->SinceNs, __ATOMIC_RELAXED);
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(&Info->Tid, __ATOMIC_RELAXED) == Tid) {
+        const int64_t Now = Linux::MonotonicNs();
+        const uint64_t Held = Now > 0 && static_cast<uint64_t>(Now) > Since ? (static_cast<uint64_t>(Now) - Since) / 1000 : 0;
+        return {.State = 2, .Tid = Tid, .Line = Line, .HeldUs = static_cast<uint32_t>(std::min<uint64_t>(Held, UINT32_MAX)), .SinceNs = Since};
+      }
+    }
+    return {.State = 3};
+  }
+
+  struct LockSnap {
+    std::atomic<uint32_t> Ready; // 0 free, 1 being written, 2 written
+    uint64_t Start;              // counter value when the probe's VirtualQuery began
+    uint32_t AtMs;               // how long it had waited then
+    VmHolder Holder;             // Wine's notes on the holder then (build 150)
+    char Text[LockSnapTextSize];
+  };
   // Written by the probe thread only.
   struct ProbeShared {
     ProbeEvent Ring[ProbeRingSize];
@@ -313,9 +598,24 @@ namespace {
     std::atomic<uint64_t> Max[ProbeKinds]; // longest since the log thread last took them
     std::atomic<uint64_t> MaxAt[ProbeKinds];
     std::atomic<uint64_t> Rounds;
+    std::atomic<uint64_t> VqStart; // counter value while the probe waits in VirtualQuery, 0 otherwise
+    std::atomic<int> ProbeTid;     // Linux tid of the probe thread
+    LockSnap Snaps[LockSnapSlots];  // written by the lock watch thread, taken by the log thread
   };
   ProbeShared* Probe {};
   std::atomic<void (*)()> LockProbe {};
+
+  // Build 153 (FEX_PROBE_VQ_NOTES, on unless 0): with Wine's holder notes (our Proton d2r4 and later) the probe reads who
+  // holds the memory lock and since when, instead of taking the lock with a VirtualQuery 250 times a second, and writes
+  // the '# memory lock wait' thread lists itself, so the lock watch thread ends. Without notes it measures as before.
+  bool ProbeVqNotesSwitch = true;
+  bool ProbeVqFromNotes() {
+    if (!ProbeVqNotesSwitch) {
+      return false;
+    }
+    auto* Info = VmLock.load(std::memory_order_relaxed);
+    return Info && __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) == 1;
+  }
 
   // Scheduler view (on with the stats log; FEX_SCHEDLOG=0 turns it off), read straight from Linux /proc so it costs no
   // wineserver round trips: where the main thread and the wineserver run (sampled every 10ms while runnable), how long
@@ -358,6 +658,19 @@ namespace {
     };
     CallCount QueueCalls[10];
     uint32_t QueueOther;
+    // Build 150: the present threads, sampled the same way: the frame gen layer's (lsfg-present), VKD3D's (vkd3d-fex-prese)
+    // and Mesa's X11 present queue (WSI swapchain q). In b148's heavy scenes the layer's generated present blocked 18-26 ms
+    // in the driver; this says in what.
+    static constexpr size_t FrameCallSlots = 8;
+    static constexpr size_t FrameThreads = 3;
+    struct FrameSampler {
+      int Tid;
+      int Fd = -1;
+      uint32_t Samples;
+      CallCount Calls[FrameCallSlots];
+      uint32_t Other;
+    };
+    FrameSampler Frame[FrameThreads];
     fextl::unordered_map<int, SchedPrev> Tasks;
     fextl::unordered_map<int, SchedPrev> Procs;
     fextl::unordered_map<int, fextl::string> ProcNames;
@@ -893,6 +1206,58 @@ namespace {
 
   char SystemBuffer[16384];
 
+  // Build 147: the kernel's reclaim marks and settings, once at the start. kswapd wakes when a zone's free memory falls
+  // below its low mark and reclaims until the high mark; in the build 146 run Android's memory killer closed 18 apps
+  // after kswapd's work at the first area load (unused memory 162 MB, memory pressure 7%).
+  fextl::string ReclaimSettings() {
+    fextl::string Out = "system: memory reclaim (build 147): ";
+    fextl::vector<char> Zone(65536);
+    const int64_t Len = Linux::ReadSmallFile("/proc/zoneinfo", Zone.data(), Zone.size());
+    if (Len > 0) {
+      // Sum "min", "low" and "high" (pages) over the zones; the per-CPU "high:" lines have a colon and don't match.
+      uint64_t Marks[3] {}, Zones {};
+      const char* Names[3] = {"min", "low", "high"};
+      const char* P = Zone.data();
+      const char* End = Zone.data() + std::min<int64_t>(Len, Zone.size() - 1);
+      while (P < End) {
+        const char* Eol = static_cast<const char*>(memchr(P, '\n', End - P));
+        if (!Eol) {
+          Eol = End;
+        }
+        const char* T = P;
+        while (T < Eol && *T == ' ') {
+          ++T;
+        }
+        if (Eol - T > 5 && strncmp(T, "Node ", 5) == 0) {
+          ++Zones;
+        }
+        for (size_t i = 0; i < 3; ++i) {
+          const size_t N = strlen(Names[i]);
+          if (static_cast<size_t>(Eol - T) > N + 1 && strncmp(T, Names[i], N) == 0 && T[N] == ' ') {
+            Marks[i] += strtoull(T + N, nullptr, 10);
+          }
+        }
+        P = Eol + 1;
+      }
+      Out += fextl::fmt::format("zone marks ({} zones) min {} / low {} / high {} MB", Zones, Marks[0] * 4 / 1024, Marks[1] * 4 / 1024,
+                                Marks[2] * 4 / 1024);
+    } else {
+      Out += "zone marks not readable";
+    }
+    const char* Settings[] = {"swappiness", "watermark_scale_factor", "watermark_boost_factor", "min_free_kbytes", "extra_free_kbytes"};
+    for (const char* Name : Settings) {
+      char Path[64];
+      char Value[32];
+      snprintf(Path, sizeof(Path), "/proc/sys/vm/%s", Name);
+      int64_t N = Linux::ReadSmallFile(Path, Value, sizeof(Value));
+      while (N > 0 && (Value[N - 1] == '\n' || Value[N - 1] == ' ')) {
+        --N;
+      }
+      Out += N > 0 ? fextl::fmt::format(", {} {}", Name, std::string_view(Value, N)) : fextl::fmt::format(", {} not readable", Name);
+    }
+    return Out;
+  }
+
   // The number after Key ("Key value" or "Key=value" form) in Text, at a line start (Key begins with '\n') or anywhere.
   bool SystemField(const char* Text, const char* Key, uint64_t& Out) {
     const char* P = strstr(Text, Key);
@@ -1194,6 +1559,7 @@ namespace {
                                     "GPU memory per process from kgsl (checked once the game uses the GPU)",
                                     Mem ? fextl::fmt::format("{}", TotalKB / 1024) : fextl::string("?"), SwapKB / 1024, AppNote,
                                     Vm ? "readable" : "not readable", Psi ? "readable" : "not readable"));
+    StatsLogNote(ReclaimSettings());
     uint32_t OwnUid = ~0u;
     if (const size_t At = Group.find("/uid_"); At != fextl::string::npos) {
       OwnUid = static_cast<uint32_t>(strtoull(Group.c_str() + At + 5, nullptr, 10));
@@ -1513,6 +1879,66 @@ namespace {
   constexpr uint64_t RunningKey = ~0ull;
   constexpr uint64_t OutsideKey = ~1ull; // blocked, but not in a system call
 
+  // What a /proc/self/task/<tid>/syscall text says the thread is doing, as a CallCount key.
+  uint64_t SyscallKey(char* Buffer) {
+    if (Buffer[0] == 'r') {
+      return RunningKey;
+    }
+    if (Buffer[0] == '-') {
+      return OutsideKey;
+    }
+    char* P = Buffer;
+    const uint64_t Nr = strtoull(P, &P, 10);
+    uint64_t Args[2] {};
+    for (auto& A : Args) {
+      A = strtoull(P, &P, 16);
+    }
+    uint64_t Key = Nr << 32;
+    if (Nr == 29) { // ioctl: the request says which driver call
+      Key |= Args[1] & 0xffffffff;
+    } else if (Nr == 98) { // futex: the operation, without the private flag
+      Key |= Args[1] & 0x7f;
+    }
+    return Key;
+  }
+
+  void AddCall(SchedState::CallCount* Calls, size_t Count, uint32_t& Other, uint64_t Key) {
+    for (size_t i = 0; i < Count; ++i) {
+      if (Calls[i].N && Calls[i].Key == Key) {
+        ++Calls[i].N;
+        return;
+      }
+    }
+    for (size_t i = 0; i < Count; ++i) {
+      if (!Calls[i].N) {
+        Calls[i] = {Key, 1};
+        return;
+      }
+    }
+    ++Other;
+  }
+
+  // Build 150: one sample of each present thread found.
+  void SchedSampleFrameThreads() {
+    for (auto& F : Sched.Frame) {
+      if (F.Fd < 0) {
+        continue;
+      }
+      char Buffer[256];
+      const int64_t Len = Linux::Pread(F.Fd, Buffer, sizeof(Buffer) - 1, 0);
+      if (Len <= 0) {
+        // The thread is gone (a new swapchain makes a new one): found again by name.
+        Linux::Close(F.Fd);
+        F.Fd = -1;
+        F.Tid = 0;
+        continue;
+      }
+      Buffer[Len] = 0;
+      ++F.Samples;
+      AddCall(F.Calls, SchedState::FrameCallSlots, F.Other, SyscallKey(Buffer));
+    }
+  }
+
   // One sample of what the queue thread is doing, from /proc/self/task/<tid>/syscall.
   void SchedSampleQueue() {
     if (Sched.QueueFd < 0) {
@@ -1533,39 +1959,8 @@ namespace {
     }
     Sched.QueueEverRead = true;
     Buffer[Len] = 0;
-    uint64_t Key;
-    if (Buffer[0] == 'r') {
-      Key = RunningKey;
-    } else if (Buffer[0] == '-') {
-      Key = OutsideKey;
-    } else {
-      char* P = Buffer;
-      const uint64_t Nr = strtoull(P, &P, 10);
-      uint64_t Args[2] {};
-      for (auto& A : Args) {
-        A = strtoull(P, &P, 16);
-      }
-      Key = Nr << 32;
-      if (Nr == 29) { // ioctl: the request says which driver call
-        Key |= Args[1] & 0xffffffff;
-      } else if (Nr == 98) { // futex: the operation, without the private flag
-        Key |= Args[1] & 0x7f;
-      }
-    }
     ++Sched.QueueSamples;
-    for (auto& C : Sched.QueueCalls) {
-      if (C.N && C.Key == Key) {
-        ++C.N;
-        return;
-      }
-    }
-    for (auto& C : Sched.QueueCalls) {
-      if (!C.N) {
-        C = {Key, 1};
-        return;
-      }
-    }
-    ++Sched.QueueOther;
+    AddCall(Sched.QueueCalls, std::size(Sched.QueueCalls), Sched.QueueOther, SyscallKey(Buffer));
   }
 
   const char* SyscallName(uint64_t Nr) {
@@ -1604,7 +1999,28 @@ namespace {
     const uint32_t Arg = static_cast<uint32_t>(Key);
     const char* Name = SyscallName(Nr);
     fextl::string Out = Name ? fextl::string(Name) : fextl::fmt::format("nr{}", Nr);
-    if (Nr == 29) {
+    // KGSL (the Adreno kernel driver, ioctl type 0x09), build 150: the calls Turnip makes, by number.
+    const char* Kgsl = nullptr;
+    if (Nr == 29 && ((Arg >> 8) & 0xff) == 0x09) {
+      switch (Arg & 0xff) {
+      case 0x02: Kgsl = "kgsl_getproperty"; break;
+      case 0x07: Kgsl = "kgsl_wait_timestamp"; break;
+      case 0x16: Kgsl = "kgsl_read_timestamp"; break;
+      case 0x33: Kgsl = "kgsl_timestamp_event"; break;
+      case 0x34: Kgsl = "kgsl_gpumem_alloc"; break;
+      case 0x35: Kgsl = "kgsl_gpumem_free"; break;
+      case 0x3b: Kgsl = "kgsl_perfcounter_read"; break;
+      case 0x45: Kgsl = "kgsl_gpuobj_alloc"; break;
+      case 0x46: Kgsl = "kgsl_gpuobj_free"; break;
+      case 0x4a: Kgsl = "kgsl_gpu_command"; break;
+      case 0x56: Kgsl = "kgsl_bind_ranges"; break;
+      case 0x57: Kgsl = "kgsl_gpu_aux_command"; break;
+      default: break;
+      }
+    }
+    if (Kgsl) {
+      Out += fextl::fmt::format("({})", Kgsl);
+    } else if (Nr == 29) {
       Out += fextl::fmt::format("({:#x})", Arg);
     } else if (Nr == 98 && Arg == 0) {
       Out += "(wait)";
@@ -1628,6 +2044,7 @@ namespace {
     SchedSampleOne(Sched.MainFd, Sched.MainSamples, Sched.MainRunnable, Sched.MainCores, &MainCpu);
     SchedSampleOne(Sched.ServerFd, Sched.ServerSamples, Sched.ServerRunnable, Sched.ServerCores);
     SchedSampleQueue();
+    SchedSampleFrameThreads();
     CorePauseSample();
     ClockSampleTick(MainCpu);
   }
@@ -1952,6 +2369,55 @@ namespace {
         Sched.QueueTid = Busiest;
         Sched.QueueFd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/syscall", Busiest).c_str());
       }
+
+      // Build 150: what the present threads did this second, then find them again by name (the busiest of each name).
+      static constexpr const char* FrameComms[SchedState::FrameThreads] = {"lsfg-present", "vkd3d-fex-prese", "WSI swapchain q"};
+      fextl::string FrameText;
+      for (size_t f = 0; f < SchedState::FrameThreads; ++f) {
+        auto& F = Sched.Frame[f];
+        if (F.Fd >= 0 && F.Samples) {
+          SchedState::CallCount Calls[SchedState::FrameCallSlots];
+          memcpy(Calls, F.Calls, sizeof(Calls));
+          std::sort(std::begin(Calls), std::end(Calls), [](const auto& a, const auto& b) { return a.N > b.N; });
+          // Build 160: its CPU time and CPU wait this second, and its nice (FEX_PRESENT_THREADS).
+          fextl::string RunText;
+          for (const auto& R : Rows) {
+            if (R.Tid == F.Tid) {
+              RunText = fextl::fmt::format(" run+wait {:.1f}+{:.1f} ms nice {}", R.RunMs, R.WaitMs, R.Nice);
+              break;
+            }
+          }
+          FrameText += fextl::fmt::format(" | {}/{} ({}){}:", FrameComms[f], F.Tid, F.Samples, RunText);
+          for (const auto& C : Calls) {
+            if (C.N) {
+              FrameText += fextl::fmt::format(" {} {}%", QueueCallName(C.Key), (C.N * 100 + F.Samples / 2) / F.Samples);
+            }
+          }
+          if (F.Other) {
+            FrameText += fextl::fmt::format(" other {}%", (F.Other * 100 + F.Samples / 2) / F.Samples);
+          }
+        }
+        memset(F.Calls, 0, sizeof(F.Calls));
+        F.Samples = F.Other = 0;
+        int Found {};
+        double FoundRun = -1.0;
+        for (const auto& R : Rows) {
+          if (strcmp(R.Comm, FrameComms[f]) == 0 && R.RunMs > FoundRun) {
+            Found = R.Tid;
+            FoundRun = R.RunMs;
+          }
+        }
+        if (Found && Found != F.Tid && !Sched.QueueUnreadable) {
+          if (F.Fd >= 0) {
+            Linux::Close(F.Fd);
+          }
+          F.Tid = Found;
+          F.Fd = Linux::Open(fextl::fmt::format("/proc/self/task/{}/syscall", Found).c_str());
+        }
+      }
+      if (!FrameText.empty()) {
+        Out += fextl::fmt::format("  sched present threads (samples every 10 ms){}\n", FrameText);
+      }
     }
 
     // Every 5 seconds: the other processes of this user that used the CPU (Wine's other processes, the wineserver, the
@@ -2100,6 +2566,32 @@ namespace {
     // Stall probe events of 2ms or more from this and the previous second, for "# frame" lines.
     uint64_t ProbeRead;
     fextl::vector<ProbeEvent> ProbeEvents;
+    uint64_t LockWaitPrinted; // end of the last memory lock wait given a line
+    size_t LockWaitLines;
+    uint32_t VmLongSeen;      // Wine's long hold count at the last '# memory lock holds' line (build 150)
+    bool VmLongStarted;
+    size_t VmHoldLines;
+    uint64_t VmTakesPrev; // Wine's memory lock take count at the last probe line (build 153)
+    bool VmTakesHave;
+    // Wine's request counts at the last 'server calls' line (build 154).
+    uint64_t ServerPrevCount[512];
+    uint64_t ServerPrevTime[512];
+    uint64_t ServerPrevEv[6];
+    uint64_t ServerPrevCp[5]; // build 157
+    uint64_t ServerPrevTm[8]; // build 159
+    uint64_t RegPrevOpen, RegPrevValue; // build 161: registry notes counts at the last registry line
+    uint32_t RegRounds;
+    bool RegHave;
+    // Build 163: our Proton d2r12's debug output and file flush counters at the last line.
+    uint64_t OdsPrev[8];
+    uint64_t OdsPrevMax;
+    uint64_t FlushPrev[4]; // calls, ns, other calls, other ns
+    uint64_t FlushPrevMax;
+    uint64_t FlushPrevNext;
+    uint32_t FlushTidPrevCount[8];
+    uint64_t FlushTidPrevNs[8];
+    bool D2r12Have;
+    bool ServerHave;
 
     // Busy frames, see BusyFrameMinMs: the main thread at every sample tick of this and the previous second.
     struct MainTick {
@@ -2128,7 +2620,7 @@ namespace {
   };
 
   // Up to sixteen, see StatsLogSetLineProvider.
-  constexpr size_t MaxLineProviders = 16;
+  constexpr size_t MaxLineProviders = 24;
   std::atomic<fextl::string (*)()> LineProviders[MaxLineProviders] {};
   // Called with every sample of the main thread, see StatsLogSetMainSampleHook.
   std::atomic<uint8_t (*)(uint64_t)> MainSampleHook {};
@@ -2145,8 +2637,178 @@ namespace {
     return Result ? Result : 1;
   }
 
+  // Linux syscall names (arm64) for the lock watch's thread list.
+  const char* SyscallName(int64_t Nr) {
+    switch (Nr) {
+    case 17: return "getcwd";
+    case 22: return "epoll_pwait";
+    case 29: return "ioctl";
+    case 56: return "openat";
+    case 57: return "close";
+    case 61: return "getdents64";
+    case 62: return "lseek";
+    case 63: return "read";
+    case 64: return "write";
+    case 65: return "readv";
+    case 66: return "writev";
+    case 67: return "pread64";
+    case 68: return "pwrite64";
+    case 72: return "pselect6";
+    case 73: return "ppoll";
+    case 78: return "readlinkat";
+    case 79: return "newfstatat";
+    case 80: return "fstat";
+    case 82: return "fsync";
+    case 98: return "futex";
+    case 101: return "nanosleep";
+    case 113: return "clock_gettime";
+    case 115: return "clock_nanosleep";
+    case 124: return "sched_yield";
+    case 129: return "kill";
+    case 130: return "tkill";
+    case 131: return "tgkill";
+    case 134: return "rt_sigaction";
+    case 135: return "rt_sigprocmask";
+    case 139: return "rt_sigreturn";
+    case 172: return "getpid";
+    case 178: return "gettid";
+    case 203: return "connect";
+    case 206: return "sendto";
+    case 207: return "recvfrom";
+    case 211: return "sendmsg";
+    case 212: return "recvmsg";
+    case 214: return "brk";
+    case 215: return "munmap";
+    case 216: return "mremap";
+    case 220: return "clone";
+    case 222: return "mmap";
+    case 223: return "fadvise64";
+    case 226: return "mprotect";
+    case 227: return "msync";
+    case 232: return "mincore";
+    case 233: return "madvise";
+    case 260: return "wait4";
+    case 281: return "execveat";
+    case 285: return "copy_file_range";
+    case 435: return "clone3";
+    default: return nullptr;
+    }
+  }
+
+  struct LockSnapArgs {
+    fextl::string Text;
+    int Self;
+    uint32_t Waiting; // threads asleep in a wait (futex, poll, sleep), not listed
+    uint32_t Futex;   // ... of them in futex
+    uint32_t Listed;
+  };
+
+  void LockSnapTask(const char* Name, void* Arg) {
+    auto* A = static_cast<LockSnapArgs*>(Arg);
+    const int Tid = atoi(Name);
+    if (Tid <= 0 || Tid == A->Self) {
+      return;
+    }
+    char Path[64];
+    char Sys[256];
+    snprintf(Path, sizeof(Path), "/proc/self/task/%d/syscall", Tid);
+    if (Linux::ReadSmallFile(Path, Sys, sizeof(Sys)) <= 0) {
+      return;
+    }
+    Linux::TaskStat St {};
+    snprintf(Path, sizeof(Path), "/proc/self/task/%d/stat", Tid);
+    const bool HaveStat = Linux::ReadTaskStat(Path, St);
+    const char State = HaveStat ? St.State : '?';
+    fextl::string What;
+    if (!strncmp(Sys, "running", 7)) {
+      What = "running";
+    } else {
+      // "nr a0 a1 a2 a3 a4 a5 sp pc", or "-1 sp pc" when blocked outside a syscall (a page fault).
+      char* Cursor = Sys;
+      const int64_t Nr = strtoll(Cursor, &Cursor, 10);
+      uint64_t Args[3] {};
+      for (auto& V : Args) {
+        V = strtoull(Cursor, &Cursor, 16);
+      }
+      const bool Wait = Nr == 98 || Nr == 73 || Nr == 22 || Nr == 101 || Nr == 115 || Nr == 72 || Nr == 260;
+      if (Wait && State == 'S') {
+        ++A->Waiting;
+        A->Futex += Nr == 98 ? 1 : 0;
+        return;
+      }
+      const char* SysName = SyscallName(Nr);
+      if (Nr < 0) {
+        What = "fault/outside a syscall";
+      } else if (Nr == 215 || Nr == 226 || Nr == 233 || Nr == 222 || Nr == 216 || Nr == 232 || Nr == 227) {
+        // Memory calls: address and length.
+        What = fextl::fmt::format("{}(0x{:x}, {:.1f} MB)", SysName ? SysName : "?", Args[0], static_cast<double>(Args[1]) / (1024.0 * 1024.0));
+      } else if (SysName) {
+        What = SysName;
+      } else {
+        What = fextl::fmt::format("syscall {}", Nr);
+      }
+    }
+    if (A->Text.size() < LockSnapTextSize - 96) {
+      A->Text += fextl::fmt::format(" {} {} {} cpu{} {};", Tid, HaveStat ? St.Comm : "?", State, HaveStat ? St.Processor : -1, What);
+      ++A->Listed;
+    }
+  }
+
+  // A '# memory lock wait' thread list for a wait (or, from Wine's notes, a hold) that began at Start and has lasted
+  // Waited ticks: Wine's note on the holder first (it may let go while the list is read), then every thread of the process
+  // that is not asleep in a wait, into a free slot the log thread takes.
+  void TakeLockSnap(ProbeShared* P, uint64_t Start, uint64_t Waited, uint64_t Freq) {
+    const VmHolder Holder = ReadVmHolder();
+    LockSnapArgs A {.Self = P->ProbeTid.load(std::memory_order_relaxed)};
+    Linux::ForEachEntry("/proc/self/task", LockSnapTask, &A);
+    for (auto& S : P->Snaps) {
+      uint32_t Free = 0;
+      if (S.Ready.compare_exchange_strong(Free, 1, std::memory_order_acquire)) {
+        S.Start = Start;
+        S.AtMs = static_cast<uint32_t>(Waited * 1000 / Freq);
+        S.Holder = Holder;
+        snprintf(S.Text, sizeof(S.Text), "%u not waiting:%s %u asleep in waits (%u in futex)", A.Listed, A.Text.c_str(), A.Waiting, A.Futex);
+        S.Ready.store(2, std::memory_order_release);
+        break;
+      }
+    }
+  }
+
+  void* LockWatchThread(void*) {
+    auto* P = Probe;
+    const uint64_t Freq = GetCounterFrequency();
+    const uint64_t First = Freq * LockSnapFirstMs / 1000;
+    const uint64_t Second = Freq * LockSnapSecondMs / 1000;
+    uint64_t Last {};
+    int Stage {};
+    for (;;) {
+      Linux::SleepNs(5'000'000);
+      if (ProbeVqFromNotes()) {
+        // Build 153: the probe follows the lock in Wine's notes and writes the lists itself; this thread isn't needed.
+        return nullptr;
+      }
+      const uint64_t Start = P->VqStart.load(std::memory_order_acquire);
+      if (!Start) {
+        continue;
+      }
+      if (Start != Last) {
+        Last = Start;
+        Stage = 0;
+      }
+      const uint64_t Now = GetCounter();
+      const uint64_t Waited = Now > Start ? Now - Start : 0;
+      if (!((Stage == 0 && Waited >= First) || (Stage == 1 && Waited >= Second))) {
+        continue;
+      }
+      ++Stage;
+      TakeLockSnap(P, Start, Waited, Freq);
+    }
+    return nullptr;
+  }
+
   void* ProbeThread(void*) {
     auto* P = Probe;
+    P->ProbeTid.store(Linux::GetTid(), std::memory_order_relaxed);
     const uint64_t Freq = GetCounterFrequency();
     const uint64_t SleepTicks = Freq * static_cast<uint64_t>(ProbeSleep100ns) / 10'000'000;
     const uint64_t KeepTicks = static_cast<uint64_t>(ProbeKeepMs * static_cast<double>(Freq) / 1000.0);
@@ -2168,6 +2830,14 @@ namespace {
       Region = nullptr;
     }
     size_t Page {};
+    // The memory lock hold being followed in Wine's notes (build 153): when it was taken (Wine's clock and this
+    // counter), when it was last seen held, and how many thread lists were taken for it.
+    struct {
+      uint64_t Since, Start, Last;
+      int Stage;
+    } Hold {};
+    const uint64_t SnapFirst = Freq * LockSnapFirstMs / 1000;
+    const uint64_t SnapSecond = Freq * LockSnapSecondMs / 1000;
     for (uint64_t Round = 0;; ++Round) {
       // Sleep: how much later than asked a normal priority thread gets the CPU back.
       LARGE_INTEGER Interval {.QuadPart = -ProbeSleep100ns};
@@ -2176,23 +2846,62 @@ namespace {
       uint64_t T1 = GetCounter();
       Record(ProbeSleep, T1, T1 - T0 > SleepTicks ? T1 - T0 - SleepTicks : 0);
 
-      // VirtualQuery: Wine's process-wide memory lock (virtual_mutex), taken by every memory call and Wine fault.
-      MEMORY_BASIC_INFORMATION Info {};
-      T0 = GetCounter();
-      NtQueryVirtualMemory(NtCurrentProcess(), Region ? Region : static_cast<void*>(&Info), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
-      T1 = GetCounter();
-      Record(ProbeVQ, T1, T1 - T0);
+      // Wine's process-wide memory lock (virtual_mutex), taken by every memory call and Wine fault.
+      if (ProbeVqFromNotes()) {
+        // Build 153: read from Wine's notes, without taking the lock. A hold is followed from the first round that sees
+        // it until a round sees the lock free or taken again; its event is how long it had lasted when last seen, so a
+        // long hold's length is known to within one round (4 ms) and most short holds are never seen.
+        const VmHolder H = ReadVmHolder();
+        const uint64_t Now = GetCounter();
+        if (H.State == 1 || H.State == 2) {
+          const bool Same = H.State == 2 && Hold.Since && Hold.Since == H.SinceNs;
+          if (!Same && Hold.Since) {
+            Record(ProbeVQ, Hold.Last, Hold.Last - Hold.Start);
+            Hold = {};
+            P->VqStart.store(0, std::memory_order_release);
+          }
+          if (H.State == 2) {
+            if (Same) {
+              Hold.Last = Now;
+            } else {
+              const uint64_t Age = static_cast<uint64_t>(H.HeldUs) * Freq / 1'000'000;
+              Hold = {.Since = H.SinceNs, .Start = Now > Age ? Now - Age : 1, .Last = Now};
+              P->VqStart.store(Hold.Start, std::memory_order_release);
+            }
+            const uint64_t Age = Hold.Last - Hold.Start;
+            if ((Hold.Stage == 0 && Age >= SnapFirst) || (Hold.Stage == 1 && Age >= SnapSecond)) {
+              ++Hold.Stage;
+              TakeLockSnap(P, Hold.Start, Age, Freq);
+            }
+          }
+        }
+      } else {
+        // VirtualQuery: waits for the lock like every memory call and Wine fault.
+        MEMORY_BASIC_INFORMATION Info {};
+        T0 = GetCounter();
+        P->VqStart.store(T0, std::memory_order_release);
+        NtQueryVirtualMemory(NtCurrentProcess(), Region ? Region : static_cast<void*>(&Info), MemoryBasicInformation, &Info, sizeof(Info), nullptr);
+        T1 = GetCounter();
+        P->VqStart.store(0, std::memory_order_release);
+        Record(ProbeVQ, T1, T1 - T0);
+      }
 
       // First touch of a page: the kernel's per-process memory map lock, held for writing by every mprotect/mmap/munmap.
       if (Region) {
         if (Page == ProbeFaultPages) {
-          void* Base = Region;
-          SIZE_T Size = RegionSize;
-          NtFreeVirtualMemory(NtCurrentProcess(), &Base, &Size, MEM_DECOMMIT);
-          Base = Region;
-          Size = RegionSize;
-          if (NtAllocateVirtualMemory(NtCurrentProcess(), &Base, 0, &Size, MEM_COMMIT, PAGE_READWRITE) != STATUS_SUCCESS) {
-            Region = nullptr;
+          // Build 153: the pages go back with madvise straight through Linux, so the probe doesn't take Wine's memory lock
+          // for it (a decommit and commit through Wine held that lock 4-4.5 ms in the b150 run, at t=18 and t=154); the
+          // next touches fault in fresh pages all the same. The Wine calls stay as the fallback.
+          constexpr int64_t NrMadvise = 233, MadvDontNeed = 4;
+          if (Linux::Syscall(NrMadvise, reinterpret_cast<int64_t>(Region), static_cast<int64_t>(RegionSize), MadvDontNeed) != 0) {
+            void* Base = Region;
+            SIZE_T Size = RegionSize;
+            NtFreeVirtualMemory(NtCurrentProcess(), &Base, &Size, MEM_DECOMMIT);
+            Base = Region;
+            Size = RegionSize;
+            if (NtAllocateVirtualMemory(NtCurrentProcess(), &Base, 0, &Size, MEM_COMMIT, PAGE_READWRITE) != STATUS_SUCCESS) {
+              Region = nullptr;
+            }
           }
           Page = 0;
         }
@@ -2278,6 +2987,12 @@ namespace {
   fextl::unordered_map<uint32_t, HANDLE> ThreadHandles;
 
   uint64_t QueryThreadCPUTime(uint32_t TID) {
+    // Build 161: from Linux (schedstat) by the Linux tid in our Proton d2r10's thread table, no wineserver request.
+    if (ThreadTable::Entry Listed; ThreadTable::Find(TID, Listed) && Listed.UnixTid > 0) {
+      if (const uint64_t Time = ThreadTable::CpuTime100ns(Listed)) {
+        return Time;
+      }
+    }
     auto [It, Inserted] = ThreadHandles.try_emplace(TID, nullptr);
     if (Inserted) {
       It->second = OpenThreadForQuery(TID);
@@ -2315,6 +3030,9 @@ namespace {
   std::atomic<uint64_t> SharedSecond {}; // the same for other threads, see StatsLogSecond
 
   fextl::string QueryThreadNameUncached(uint32_t TID) {
+    if (ThreadTable::Entry Listed; ThreadTable::Find(TID, Listed)) {
+      return ThreadTable::HelperName(Listed); // build 161
+    }
     HANDLE Handle = OpenThreadForQuery(TID);
     if (!Handle) {
       return {};
@@ -2346,6 +3064,10 @@ namespace {
   }
 
   const CHPE_V2_CPU_AREA_INFO* QueryCPUArea(uint32_t TID) {
+    // Build 161: the TEB from our Proton d2r10's thread table.
+    if (ThreadTable::Entry Listed; ThreadTable::Find(TID, Listed) && Listed.Teb) {
+      return *reinterpret_cast<CHPE_V2_CPU_AREA_INFO* const*>(static_cast<uintptr_t>(Listed.Teb) + 0x1788);
+    }
     HANDLE Handle {};
     CLIENT_ID ClientId {
       .UniqueProcess = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())),
@@ -2984,7 +3706,597 @@ namespace {
       const int64_t Bin = At > State->SecondStart ? static_cast<int64_t>((At - State->SecondStart) * TimelineBins / State->CounterFreq) : -1;
       Line += fextl::fmt::format(" {}={:.1f}ms@{}", ProbeNames[k], static_cast<double>(Ticks) * MsPerTick, Bin);
     }
+    // Build 153: how often Wine's memory lock was taken this second, from its notes (every memory call, Wine fault and
+    // VirtualQuery of every thread, FEX's included).
+    if (auto* Info = VmLock.load(std::memory_order_relaxed); Info && __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) == 1) {
+      const uint64_t Total = __atomic_load_n(&Info->HoldsTotal, __ATOMIC_RELAXED);
+      if (State->VmTakesHave && Total >= State->VmTakesPrev) {
+        Line += fextl::fmt::format(" | memory lock taken {}/s{}", Total - State->VmTakesPrev, ProbeVqFromNotes() ? " (vq from Wine's notes)" : "");
+      }
+      State->VmTakesPrev = Total;
+      State->VmTakesHave = true;
+    }
     return Line + "\n";
+  }
+
+  // '# memory lock wait' lines (build 133) for the probe's VirtualQuery waits of LockWaitMinMs or more that ended since the
+  // last ones: the watch thread's thread lists taken during the wait, then what the sampled threads were doing meanwhile.
+  LogState::Run CollectFrameRun(LogState* State, uint64_t Begin, uint64_t End);
+
+  // Where virtual.c took the memory lock, by line, from our Proton's share/wine/d2r-vm-lock-lines.txt ("line function"
+  // per row, made by tools/proton/vm-lock-lines.sh), found next to the ntdll.so this process mapped. Read once.
+  fextl::vector<std::pair<uint32_t, fextl::string>> VmLockLineTable;
+  bool VmLockLinesRead {};
+  fextl::string VmLockLinesNote;
+
+  // Where our Proton's share/wine folder is: next to the lib/wine/aarch64-unix/ntdll.so this process mapped. Empty, with
+  // Why set, when it can't be found.
+  fextl::string WineShareDir(fextl::string& Why) {
+    fextl::string Ntdll;
+    const int Fd = Linux::Open("/proc/self/maps");
+    if (Fd >= 0) {
+      static char Chunk[65536];
+      fextl::string Tail;
+      constexpr std::string_view Key = "/aarch64-unix/ntdll.so";
+      for (uint64_t Offset = 0; Offset < (64ull << 20) && Ntdll.empty();) {
+        const int64_t Len = Linux::Pread(Fd, Chunk, sizeof(Chunk), Offset);
+        if (Len <= 0) {
+          break;
+        }
+        Offset += Len;
+        fextl::string Text = Tail;
+        Text.append(Chunk, Len);
+        const size_t At = Text.find(Key);
+        if (At != fextl::string::npos) {
+          const size_t LineBegin = Text.rfind('\n', At);
+          const size_t Slash = Text.find('/', LineBegin == fextl::string::npos ? 0 : LineBegin);
+          if (Slash != fextl::string::npos && Slash <= At) {
+            Ntdll = Text.substr(Slash, At + Key.size() - Slash);
+          }
+          break;
+        }
+        const size_t LastNewline = Text.rfind('\n');
+        Tail = LastNewline == fextl::string::npos ? Text : Text.substr(LastNewline);
+      }
+      Linux::Close(Fd);
+    }
+    constexpr std::string_view Lib = "lib/wine/aarch64-unix/ntdll.so";
+    if (Ntdll.size() <= Lib.size() || Ntdll.compare(Ntdll.size() - Lib.size(), Lib.size(), Lib) != 0) {
+      Why = fextl::fmt::format("ntdll.so {}", Ntdll.empty() ? "not in /proc/self/maps" : Ntdll);
+      return {};
+    }
+    return Ntdll.substr(0, Ntdll.size() - Lib.size()) + "share/wine/";
+  }
+
+  void ReadVmLockLines() {
+    VmLockLinesRead = true;
+    fextl::string Why;
+    const fextl::string Share = WineShareDir(Why);
+    if (Share.empty()) {
+      VmLockLinesNote = fextl::fmt::format("line table not found ({})", Why);
+      return;
+    }
+    const fextl::string Path = Share + "d2r-vm-lock-lines.txt";
+    static char Buffer[16384];
+    const int64_t Len = Linux::ReadSmallFile(Path.c_str(), Buffer, sizeof(Buffer));
+    if (Len <= 0) {
+      VmLockLinesNote = fextl::fmt::format("line table {} can't be read ({})", Path, Len);
+      return;
+    }
+    const char* Cursor = Buffer;
+    const char* End = Buffer + Len;
+    while (Cursor < End) {
+      char* After {};
+      const unsigned long Line = strtoul(Cursor, &After, 10);
+      const char* NameBegin = After;
+      while (NameBegin < End && *NameBegin == ' ') {
+        ++NameBegin;
+      }
+      const char* NameEnd = NameBegin;
+      while (NameEnd < End && *NameEnd != '\n' && *NameEnd != '\r' && *NameEnd != ' ') {
+        ++NameEnd;
+      }
+      if (Line && NameEnd > NameBegin) {
+        VmLockLineTable.push_back({static_cast<uint32_t>(Line), fextl::string(NameBegin, NameEnd)});
+      }
+      Cursor = NameEnd;
+      while (Cursor < End && *Cursor != '\n') {
+        ++Cursor;
+      }
+      ++Cursor;
+    }
+    VmLockLinesNote = fextl::fmt::format("line table {} ({} places)", Path, VmLockLineTable.size());
+  }
+
+  fextl::string VmLockLineName(uint32_t Line) {
+    if (!VmLockLinesRead) {
+      ReadVmLockLines();
+    }
+    for (const auto& [L, Name] : VmLockLineTable) {
+      if (L == Line) {
+        return fextl::fmt::format("{} {}", Line, Name);
+      }
+    }
+    return fextl::fmt::format("{}", Line);
+  }
+
+  // Wine's note on the holder in a '# memory lock wait' snapshot ("" without notes).
+  fextl::string VmHolderText(const VmHolder& H) {
+    switch (H.State) {
+    case 1: return "Wine's notes: lock free (let go just before); ";
+    case 2:
+      return fextl::fmt::format("Wine's notes: HELD by tid={} {} for {:.1f} ms, taken at virtual.c:{}; ", H.Tid, QueryThreadName(H.Tid),
+                                H.HeldUs / 1000.0, VmLockLineName(H.Line));
+    case 3: return "Wine's notes: holder changed while read; ";
+    default: return {};
+    }
+  }
+
+  // Request names for the 'server calls' line, from our Proton's share/wine/d2r-server-requests.txt. Read once.
+  fextl::vector<fextl::string> ServerRequestNames;
+  bool ServerRequestNamesRead {};
+  fextl::string ServerRequestNamesNote;
+
+  void ReadServerRequestNames() {
+    ServerRequestNamesRead = true;
+    fextl::string Why;
+    const fextl::string Share = WineShareDir(Why);
+    if (Share.empty()) {
+      ServerRequestNamesNote = fextl::fmt::format("request names not found ({})", Why);
+      return;
+    }
+    const fextl::string Path = Share + "d2r-server-requests.txt";
+    static char Buffer[32768];
+    const int64_t Len = Linux::ReadSmallFile(Path.c_str(), Buffer, sizeof(Buffer));
+    if (Len <= 0) {
+      ServerRequestNamesNote = fextl::fmt::format("request names {} can't be read ({})", Path, Len);
+      return;
+    }
+    const char* Cursor = Buffer;
+    const char* End = Buffer + Len;
+    size_t Names {};
+    while (Cursor < End) {
+      char* After {};
+      const unsigned long Number = strtoul(Cursor, &After, 10);
+      const bool HaveNumber = After != Cursor;
+      const char* NameBegin = After;
+      while (NameBegin < End && *NameBegin == ' ') {
+        ++NameBegin;
+      }
+      const char* NameEnd = NameBegin;
+      while (NameEnd < End && *NameEnd != '\n' && *NameEnd != '\r' && *NameEnd != ' ') {
+        ++NameEnd;
+      }
+      if (HaveNumber && Number < 512 && NameEnd > NameBegin) {
+        if (ServerRequestNames.size() <= Number) {
+          ServerRequestNames.resize(Number + 1);
+        }
+        ServerRequestNames[Number] = fextl::string(NameBegin, NameEnd);
+        ++Names;
+      }
+      Cursor = NameEnd;
+      while (Cursor < End && *Cursor != '\n') {
+        ++Cursor;
+      }
+      if (Cursor < End) {
+        ++Cursor;
+      }
+    }
+    ServerRequestNamesNote = fextl::fmt::format("{} request names from {}", Names, Path);
+  }
+
+  fextl::string ServerRequestName(uint32_t Number) {
+    if (Number < ServerRequestNames.size() && !ServerRequestNames[Number].empty()) {
+      return ServerRequestNames[Number];
+    }
+    return fextl::fmt::format("req{}", Number);
+  }
+
+  // 'server calls' (build 154): this process's wineserver requests in the last second from Wine's counts, the busiest
+  // types with how long each took on average (send to reply; for a select only the request, its wait comes after the
+  // reply), and Wine's anonymous event reuse. A first line notes where the names came from. Build 157, with our Proton
+  // d2r8's second export: each shown type's latest caller (@tid), the watched types outside the busiest ten, the
+  // callers' names, and what the completion port waits in the process did.
+  fextl::string D2r12Lines(LogState* State, uint64_t Seconds, const ServerCallsExtInfo* Ext);
+  fextl::string ServerCallsLine(LogState* State, uint64_t Seconds) {
+    auto* Info = ServerCalls.load(std::memory_order_relaxed);
+    if (!Info || __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) != 1) {
+      return {};
+    }
+    const uint32_t Types = std::min<uint32_t>(__atomic_load_n(&Info->NbRequests, __ATOMIC_RELAXED), 512);
+    const uint64_t* EvFields[6] = {&Info->EvKept, &Info->EvReused, &Info->EvShared, &Info->EvOtherThread, &Info->EvTooOld, &Info->EvPoolFull};
+    uint64_t Ev[6];
+    for (size_t i = 0; i < 6; ++i) {
+      Ev[i] = __atomic_load_n(EvFields[i], __ATOMIC_RELAXED);
+    }
+    if (!State->ServerHave) {
+      State->ServerHave = true;
+      for (uint32_t i = 0; i < Types; ++i) {
+        State->ServerPrevCount[i] = __atomic_load_n(&Info->Count[i], __ATOMIC_RELAXED);
+        State->ServerPrevTime[i] = __atomic_load_n(&Info->TimeNs[i], __ATOMIC_RELAXED);
+      }
+      memcpy(State->ServerPrevEv, Ev, sizeof(Ev));
+      if (auto* Ext = ServerCallsExt.load(std::memory_order_relaxed); Ext && __atomic_load_n(&Ext->Version, __ATOMIC_ACQUIRE) == 1) {
+        for (size_t i = 0; i < 5; ++i) {
+          State->ServerPrevCp[i] = __atomic_load_n(&Ext->Cp[i], __ATOMIC_RELAXED);
+        }
+        if (ServerCallsExtHasTimers(Ext)) {
+          for (size_t i = 0; i < 8; ++i) {
+            State->ServerPrevTm[i] = __atomic_load_n(&Ext->Tm[i], __ATOMIC_RELAXED);
+          }
+        }
+      }
+      if (!ServerRequestNamesRead) {
+        ReadServerRequestNames();
+      }
+      uint64_t SoFar {};
+      for (uint32_t i = 0; i < Types; ++i) {
+        SoFar += State->ServerPrevCount[i];
+      }
+      return fextl::fmt::format("# server calls: Wine's request counts (our Proton, __wine_d2r_server_calls) read: {} request types, {} "
+                                "requests so far; {}\n",
+                                Types, SoFar, ServerRequestNamesNote);
+    }
+    struct Item {
+      uint32_t Type;
+      uint64_t Count;
+      uint64_t Ns;
+    };
+    fextl::vector<Item> Items;
+    uint64_t Total {}, TotalNs {}, SelectNs {};
+    for (uint32_t i = 0; i < Types; ++i) {
+      const uint64_t Count = __atomic_load_n(&Info->Count[i], __ATOMIC_RELAXED);
+      const uint64_t Ns = __atomic_load_n(&Info->TimeNs[i], __ATOMIC_RELAXED);
+      const uint64_t DCount = Count >= State->ServerPrevCount[i] ? Count - State->ServerPrevCount[i] : 0;
+      const uint64_t DNs = Ns >= State->ServerPrevTime[i] ? Ns - State->ServerPrevTime[i] : 0;
+      State->ServerPrevCount[i] = Count;
+      State->ServerPrevTime[i] = Ns;
+      if (!DCount) {
+        continue;
+      }
+      Items.push_back({i, DCount, DNs});
+      Total += DCount;
+      if (ServerRequestName(i) == "select") {
+        SelectNs += DNs;
+      } else {
+        TotalNs += DNs;
+      }
+    }
+    std::sort(Items.begin(), Items.end(), [](const Item& a, const Item& b) { return a.Count > b.Count; });
+    auto* Ext = ServerCallsExt.load(std::memory_order_relaxed);
+    if (Ext && __atomic_load_n(&Ext->Version, __ATOMIC_ACQUIRE) != 1) {
+      Ext = nullptr;
+    }
+    const uint32_t ExtTypes = Ext ? std::min<uint32_t>(__atomic_load_n(&Ext->NbRequests, __ATOMIC_RELAXED), 512) : 0;
+    fextl::vector<uint32_t> Callers;
+    // " @tid" of a type's latest caller, with the tid kept for the callers' names.
+    auto Caller = [&](uint32_t Type) -> fextl::string {
+      if (Type >= ExtTypes) {
+        return {};
+      }
+      const uint32_t Tid = __atomic_load_n(&Ext->LastTid[Type], __ATOMIC_RELAXED);
+      if (!Tid) {
+        return {};
+      }
+      if (std::find(Callers.begin(), Callers.end(), Tid) == Callers.end()) {
+        Callers.push_back(Tid);
+      }
+      return fextl::fmt::format(" @{}", Tid);
+    };
+    fextl::string Out = fextl::fmt::format("  server calls {}/s, {} types, {:.1f} ms in round trips (selects {:.1f} ms, requests only) |", Total,
+                                           Items.size(), TotalNs / 1e6, SelectNs / 1e6);
+    for (size_t i = 0; i < std::min(Items.size(), ServerCallsShown); ++i) {
+      Out += fextl::fmt::format(" {} {} ({:.3f} ms){}", ServerRequestName(Items[i].Type), Items[i].Count,
+                                Items[i].Ns / 1e6 / static_cast<double>(Items[i].Count), Caller(Items[i].Type));
+    }
+    if (Items.size() > ServerCallsShown) {
+      uint64_t Rest {};
+      fextl::string Watched;
+      for (size_t i = ServerCallsShown; i < Items.size(); ++i) {
+        Rest += Items[i].Count;
+        if (Ext) {
+          const fextl::string Name = ServerRequestName(Items[i].Type);
+          if (std::find_if(std::begin(ServerCallsWatched), std::end(ServerCallsWatched), [&](const char* W) { return Name == W; }) !=
+              std::end(ServerCallsWatched)) {
+            Watched += fextl::fmt::format(" {} {} ({:.3f} ms){}", Name, Items[i].Count, Items[i].Ns / 1e6 / static_cast<double>(Items[i].Count),
+                                          Caller(Items[i].Type));
+          }
+        }
+      }
+      Out += fextl::fmt::format(" others {}{}", Rest, Watched.empty() ? fextl::string {} : " | also" + Watched);
+    }
+    if (!Callers.empty()) {
+      Out += " | callers:";
+      for (size_t i = 0; i < Callers.size(); ++i) {
+        const fextl::string Name = QueryThreadName(Callers[i]);
+        Out += fextl::fmt::format("{} {} {}", i ? "," : "", Callers[i], Name.empty() ? "-" : Name);
+      }
+    }
+    uint64_t D[6];
+    for (size_t i = 0; i < 6; ++i) {
+      D[i] = Ev[i] >= State->ServerPrevEv[i] ? Ev[i] - State->ServerPrevEv[i] : 0;
+      State->ServerPrevEv[i] = Ev[i];
+    }
+    Out += fextl::fmt::format(" | event reuse: made from kept {}, kept at close {}, not kept: shared {}, other thread {}, too old {}, no room {}",
+                              D[1], D[0], D[2], D[3], D[4], D[5]);
+    if (Ext) {
+      uint64_t Cp[5];
+      for (size_t i = 0; i < 5; ++i) {
+        const uint64_t Now = __atomic_load_n(&Ext->Cp[i], __ATOMIC_RELAXED);
+        Cp[i] = Now >= State->ServerPrevCp[i] ? Now - State->ServerPrevCp[i] : 0;
+        State->ServerPrevCp[i] = Now;
+      }
+      Out += fextl::fmt::format(" | completion waits in the process: woken {}, timed out {}, lost race {}, server path {}, batch ends saved {}",
+                                Cp[0], Cp[1], Cp[2], Cp[3], Cp[4]);
+      if (ServerCallsExtHasTimers(Ext)) {
+        uint64_t Tm[8];
+        for (size_t i = 0; i < 8; ++i) {
+          const uint64_t Now = __atomic_load_n(&Ext->Tm[i], __ATOMIC_RELAXED);
+          Tm[i] = Now >= State->ServerPrevTm[i] ? Now - State->ServerPrevTm[i] : 0;
+          State->ServerPrevTm[i] = Now;
+        }
+        Out += fextl::fmt::format(" | timer reuse: kept at close {}, made from kept {}, reset in a request of its own {}, not kept: still set {}, "
+                                  "shared {}, other thread {}, too old {}, no room {}",
+                                  Tm[0], Tm[1], Tm[2], Tm[3], Tm[4], Tm[5], Tm[6], Tm[7]);
+      }
+    }
+    Out += "\n";
+    // Build 161: every 5 s, the registry keys and values Wine noted last (d2r10), grouped by caller and name.
+    const auto* Reg = Ext ? ServerCallsRegistry(Ext) : nullptr;
+    if (Reg && !State->RegHave) {
+      State->RegHave = true;
+      State->RegPrevOpen = __atomic_load_n(&Reg->OpenNext, __ATOMIC_ACQUIRE);
+      State->RegPrevValue = __atomic_load_n(&Reg->ValueNext, __ATOMIC_ACQUIRE);
+    } else if (Reg && ++State->RegRounds % 5 == 0) {
+      const uint64_t OpenNow = __atomic_load_n(&Reg->OpenNext, __ATOMIC_ACQUIRE);
+      const uint64_t ValueNow = __atomic_load_n(&Reg->ValueNext, __ATOMIC_ACQUIRE);
+      const uint64_t Opens = OpenNow - std::min(OpenNow, State->RegPrevOpen);
+      const uint64_t Values = ValueNow - std::min(ValueNow, State->RegPrevValue);
+      State->RegPrevOpen = OpenNow;
+      State->RegPrevValue = ValueNow;
+      const auto Group = [&](const RegistryNote* Notes, size_t N, uint64_t Next) {
+        struct Seen {
+          uint32_t Tid;
+          uint32_t Status;
+          fextl::string Name;
+          uint32_t Times;
+        };
+        fextl::vector<Seen> List;
+        for (size_t i = 0; i < std::min<uint64_t>(N, Next); ++i) {
+          RegistryNote Copy;
+          if (!ReadRegistryNote(Notes[i], Copy)) {
+            continue;
+          }
+          fextl::string Name(Copy.Name);
+          auto It = std::find_if(List.begin(), List.end(), [&](const Seen& S) { return S.Tid == Copy.Tid && S.Name == Name; });
+          if (It != List.end()) {
+            ++It->Times;
+          } else {
+            List.push_back({Copy.Tid, Copy.Status, std::move(Name), 1});
+          }
+        }
+        fextl::string Text;
+        for (const auto& S : List) {
+          Text += fextl::fmt::format("{} tid={} {} x{} '{}'{}", Text.empty() ? "" : ",", S.Tid, QueryThreadName(S.Tid), S.Times, S.Name,
+                                     S.Status ? fextl::fmt::format(" status {:#x}", S.Status) : fextl::string {});
+        }
+        return Text.empty() ? fextl::string(" none") : " " + Text;
+      };
+      Out += fextl::fmt::format("  registry (our Proton d2r10's notes, last 5 s): {} key opens, {} value reads | latest {} opens:{} | "
+                                "latest {} value reads:{}\n",
+                                Opens, Values, std::min<uint64_t>(8, OpenNow), Group(Reg->Open, 8, OpenNow),
+                                std::min<uint64_t>(4, ValueNow), Group(Reg->Value, 4, ValueNow));
+    }
+    // Build 163: our Proton d2r12's debug output and file flush counters, a line each in seconds that had any.
+    if (Ext && ServerCallsHasD2r12(Ext)) {
+      Out += D2r12Lines(State, Seconds, Ext);
+    }
+    return Out;
+  }
+
+  fextl::string D2r12Lines(LogState* State, uint64_t Seconds, const ServerCallsExtInfo* Ext) {
+    const auto* Ods = ServerCallsOds(Ext);
+    const auto* Fl = ServerCallsFlush(Ext);
+    const uint64_t* OdsFields[7] = {&Ods->WCalls, &Ods->WNs, &Ods->ACalls, &Ods->ANs, &Ods->Raised, &Ods->DbwinOpens, &Ods->DbwinSkipped};
+    uint64_t O[7];
+    for (size_t i = 0; i < 7; ++i) {
+      O[i] = __atomic_load_n(OdsFields[i], __ATOMIC_RELAXED);
+    }
+    const uint64_t OdsMax = __atomic_load_n(&Ods->MaxNs, __ATOMIC_RELAXED);
+    const uint64_t* FlushFields[4] = {&Fl->Calls, &Fl->Ns, &Fl->OtherCalls, &Fl->OtherNs};
+    uint64_t F[4];
+    for (size_t i = 0; i < 4; ++i) {
+      F[i] = __atomic_load_n(FlushFields[i], __ATOMIC_RELAXED);
+    }
+    const uint64_t FlushMax = __atomic_load_n(&Fl->MaxNs, __ATOMIC_RELAXED);
+    const uint64_t FlushNext = __atomic_load_n(&Fl->Next, __ATOMIC_ACQUIRE);
+    if (!State->D2r12Have) {
+      State->D2r12Have = true;
+      memcpy(State->OdsPrev, O, sizeof(O));
+      State->OdsPrevMax = OdsMax;
+      memcpy(State->FlushPrev, F, sizeof(F));
+      State->FlushPrevMax = FlushMax;
+      State->FlushPrevNext = FlushNext;
+      for (size_t i = 0; i < 8; ++i) {
+        State->FlushTidPrevCount[i] = __atomic_load_n(&Fl->Tid[i].Count, __ATOMIC_RELAXED);
+        State->FlushTidPrevNs[i] = __atomic_load_n(&Fl->Tid[i].Ns, __ATOMIC_RELAXED);
+      }
+      return fextl::fmt::format("# debug output and file flushes (our Proton d2r12) at the first read: {} OutputDebugStringW and {} A calls, {} "
+                                "exceptions raised, {} DBWIN_BUFFER looks, {} left out | {} file flushes in {:.1f} ms\n",
+                                O[0], O[2], O[4], O[5], O[6], F[0], F[1] / 1e6);
+    }
+    uint64_t DO[7], DF[4];
+    for (size_t i = 0; i < 7; ++i) {
+      DO[i] = O[i] >= State->OdsPrev[i] ? O[i] - State->OdsPrev[i] : 0;
+      State->OdsPrev[i] = O[i];
+    }
+    for (size_t i = 0; i < 4; ++i) {
+      DF[i] = F[i] >= State->FlushPrev[i] ? F[i] - State->FlushPrev[i] : 0;
+      State->FlushPrev[i] = F[i];
+    }
+    fextl::string Out;
+    if (DO[0] || DO[2]) {
+      const uint32_t Tid = __atomic_load_n(&Ods->LastTid, __ATOMIC_RELAXED);
+      const uint32_t Watchers = __atomic_load_n(&Ods->Watchers, __ATOMIC_RELAXED);
+      const fextl::string Name = Tid ? QueryThreadName(Tid) : fextl::string {};
+      Out += fextl::fmt::format("  debug output (our Proton d2r12): OutputDebugStringW {} in {:.1f} ms, A {} in {:.1f} ms (counts the one inside "
+                                "each W) | longest {:.2f} ms{} | exceptions raised {} | DBWIN_BUFFER looks {}, left out {} | latest caller {} {} "
+                                "| could see the exceptions: {}\n",
+                                DO[0], DO[1] / 1e6, DO[2], DO[3] / 1e6, OdsMax / 1e6, OdsMax > State->OdsPrevMax ? " (new)" : " (so far)",
+                                DO[4], DO[5], DO[6], Tid, Name.empty() ? "-" : Name, OdsWatchersText(Watchers));
+    }
+    State->OdsPrevMax = OdsMax;
+    const uint64_t NewNotes = FlushNext - std::min(FlushNext, State->FlushPrevNext);
+    State->FlushPrevNext = FlushNext;
+    fextl::string Threads;
+    for (size_t i = 0; i < 8; ++i) {
+      const uint32_t Tid = __atomic_load_n(&Fl->Tid[i].Tid, __ATOMIC_RELAXED);
+      const uint32_t Count = __atomic_load_n(&Fl->Tid[i].Count, __ATOMIC_RELAXED);
+      const uint64_t Ns = __atomic_load_n(&Fl->Tid[i].Ns, __ATOMIC_RELAXED);
+      const uint32_t DCount = Count - std::min(Count, State->FlushTidPrevCount[i]);
+      const uint64_t DNs = Ns - std::min(Ns, State->FlushTidPrevNs[i]);
+      State->FlushTidPrevCount[i] = Count;
+      State->FlushTidPrevNs[i] = Ns;
+      if (!Tid || !DCount) {
+        continue;
+      }
+      const fextl::string Name = QueryThreadName(Tid);
+      Threads += fextl::fmt::format("{} {} {} {} in {:.1f} ms (longest {:.1f})", Threads.empty() ? "" : ",", Tid, Name.empty() ? "-" : Name,
+                                    DCount, DNs / 1e6, __atomic_load_n(&Fl->Tid[i].MaxNs, __ATOMIC_RELAXED) / 1e6);
+    }
+    if (DF[2]) {
+      Threads += fextl::fmt::format("{} threads without a slot {} in {:.1f} ms", Threads.empty() ? "" : ",", DF[2], DF[3] / 1e6);
+    }
+    if (DF[0]) {
+      // The calls noted since the last line, oldest first, at their start time on the log's clock.
+      fextl::string Notes;
+      const uint64_t Shown = std::min<uint64_t>(NewNotes, 8);
+      const uint64_t NowCounter = GetCounter();
+      const int64_t NowMono = Linux::MonotonicNs();
+      const double NowT = static_cast<double>(Seconds) +
+                          (static_cast<double>(NowCounter) - static_cast<double>(State->SecondStart)) / static_cast<double>(State->CounterFreq);
+      for (uint64_t n = FlushNext - Shown; n != FlushNext; ++n) {
+        FlushNote Copy;
+        if (!ReadFlushNote(Fl->Notes[n % 8], Copy)) {
+          continue;
+        }
+        const double AgoS = NowMono > 0 && static_cast<uint64_t>(NowMono) > Copy.StartNs ? (static_cast<uint64_t>(NowMono) - Copy.StartNs) / 1e9 : 0.0;
+        Notes += fextl::fmt::format(" t={:.2f} {:.1f} ms {} tid={}{};", NowT - AgoS, Copy.Ns / 1e6, FlushKindName(Copy.Kind), Copy.Tid,
+                                    Copy.Status ? fextl::fmt::format(" status {:#x}", Copy.Status) : fextl::string {});
+      }
+      Out += fextl::fmt::format("  file flushes (our Proton d2r12): {} in {:.1f} ms, longest {:.1f} ms{} | by thread:{} | latest {} of {}:{}\n",
+                                DF[0], DF[1] / 1e6, FlushMax / 1e6, FlushMax > State->FlushPrevMax ? " (new)" : " (so far)",
+                                Threads.empty() ? fextl::string(" -") : Threads, Shown, NewNotes, Notes.empty() ? fextl::string(" -") : Notes);
+    }
+    State->FlushPrevMax = FlushMax;
+    return Out;
+  }
+
+  // '# memory lock holds' (build 150): the holds of 4 ms or more Wine noted since the last line, each with its start time
+  // (t=, from its end and length), length, where virtual.c took the lock and the holder.
+  fextl::string VmLockHoldLines(LogState* State, uint64_t Seconds) {
+    auto* Info = VmLock.load(std::memory_order_relaxed);
+    if (!Info || __atomic_load_n(&Info->Version, __ATOMIC_ACQUIRE) != 1) {
+      return {};
+    }
+    const uint32_t Long = __atomic_load_n(&Info->LongHolds, __ATOMIC_ACQUIRE);
+    if (!State->VmLongStarted) {
+      // Holds from before the log (process start) are left out.
+      State->VmLongStarted = true;
+      State->VmLongSeen = Long;
+      if (!VmLockLinesRead) {
+        ReadVmLockLines();
+      }
+      return fextl::fmt::format("# memory lock holds: Wine's notes (our Proton, __wine_d2r_vm_lock) read: {} holds so far, {} of "
+                                "4+ ms; {}\n",
+                                __atomic_load_n(&Info->HoldsTotal, __ATOMIC_RELAXED), Long, VmLockLinesNote);
+    }
+    if (Long == State->VmLongSeen) {
+      return {};
+    }
+    uint32_t New = Long - State->VmLongSeen;
+    const uint32_t Lost = New > 16 ? New - 16 : 0;
+    New -= Lost;
+    State->VmLongSeen = Long;
+    if (State->VmHoldLines >= MaxVmHoldLines) {
+      return {};
+    }
+    ++State->VmHoldLines;
+    const uint64_t NowCounter = GetCounter();
+    const int64_t NowMono = Linux::MonotonicNs();
+    const double Freq = static_cast<double>(State->CounterFreq);
+    fextl::string Out = fextl::fmt::format("# memory lock holds: {} of 4+ ms since the last line{}:", New + Lost,
+                                           Lost ? fextl::fmt::format(" (oldest {} not listed)", Lost) : fextl::string {});
+    for (uint32_t i = Long - New; i != Long; ++i) {
+      const auto& Slot = Info->Holds[i % 16];
+      const uint32_t Line = __atomic_load_n(&Slot.Line, __ATOMIC_RELAXED);
+      const uint32_t Tid = __atomic_load_n(&Slot.Tid, __ATOMIC_RELAXED);
+      const uint32_t HeldUs = __atomic_load_n(&Slot.HeldUs, __ATOMIC_RELAXED);
+      const uint64_t EndNs = __atomic_load_n(&Slot.EndNs, __ATOMIC_RELAXED);
+      const double AgoS = NowMono > 0 && static_cast<uint64_t>(NowMono) > EndNs ? (static_cast<uint64_t>(NowMono) - EndNs) / 1e9 : 0.0;
+      const double StartTicks = static_cast<double>(NowCounter) - (AgoS + HeldUs / 1e6) * Freq;
+      const uint64_t StartCounter = StartTicks > 0 ? static_cast<uint64_t>(StartTicks) : 0;
+      Out += fextl::fmt::format(" t={} {:.1f} ms virtual.c:{} tid={} {};", FrameTime(State, Seconds, StartCounter), HeldUs / 1000.0,
+                                VmLockLineName(Line), Tid, QueryThreadName(Tid));
+    }
+    return Out + "\n";
+  }
+
+  fextl::string LockWaitLines(LogState* State, uint64_t Seconds) {
+    if (!Probe) {
+      return {};
+    }
+    const double MsPerTick = 1000.0 / static_cast<double>(State->CounterFreq);
+    const uint64_t MinTicks = static_cast<uint64_t>(LockWaitMinMs / MsPerTick);
+    fextl::string Out;
+    for (const auto& E : State->ProbeEvents) {
+      if (E.Kind != ProbeVQ || E.Ticks < MinTicks || E.End <= State->LockWaitPrinted) {
+        continue;
+      }
+      State->LockWaitPrinted = E.End;
+      const uint64_t Start = E.End - E.Ticks;
+      if (State->LockWaitLines >= MaxLockWaitLines) {
+        continue;
+      }
+      ++State->LockWaitLines;
+      Out += fextl::fmt::format("# memory lock wait t={} {:.0f}ms (Wine's memory lock, {})", FrameTime(State, Seconds, Start),
+                                static_cast<double>(E.Ticks) * MsPerTick,
+                                ProbeVqFromNotes() ? "a hold the stall probe saw in Wine's notes" : "the stall probe's VirtualQuery");
+      for (auto& S : Probe->Snaps) {
+        if (S.Ready.load(std::memory_order_acquire) == 2 && S.Start == Start) {
+          Out += fextl::fmt::format(" | at {} ms: {}{}", S.AtMs, VmHolderText(S.Holder), S.Text);
+          S.Ready.store(0, std::memory_order_release);
+        }
+      }
+      const LogState::Run R = CollectFrameRun(State, Start, E.End);
+      fextl::vector<std::pair<uint32_t, uint64_t>> Blocks, Natives;
+      SplitCounts(R.Counts, Blocks, Natives);
+      Out += fextl::fmt::format(" | sampled meanwhile: main samples={}", R.Samples);
+      AppendNatives(State, Natives, 2, Out);
+      fextl::vector<std::pair<uint32_t, const LogState::RunThread*>> Others;
+      for (const auto& [TID, T] : R.Others) {
+        if (T.Samples) {
+          Others.push_back({TID, &T});
+        }
+      }
+      std::sort(Others.begin(), Others.end(), [](const auto& a, const auto& b) { return a.second->Samples > b.second->Samples; });
+      for (size_t i = 0; i < std::min<size_t>(Others.size(), 8); ++i) {
+        const auto& T = *Others[i].second;
+        Out += fextl::fmt::format("; tid={} {} emu={}%", Others[i].first, QueryThreadName(Others[i].first), T.InSim * 100 / T.Samples);
+        fextl::vector<std::pair<uint32_t, uint64_t>> OtherBlocks, OtherNatives;
+        SplitCounts(T.Counts, OtherBlocks, OtherNatives);
+        AppendNatives(State, OtherNatives, 2, Out);
+      }
+      Out += "\n";
+    }
+    // Lists whose wait ended before the events kept (or under the minimum) are let go.
+    const uint64_t KeepFrom = State->PrevSecondStart ? State->PrevSecondStart : State->SecondStart;
+    for (auto& S : Probe->Snaps) {
+      if (S.Ready.load(std::memory_order_acquire) == 2 && S.Start < KeepFrom && Probe->VqStart.load(std::memory_order_relaxed) != S.Start) {
+        S.Ready.store(0, std::memory_order_release);
+      }
+    }
+    return Out;
   }
 
   // A "# frame" line: what Main was sampled doing from frame start Begin to the next frame start End, from this and the
@@ -3453,15 +4765,21 @@ namespace {
     const uint64_t MaxHoldAt = Take(CodeLockStats.MaxHoldAt);
     const uint64_t ReaderSleeps = Take(CodeLockStats.ReaderSleeps);
     const uint64_t WriterSleeps = Take(CodeLockStats.WriterSleeps);
+    const int MaxHoldTid = CodeLockStats.MaxHoldTid.exchange(0, std::memory_order_relaxed);
     if (!Locks && !GiveUps && !ReaderSleeps && !WriterSleeps) {
       return {};
+    }
+    // Build 156 (with FEX_LOCK_BOOST on): who held it longest, from 5 ms on.
+    fextl::string HoldBy;
+    if (MaxHoldTid && MaxHold * MsPerTick >= 5.0) {
+      HoldBy = fextl::fmt::format(" by {} {}", MaxHoldTid, FEX::Windows::LockBoost::ThreadName(MaxHoldTid));
     }
     auto Bin = [State](uint64_t At) {
       return At > State->SecondStart ? static_cast<int64_t>((At - State->SecondStart) * TimelineBins / State->CounterFreq) : -1;
     };
     // Build 125: how often a compile (reader) or a writer had to sleep for the lock, and through what.
-    return fextl::fmt::format("  codelock writes={} slow={} giveup={} wait={:.1f}ms@{} hold={:.1f}ms@{} sleeps readers={} writers={} ({})\n",
-                              Locks, Slow, GiveUps, MaxWait * MsPerTick, Bin(MaxWaitAt), MaxHold * MsPerTick, Bin(MaxHoldAt),
+    return fextl::fmt::format("  codelock writes={} slow={} giveup={} wait={:.1f}ms@{} hold={:.1f}ms@{}{} sleeps readers={} writers={} ({})\n",
+                              Locks, Slow, GiveUps, MaxWait * MsPerTick, Bin(MaxWaitAt), MaxHold * MsPerTick, Bin(MaxHoldAt), HoldBy,
                               ReaderSleeps, WriterSleeps, FEXCore::Utils::WritePriorityMutex::KernelFutex ? "kernel" : "wine");
   }
 
@@ -3770,6 +5088,9 @@ namespace {
       Line += SchedLines(Seconds);
       Line += GpuLine();
       Line += ProbeLine(State, MsPerTick);
+      Line += LockWaitLines(State, Seconds);
+      Line += VmLockHoldLines(State, Seconds);
+      Line += ServerCallsLine(State, Seconds);
       Line += FrameLines(State, Seconds);
       if (State->Profile) {
         Line += MainHitches(State, Seconds);
@@ -3794,6 +5115,7 @@ namespace {
       }
 
       Line += CodeLockLine(State, MsPerTick);
+      Line += FEX::Windows::LockBoost::Line();
       // How long the log thread's own work between the last two sampling seconds took (nothing is sampled meanwhile).
       Line += fextl::fmt::format("  logger work={:.1f}ms\n", State->WorkTicks * MsPerTick);
 
@@ -4072,7 +5394,8 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
                        "list read (MB asked, calls, MB that came from storage, time); kept ... + learned = pieces the drops left only "
                        "because they are learned; ucache main thread in play = unpack cache hits the main thread left to the game "
                        "while frames came (FEX_UNPACK_CACHE_MAIN_PLAY) beyond those the lookup rate left, then learned streams taken "
-                       "from the file cache (count/ms) and those not there; ucache learned = the list of unpack cache streams the main "
+                       "from the file cache (count/ms) and those not there, then hits while frames came that asked for no read-ahead "
+                       "(FEX_UNPACK_CACHE_FRAMES_AHEAD=0, build 164: from read-ahead memory, not in it); ucache learned = the list of unpack cache streams the main "
                        "thread looked up in frames of play (FEX_UNPACK_CACHE_LEARN): ranges and MB, ranges used and learned this "
                        "session, this second's new ranges and MB, lookups left out because their frame was a loading screen's, and "
                        "what asking storage for the list took (MB, calls, time); ucache flushed = new unpack cache data sent to storage "
@@ -4110,12 +5433,18 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
   const auto WineSync = WineSyncLine();
   fwrite(WineSync.data(), 1, WineSync.size(), File);
   const char* StallProbe = Switch("FEX_STALLPROBE");
+  const char* VqNotes = Switch("FEX_PROBE_VQ_NOTES");
+  ProbeVqNotesSwitch = !(VqNotes && VqNotes[0] == '0');
   static fextl::unique_ptr<FEXCore::Threads::Thread> ProbeThreadObject;
   if (State->Profile && !(StallProbe && StallProbe[0] == '0')) {
     Probe = new ProbeShared {};
     ProbeThreadObject = FEXCore::Threads::Thread::Create(ProbeThread, nullptr, {.LowPriority = false, .Internal = true}, "FEXStallProbe");
+    static fextl::unique_ptr<FEXCore::Threads::Thread> LockWatchObject;
+    LockWatchObject = FEXCore::Threads::Thread::Create(LockWatchThread, nullptr, {.LowPriority = false, .Internal = true}, "FEXLockWatch");
     const char* ProbeNote = "# stall probe: on, every 4ms: sleep (late wakeup), vq (Wine memory lock), fault (kernel memory map lock), "
-                            "fexlock (FEX memory/SMC lock), every 16ms server (wineserver round trip); FEX_STALLPROBE=0 turns it off\n";
+                            "fexlock (FEX memory/SMC lock), every 32ms server (wineserver round trip); FEX_STALLPROBE=0 turns it off. "
+                            "vq waits of 15 ms or more get a '# memory lock wait' line with every thread not asleep in a wait at 15 and "
+                            "45 ms (Linux syscall, state, CPU) and what the sampled threads did meanwhile (build 133)\n";
     fwrite(ProbeNote, 1, strlen(ProbeNote), File);
   }
   // Keep the thread object alive: its RunThread reads the object after creation, so it must outlive the thread.
@@ -4125,6 +5454,87 @@ void StartStatsLog(const StatAlloc* Stats, std::string_view AppName) {
 
 FEXCore::Utils::WritePriorityMutex::ContentionStats* StatsLogCodeLockStats() {
   return &CodeLockStats;
+}
+
+void StatsLogSetVmLockNotes(const void* Info) {
+  auto* Notes = static_cast<VmLockInfo*>(const_cast<void*>(Info));
+  VmLock.store(Notes, std::memory_order_relaxed);
+  const uint32_t Version = Notes ? __atomic_load_n(&Notes->Version, __ATOMIC_ACQUIRE) : 0;
+  StatsLogNote(!Notes        ? "memory lock: this Wine has no holder notes (__wine_d2r_vm_lock: stock Proton or our Proton older than "
+                               "d2r4), so '# memory lock wait' lines can't name the holder" :
+               Version == 1  ? "memory lock: Wine's holder notes found (our Proton d2r4 and later, __wine_d2r_vm_lock version 1): '# memory "
+                               "lock wait' lines name the holder ('Wine's notes: HELD by'), '# memory lock holds' lines list its holds of "
+                               "4 ms or more" :
+               Version == 0  ? "memory lock: Wine's holder notes are off (__wine_d2r_vm_lock version 0: WINE_D2R_VM_NOTES=0)" :
+                               "memory lock: Wine's holder notes have an unknown layout, not read");
+  if (Probe && Version == 1) {
+    StatsLogNote(ProbeVqNotesSwitch ?
+                   "stall probe: vq from Wine's notes (build 153, FEX_PROBE_VQ_NOTES=1): the probe no longer takes Wine's memory lock "
+                   "with a VirtualQuery every 4 ms; vq = how long a hold it saw had lasted (holds are seen every 4 ms), '# memory lock "
+                   "wait' lines = holds seen at 15 ms or more, with the thread lists taken by the probe (no lock watch thread); the "
+                   "probe line also gives 'memory lock taken N/s' from Wine's count; FEX_PROBE_VQ_NOTES=0 measures with the "
+                   "VirtualQuery again" :
+                   "stall probe: vq measured with a VirtualQuery (FEX_PROBE_VQ_NOTES=0); the probe line gives 'memory lock taken N/s' "
+                   "from Wine's notes");
+  }
+}
+
+void StatsLogSetServerCalls(const void* Info) {
+  auto* Calls = static_cast<ServerCallsInfo*>(const_cast<void*>(Info));
+  ServerCalls.store(Calls, std::memory_order_relaxed);
+  const uint32_t Version = Calls ? __atomic_load_n(&Calls->Version, __ATOMIC_ACQUIRE) : 0;
+  StatsLogNote(!Calls       ? "server calls: this Wine doesn't count its wineserver requests (__wine_d2r_server_calls: stock Proton or our "
+                              "Proton older than d2r6)" :
+               Version == 1 ? "server calls: Wine's wineserver request counts found (our Proton d2r6 and later, __wine_d2r_server_calls "
+                              "version 1): a 'server calls' line every second gives this process's requests by type, their time from "
+                              "send to reply (for a select only its request: its wait comes after the reply), and what Wine's "
+                              "anonymous event reuse did" :
+               Version == 0 ? "server calls: Wine's request counts are off (__wine_d2r_server_calls version 0: WINE_D2R_CALL_COUNTS=0)" :
+                              "server calls: Wine's request counts have an unknown layout, not read");
+}
+
+void StatsLogSetServerCallsExt(const void* Info) {
+  auto* Ext = static_cast<ServerCallsExtInfo*>(const_cast<void*>(Info));
+  ServerCallsExt.store(Ext, std::memory_order_relaxed);
+  if (!ServerCalls.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const uint32_t Version = Ext ? __atomic_load_n(&Ext->Version, __ATOMIC_ACQUIRE) : 0;
+  StatsLogNote(!Ext         ? "server calls: no latest callers or completion port wait counts (__wine_d2r_server_calls_ext: our Proton "
+                              "older than d2r8)" :
+               Version == 1 ? "server calls: Wine's latest callers and completion port wait counts found (our Proton d2r8 and later, "
+                              "__wine_d2r_server_calls_ext version 1): '@tid' after a request type = the thread that sent the latest "
+                              "one, 'also' = timer, close and thread list requests outside the busiest ten, 'callers' = those threads' "
+                              "names, 'completion waits in the process' = the game's I/O completion port waits Wine did without the "
+                              "wineserver (woken = found an entry signaled, timed out = no server call at all, lost race and server path = "
+                              "went to the wineserver as stock Wine, batch ends saved = GetQueuedCompletionStatusEx batches that skipped "
+                              "the last empty remove; WINE_D2R_COMPLETION_WAIT=0 turns them off)" :
+               Version == 0 ? "server calls: Wine's latest callers are off (__wine_d2r_server_calls_ext version 0: WINE_D2R_CALL_COUNTS=0)" :
+                              "server calls: Wine's latest callers have an unknown layout, not read");
+  if (Ext && Version == 1) {
+    StatsLogNote(ServerCallsExtHasTimers(Ext) ?
+                   "server calls: Wine's timer reuse counts found (our Proton d2r9 and later): 'timer reuse' = unnamed timers Wine kept "
+                   "open at close and handed back at the next create instead of asking the wineserver (kept at close, made from kept, "
+                   "reset in a request of its own = a reused timer that had to be made new in an extra call), and timers it closed for "
+                   "real (still set = closed before its setting was seen to fire, shared = APC, period, set again, cancelled, duplicated "
+                   "or used by another thread, other thread = closed by another thread, too old = older than 100 ms, no room = the "
+                   "kept list was full); WINE_D2R_TIMER_REUSE=0 turns it off" :
+                   "server calls: no timer reuse counts (our Proton older than d2r9)");
+    StatsLogNote(ServerCallsRegistry(Ext) ?
+                   "server calls: Wine's registry notes found (our Proton d2r10 and later; d2r10 keeps timers for reuse up to 10 s, so "
+                   "'too old' = closed more than 10 s after it was made): every 5 s a 'registry' line names the keys and values the "
+                   "latest 8 key opens and 4 value reads asked for, with their callers (build 161)" :
+                   "server calls: no registry notes (our Proton older than d2r10)");
+    StatsLogNote(ServerCallsHasD2r12(Ext) ?
+                   "server calls: Wine's debug output and file flush counts found (our Proton d2r12 and later, build 163): a 'debug "
+                   "output' line in seconds with OutputDebugString calls (A counts the one inside every W call; exceptions raised = 0 "
+                   "when nothing could see them, since d2r12 leaves them out then; DBWIN_BUFFER looks = open_mapping requests, left out = "
+                   "looks d2r12 skipped because no debug monitor was there less than 1 s ago; 'could see the exceptions' names a "
+                   "debugger, vectored handler or hooked x64 dispatcher, which keep the exceptions as in stock; WINE_D2R_ODS_FAST=0 "
+                   "turns both off), and a 'file flushes' line in seconds with FlushFileBuffers calls: per thread, and each call since "
+                   "the last line with its start t=, time and kind (fsync, server = a pipe or other wineserver flush, serial)" :
+                   "server calls: no debug output or file flush counts (our Proton older than d2r12)");
+  }
 }
 
 void StatsLogSetLockProbe(void (*ProbeFunction)()) {

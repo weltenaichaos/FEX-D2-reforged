@@ -13,14 +13,17 @@ add_library(CommonWindows STATIC
   FEXUnixLib.cpp
   SHMStats.cpp
   StatsLog.cpp
+  StartWatch.cpp
   Switches.cpp
   ThreadPlacer.cpp
   PriorityGuard.cpp
   LinuxSys.cpp
+  LockBoost.cpp
   InvalidationTracker.cpp
   ImageTracker.cpp
   Logging.cpp
-  Threads.cpp)
+  Threads.cpp
+  ThreadTable.cpp)
 
 target_link_libraries(CommonWindows FEXCore_Base)
 
@@ -34,8 +37,8 @@ target_include_directories(CommonWindows PRIVATE "${CMAKE_SOURCE_DIR}/Source/Win
 # CI's build number and description go into the stats log's file name and header. Only StatsLog.cpp sees them, so a new
 # number recompiles that one file.
 if (DEFINED ENV{FEX_BUILD_NUMBER})
-  set_property(SOURCE StatsLog.cpp APPEND PROPERTY COMPILE_DEFINITIONS "FEX_BUILD_NUMBER=\"$ENV{FEX_BUILD_NUMBER}\"")
+  set_property(SOURCE StatsLog.cpp StartWatch.cpp APPEND PROPERTY COMPILE_DEFINITIONS "FEX_BUILD_NUMBER=\"$ENV{FEX_BUILD_NUMBER}\"")
 endif()
 if (DEFINED ENV{FEX_BUILD_INFO})
-  set_property(SOURCE StatsLog.cpp APPEND PROPERTY COMPILE_DEFINITIONS "FEX_BUILD_INFO=\"$ENV{FEX_BUILD_INFO}\"")
+  set_property(SOURCE StatsLog.cpp StartWatch.cpp APPEND PROPERTY COMPILE_DEFINITIONS "FEX_BUILD_INFO=\"$ENV{FEX_BUILD_INFO}\"")
 endif()

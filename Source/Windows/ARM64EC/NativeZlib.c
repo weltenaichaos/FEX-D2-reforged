@@ -20,6 +20,9 @@
 
 #include <stdint.h>
 
+// FEX's own inflate_fast (FEX_INFLATE_FAST, build 158), see the comment at its top.
+#include "InflateFast.c"
+
 #if (defined(__aarch64__) || defined(__arm64ec__)) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #define FEX_ADLER_NEON 1
@@ -32,6 +35,7 @@ struct FEXNativeCallStats FEXNativeAdler32ZStats;
 int FEXNativeZlibTrackStreams;
 int FEXNativeSkipHitAdler = 1;
 int FEXNativeAdlerNeon = 1;
+int FEXNativeInflateChunk = 1;
 uint64_t FEXNativeImageBase;
 uint64_t FEXNativeTextBegin;
 uint64_t FEXNativeTextEnd;
@@ -595,7 +599,11 @@ void FEXNativeInflateFast(z_streamp strm, unsigned start, const uint64_t* GuestS
   }
 
   if (!Hit) {
-    inflate_fast(strm, start);
+    if (FEXNativeInflateChunk) {
+      FEXInflateFastChunk(strm, start);
+    } else {
+      inflate_fast(strm, start);
+    }
   }
   const uInt Produced = AvailOut - strm->avail_out;
   if (StreamStart && Produced >= 4) {

@@ -53,6 +53,13 @@ namespace {
   uint32_t LoadMs {};
   // Renewals done (NoteStarted), so a loading screen asks for at most one.
   std::atomic<uint64_t> Renewals {};
+  // Build 160, FEX_CODE_BUFFER_RENEW_GAP: a loading screen that starts within this many seconds of the last renewal asks
+  // at RenewPercent at least, even among the first EarlyLoads. One load the game shows in parts counts as several: in the
+  // build 159 run entering the game renewed at t=27.4 (frames stopped) and again at t=29.6 (GPU-light frames after more
+  // than PlayFrames normal ones), and the second renewal dropped the 13,084 blocks just loaded for the new area (18% of
+  // the buffer); the game's threads then placed ~11,700 more blocks in the next 11 s than in the build 157 run. 0 = off.
+  uint32_t RenewGapSeconds {};
+  std::atomic<uint64_t> LastRenewalAt {}; // CNTVCT_EL0 of the last renewal (NoteStarted), 0 = none yet
 
   uint64_t Counter() {
     uint64_t Result {};
@@ -82,6 +89,7 @@ namespace {
   std::atomic<uint64_t> Loads {};
   std::atomic<uint64_t> LoadAt {};
   std::atomic<uint32_t> LoadPercent {};
+  std::atomic<uint32_t> LoadSinceRenewalMs {}; // build 160: ms from the last renewal to the load when within the gap, else 0
   std::atomic<bool> LoadLight {}; // build 94: seen by GPU-light frames (LoadScreen.h), not a frame gap
   uint64_t LoadsRead {};
 
@@ -256,11 +264,16 @@ namespace {
     const uint64_t LoadCount = Loads.load(std::memory_order_acquire);
     if (LoadCount != LoadsRead) {
       const bool Light = LoadLight.load(std::memory_order_relaxed);
+      const uint32_t SinceRenewal = LoadSinceRenewalMs.load(std::memory_order_relaxed);
       Out += fextl::fmt::format("# code buffer: loading screen #{} ({}, {:.0f} ms before this line), renewal asked if the buffer is "
-                                "{}% used or more\n",
+                                "{}% used or more{}\n",
                                 LoadCount,
                                 Light ? fextl::string("GPU-light frames") : fextl::fmt::format("no frame for {} ms or more", LoadMs),
-                                MsAgo(LoadAt.load(std::memory_order_relaxed)), LoadPercent.load(std::memory_order_relaxed));
+                                MsAgo(LoadAt.load(std::memory_order_relaxed)), LoadPercent.load(std::memory_order_relaxed),
+                                SinceRenewal ? fextl::fmt::format(" (build 160: {:.1f} s after the last renewal, within "
+                                                                  "FEX_CODE_BUFFER_RENEW_GAP={} s, so {}% at least)",
+                                                                  SinceRenewal / 1000.0, RenewGapSeconds, RenewPercent) :
+                                               fextl::string {});
       LoadsRead = LoadCount;
     }
 
@@ -342,11 +355,19 @@ namespace {
         InLoad = true;
         ++LoadCount;
         Percent = LoadCount <= EarlyLoads ? std::min(RenewEarlyPercent, RenewPercent) : RenewPercent;
+        // Build 160: soon after a renewal, only a buffer that is RenewPercent used or more is renewed again.
+        const uint64_t LastRenewal = LastRenewalAt.load(std::memory_order_relaxed);
+        uint32_t SinceRenewalMs {};
+        if (RenewGapSeconds && LastRenewal && Now > LastRenewal && Now - LastRenewal < RenewGapSeconds * Freq) {
+          SinceRenewalMs = std::max<uint32_t>(1, static_cast<uint32_t>((Now - LastRenewal) * 1000 / Freq));
+          Percent = std::max(Percent, RenewPercent);
+        }
         RenewalsAtLoad = Renewals.load(std::memory_order_relaxed);
         Ctx->RequestCodeBufferRenewal(Percent, 2 * TickMs);
         LoadAt.store(NoFrame ? LastFrame + LoadTicks : Now, std::memory_order_relaxed);
         LoadLight.store(!NoFrame, std::memory_order_relaxed);
         LoadPercent.store(Percent, std::memory_order_relaxed);
+        LoadSinceRenewalMs.store(SinceRenewalMs, std::memory_order_relaxed);
         Loads.fetch_add(1, std::memory_order_release);
       }
     }
@@ -381,16 +402,23 @@ void Init(FEXCore::Context::Context* CTX, bool StatsLog) {
   const bool JitReuse = JitReuseSwitch && JitReuseSwitch[0] == '1';
   CTX->SetTranslatedCodeReuse(JitReuse);
 
+  const char* GapSwitch = FEX::Windows::Switch("FEX_CODE_BUFFER_RENEW_GAP");
+  RenewGapSeconds = GapSwitch && GapSwitch[0] >= '0' && GapSwitch[0] <= '9' ? std::min<uint32_t>(strtoul(GapSwitch, nullptr, 10), 600) : 0;
+
   const char* LoadSwitch = FEX::Windows::Switch("FEX_CODE_BUFFER_LOAD_MS");
   LoadMs = LoadSwitch && LoadSwitch[0] >= '0' && LoadSwitch[0] <= '9' ? std::clamp<uint32_t>(strtoul(LoadSwitch, nullptr, 10), 100, 5000) : 250;
 
   if (StatsLog) {
     FEX::Windows::StatsLogNote(fextl::fmt::format(
       "code buffer: {}; {}; {}; {} (FEX_CODE_BUFFER_START=max|grow, FEX_CODE_BUFFER_RENEW=N|off, FEX_CODE_BUFFER_RENEW_EARLY=N, "
-      "FEX_CODE_BUFFER_LOAD_MS={}, FEX_CODE_REUSE=1|0, FEX_JIT_REUSE=1|0)",
+      "FEX_CODE_BUFFER_RENEW_GAP=N s|0, FEX_CODE_BUFFER_LOAD_MS={}, FEX_CODE_REUSE=1|0, FEX_JIT_REUSE=1|0)",
       StartMax ? "starts at 128 MB" : "starts at 16 MB and doubles up to 128 MB (upstream)",
-      RenewPercent ? fextl::fmt::format("renewed at a loading screen when {}% used or more ({}% at the first {})", RenewPercent,
-                                        std::min(RenewEarlyPercent, RenewPercent), EarlyLoads) :
+      RenewPercent ? fextl::fmt::format("renewed at a loading screen when {}% used or more ({}% at the first {}{})", RenewPercent,
+                                        std::min(RenewEarlyPercent, RenewPercent), EarlyLoads,
+                                        RenewGapSeconds ? fextl::fmt::format(", but {}% at a loading screen within {} s of the last "
+                                                                             "renewal (build 160)",
+                                                                             RenewPercent, RenewGapSeconds) :
+                                                          fextl::string {}) :
                      fextl::string("never renewed early"),
       Reuse ? "disk cache code that comes back the same after its blocks were dropped is mapped again from the copy already in the "
               "buffer" :
@@ -420,6 +448,7 @@ void SetMainImage(uint64_t Base, uint64_t Size) {
 
 void NoteStarted(const FEXCore::HLE::SyscallHandler::CodeBufferStart& Info) {
   if (Info.Reason == 2) {
+    LastRenewalAt.store(Counter(), std::memory_order_relaxed);
     Renewals.fetch_add(1, std::memory_order_relaxed);
   }
   if (!Logging) {

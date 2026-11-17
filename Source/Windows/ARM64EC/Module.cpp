@@ -52,11 +52,16 @@ $end_info$
 #include "Windows/Common/StatsLog.h"
 #include "Windows/Common/ThreadPlacer.h"
 #include "Windows/Common/PriorityGuard.h"
+#include "Windows/Common/ThreadTable.h"
+#include "Windows/Common/StartWatch.h"
 #include "Windows/Common/LinuxSys.h"
+#include "Windows/Common/LockBoost.h"
 #include "Windows/Common/Switches.h"
 #include "CodeBuffer.h"
 #include "FrameLatency.h"
 #include "Rumble.h"
+#include "PipeWatch.h"
+#include "WineWaitFix.h"
 #include "LoaderWatch.h"
 #include "GameFiles.h"
 #include "LoadScreen.h"
@@ -70,6 +75,7 @@ $end_info$
 #include <type_traits>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <ntstatus.h>
@@ -105,6 +111,8 @@ uint64_t WineNtContinueSyscallId;
 uint64_t WineNtAllocateVirtualMemorySyscallId;
 uint64_t WineNtProtectVirtualMemorySyscallId;
 uint64_t WineNtRaiseExceptionSyscallId;
+// Build 134: the game's own NtTerminateProcess system calls are noted before they run (see ECSyscallHandler).
+uint64_t WineNtTerminateProcessSyscallId = ~0ULL;
 
 NTSTATUS NtContinueNative(ARM64_NT_CONTEXT* NativeContext, BOOLEAN Alert);
 NTSTATUS NtAllocateVirtualMemoryNative(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG, ULONG);
@@ -198,13 +206,25 @@ public:
         Current = State.exchange(2, std::memory_order_acquire);
       }
       while (Current != 0) {
+        // Build 156 (FEX_LOCK_BOOST): an owner that holds it too long gets raised; until then a timed wait.
+        struct {
+          int64_t Sec, Nsec;
+        } Timeout {};
+        const uint64_t Wait = Boosting ? Boost.Check(BoostKind) : 0;
+        if (Wait) {
+          Timeout = {static_cast<int64_t>(Wait / 1'000'000'000), static_cast<int64_t>(Wait % 1'000'000'000)};
+        }
         FEXCore::Utils::WritePriorityMutex::KernelFutexCall(
-          &State, FEXCore::Utils::WritePriorityMutex::KFUTEX_WAIT | FEXCore::Utils::WritePriorityMutex::KFUTEX_PRIVATE_FLAG, 2, nullptr, 0);
+          &State, FEXCore::Utils::WritePriorityMutex::KFUTEX_WAIT | FEXCore::Utils::WritePriorityMutex::KFUTEX_PRIVATE_FLAG, 2,
+          Wait ? &Timeout : nullptr, 0);
         Current = State.exchange(2, std::memory_order_acquire);
       }
     }
     Owner.store(Self, std::memory_order_relaxed);
     Depth = 1;
+    if (Boosting) {
+      Boost.Acquired();
+    }
   }
 
   bool try_lock() {
@@ -222,6 +242,9 @@ public:
     }
     Owner.store(Self, std::memory_order_relaxed);
     Depth = 1;
+    if (Boosting) {
+      Boost.Acquired();
+    }
     return true;
   }
 
@@ -233,11 +256,27 @@ public:
     if (--Depth) {
       return;
     }
+    const uint64_t BoostSince = Boosting ? Boost.Releasing() : 0;
     Owner.store(0, std::memory_order_relaxed);
     if (State.exchange(0, std::memory_order_release) == 2) {
       FEXCore::Utils::WritePriorityMutex::KernelFutexCall(
         &State, FEXCore::Utils::WritePriorityMutex::KFUTEX_WAKE | FEXCore::Utils::WritePriorityMutex::KFUTEX_PRIVATE_FLAG, 1, nullptr, 0);
     }
+    if (Boosting) {
+      Boost.Released(BoostKind, BoostSince);
+    }
+  }
+
+  // Build 156: owners get raised by waiters (FEX_LOCK_BOOST), as lock kind Kind. Once, in ProcessInit, before any other
+  // thread can take it, after WritePriorityMutex::LockBoost is set.
+  void SetBoostKind(uint32_t Kind) {
+    BoostKind = Kind;
+    Boosting = FEXCore::Utils::WritePriorityMutex::KernelFutex && FEXCore::Utils::WritePriorityMutex::LockBoost && Kind;
+  }
+
+  // Build 165: the owner and since when, for the stats log's held-too-long note (kept only while Boosting).
+  const FEXCore::Utils::WritePriorityMutex::BoostSlot& GetBoostSlot() const {
+    return Boost;
   }
 
 private:
@@ -245,6 +284,9 @@ private:
   std::atomic<uint32_t> Owner {};
   uint32_t Depth {}; // only the owner touches it
   std::recursive_mutex Fallback;
+  bool Boosting {};
+  uint32_t BoostKind {};
+  FEXCore::Utils::WritePriorityMutex::BoostSlot Boost {};
 };
 
 MemoryLock ThreadCreationMutex;
@@ -364,7 +406,8 @@ void ParseWineSyscallNumbers(HMODULE NtDll) {
     } else if (strcmp(it->Name, "NtProtectVirtualMemory") == 0) {
       WineNtProtectVirtualMemorySyscallId = CurSyscallId;
     } else if (strcmp(it->Name, "NtRaiseException") == 0) {
-      WineNtRaiseExceptionSyscallId = CurSyscallId;
+      WineNtRaiseExceptionSyscallId = CurSyscallId;    } else if (strcmp(it->Name, "NtTerminateProcess") == 0) {
+      WineNtTerminateProcessSyscallId = CurSyscallId;
     }
   }
 }
@@ -430,6 +473,7 @@ bool InitSyscalls() {
     WineNtAllocateVirtualMemorySyscallId = GetNTSyscallNo(NtDll, "NtAllocateVirtualMemory");
     WineNtProtectVirtualMemorySyscallId = GetNTSyscallNo(NtDll, "NtProtectVirtualMemory");
     WineNtRaiseExceptionSyscallId = GetNTSyscallNo(NtDll, "NtRaiseException");
+    WineNtTerminateProcessSyscallId = GetNTSyscallNo(NtDll, "NtTerminateProcess");
 
     // Fail if the syscall number we found is beyond the bounds
     // of our static table. This is almost certainly not going
@@ -501,9 +545,101 @@ Entry Ring[RingSize];
 std::atomic<uint64_t> Count;
 std::atomic<bool> Written;
 
-void Note(Kind Where, uint32_t Code, uint64_t HostPc, uint64_t Fault, uint64_t RIP) {
+// Build 140: where an address is: its memory region (base, size, allocation base, state, protection, type) and the file
+// mapped there, if any.
+fextl::string DescribeAddress(uint64_t Address) {
+  MEMORY_BASIC_INFORMATION Info {};
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr) !=
+      STATUS_SUCCESS) {
+    return "(no region)";
+  }
+  auto Text = fextl::fmt::format("(region {:X}+{:X} alloc {:X} state {:X} protect {:X} type {:X}", reinterpret_cast<uint64_t>(Info.BaseAddress),
+                                 Info.RegionSize, reinterpret_cast<uint64_t>(Info.AllocationBase), Info.State, Info.Protect, Info.Type);
+  struct {
+    UNICODE_STRING Name;
+    WCHAR Buffer[300];
+  } Name {};
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryMappedFilenameInformation,
+                           &Name, sizeof(Name), nullptr) == STATUS_SUCCESS &&
+      Name.Name.Buffer) {
+    const size_t Chars = Name.Name.Length / sizeof(WCHAR);
+    size_t Start = 0;
+    for (size_t i = 0; i < Chars; ++i) {
+      if (Name.Name.Buffer[i] == L'\\') {
+        Start = i + 1;
+      }
+    }
+    Text += " file ";
+    for (size_t i = Start; i < Chars; ++i) {
+      const WCHAR C = Name.Name.Buffer[i];
+      Text += C < 128 ? static_cast<char>(C) : '?';
+    }
+  }
+  return Text + ")";
+}
+
+// Build 140: the failed D2R starts end with Wine's "Unhandled exception code c0000005" in the main thread ~1.6 s in,
+// at an address outside the game's exe, right after the protection maps a fresh copy of ntdll.dll. Exceptions passed
+// on outside the main exe (the game's own code raises hundreds on purpose; those are skipped) go to the start watch
+// file at once, with where the code and the faulting address are, the code bytes and the top of the guest stack.
+std::atomic<uint32_t> Watched;
+std::atomic<uint64_t> SkippedBreaks;
+constexpr uint32_t MaxWatched = 400;
+
+void WatchNote(Kind Where, uint32_t Code, uint64_t HostPc, uint64_t Fault, uint64_t RIP, uint64_t Sp, uint32_t Access) {
+  if (!FEX::Windows::StartWatchActive()) {
+    return;
+  }
+  const uint64_t Pc = Where == Kind::Guest ? RIP : HostPc;
+  if (Where == Kind::Guest && Pc - MainExeBase < MainExeSize) {
+    return;
+  }
+  // Build 146: D2R_loader.dll's own code runs on int3 breakpoints (hundreds a second at start-up, each also seen once more
+  // as native code); in build 140 they used up the 400 lines before the crash point. Breakpoints and single steps are
+  // only counted.
+  if (Code == EXCEPTION_BREAKPOINT || Code == EXCEPTION_SINGLE_STEP) {
+    SkippedBreaks.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  const uint32_t N = Watched.fetch_add(1, std::memory_order_relaxed);
+  if (N >= MaxWatched) {
+    return;
+  }
+  constexpr const char* Names[] = {"guest code", "native code", "JIT, unexpected", "non-emulated thread"};
+  auto Text = fextl::fmt::format("exception #{} passed on ({} breakpoints/single steps so far, not listed): code {:X} in {} tid {} at {:X} {}", N,
+                                 SkippedBreaks.load(std::memory_order_relaxed), Code, Names[static_cast<uint8_t>(Where)], GetCurrentThreadId(), Pc,
+                                 DescribeAddress(Pc));
+  if (Code == EXCEPTION_ACCESS_VIOLATION) {
+    Text += fextl::fmt::format(" | {} {:X} {}", Access == 0 ? "read" : Access == 1 ? "write" : Access == 8 ? "execute" : "access", Fault,
+                               DescribeAddress(Fault));
+  }
+  if (Where == Kind::Guest) {
+    uint8_t Bytes[16] {};
+    if (FEX::Windows::Linux::ReadOwnMemory(Pc, Bytes, sizeof(Bytes))) {
+      Text += " | code";
+      for (uint8_t B : Bytes) {
+        Text += fextl::fmt::format(" {:02X}", B);
+      }
+    }
+    uint64_t Stack[4] {};
+    if (Sp && FEX::Windows::Linux::ReadOwnMemory(Sp, Stack, sizeof(Stack))) {
+      Text += fextl::fmt::format(" | rsp {:X}: {:X} {} {:X} {:X} {:X}", Sp, Stack[0], DescribeAddress(Stack[0]), Stack[1], Stack[2], Stack[3]);
+    }
+  }
+  if (N + 1 == MaxWatched) {
+    Text += fextl::fmt::format(" (the last one noted, {} at most)", MaxWatched);
+  }
+  FEX::Windows::StartWatchNote(Text);
+}
+
+void Note(Kind Where, uint32_t Code, uint64_t HostPc, uint64_t Fault, uint64_t RIP, uint64_t Sp = 0, uint32_t Access = ~0U) {
   const uint64_t Index = Count.fetch_add(1, std::memory_order_relaxed);
   Ring[Index % RingSize] = {.Code = Code, .TID = GetCurrentThreadId(), .HostPc = HostPc, .Fault = Fault, .RIP = RIP, .Where = Where};
+  WatchNote(Where, Code, HostPc, Fault, RIP, Sp, Access);
+}
+
+uint32_t AccessKind(const EXCEPTION_RECORD& Rec) {
+  return Rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && Rec.NumberParameters >= 2 ? static_cast<uint32_t>(Rec.ExceptionInformation[0]) : ~0U;
 }
 
 uint64_t FaultAddress(const EXCEPTION_RECORD& Rec) {
@@ -739,7 +875,8 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
 
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
-  CrashRecord::Note(CrashRecord::Kind::Guest, GuestRec.ExceptionCode, Context.Pc, CrashRecord::FaultAddress(GuestRec), GuestContext.Pc);
+  CrashRecord::Note(CrashRecord::Kind::Guest, GuestRec.ExceptionCode, Context.Pc, CrashRecord::FaultAddress(GuestRec), GuestContext.Pc,
+                    GuestContext.Sp, CrashRecord::AccessKind(GuestRec));
   if (GuestContext.Pc - MainExeBase < MainExeSize) {
     auto* Frontend = GetFrontendThreadData(Thread);
     __atomic_store_n(&Frontend->GameExceptions, Frontend->GameExceptions + 1, __ATOMIC_RELAXED);
@@ -759,6 +896,236 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
 // is published, leaving it cached for good: every later run raises an execute fault for a page that is executable.
 // Decrypt-on-demand protectors (Overwatch_loader.dll) then spin forever, since their handler has nothing left to
 // unlock. Real hardware would just run the code, so when the fault is stale drop the cached code and resume at RIP.
+// Build 151: the failed D2R starts (black screen, ~1.5 s in) all crash the same way. Something builds a small code stub in
+// the game process (a private executable page) that calls kernel32 at the address kernel32 has in the process that
+// built it: its usual base (0x6FFF630000 with our Proton, + 0x62600). In a failed start Wine had loaded kernel32 and
+// kernelbase of the game process elsewhere (0x7FF5700000: the usual place was taken when they were mapped), so the call
+// lands on free memory and the game dies with "Unhandled exception c0000005". Windows keeps these DLLs at the same
+// address in every process, which such code relies on. Here a call into free memory that is inside where kernel32,
+// kernelbase or ntdll would have been continues at the same offset of where they are. FEX_SYSDLL_REDIRECT=0 turns it off.
+namespace SysDllRedirect {
+struct Dll {
+  const wchar_t* Name;
+  const wchar_t* Path;
+  uint64_t Base;      // where it is in this process
+  uint64_t Preferred; // where the other Wine programs have it
+  uint64_t Size;
+};
+Dll Dlls[] = {
+  {L"kernel32.dll", L"\\??\\C:\\windows\\system32\\kernel32.dll", 0, 0, 0},
+  {L"kernelbase.dll", L"\\??\\C:\\windows\\system32\\kernelbase.dll", 0, 0, 0},
+  {L"ntdll.dll", L"\\??\\C:\\windows\\system32\\ntdll.dll", 0, 0, 0},
+};
+std::atomic<int> State; // 0 not looked up, 1 looked up, -1 off
+
+fextl::string Narrow(const wchar_t* Name) {
+  fextl::string Out;
+  for (; *Name; ++Name) {
+    Out += static_cast<char>(*Name);
+  }
+  return Out;
+}
+std::atomic<uint32_t> Redirects;
+
+// Build 155: the "usual" place is where the other Wine programs of this container have the DLL (Wine picks builtin DLL
+// addresses itself; the image base in the file, 0x180000000, is not it). Read from /proc/<pid>/maps: the line that maps
+// the same file at offset 0. The address most of them use wins.
+fextl::string ReadAll(const char* Path) {
+  fextl::string Out;
+  const int Fd = FEX::Windows::Linux::Open(Path);
+  if (Fd < 0) {
+    return Out;
+  }
+  char Buffer[16384];
+  uint64_t Offset = 0;
+  for (;;) {
+    const int64_t N = FEX::Windows::Linux::Pread(Fd, Buffer, sizeof(Buffer), Offset);
+    if (N <= 0) {
+      break;
+    }
+    Out.append(Buffer, static_cast<size_t>(N));
+    Offset += static_cast<uint64_t>(N);
+    if (Out.size() > (8u << 20)) {
+      break;
+    }
+  }
+  FEX::Windows::Linux::Close(Fd);
+  return Out;
+}
+
+struct MapLine {
+  uint64_t Start;
+  uint64_t Offset;
+  std::string_view Path;
+};
+
+// Calls Fn for each line of a maps text.
+template<typename F>
+void ForEachMap(const fextl::string& Maps, F&& Fn) {
+  size_t Pos = 0;
+  while (Pos < Maps.size()) {
+    size_t End = Maps.find('\n', Pos);
+    if (End == fextl::string::npos) {
+      End = Maps.size();
+    }
+    const std::string_view Line(Maps.data() + Pos, End - Pos);
+    Pos = End + 1;
+    // start-end perms offset dev inode path
+    MapLine M {};
+    M.Start = strtoull(Line.data(), nullptr, 16);
+    size_t Field = 0, i = 0;
+    while (i < Line.size() && Field < 5) {
+      while (i < Line.size() && Line[i] != ' ') {
+        ++i;
+      }
+      while (i < Line.size() && Line[i] == ' ') {
+        ++i;
+      }
+      ++Field;
+      if (Field == 2) {
+        M.Offset = strtoull(Line.data() + i, nullptr, 16);
+      }
+    }
+    if (Field == 5 && i < Line.size()) {
+      M.Path = Line.substr(i);
+      Fn(M);
+    }
+  }
+}
+
+void FindUsualBases() {
+  const fextl::string Own = ReadAll("/proc/self/maps");
+  fextl::string Paths[std::size(Dlls)];
+  ForEachMap(Own, [&](const MapLine& M) {
+    for (size_t d = 0; d < std::size(Dlls); ++d) {
+      if (Dlls[d].Base && M.Start == Dlls[d].Base && Paths[d].empty()) {
+        Paths[d] = fextl::string(M.Path);
+      }
+    }
+  });
+  const uint32_t Uid = FEX::Windows::Linux::GetUid();
+  const int Self = FEX::Windows::Linux::GetPid();
+  fextl::vector<int> Pids;
+  FEX::Windows::Linux::ForEachEntry(
+    "/proc",
+    [](const char* Name, void* Arg) {
+      const int Pid = atoi(Name);
+      if (Pid > 0) {
+        static_cast<fextl::vector<int>*>(Arg)->push_back(Pid);
+      }
+    },
+    &Pids);
+  constexpr size_t MaxBases = 8;
+  uint64_t Seen[std::size(Dlls)][MaxBases] {};
+  uint32_t Votes[std::size(Dlls)][MaxBases] {};
+  uint32_t Checked = 0;
+  for (int Pid : Pids) {
+    if (Pid == Self || Checked >= 40) {
+      continue;
+    }
+    char Path[48];
+    snprintf(Path, sizeof(Path), "/proc/%d", Pid);
+    FEX::Windows::Linux::FileInfo Info {};
+    if (!FEX::Windows::Linux::Stat(Path, Info) || Info.Uid != Uid) {
+      continue;
+    }
+    snprintf(Path, sizeof(Path), "/proc/%d/maps", Pid);
+    const fextl::string Maps = ReadAll(Path);
+    if (Maps.empty()) {
+      continue;
+    }
+    ++Checked;
+    ForEachMap(Maps, [&](const MapLine& M) {
+      for (size_t d = 0; d < std::size(Dlls); ++d) {
+        if (M.Offset != 0 || Paths[d].empty() || M.Path != std::string_view(Paths[d])) {
+          continue;
+        }
+        for (size_t b = 0; b < MaxBases; ++b) {
+          if (Seen[d][b] == M.Start || !Seen[d][b]) {
+            Seen[d][b] = M.Start;
+            ++Votes[d][b];
+            break;
+          }
+        }
+      }
+    });
+  }
+  for (size_t d = 0; d < std::size(Dlls); ++d) {
+    uint32_t Best = 0;
+    for (size_t b = 0; b < MaxBases; ++b) {
+      if (Votes[d][b] > Best && Seen[d][b] != Dlls[d].Base) {
+        Best = Votes[d][b];
+        Dlls[d].Preferred = Seen[d][b];
+      }
+    }
+  }
+}
+
+void LookUp() {
+  const char* Value = FEX::Windows::Switch("FEX_SYSDLL_REDIRECT");
+  if (Value && Value[0] == '0') {
+    State.store(-1);
+    FEX::Windows::StartWatchNote("system DLL redirect: off (FEX_SYSDLL_REDIRECT=0)");
+    return;
+  }
+  for (auto& D : Dlls) {
+    D.Base = FrameLatency::FindModule(D.Name);
+  }
+  FindUsualBases();
+  fextl::string Text = "system DLL redirect: looked up at the first call into free memory (usual = where the other Wine programs have it):";
+  for (auto& D : Dlls) {
+    if (D.Base) {
+      const auto* Dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(D.Base);
+      const auto* Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(D.Base + Dos->e_lfanew);
+      D.Size = Nt->OptionalHeader.SizeOfImage;
+    }
+    Text += fextl::fmt::format(" {} at {:X} (usual {:X}, size {:X})", Narrow(D.Name), D.Base,
+                               D.Preferred, D.Size);
+  }
+  FEX::Windows::StatsLogNote(Text);
+  FEX::Windows::StartWatchNote(Text);
+  State.store(1);
+}
+
+// Where Rip would be if the DLL whose usual place holds it were there; 0 if none.
+uint64_t Target(uint64_t Rip) {
+  if (State.load() < 0) {
+    return 0;
+  }
+  MEMORY_BASIC_INFORMATION Info {};
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Rip), MemoryBasicInformation, &Info, sizeof(Info), nullptr) !=
+        STATUS_SUCCESS ||
+      Info.State != MEM_FREE) {
+    return 0;
+  }
+  if (State.load() == 0) {
+    static std::mutex Lock;
+    std::scoped_lock Guard {Lock};
+    if (State.load() == 0) {
+      LookUp();
+    }
+    if (State.load() < 0) {
+      return 0;
+    }
+  }
+  for (const auto& D : Dlls) {
+    if (D.Base && D.Preferred && D.Size && D.Base != D.Preferred && Rip - D.Preferred < D.Size) {
+      const uint64_t New = D.Base + (Rip - D.Preferred);
+      if (Redirects.fetch_add(1, std::memory_order_relaxed) < 20) {
+        const auto Text = fextl::fmt::format("system DLL redirect: call to {:X} (free memory, where {} usually is, +{:X}) continues at {:X} "
+                                             "(tid {})",
+                                             Rip, Narrow(D.Name), Rip - D.Preferred, New,
+                                             GetCurrentThreadId());
+        FEX::Windows::StatsLogNote(Text);
+        FEX::Windows::StartWatchNote(Text);
+      }
+      return New;
+    }
+  }
+  return 0;
+}
+} // namespace SysDllRedirect
+
 static bool RetryStaleNoExecFault(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT& Context) {
   auto* Thread = CPUArea.ThreadState();
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
@@ -772,11 +1139,22 @@ static bool RetryStaleNoExecFault(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT&
   }
   const uint64_t Rip = Thread->CurrentFrame->State.rip;
 
-  // Bound the retries so a disagreement between the tracker and the compiler can never become a hang.
-  static thread_local uint64_t LastRip {};
-  static thread_local uint32_t Retries {};
-  Retries = (Rip == LastRip) ? Retries + 1 : 0;
-  LastRip = Rip;
+  // Build 151: a call to where a system DLL usually is (see SysDllRedirect) continues where it is.
+  if (const uint64_t New = SysDllRedirect::Target(Rip)) {
+    Thread->CurrentFrame->State.rip = New;
+    Fault.FaultToTopAndGeneratedException = false;
+    Context.Pc = CPUArea.DispatcherLoopTopEnterECFillSRA();
+    Context.Sp = CPUArea.EmulatorStackBase();
+    Context.X11 = 0;                                        // ENTRY_FILL_SRA_SINGLE_INST_REG: normal block
+    Context.X17 = reinterpret_cast<uint64_t>(CPUArea.Area); // EC_ENTRY_CPUAREA_REG
+    return true;
+  }
+
+  // Bound the retries so a disagreement between the tracker and the compiler can never become a hang. Per thread in its
+  // FEX state (a thread_local here would land in TLS slot 0, the game's: FEX's DLLs have no TLS directory).
+  auto& Retries = Thread->NoExecRetries;
+  Retries = (Rip == Thread->NoExecRetryRip) ? Retries + 1 : 0;
+  Thread->NoExecRetryRip = Rip;
   if (Retries >= 16) {
     Retries = 0;
     return false;
@@ -849,6 +1227,29 @@ public:
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
     ProcessPendingCrossProcessEmulatorWork();
 
+    // Build 134: the failed D2R starts (black screen, D2R and then Steam gone ~1.5 s in) left no exit record: the process
+    // ended without going through RtlExitUserProcess, whose NtTerminateProcess(0) is where Wine tells FEX (ProcessTerm).
+    // The game's protection code issues system calls itself; one that ends this process is written down here first,
+    // with where it came from, before Wine runs it.
+    if (WineNtTerminateProcessSyscallId != ~0ULL &&
+        static_cast<uint32_t>(Frame->State.gregs[FEXCore::X86State::REG_RAX]) == WineNtTerminateProcessSyscallId) {
+      const uint64_t Handle = Frame->State.gregs[FEXCore::X86State::REG_R10];
+      const uint64_t Status = Frame->State.gregs[FEXCore::X86State::REG_RDX];
+      const uint64_t Rsp = Frame->State.gregs[FEXCore::X86State::REG_RSP];
+      uint64_t Return[4] {};
+      FEX::Windows::Linux::ReadOwnMemory(Rsp, Return, sizeof(Return));
+      const bool Self = Handle == ~0ULL || Handle == 0;
+      const auto Text = fextl::fmt::format("game system call NtTerminateProcess(handle {:X}{}, status {:X}) at rip {:X}, stack {:X} {:X} {:X} {:X} "
+                                           "(tid {})",
+                                           Handle, Self ? (Handle ? " = this process" : " = the other threads") : "", static_cast<uint32_t>(Status),
+                                           Frame->State.rip, Return[0], Return[1], Return[2], Return[3], GetCurrentThreadId());
+      FEX::Windows::StatsLogNote(Text);
+      FEX::Windows::StartWatchNote(Text);
+      if (Handle == ~0ULL) {
+        CrashRecord::Write(static_cast<NTSTATUS>(Status));
+      }
+    }
+
     // Manually raise an exeption with the current JIT state packed into a native context, ntdll handles this and
     // reenters the JIT (see dlls/ntdll/signal_arm64ec.c in wine).
     uint64_t FPCR, FPSR;
@@ -873,7 +1274,21 @@ public:
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
-    InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+    // Build 165: called from translated code (a self-checking block found its bytes changed) with Wine's memory
+    // callbacks still on and without the memory/SMC lock. The invalidation takes the code lock exclusively and then
+    // resets each affected thread's call-return stack with VirtualFree/VirtualAlloc; with the callbacks on, Wine calls
+    // NotifyMemoryFree for that, which takes the memory/SMC lock and then the code lock again, which this thread already
+    // holds, so it waited forever (b164 run, t=4817: the run's one self-check failure, then no frames). Turn the
+    // callbacks off as every other invalidation runs (Wine's own notifications, the fault handler), and take the
+    // memory/SMC lock first: the same order as those paths, and the thread list read below is guarded by it.
+    auto* CPUArea = GetCPUArea().Area;
+    const bool PrevCallback = CPUArea->InSyscallCallback;
+    CPUArea->InSyscallCallback = true;
+    {
+      std::scoped_lock Lock(ThreadCreationMutex);
+      InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+    }
+    CPUArea->InSyscallCallback = PrevCallback;
   }
 
   bool IsFullSMCRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
@@ -966,6 +1381,9 @@ NTSTATUS ProcessInit() {
     const char* KernelFutexSwitch = FEX::Windows::Switch("FEX_KERNEL_FUTEX");
     FEXCore::Utils::WritePriorityMutex::KernelFutex = KernelFutexSwitch && KernelFutexSwitch[0] == '1';
   }
+  // Build 142: ntdll's wait lists (every SRW lock, condition variable and WaitOnAddress) run with upstream Wine's race fix
+  // (WineWaitFix.h). Here, while this is the process's only thread and nothing waits yet.
+  WineWaitFix::Init();
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
@@ -1006,6 +1424,14 @@ NTSTATUS ProcessInit() {
   const char* PoliteSwitch = FEX::Windows::Switch("FEX_CODELOCK_POLITE");
   const uint32_t PoliteMs = PoliteSwitch ? std::min<uint32_t>(strtoul(PoliteSwitch, nullptr, 10), 5000) : 0;
   CTX->GetCodeInvalidationMutex().SetPoliteWriteWait(PoliteMs);
+  // Build 156 (FEX_LOCK_BOOST): owners of FEX's code lock and memory lock that hold them long while others wait run at the
+  // main thread's priority until they let go (LockBoost.h). Here, while no other thread can take either lock.
+  if (FEX::Windows::LockBoost::Init()) {
+    CTX->GetCodeInvalidationMutex().SetBoostKind(FEX::Windows::LockBoost::KindCodeLock);
+    ThreadCreationMutex.SetBoostKind(FEX::Windows::LockBoost::KindMemoryLock);
+    // Build 165: a lock held 1 s or more is named in the stats log.
+    FEX::Windows::LockBoost::WatchOwners(&CTX->GetCodeInvalidationMutex().GetBoostSlot(), &ThreadCreationMutex.GetBoostSlot());
+  }
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
   // FEX_SMC_HOTPAGE=<faults>: a page with that many write faults within 100 ms stops being write-protected and its code
@@ -1050,8 +1476,14 @@ NTSTATUS ProcessInit() {
     // The stall probe's "fexlock": how long taking FEX's global memory/SMC lock takes (every VirtualProtect, VirtualAlloc,
     // VirtualFree and code write by the game holds it).
     FEX::Windows::StatsLogSetLockProbe([] { std::scoped_lock Lock(ThreadCreationMutex); });
+    // Build 150: our Proton d2r4 and later note who holds Wine's memory lock (PE ntdll export __wine_d2r_vm_lock).
+    FEX::Windows::StatsLogSetVmLockNotes(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_vm_lock")));
+    // Build 154: our Proton d2r6 and later count this process's wineserver requests by type (__wine_d2r_server_calls).
+    FEX::Windows::StatsLogSetServerCalls(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_server_calls")));
+    FEX::Windows::StatsLogSetServerCallsExt(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_server_calls_ext")));
     FEX::Windows::StatsLogNote(PoliteMs ? fextl::fmt::format("codelock: writers wait up to {}ms without blocking compiles", PoliteMs) :
                                           fextl::string("codelock: writers queue at once (upstream)"));
+    FEX::Windows::StatsLogNote(FEX::Windows::LockBoost::Note());
     FEX::Windows::StatsLogNote(
       FEXCore::Utils::WritePriorityMutex::KernelFutex ?
         "locks: FEX's code lock and memory lock (fexlock) wait in the Linux kernel (futex), not through Wine's shared wait lists "
@@ -1062,11 +1494,22 @@ NTSTATUS ProcessInit() {
   } else if (IsWine && ProfileStats()) {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
+  // Build 161: our Proton d2r10's thread table (ThreadTable.h): the priority guard and the stats log read threads from it
+  // instead of asking the wineserver.
+  FEX::Windows::ThreadTable::Init(reinterpret_cast<const void*>(GetProcAddress(NtDll, "__wine_d2r_threads")));
+  if (StatsLog) {
+    FEX::Windows::StatsLogNote(FEX::Windows::ThreadTable::Note());
+  }
+  WineWaitFix::StartStats(StatsLog);
   FEX::Windows::StartThreadPlacer(AppConfigName);
+  // Build 128: who ends a start that never gets going (StartWatch.h).
+  FEX::Windows::StartStartWatch(AppConfigName);
   LoaderWatch::Init(StatsLog);
   FEX::Windows::StartPriorityGuard(AppConfigName);
   FrameLatency::Init(reinterpret_cast<uint64_t>(MainModule), StatsLog);
   Rumble::Init(StatsLog);
+  // Build 146: the main thread's pipe traffic (Steam), logging build only.
+  PipeWatch::Init(StatsLog);
   GameFiles::Init(StatsLog);
   // Build 94: loading screens that still draw frames, for the code buffer renewal and the learned lists.
   LoadScreen::Init(StatsLog, CodeBufferPolicy::WantsFrameMarks() || GameFiles::WantsFrameMarks());
@@ -1193,7 +1636,8 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 
   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
     LogMan::Msg::DFmt("Passing through exception");
-    CrashRecord::Note(CrashRecord::Kind::Native, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0);
+    CrashRecord::Note(CrashRecord::Kind::Native, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0, 0,
+                      CrashRecord::AccessKind(*Exception));
     return false;
   }
 
@@ -1221,7 +1665,8 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     return true;
   } else {
     LogMan::Msg::EFmt("Unexpected exception in JIT code on guest stack");
-    CrashRecord::Note(CrashRecord::Kind::JITUnexpected, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0);
+    CrashRecord::Note(CrashRecord::Kind::JITUnexpected, Exception->ExceptionCode, NativeContext->Pc, CrashRecord::FaultAddress(*Exception), 0, 0,
+                      CrashRecord::AccessKind(*Exception));
     return false;
   }
 }

@@ -48,7 +48,7 @@ void StatsLogWatchImage(uint64_t Base);
 void StatsLogSetMainAwayFrom(uint64_t CoreMask);
 
 // Adds the lines Provider returns (each indented and ending in a newline, or nothing) to every per-second block.
-// Provider runs on the log thread. Up to sixteen providers, in the order they were set.
+// Provider runs on the log thread. Up to 24 providers, in the order they were set.
 void StatsLogSetLineProvider(fextl::string (*Provider)());
 // The number of the last second the log sampled (1 for the first; the next one is being sampled now), 0 before the log
 // runs or without it. A line provider runs right after its second was sampled, with this number.
@@ -73,7 +73,22 @@ FEXCore::Utils::WritePriorityMutex::ContentionStats* StatsLogCodeLockStats();
 
 // Stall probe (FEX_STALLPROBE, on with FEX_STATSLOG_PROFILE=1 unless set to 0): a helper thread that every 4ms times how
 // late its own sleep wakes up (CPU starvation), a VirtualQuery (Wine's memory lock), touching a fresh page (the kernel's
-// memory map lock), Probe (FEX's global memory/SMC lock), and every 16ms a wineserver round trip. Each second's longest
+// memory map lock), Probe (FEX's global memory/SMC lock), and every 32ms a wineserver round trip. Each second's longest
 // of each goes on a "probe" line, and every "# frame" line gets the longest ones that overlapped that frame.
 void StatsLogSetLockProbe(void (*Probe)());
+
+// Wine's memory lock holder notes (build 150): Info = PE ntdll's export __wine_d2r_vm_lock (our Proton d2r4 and later,
+// struct d2r_vm_lock_info of proton-patches/11.0-1/0006), nullptr when this Wine has none. '# memory lock wait' lines then
+// name the thread that held the lock, where it took it and for how long, and '# memory lock holds' lines list the holds
+// of 4 ms or more Wine noted since the last line.
+void StatsLogSetVmLockNotes(const void* Info);
+
+// Wineserver request counts (build 154): Info = PE ntdll's export __wine_d2r_server_calls (our Proton d2r6 and later),
+// nullptr when this Wine has none. A 'server calls' line then gives every second this process's wineserver requests by
+// type (count and time from send to reply) and what Wine's anonymous event reuse did.
+void StatsLogSetServerCalls(const void* Info);
+// Build 157: Info = PE ntdll's second export __wine_d2r_server_calls_ext (our Proton d2r8 and later), nullptr when this
+// Wine has none. After StatsLogSetServerCalls. The 'server calls' line then also names each busy type's latest caller and
+// what Wine's completion port waits in the process did.
+void StatsLogSetServerCallsExt(const void* Info);
 } // namespace FEX::Windows

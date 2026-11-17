@@ -1,0 +1,150 @@
+diff --git a/libs/vkd3d/fex_timeline.c b/libs/vkd3d/fex_timeline.c
+index 71784c6..4dfb32e 100644
+--- a/libs/vkd3d/fex_timeline.c
++++ b/libs/vkd3d/fex_timeline.c
+@@ -35,6 +35,9 @@ bool vkd3d_fex_latency_resync_on;
+ bool vkd3d_fex_present_thread_on;
+ uint32_t vkd3d_fex_frame_start_max_ms = 50;
+ uint32_t vkd3d_fex_frame_start_window = 256;
++/* VKD3D fex38: frames that came late without any hold-back stay out of the long memory (VKD3D_FEX_START_HITCH_SKIP, on
++ * unless 0). */
++bool vkd3d_fex_frame_start_hitch_skip = true;
+ uint32_t vkd3d_fex_frame_start_margin_ms = 6;
+ 
+ struct fex_timeline_stat
+@@ -67,6 +70,7 @@ static struct
+     uint32_t pacing_ceiling;    /* frames whose spare times allowed more than the ceiling */
+     uint32_t pacing_memory;     /* frames the longer memory (VKD3D fex15) held back less than the last 64 frames would */
+     int64_t pacing_memory_less_ns; /* ... and by how much in all */
++    uint32_t pacing_hitch_skipped; /* frames late without a hold-back, kept out of the longer memory (VKD3D fex38) */
+     uint32_t pacing_gpu_bound;  /* frames paced as GPU-bound (VKD3D fex10) */
+     /* GPU time of frames the GPU went to straight from the frame before, by whether they had pass meter timers */
+     struct fex_timeline_stat gpu_frame[3];
+@@ -175,6 +179,8 @@ void vkd3d_fex_timeline_init(void)
+         if (frames >= 64 && frames <= 1024)
+             vkd3d_fex_frame_start_window = frames;
+     }
++    if (vkd3d_get_env_var("VKD3D_FEX_START_HITCH_SKIP", env, sizeof(env)))
++        vkd3d_fex_frame_start_hitch_skip = strcmp(env, "0") != 0;
+     /* Smallest margin outside GPU-bound pacing in ms (VKD3D fex18: 6 unless set; 1-20 taken, 3 = fex9 to fex17). */
+     if (vkd3d_get_env_var("VKD3D_FEX_START_MARGIN_MS", env, sizeof(env)))
+     {
+@@ -392,6 +398,15 @@ void vkd3d_fex_timeline_pacing(uint64_t delay_ns, uint64_t margin_ns, int64_t sp
+     spinlock_release(&fex_timeline.lock);
+ }
+ 
++void vkd3d_fex_timeline_pacing_hitch_skipped(void)
++{
++    if (!vkd3d_fex_timeline_on)
++        return;
++    spinlock_acquire(&fex_timeline.lock);
++    fex_timeline.pacing_hitch_skipped++;
++    spinlock_release(&fex_timeline.lock);
++}
++
+ void vkd3d_fex_timeline_vkqueue_lock(uint64_t wait_ns, uint64_t held_ns)
+ {
+     spinlock_acquire(&fex_timeline.lock);
+@@ -465,7 +480,7 @@ static void fex_timeline_publish(double seconds)
+     bool resync_stopped;
+     uint64_t pacing_delay_ns, pacing_margin_ns, cap_step_ns, cap_guard_ns;
+     int64_t pacing_spare_min_ns, pacing_aim_ns;
+-    uint32_t pacing_ceiling, pacing_gpu_bound, pacing_memory;
++    uint32_t pacing_ceiling, pacing_gpu_bound, pacing_memory, pacing_hitch_skipped;
+     int64_t pacing_memory_less_ns;
+     struct fex_timeline_stat gpu_frame[3];
+     bool cap_active, cap_from_fex;
+@@ -509,6 +524,8 @@ static void fex_timeline_publish(double seconds)
+     fex_timeline.pacing_gpu_bound = 0;
+     pacing_memory = fex_timeline.pacing_memory;
+     fex_timeline.pacing_memory = 0;
++    pacing_hitch_skipped = fex_timeline.pacing_hitch_skipped;
++    fex_timeline.pacing_hitch_skipped = 0;
+     pacing_memory_less_ns = fex_timeline.pacing_memory_less_ns;
+     fex_timeline.pacing_memory_less_ns = 0;
+     memcpy(gpu_frame, fex_timeline.gpu_frame, sizeof(gpu_frame));
+@@ -568,12 +585,14 @@ static void fex_timeline_publish(double seconds)
+                 "  frame start n=%u | held back now %.1f ms (margin %.0f ms) | spare min %.1f ms | late %u (%u from the hold-back)"
+                 " | spare from a busy GPU %u | skipped (GPU finish before not seen) %u"
+                 " | spare times allow %.1f ms (ceiling %u ms, more than that %u) | paced as GPU-bound %u"
+-                " | memory %u frames: held back less than the last 64 frames alone allow in %u, by %.1f ms avg\n",
++                " | memory %u frames: held back less than the last 64 frames alone allow in %u, by %.1f ms avg"
++                " | late without a hold-back, left out of that memory %u (%s)\n",
+                 pacing_frames, pacing_delay_ns / 1e6, pacing_margin_ns / 1e6, pacing_frames ? pacing_spare_min_ns / 1e6 : 0.0,
+                 pacing_late, pacing_caused, pacing_busy, pacing_unseen, pacing_aim_ns / 1e6, vkd3d_fex_frame_start_max_ms,
+                 pacing_ceiling,
+                 pacing_gpu_bound, vkd3d_fex_frame_start_window, pacing_memory,
+-                pacing_memory ? pacing_memory_less_ns / 1e6 / pacing_memory : 0.0);
++                pacing_memory ? pacing_memory_less_ns / 1e6 / pacing_memory : 0.0,
++                pacing_hitch_skipped, vkd3d_fex_frame_start_hitch_skip ? "VKD3D fex38" : "off");
+     if (gpu_frame[0].count || gpu_frame[1].count || gpu_frame[2].count)
+     {
+         len = vkd3d_fex_report_append(text, sizeof(text), len,
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 0c2a692..009b318 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -2342,7 +2342,7 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+ {
+     uint64_t target_interval_ns = chain->frame_rate_limit.target_interval_ns;
+     struct vkd3d_queue_family_info *const *families = chain->queue->device->queue_families;
+-    char text[1600], pacing[448];
++    char text[1700], pacing[560];
+ 
+     if (!vkd3d_fex_timeline_on)
+         return;
+@@ -2351,10 +2351,12 @@ static void fex_timeline_note_swapchain(struct dxgi_vk_swap_chain *chain, const
+         snprintf(pacing, sizeof(pacing), "%s", vkd3d_fex_frame_start_on ? "off (no game latency handle)" : "off");
+     else if (chain->fex_done.enable)
+         snprintf(pacing, sizeof(pacing), "on (up to %u ms: VKD3D fex14, spare times of the last %u frames outside GPU-bound"
+-                " pacing: VKD3D fex15, a busy GPU counts as spare time, GPU finish seen as it happens, margin 1 ms smaller"
++                " pacing: VKD3D fex15, %s, a busy GPU counts as spare time, GPU finish seen as it happens, margin 1 ms smaller"
+                 " per 60 frames without a late one down to %u ms outside GPU-bound pacing: VKD3D fex18, GPU-bound pacing"
+                 " when 48 of the last 64 frames had a busy GPU: VKD3D fex10)", vkd3d_fex_frame_start_max_ms,
+-                vkd3d_fex_frame_start_window, vkd3d_fex_frame_start_margin_ms);
++                vkd3d_fex_frame_start_window, vkd3d_fex_frame_start_hitch_skip ?
++                "frames late without a hold-back left out of them: VKD3D fex38" : "frames late without a hold-back kept in them",
++                vkd3d_fex_frame_start_margin_ms);
+     else
+         snprintf(pacing, sizeof(pacing), "on (up to %u ms: VKD3D fex14, spare times of the last %u frames: VKD3D fex15,"
+                 " a busy GPU counts as spare time: VKD3D fex6)", vkd3d_fex_frame_start_max_ms,
+@@ -4554,10 +4556,22 @@ static void dxgi_vk_swap_chain_fex_start_frame_done(struct dxgi_vk_swap_chain *c
+         chain->fex_start.spare_pos = (chain->fex_start.spare_pos + 1) % ARRAY_SIZE(chain->fex_start.spare_ns);
+         if (chain->fex_start.spare_count < ARRAY_SIZE(chain->fex_start.spare_ns))
+             chain->fex_start.spare_count++;
+-        chain->fex_start.long_spare_ns[chain->fex_start.long_pos] = natural;
+-        chain->fex_start.long_pos = (chain->fex_start.long_pos + 1) % ARRAY_SIZE(chain->fex_start.long_spare_ns);
+-        if (chain->fex_start.long_count < ARRAY_SIZE(chain->fex_start.long_spare_ns))
+-            chain->fex_start.long_count++;
++        /* VKD3D fex38: a frame that would have come late with no hold-back at all (a hitch: a loading screen, an area
++         * change, the game streaming in a new area) says nothing about how much hold-back is safe; holding back less
++         * would not have saved it. Up to fex37 it still went into the longer memory and kept the hold-back at 0 for the
++         * next 256 frames (~8.5 s), and every later hitch started that again: in the FEX build 131 log the lag stayed
++         * ~57 ms instead of ~45 for 17-25 s after loads (spare min -39, -11, -13 ms at t=36, 37, 49, held back 0.0
++         * until t=46 and again t=49-57). It still counts among the last 64 frames (~2 s), so the hold-back stays down
++         * right after it. */
++        if (vkd3d_fex_frame_start_hitch_skip && natural < -FEX_START_LATE_NS)
++            vkd3d_fex_timeline_pacing_hitch_skipped();
++        else
++        {
++            chain->fex_start.long_spare_ns[chain->fex_start.long_pos] = natural;
++            chain->fex_start.long_pos = (chain->fex_start.long_pos + 1) % ARRAY_SIZE(chain->fex_start.long_spare_ns);
++            if (chain->fex_start.long_count < ARRAY_SIZE(chain->fex_start.long_spare_ns))
++                chain->fex_start.long_count++;
++        }
+ 
+         busy_frames = 0;
+         for (i = 0; i < chain->fex_start.spare_count; i++)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 7ddb4e7..d4b919b 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3214,6 +3214,8 @@ extern uint32_t vkd3d_fex_frame_start_max_ms;
+ /* Frames whose spare times frame start pacing remembers outside GPU-bound pacing (VKD3D_FEX_START_WINDOW, 64-1024;
+  * VKD3D fex15: 256 unless set, was 64). */
+ extern uint32_t vkd3d_fex_frame_start_window;
++extern bool vkd3d_fex_frame_start_hitch_skip;
++void vkd3d_fex_timeline_pacing_hitch_skipped(void);
+ /* Smallest margin of frame start pacing outside GPU-bound pacing in ms (VKD3D_FEX_START_MARGIN_MS, 1-20; VKD3D fex18: 6
+  * unless set, was 3). */
+ extern uint32_t vkd3d_fex_frame_start_margin_ms;

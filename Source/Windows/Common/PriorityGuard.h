@@ -122,9 +122,11 @@ namespace FEX::Windows {
 //                      and the user's CPU use that no /proc process accounts for was ~0.14 of a core.
 //   FEX_MAINCORE_OTHERS=process  only this process's threads Wine doesn't list
 //   FEX_MAINCORE_OTHERS=off  other programs may run on the main thread's core (build 75 and earlier)
-//   FEX_HELPER_CORES=little  the stats log thread (a 2ms sampler), this guard, the rumble sender (FEXRumble) and the
-//                      file cache dropper (FEXFileCache) on the slowest cores, off the game's (the D2R default), when the
-//                      process may use them. The stall probe, disk cache and unpack cache threads stay on the game's cores.
+//   FEX_HELPER_CORES=little  the stats log thread (a 2ms sampler), this guard, the rumble sender (FEXRumble), the file
+//                      cache dropper (FEXFileCache) and the escape watcher (FEXMainWatch) on the slowest cores, off the
+//                      game's (the D2R default). Where Wine refuses them (GameNative's "cores 3-7" process mask) they are
+//                      moved at the Linux level, found by their Linux names (build 156). The stall probe, disk cache and
+//                      unpack cache threads stay on the game's cores.
 //
 // Wineserver. Every file, pipe, controller and window message request of every Wine process goes through the one
 // wineserver thread; under load the build 48 probe saw single round trips take up to 27 ms.
