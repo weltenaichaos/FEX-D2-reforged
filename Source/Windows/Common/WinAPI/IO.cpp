@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <cerrno>
 #include <winternl.h>
 #include <windows.h>
@@ -369,11 +370,60 @@ DLLEXPORT_FUNC(WINBOOL, SetFileTime,
 }
 
 DLLEXPORT_FUNC(WINBOOL, MoveFileExA, (LPCSTR lpExistingFileName, LPCSTR lpNewFileName, DWORD dwFlags)) {
-  UNIMPLEMENTED();
+  ScopedUnicodeString From {lpExistingFileName};
+  ScopedUnicodeString To {lpNewFileName};
+  return MoveFileExW(From->Buffer, To->Buffer, dwFlags);
 }
 
+// Build 167: a rename of a file within its volume (the disk cache sets a full cache file aside). Only
+// MOVEFILE_REPLACE_EXISTING is supported; the file may be open elsewhere with FILE_SHARE_DELETE.
 DLLEXPORT_FUNC(WINBOOL, MoveFileExW, (LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags)) {
-  UNIMPLEMENTED();
+  UNICODE_STRING FromW, ToW;
+  RtlInitUnicodeString(&FromW, lpExistingFileName);
+  RtlInitUnicodeString(&ToW, lpNewFileName);
+
+  ScopedUnicodeString FromNT, ToNT;
+  if (!RtlDosPathNameToNtPathName_U(FromW.Buffer, &*FromNT, nullptr, nullptr) ||
+      !RtlDosPathNameToNtPathName_U(ToW.Buffer, &*ToNT, nullptr, nullptr)) {
+    SetLastError(ERROR_PATH_NOT_FOUND);
+    return false;
+  }
+
+  // FILE_RENAME_INFORMATION, spelled out: not every header set has it.
+  struct RenameInfo {
+    BOOLEAN ReplaceIfExists;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+  };
+  alignas(8) uint8_t Buffer[sizeof(RenameInfo) + 2048 * sizeof(WCHAR)];
+  if (ToNT->Length > 2048 * sizeof(WCHAR)) {
+    SetLastError(ERROR_FILENAME_EXCED_RANGE);
+    return false;
+  }
+
+  OBJECT_ATTRIBUTES ObjAttributes;
+  InitializeObjectAttributes(&ObjAttributes, &*FromNT, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+
+  HANDLE Handle;
+  IO_STATUS_BLOCK IOSB;
+  NTSTATUS Status = NtCreateFile(&Handle, SYNCHRONIZE | DELETE, &ObjAttributes, &IOSB, nullptr, 0,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+                                 FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
+  if (!WinAPIReturn(Status)) {
+    return false;
+  }
+
+  auto* Info = reinterpret_cast<RenameInfo*>(Buffer);
+  memset(Buffer, 0, sizeof(Buffer));
+  Info->ReplaceIfExists = (dwFlags & MOVEFILE_REPLACE_EXISTING) != 0;
+  Info->RootDirectory = nullptr;
+  Info->FileNameLength = ToNT->Length;
+  memcpy(Info->FileName, ToNT->Buffer, ToNT->Length);
+  constexpr auto RenameClass = static_cast<FILE_INFORMATION_CLASS>(10); // FileRenameInformation
+  Status = NtSetInformationFile(Handle, &IOSB, Info, sizeof(RenameInfo) + ToNT->Length, RenameClass);
+  NtClose(Handle);
+  return WinAPIReturn(Status);
 }
 
 DLLEXPORT_FUNC(WINBOOL, GetDiskFreeSpaceExA,

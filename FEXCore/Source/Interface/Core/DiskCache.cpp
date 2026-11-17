@@ -428,12 +428,12 @@ namespace DiskCache {
       return;
     }
 #ifdef _WIN32
-    // No CRT remove() in the ARM64EC build; Win32 calls, which also give the error code.
+    // No CRT remove()/rename() in the ARM64EC build; FEX's own DeleteFileA/MoveFileExA (Common/WinAPI/IO.cpp).
     auto Remove = [](const fextl::string& Path) {
       DeleteFileA(Path.c_str());
     };
     auto Move = [](const fextl::string& From, const fextl::string& To) -> int {
-      return MoveFileA(From.c_str(), To.c_str()) ? 0 : static_cast<int>(GetLastError() ? GetLastError() : 1);
+      return MoveFileExA(From.c_str(), To.c_str(), 0) ? 0 : static_cast<int>(GetLastError() ? GetLastError() : 1);
     };
 #else
     auto Remove = [](const fextl::string& Path) {
