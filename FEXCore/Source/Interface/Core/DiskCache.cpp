@@ -19,7 +19,9 @@
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXHeaderUtils/Filesystem.h>
 
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <atomic>
 
@@ -400,6 +402,43 @@ namespace DiskCache {
       &SimpleCapture);
   }
 
+  // Build 167: a cache file at its size limit takes no new code, so code the game runs for the first time after the file
+  // filled up is compiled again in every session. That happened with D2R: the file reached 1 GB on 2026-11-04 (FEX
+  // build 162), and after the 2026-11 game update none of the new game's code could be kept (the b166 run compiled 65
+  // ms a second in play, 4.6x the old game's). A file within 64 MB of the limit is set aside at start (as _old, which
+  // replaces an older _old) and a new one begins. The files are opened with FILE_SHARE_DELETE, so this works while
+  // another process has them open; if it fails, the full file stays in use as before.
+  static void RenewIfFull(const fextl::string& Base) {
+    FEX_CONFIG_OPT(MaxFileSize, DISKCACHEMAXFILESIZE);
+    constexpr uint64_t Margin = 64ULL << 20;
+    const fextl::string Foz = Base + ".foz", Idx = Base + "_idx.foz";
+    const fextl::string OldFoz = Base + "_old.foz", OldIdx = Base + "_old_idx.foz";
+    ssize_t Size;
+    {
+      File::File F(Foz.c_str(), File::FileModes::READ, false);
+      if (!F.IsValid()) {
+        return;
+      }
+      Size = F.Size();
+    }
+    if (Size <= 0 || static_cast<uint64_t>(Size) + Margin < static_cast<uint64_t>(MaxFileSize)) {
+      return;
+    }
+    std::remove(OldFoz.c_str());
+    std::remove(OldIdx.c_str());
+    // The index first: a cache file without its index is never read, an index without its file would be.
+    if (std::rename(Idx.c_str(), OldIdx.c_str()) != 0) {
+      SHMStats::DiskCacheWriter.RenewError.store(errno ? errno : -1, std::memory_order_relaxed);
+      return;
+    }
+    if (std::rename(Foz.c_str(), OldFoz.c_str()) != 0) {
+      SHMStats::DiskCacheWriter.RenewError.store(errno ? errno : -1, std::memory_order_relaxed);
+      std::rename(OldIdx.c_str(), Idx.c_str());
+      return;
+    }
+    SHMStats::DiskCacheWriter.RenewedFrom.store(Size, std::memory_order_relaxed);
+  }
+
   void DiskCache::Init(FEXCore::Context::ContextImpl* CTX) {
     this->CTX = CTX;
 
@@ -446,6 +485,7 @@ namespace DiskCache {
     }
 
     const auto RWDBBasePath = fextl::fmt::format("{}RWCacheDB_{:016x}", BasePath, ProcessBucketHash);
+    RenewIfFull(RWDBBasePath);
     OpenCacheDB(RWDBBasePath, false);
 
     if (RWCacheDB && !FoundMetadata) {

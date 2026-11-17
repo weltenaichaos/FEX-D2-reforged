@@ -148,6 +148,8 @@ struct DiskCacheWriterStats {
   std::atomic<uint64_t> Written;
   std::atomic<uint64_t> Failed;     // file write or lock failed, the entry only lives in memory this session
   std::atomic<uint64_t> MemoryOnly; // cache file full
+  std::atomic<uint64_t> RenewedFrom; // build 167: size of the full cache file set aside at start (0 = not renewed)
+  std::atomic<int32_t> RenewError;   // build 167: errno of a failed set-aside (0 = none tried or it worked)
 };
 extern DiskCacheWriterStats DiskCacheWriter;
 

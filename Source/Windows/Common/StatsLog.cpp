@@ -5126,6 +5126,19 @@ namespace {
         const uint64_t Written = Writer.Written.load(std::memory_order_relaxed);
         const uint64_t Failed = Writer.Failed.load(std::memory_order_relaxed);
         const uint64_t MemoryOnly = Writer.MemoryOnly.load(std::memory_order_relaxed);
+        static bool RenewNoted;
+        if (!RenewNoted) {
+          RenewNoted = true;
+          const uint64_t Renewed = Writer.RenewedFrom.load(std::memory_order_relaxed);
+          const int32_t Error = Writer.RenewError.load(std::memory_order_relaxed);
+          StatsLogNote(Renewed ? fextl::fmt::format("diskcache: the cache file was full ({} MB), set aside as _old and started anew (build 167): "
+                                                    "code compiled from now on is kept again",
+                                                    Renewed >> 20) :
+                       Error  ? fextl::fmt::format("diskcache: the cache file is full but could not be set aside (error {}), new code stays "
+                                                    "memory only (build 167)",
+                                                    Error) :
+                                "diskcache: cache file below its size limit, kept (build 167 sets a full one aside at start)");
+        }
         fextl::string Outcome;
         auto Add = [&Outcome](const char* Name, uint64_t Value) {
           if (Value) {
