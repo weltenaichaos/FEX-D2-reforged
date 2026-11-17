@@ -622,7 +622,7 @@ namespace {
     // there (moved by as much as the getter moved).
     constexpr uint32_t KnownGetterRVA = 0x7B7940;
     constexpr uint32_t KnownCallSiteRVA = 0x876948;
-    constexpr uint64_t QueueOffset = 0x1A0; // job system -> queue the wait loop helps with
+    uint64_t QueueOffset = 0x1A0;           // job system -> queue the wait loop helps with (read from the loop, build 166)
     constexpr uint64_t ListOffset = 0x38;   // queue -> list head of priority 2 jobs (empty when it points to itself)
 
     // The whole getter, the wait loop from the getter call to its loop branch, and TryRunJob up to where it reads the
@@ -645,12 +645,6 @@ namespace {
     // Each guard reference: the displacement's offset and the end of its instruction.
     constexpr std::pair<uint8_t, uint8_t> GuardRefs[] = {{0x1a, 0x1e}, {0x27, 0x2b}, {0x32, 0x37}, {0xa5, 0xa9}};
     constexpr std::pair<uint8_t, uint8_t> ObjectRef {0xb1, 0xb5};
-    constexpr uint8_t CallSiteCode[] = {
-      0xe8, 0x03, 0x11, 0xf4, 0xff, 0x41, 0xb1, 0xff, 0x45, 0x8b, 0xc4, 0x48, 0x8b, 0x90, 0xa0, 0x01, 0x00, 0x00, 0xe8, 0x41, 0x12,
-      0xf4, 0xff, 0x8b, 0x97, 0xe8, 0x60, 0x00, 0x00, 0x48, 0x8b, 0x8f, 0xc0, 0x5e, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x48,
-      0xd3, 0xe0, 0xff, 0xc8, 0x3b, 0xd0, 0x75, 0xce,
-    };
-    constexpr uint8_t CallSiteRel32[] = {0x01, 0x13}; // call getter; call TryRunJob (which ends at 0x17)
     constexpr uint8_t TryRunCode[] = {
       0x48, 0x83, 0xec, 0x28, 0x48, 0x8d, 0x42, 0x10, 0x4c, 0x8b, 0xda, 0x48, 0x87, 0x42, 0x10, 0x48, 0x85, 0xc0, 0x74, 0x18, 0xf3,
       0x90, 0x48, 0x8b, 0x42, 0x10, 0x48, 0x85, 0xc0, 0x75, 0xf5, 0x48, 0x8d, 0x42, 0x10, 0x48, 0x87, 0x42, 0x10, 0x48, 0x85, 0xc0,
@@ -659,7 +653,6 @@ namespace {
     };
 
     constexpr Pattern Getter {GetterCode, sizeof(GetterCode), GetterRel32, sizeof(GetterRel32)};
-    constexpr Pattern CallSite {CallSiteCode, sizeof(CallSiteCode), CallSiteRel32, sizeof(CallSiteRel32)};
     // Searches for the wait loop when its page couldn't be read, at most every 2 seconds.
     constexpr uint32_t MaxCallSiteScans = 10;
 
@@ -678,22 +671,50 @@ namespace {
     void (*Invalidate)(uint64_t Address, uint64_t Size) {};
   } // namespace JobWait
 
-  // D2R's main thread starts every frame in one function (0x1408764C0 in the 2026-10 version) that first reads the clock:
-  // lea rcx, [rsp+0x20]; call [QueryPerformanceCounter]. Where that call returns to marks a frame start, so the stats
-  // log can time every frame without touching the game's code (Module.S, ExitFunctionEC). FEX_FRAMETIMES=0 turns it off.
+  // D2R's main thread starts every frame in one function (0x1408764C0 in the 2026-10 version, 0x14087F940 in the
+  // 2026-11 one) that first reads the clock: lea rcx, [rsp+N]; call [QueryPerformanceCounter], then reads the counter
+  // frequency into rbx's partner and splits the count into seconds and nanoseconds (two imuls by 1,000,000,000). Where
+  // the clock call returns to marks a frame start, so the stats log can time every frame without touching the game's
+  // code (Module.S, ExitFunctionEC). FEX_FRAMETIMES=0 turns it off.
+  //
+  // Build 166: the 2026-11 game update gave the function a stack cookie and other registers, and build 165's exact
+  // byte pattern stopped matching: no frame times, and with them no loading screens, no 'frames coming' for the unpack
+  // cache (10 GB read ahead in 9 minutes of play) and no code buffer renewal at loads. The function is now found by its
+  // shape: push rbx (40 53) at the start, then within 0x40 bytes
+  //   48 8d 4c 24 d8   lea rcx, [rsp+d8]
+  //   ff 15 r32        call [QueryPerformanceCounter]
+  //   48 8b 5c 24 d8   mov rbx, [rsp+d8]      (the same d8)
+  //   ff 15 r32        call [frequency]
+  //   33 d2            xor edx, edx
+  // and within 0x50 bytes after that two imuls by 1,000,000,000 (00 ca 9a 3b).
   namespace FrameClock {
-    constexpr uint8_t Code[] = {
-      0x40, 0x53, 0x55, 0x56, 0x57, 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xf9, 0x4c, 0x89, 0xa4, 0x24, 0xb8,
-      0x00, 0x00, 0x00, 0x48, 0x8d, 0x4c, 0x24, 0x20, 0xff, 0x15, 0xbe, 0x93, 0xd5, 0x00, 0x48, 0x8b, 0x5c, 0x24, 0x20, 0xff,
-      0x15, 0xe3, 0x73, 0x49, 0x01, 0x33, 0xd2, 0x48, 0x8d, 0x2d, 0xd2, 0x5f, 0x48, 0x01, 0x4c, 0x8b, 0xc0, 0x33, 0xf6, 0x48,
-      0x8b, 0xc3, 0x49, 0xf7, 0xf0, 0x44, 0x8d, 0x66, 0x02, 0x48, 0x8b, 0xc8, 0x48, 0x69, 0xc2, 0x00, 0xca, 0x9a, 0x3b, 0x33,
-      0xd2, 0x49, 0xf7, 0xf0, 0x48, 0x8b, 0xd8, 0x48, 0x69, 0xc1, 0x00, 0xca, 0x9a, 0x3b, 0x48, 0x03, 0xd8,
-    };
-    // call [QueryPerformanceCounter]; call [the counter frequency]; lea rbp, [...]
-    constexpr uint8_t Rel32[] = {0x1e, 0x29, 0x32};
-    constexpr Pattern Function {Code, sizeof(Code), Rel32, sizeof(Rel32)};
-    constexpr uint64_t ClockCallReturn = 0x22;
-    constexpr uint32_t KnownRVA = 0x8764C0;
+    constexpr uint32_t KnownRVA = 0x87F940;
+    constexpr size_t ScanSize = 0xa0; // bytes of the block looked at
+
+    // The clock call's return offset in a block that has the shape, 0 if it hasn't.
+    size_t ClockCallReturn(const uint8_t* Code, size_t Size) {
+      if (Size < ScanSize || Code[0] != 0x40 || Code[1] != 0x53) {
+        return 0;
+      }
+      for (size_t i = 2; i < 0x40; ++i) {
+        const uint8_t* C = Code + i;
+        if (C[0] != 0x48 || C[1] != 0x8d || C[2] != 0x4c || C[3] != 0x24 || C[5] != 0xff || C[6] != 0x15) {
+          continue;
+        }
+        if (C[11] != 0x48 || C[12] != 0x8b || C[13] != 0x5c || C[14] != 0x24 || C[15] != C[4] || C[16] != 0xff || C[17] != 0x15 ||
+            C[22] != 0x33 || C[23] != 0xd2) {
+          continue;
+        }
+        int Billions = 0;
+        for (size_t j = i + 24; j + 4 <= std::min<size_t>(Size, i + 24 + 0x50); ++j) {
+          Billions += Code[j] == 0x00 && Code[j + 1] == 0xca && Code[j + 2] == 0x9a && Code[j + 3] == 0x3b;
+        }
+        if (Billions >= 2) {
+          return i + 11;
+        }
+      }
+      return 0;
+    }
 
     bool Enabled {};
     std::atomic<uint64_t> Address {};
@@ -708,34 +729,57 @@ namespace {
     return Ticks;
   }
 
-  // Finds the wait loop's call of the getter: the call, then the constant part of the loop, then a call of code that is
-  // TryRunJob. Its return address tells the wait loop's calls apart from everyone else's.
+  // Finds the wait loop's call of the getter: a call of the getter, within 0x20 bytes a load of the queue from the
+  // returned object (mov rdx, [rax+disp]) and a call of code that is TryRunJob, then within 0x30 bytes a jnz back to the
+  // getter call. Its return address tells the wait loop's calls apart from everyone else's. Build 166: the loop's own
+  // registers and offsets changed in the 2026-11 game update, so only these parts are checked, and the queue offset
+  // is read from the load.
   ScanResult FindWaitLoop(uint64_t Getter) {
     const uint64_t Expected = ImageBase + JobWait::KnownCallSiteRVA + (Getter - (ImageBase + JobWait::KnownGetterRVA));
-    constexpr size_t TailOffset = 5, TailSize = 14; // 41 b1 ff ... e8: everything between the two calls
-    return ScanNear(
-      Expected, FEXNativeTextBegin, FEXNativeTextEnd, sizeof(JobWait::CallSiteCode), [&](uint64_t At, const uint8_t* Data, size_t Size) {
-        for (size_t i = 0; i + sizeof(JobWait::CallSiteCode) <= Size; ++i) {
-          if (Data[i] != 0xe8 || memcmp(Data + i + TailOffset, JobWait::CallSiteCode + TailOffset, TailSize) != 0) {
-            continue;
-          }
-          const uint64_t Call = At + i;
-          if (Call + 5 + Rel32At(Data, i + 1) != Getter || !Matches(JobWait::CallSite, Data + i, sizeof(JobWait::CallSiteCode))) {
-            continue;
-          }
-          const uint64_t TryRun = Call + 0x17 + Rel32At(Data, i + 0x13);
-          uint8_t Code[sizeof(JobWait::TryRunCode)];
-          if (!Read(TryRun, Code, sizeof(Code)) || memcmp(Code, JobWait::TryRunCode, sizeof(Code)) != 0) {
-            continue;
-          }
-          JobWaitReturn = Call + 5;
-          FEX::Windows::StatsLogNote(fextl::fmt::format("native jobwait: frame wait loop calls the getter at {:X} (last known at {:X}), "
-                                                        "TryRunJob at {:X}",
-                                                        Call, ImageBase + JobWait::KnownCallSiteRVA, TryRun));
-          return true;
+    constexpr size_t Window = 0x60;
+    return ScanNear(Expected, FEXNativeTextBegin, FEXNativeTextEnd, Window, [&](uint64_t At, const uint8_t* Data, size_t Size) {
+      for (size_t i = 0; i + Window <= Size; ++i) {
+        if (Data[i] != 0xe8 || At + i + 5 + Rel32At(Data, i + 1) != Getter) {
+          continue;
         }
-        return false;
-      });
+        const uint64_t Call = At + i;
+        uint64_t QueueOffset = 0;
+        size_t TryCall = 0;
+        for (size_t j = i + 5; j < i + 0x20; ++j) {
+          if (Data[j] == 0x48 && Data[j + 1] == 0x8b && Data[j + 2] == 0x90) { // mov rdx, [rax+disp32]
+            QueueOffset = static_cast<uint32_t>(Rel32At(Data, j + 3));
+          } else if (Data[j] == 0x48 && Data[j + 1] == 0x8b && Data[j + 2] == 0x50) { // mov rdx, [rax+disp8]
+            QueueOffset = Data[j + 3];
+          } else if (Data[j] == 0xe8 && QueueOffset) {
+            TryCall = j;
+            break;
+          }
+        }
+        if (!TryCall || QueueOffset >= 0x10000 || (QueueOffset & 7)) {
+          continue;
+        }
+        const uint64_t TryRun = At + TryCall + 5 + Rel32At(Data, TryCall + 1);
+        bool Loops = false;
+        for (size_t k = TryCall + 5; k < TryCall + 5 + 0x30 && !Loops; ++k) {
+          Loops = (Data[k] == 0x75 && At + k + 2 + static_cast<int8_t>(Data[k + 1]) == Call) ||
+                  (Data[k] == 0x0f && Data[k + 1] == 0x85 && At + k + 6 + Rel32At(Data, k + 2) == Call);
+        }
+        if (!Loops) {
+          continue;
+        }
+        uint8_t Code[sizeof(JobWait::TryRunCode)];
+        if (!Read(TryRun, Code, sizeof(Code)) || memcmp(Code, JobWait::TryRunCode, sizeof(Code)) != 0) {
+          continue;
+        }
+        JobWait::QueueOffset = QueueOffset;
+        JobWaitReturn = Call + 5;
+        FEX::Windows::StatsLogNote(fextl::fmt::format("native jobwait: frame wait loop calls the getter at {:X} (last known at {:X}), "
+                                                      "TryRunJob at {:X}, queue at +{:X}",
+                                                      Call, ImageBase + JobWait::KnownCallSiteRVA, TryRun, QueueOffset));
+        return true;
+      }
+      return false;
+    });
   }
 
   CheckResult CheckJobWait() {
@@ -1160,12 +1204,18 @@ uintptr_t LookupByCode(uint64_t GuestRIP, uint64_t FaultPage) {
   if (JobWait::Enabled && !JobWait::GetterAddress.load(std::memory_order_acquire) && Found(JobWait::Getter)) {
     return FoundGetter(GuestRIP, Code);
   }
-  if (FrameClock::Enabled && !FrameClock::Address.load(std::memory_order_acquire) && Found(FrameClock::Function)) {
+  if (FrameClock::Enabled && !FrameClock::Address.load(std::memory_order_acquire) && Code[0] == 0x40 && Code[1] == 0x53) {
+    if (Have < FrameClock::ScanSize) {
+      if (!CopyCode(GuestRIP, Code, FrameClock::ScanSize, FaultPage)) {
+        return 0;
+      }
+      Have = FrameClock::ScanSize;
+    }
+    const size_t Return = FrameClock::ClockCallReturn(Code, Have);
     uint64_t Expected = 0;
-    if (FrameClock::Address.compare_exchange_strong(Expected, GuestRIP, std::memory_order_acq_rel)) {
-      __atomic_store_n(&FEXFrameMarkReturn, GuestRIP + FrameClock::ClockCallReturn, __ATOMIC_RELEASE);
-      FEX::Windows::StatsLogNote(
-        fextl::fmt::format("frames: timing every frame from the clock read at {:X}", GuestRIP + FrameClock::ClockCallReturn - 6));
+    if (Return && FrameClock::Address.compare_exchange_strong(Expected, GuestRIP, std::memory_order_acq_rel)) {
+      __atomic_store_n(&FEXFrameMarkReturn, GuestRIP + Return, __ATOMIC_RELEASE);
+      FEX::Windows::StatsLogNote(fextl::fmt::format("frames: timing every frame from the clock read at {:X}", GuestRIP + Return - 6));
       FoundOne("frames", "frame function", GuestRIP, ImageBase + FrameClock::KnownRVA);
     }
   }
