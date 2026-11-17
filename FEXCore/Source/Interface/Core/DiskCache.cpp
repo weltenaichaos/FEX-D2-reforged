@@ -23,6 +23,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <atomic>
 
 namespace FEXCore {
@@ -424,16 +427,32 @@ namespace DiskCache {
     if (Size <= 0 || static_cast<uint64_t>(Size) + Margin < static_cast<uint64_t>(MaxFileSize)) {
       return;
     }
-    std::remove(OldFoz.c_str());
-    std::remove(OldIdx.c_str());
+#ifdef _WIN32
+    // No CRT remove() in the ARM64EC build; Win32 calls, which also give the error code.
+    auto Remove = [](const fextl::string& Path) {
+      DeleteFileA(Path.c_str());
+    };
+    auto Move = [](const fextl::string& From, const fextl::string& To) -> int {
+      return MoveFileA(From.c_str(), To.c_str()) ? 0 : static_cast<int>(GetLastError() ? GetLastError() : 1);
+    };
+#else
+    auto Remove = [](const fextl::string& Path) {
+      unlink(Path.c_str());
+    };
+    auto Move = [](const fextl::string& From, const fextl::string& To) -> int {
+      return ::rename(From.c_str(), To.c_str()) == 0 ? 0 : (errno ? errno : 1);
+    };
+#endif
+    Remove(OldFoz);
+    Remove(OldIdx);
     // The index first: a cache file without its index is never read, an index without its file would be.
-    if (std::rename(Idx.c_str(), OldIdx.c_str()) != 0) {
-      SHMStats::DiskCacheWriter.RenewError.store(errno ? errno : -1, std::memory_order_relaxed);
+    if (const int Error = Move(Idx, OldIdx)) {
+      SHMStats::DiskCacheWriter.RenewError.store(Error, std::memory_order_relaxed);
       return;
     }
-    if (std::rename(Foz.c_str(), OldFoz.c_str()) != 0) {
-      SHMStats::DiskCacheWriter.RenewError.store(errno ? errno : -1, std::memory_order_relaxed);
-      std::rename(OldIdx.c_str(), Idx.c_str());
+    if (const int Error = Move(Foz, OldFoz)) {
+      SHMStats::DiskCacheWriter.RenewError.store(Error, std::memory_order_relaxed);
+      Move(OldIdx, Idx);
       return;
     }
     SHMStats::DiskCacheWriter.RenewedFrom.store(Size, std::memory_order_relaxed);
